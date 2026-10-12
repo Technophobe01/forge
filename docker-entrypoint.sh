@@ -98,20 +98,64 @@ if [ -n "${MIDDLEMAN_KATA_URL:-}" ]; then
   fi
 fi
 
-# forge's first start renames middleman.db to forge.db in data_dir, and nothing
-# renames it back: the old image would then start on an empty database. Keep a
-# copy to roll back to, once, while the database is still closed. data_dir is
-# MIDDLEMAN_HOME in the config seeded above.
-if [ -f "${MIDDLEMAN_HOME}/middleman.db" ] && [ ! -e "${MIDDLEMAN_HOME}/forge.db" ] \
-   && ! ls "${MIDDLEMAN_HOME}"/middleman.db.pre-forge.* >/dev/null 2>&1; then
-  backup="${MIDDLEMAN_HOME}/middleman.db.pre-forge.$(date -u +%Y%m%dT%H%M%SZ)"
+# The config serve will use: a --config passed to the container is handed to
+# serve below, so it is the one that counts when present.
+serve_config="${CONFIG}"
+prev=""
+for arg in "$@"; do
+  case "${prev}" in --config|-config) serve_config="${arg}" ;; esac
+  case "${arg}" in --config=*|-config=*) serve_config="${arg#*=}" ;; esac
+  prev="${arg}"
+done
+
+# forge's first start renames middleman.db to forge.db in that config's
+# data_dir, and nothing renames it back: the old image would then start on an
+# empty database. Keep a copy to roll back to, while the database is closed.
+#   - The copy goes to a temporary directory and is moved into place only once
+#     it is whole, the database file last since it is what this check looks
+#     for; an interrupted copy is cleared on the next start.
+#   - A database or WAL newer than the latest backup gets a new one, so a
+#     rollback followed by another upgrade does not leave a stale copy.
+#   - It is copied under middleman.lock, the lock forge's migration takes; a
+#     middleman still holding it means the database is in use.
+backup_middleman_db() {
+  dir="$1"
+  [ -f "${dir}/middleman.db" ] && [ ! -e "${dir}/forge.db" ] || return 0
+  rm -rf "${dir}"/.pre-forge-tmp.* 2>/dev/null || true
+  newest="$(ls -t "${dir}"/middleman.db.pre-forge.* 2>/dev/null | grep -Ev -- '-(wal|shm)$' | head -n 1 || true)"
+  if [ -n "${newest}" ] && [ ! "${dir}/middleman.db" -nt "${newest}" ]; then
+    if [ ! -f "${dir}/middleman.db-wal" ] \
+       || { [ -f "${newest}-wal" ] && [ ! "${dir}/middleman.db-wal" -nt "${newest}-wal" ]; }; then
+      return 0
+    fi
+  fi
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>>"${dir}/middleman.lock"
+    if ! flock -n 9; then
+      echo "kenn-forge: ${dir}/middleman.db is in use by another process (middleman.lock is held); not copying or migrating it" >&2
+      exit 1
+    fi
+  fi
+  tmp="${dir}/.pre-forge-tmp.$$"
+  mkdir "${tmp}"
   for suffix in "" -wal -shm; do
-    if [ -f "${MIDDLEMAN_HOME}/middleman.db${suffix}" ]; then
-      cp -p "${MIDDLEMAN_HOME}/middleman.db${suffix}" "${backup}${suffix}"
+    if [ -f "${dir}/middleman.db${suffix}" ]; then
+      cp -p "${dir}/middleman.db${suffix}" "${tmp}/middleman.db${suffix}"
     fi
   done
+  backup="${dir}/middleman.db.pre-forge.$(date -u +%Y%m%dT%H%M%SZ)"
+  for suffix in -wal -shm ""; do
+    if [ -f "${tmp}/middleman.db${suffix}" ]; then
+      mv "${tmp}/middleman.db${suffix}" "${backup}${suffix}"
+    fi
+  done
+  rmdir "${tmp}"
+  if command -v flock >/dev/null 2>&1; then exec 9>&-; fi
   echo "kenn-forge: kept the middleman database as ${backup} before its one-way migration" >&2
-fi
+}
+data_dir="$(kenn-forge config read --config "${serve_config}" data_dir 2>/dev/null || true)"
+[ -n "${data_dir}" ] || data_dir="${MIDDLEMAN_HOME}"
+backup_middleman_db "${data_dir}"
 
 # Seed-only mode: write the config and exit (used by tests to validate the
 # generated config without starting the server). No kenn-forge binary required.
@@ -120,15 +164,7 @@ if [ "${MIDDLEMAN_SEED_ONLY:-}" = "1" ]; then
 fi
 
 # Honor a hand-edited config: read the port kenn-forge will actually bind,
-# from the config serve will use. A --config passed to the container is handed
-# to serve below, so it is the one to read when present.
-serve_config="${CONFIG}"
-prev=""
-for arg in "$@"; do
-  case "${prev}" in --config|-config) serve_config="${arg}" ;; esac
-  case "${arg}" in --config=*|-config=*) serve_config="${arg#*=}" ;; esac
-  prev="${arg}"
-done
+# from the config serve will use.
 backend_port="$(kenn-forge config read --config "${serve_config}" port 2>/dev/null || true)"
 case "${backend_port}" in
   ''|*[!0-9]*) backend_port="${MIDDLEMAN_INTERNAL_PORT}" ;;

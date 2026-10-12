@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -428,4 +429,95 @@ func TestDockerEntrypointBridgesThePortOfTheConfigServeUses(t *testing.T) {
 		require.NoError(t, err)
 		assert.Contains(t, string(calls), "config read --config "+custom+" port", args)
 	}
+}
+
+// pre-forge backups of the database file itself, without -wal/-shm.
+func preForgeBackups(t *testing.T, dir string) []string {
+	t.Helper()
+	all, err := filepath.Glob(filepath.Join(dir, "middleman.db.pre-forge.*"))
+	require.NoError(t, err)
+	var bases []string
+	for _, p := range all {
+		if !strings.HasSuffix(p, "-wal") && !strings.HasSuffix(p, "-shm") {
+			bases = append(bases, p)
+		}
+	}
+	return bases
+}
+
+// An interrupted copy (disk full, a killed container) leaves only a temporary
+// directory, which must not pass for a backup.
+func TestDockerEntrypointDoesNotTakeAnInterruptedCopyForABackup(t *testing.T) {
+	home := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(home, "middleman.db"), []byte("db"), 0o600))
+	partial := filepath.Join(home, ".pre-forge-tmp.123")
+	require.NoError(t, os.MkdirAll(partial, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(partial, "middleman.db"), []byte("d"), 0o600))
+
+	runEntrypoint(t, home, nil)
+
+	backups := preForgeBackups(t, home)
+	require.Len(t, backups, 1, "a complete backup is taken despite the leftover")
+	got, err := os.ReadFile(backups[0])
+	require.NoError(t, err)
+	assert.Equal(t, "db", string(got))
+	assert.NoDirExists(t, partial, "the leftover of the interrupted copy is cleared")
+}
+
+// Forge migrates the data_dir of the config serve uses; that is the database
+// to keep, wherever it lives.
+func TestDockerEntrypointBacksUpTheDataDirForgeMigrates(t *testing.T) {
+	home, other, bin := t.TempDir(), t.TempDir(), t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(other, "middleman.db"), []byte("db"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "kenn-forge"), []byte(
+		"#!/bin/sh\n[ \"$1 $2\" = \"config read\" ] && [ \"$5\" = data_dir ] && echo "+other+"\n"), 0o755))
+
+	runEntrypoint(t, home, map[string]string{"PATH": bin + string(os.PathListSeparator) + os.Getenv("PATH")})
+
+	assert.Len(t, preForgeBackups(t, other), 1, "the configured data_dir is backed up")
+	assert.Empty(t, preForgeBackups(t, home))
+}
+
+// After a rollback the old image writes to middleman.db again; the next
+// upgrade must keep that newer database, not trust the first backup.
+func TestDockerEntrypointBacksUpADatabaseNewerThanItsLastBackup(t *testing.T) {
+	home := t.TempDir()
+	db := filepath.Join(home, "middleman.db")
+	require.NoError(t, os.WriteFile(db, []byte("v1"), 0o600))
+	runEntrypoint(t, home, nil)
+	require.Len(t, preForgeBackups(t, home), 1)
+
+	// An unchanged database is not copied again.
+	runEntrypoint(t, home, nil)
+	require.Len(t, preForgeBackups(t, home), 1, "an unchanged database keeps its one backup")
+
+	require.NoError(t, os.WriteFile(db, []byte("v2"), 0o600))
+	later := time.Now().Add(2 * time.Minute)
+	require.NoError(t, os.Chtimes(db, later, later))
+	time.Sleep(1100 * time.Millisecond) // the backup name has one-second resolution
+	runEntrypoint(t, home, nil)
+	assert.Len(t, preForgeBackups(t, home), 2, "the newer database gets its own backup")
+}
+
+// A middleman still holding the database (two containers on one volume) must
+// not be copied mid-write; forge would refuse to migrate it anyway.
+func TestDockerEntrypointWillNotCopyADatabaseInUse(t *testing.T) {
+	if _, err := exec.LookPath("flock"); err != nil {
+		t.Skip("needs util-linux flock, as in the image")
+	}
+	home := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(home, "middleman.db"), []byte("db"), 0o600))
+	holder := exec.Command("flock", filepath.Join(home, "middleman.lock"), "sleep", "30")
+	require.NoError(t, holder.Start())
+	t.Cleanup(func() { _ = holder.Process.Kill(); _ = holder.Wait() })
+	require.Eventually(t, func() bool {
+		return exec.Command("flock", "-n", filepath.Join(home, "middleman.lock"), "true").Run() != nil
+	}, 5*time.Second, 20*time.Millisecond)
+
+	cmd := exec.Command("sh", entrypointScript(t))
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "MIDDLEMAN_SEED_ONLY=1", "MIDDLEMAN_HOME=" + home}
+	out, err := cmd.CombinedOutput()
+	require.Error(t, err, "the entrypoint goes on while the database is in use: %s", out)
+	assert.Contains(t, string(out), "in use")
+	assert.Empty(t, preForgeBackups(t, home))
 }
