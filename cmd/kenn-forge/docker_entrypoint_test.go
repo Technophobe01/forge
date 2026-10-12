@@ -335,14 +335,24 @@ func TestDockerEntrypointLetsKennForgeFinishShuttingDown(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX entrypoint")
 	}
-	home, bin := t.TempDir(), t.TempDir()
-	done := filepath.Join(t.TempDir(), "shutdown-finished")
+	home, bin, marks := t.TempDir(), t.TempDir(), t.TempDir()
+	started := filepath.Join(marks, "serve-started")
+	done := filepath.Join(marks, "shutdown-finished")
+	socatTermed := filepath.Join(marks, "socat-got-term")
+	socatStopped := filepath.Join(marks, "socat-stopped-while-draining")
+	// The server says when it is up, which is after the entrypoint installed
+	// its trap; when it finishes draining it notes whether the bridge had
+	// already been told to stop.
 	require.NoError(t, os.WriteFile(filepath.Join(bin, "kenn-forge"), []byte(
 		"#!/bin/sh\n"+
 			"[ \"$1\" = serve ] || exit 0\n"+
-			"trap 'sleep 1; touch "+done+"; exit 0' TERM\n"+
+			"trap 'sleep 1; [ -e "+socatTermed+" ] && touch "+socatStopped+"; touch "+done+"; exit 0' TERM\n"+
+			"touch "+started+"\n"+
 			"while :; do sleep 0.1; done\n"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(bin, "socat"), []byte("#!/bin/sh\nexec sleep 30\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "socat"), []byte(
+		"#!/bin/sh\n"+
+			"trap 'touch "+socatTermed+"; exit 0' TERM\n"+
+			"while :; do sleep 0.1; done\n"), 0o755))
 
 	cmd := exec.Command("sh", entrypointScript(t))
 	cmd.Env = []string{
@@ -352,11 +362,43 @@ func TestDockerEntrypointLetsKennForgeFinishShuttingDown(t *testing.T) {
 		"MIDDLEMAN_INTERNAL_PORT=18092",
 	}
 	require.NoError(t, cmd.Start())
-	time.Sleep(500 * time.Millisecond) // let it start the server
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	require.Eventually(t, func() bool { _, err := os.Stat(started); return err == nil },
+		10*time.Second, 20*time.Millisecond, "kenn-forge serve never started")
 	require.NoError(t, cmd.Process.Signal(syscall.SIGTERM))
 	_ = cmd.Wait()
 
 	assert.FileExists(t, done, "the entrypoint exited before kenn-forge finished shutting down")
+	assert.NoFileExists(t, socatStopped, "the bridge was stopped while kenn-forge was still draining")
+}
+
+// TestDockerEntrypointKeepsTheMiddlemanDatabaseBeforeForgeRenamesIt: forge's
+// first start renames middleman.db to forge.db, and nothing renames it back,
+// so the entrypoint keeps a copy an operator can roll back to.
+func TestDockerEntrypointKeepsTheMiddlemanDatabaseBeforeForgeRenamesIt(t *testing.T) {
+	home := t.TempDir()
+	for name, body := range map[string]string{"middleman.db": "db", "middleman.db-wal": "wal"} {
+		require.NoError(t, os.WriteFile(filepath.Join(home, name), []byte(body), 0o600))
+	}
+	runEntrypoint(t, home, nil)
+
+	backups, err := filepath.Glob(filepath.Join(home, "middleman.db.pre-forge.*"))
+	require.NoError(t, err)
+	require.Len(t, backups, 2, "the database and its WAL") // sorted: base first
+	got, err := os.ReadFile(backups[0])
+	require.NoError(t, err)
+	assert.Equal(t, "db", string(got))
+	wal, err := os.ReadFile(backups[0] + "-wal")
+	require.NoError(t, err, "the WAL is kept with it")
+	assert.Equal(t, "wal", string(wal))
+
+	// Once forge has migrated, there is nothing left to keep.
+	require.NoError(t, os.Rename(filepath.Join(home, "middleman.db"), filepath.Join(home, "forge.db")))
+	require.NoError(t, os.Remove(filepath.Join(home, "middleman.db-wal")))
+	runEntrypoint(t, home, nil)
+	backups, err = filepath.Glob(filepath.Join(home, "middleman.db.pre-forge.*"))
+	require.NoError(t, err)
+	assert.Len(t, backups, 2, "the database and its WAL, from the first run only") // db + -wal
 }
 
 // TestDockerEntrypointBridgesThePortOfTheConfigServeUses: a --config passed

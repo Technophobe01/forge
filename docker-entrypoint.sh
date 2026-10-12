@@ -98,6 +98,21 @@ if [ -n "${MIDDLEMAN_KATA_URL:-}" ]; then
   fi
 fi
 
+# forge's first start renames middleman.db to forge.db in data_dir, and nothing
+# renames it back: the old image would then start on an empty database. Keep a
+# copy to roll back to, once, while the database is still closed. data_dir is
+# MIDDLEMAN_HOME in the config seeded above.
+if [ -f "${MIDDLEMAN_HOME}/middleman.db" ] && [ ! -e "${MIDDLEMAN_HOME}/forge.db" ] \
+   && ! ls "${MIDDLEMAN_HOME}"/middleman.db.pre-forge.* >/dev/null 2>&1; then
+  backup="${MIDDLEMAN_HOME}/middleman.db.pre-forge.$(date -u +%Y%m%dT%H%M%SZ)"
+  for suffix in "" -wal -shm; do
+    if [ -f "${MIDDLEMAN_HOME}/middleman.db${suffix}" ]; then
+      cp -p "${MIDDLEMAN_HOME}/middleman.db${suffix}" "${backup}${suffix}"
+    fi
+  done
+  echo "kenn-forge: kept the middleman database as ${backup} before its one-way migration" >&2
+fi
+
 # Seed-only mode: write the config and exit (used by tests to validate the
 # generated config without starting the server). No kenn-forge binary required.
 if [ "${MIDDLEMAN_SEED_ONLY:-}" = "1" ]; then
@@ -119,17 +134,26 @@ case "${backend_port}" in
   ''|*[!0-9]*) backend_port="${MIDDLEMAN_INTERNAL_PORT}" ;;
 esac
 
+# The trap goes in before anything starts, and stops only kenn-forge: the
+# bridge stays up while it drains, and is stopped once it has exited. A
+# signal that arrives before kenn-forge has started is passed on as soon as
+# it has.
+mm_pid="" socat_pid="" stopping=""
+terminate() {
+  stopping=1
+  if [ -n "${mm_pid}" ]; then kill -TERM "${mm_pid}" 2>/dev/null || true; fi
+}
+trap terminate INT TERM
+
 socat "TCP-LISTEN:${MIDDLEMAN_PORT},fork,bind=0.0.0.0,reuseaddr" "TCP:127.0.0.1:${backend_port}" &
 socat_pid=$!
 
 # KENN_FORGE_HOME makes the default config path resolve to ${CONFIG}. On the
 # first start against a middleman volume, forge renames middleman.db to
-# forge.db in data_dir; that is one way, so snapshot the volume before.
+# forge.db in data_dir; the copy kept above is the way back.
 kenn-forge serve "$@" &
 mm_pid=$!
-
-terminate() { kill -TERM "${mm_pid}" "${socat_pid}" 2>/dev/null || true; }
-trap terminate INT TERM
+if [ -n "${stopping}" ]; then kill -TERM "${mm_pid}" 2>/dev/null || true; fi
 
 # Disable errexit around wait so a non-zero kenn-forge exit still runs cleanup.
 # A trapped TERM makes wait return at once, while kenn-forge is still shutting
