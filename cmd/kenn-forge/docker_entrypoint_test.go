@@ -1,0 +1,321 @@
+package main
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/forge/internal/config"
+	"go.kenn.io/forge/internal/kata"
+)
+
+// entrypointScript returns the absolute path to the production docker entrypoint,
+// resolved from this test file's location so it works regardless of CWD.
+func entrypointScript(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	require.True(t, ok, "runtime.Caller failed")
+	p := filepath.Join(filepath.Dir(thisFile), "..", "..", "docker-entrypoint.sh")
+	if _, err := os.Stat(p); err != nil {
+		t.Skipf("entrypoint script not found at %s: %v", p, err)
+	}
+	return p
+}
+
+// seedConfig runs docker-entrypoint.sh in seed-only mode with the given env and
+// loads the generated config through the real loader. The returned config is
+// what the server itself would see, so a bad seeded key/value fails the test
+// here rather than silently breaking a container at startup.
+func seedConfig(t *testing.T, home string, env map[string]string) *config.Config {
+	t.Helper()
+	runEntrypoint(t, home, env)
+	cfg, err := config.Load(filepath.Join(home, "config.toml"))
+	require.NoErrorf(t, err, "generated config did not load")
+	return cfg
+}
+
+func TestDockerEntrypointSeedsLoadableConfig(t *testing.T) {
+	t.Run("defaults bind loopback with synonym allowlist", func(t *testing.T) {
+		assert := assert.New(t)
+		cfg := seedConfig(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":          "18091",
+			"MIDDLEMAN_INTERNAL_PORT": "18092",
+		})
+		assert.Equal("127.0.0.1", cfg.Host)
+		assert.Equal(18092, cfg.Port) // the daemon binds the internal loopback port
+		assert.Contains(cfg.AllowedHosts, "127.0.0.1:18091")
+		assert.Contains(cfg.AllowedHosts, "localhost:18091")
+		assert.False(cfg.TrustReverseProxy)
+	})
+
+	t.Run("operator allowed hosts are merged", func(t *testing.T) {
+		assert := assert.New(t)
+		cfg := seedConfig(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":          "18091",
+			"MIDDLEMAN_INTERNAL_PORT": "18092",
+			"MIDDLEMAN_ALLOWED_HOSTS": "host.example:18091, other.lan",
+		})
+		assert.Contains(cfg.AllowedHosts, "127.0.0.1:18091") // synonyms still present
+		assert.Contains(cfg.AllowedHosts, "host.example:18091")
+		assert.Contains(cfg.AllowedHosts, "other.lan")
+		assert.False(cfg.TrustReverseProxy)
+	})
+
+	t.Run("base path prefix is seeded", func(t *testing.T) {
+		assert := assert.New(t)
+		cfg := seedConfig(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":      "18091",
+			"MIDDLEMAN_BASE_PATH": "/middleman",
+		})
+		// config.Load normalizes a non-root prefix to a trailing slash.
+		assert.Equal("/middleman/", cfg.BasePath)
+	})
+
+	t.Run("no base path defaults to root", func(t *testing.T) {
+		cfg := seedConfig(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT": "18091",
+		})
+		assert.Equal(t, "/", cfg.BasePath)
+	})
+
+	t.Run("hostile base path still produces valid TOML", func(t *testing.T) {
+		assert := assert.New(t)
+		// Quotes/backslashes must not break the generated TOML; config.Load
+		// succeeding (inside seedConfig) is the core assertion.
+		cfg := seedConfig(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":      "18091",
+			"MIDDLEMAN_BASE_PATH": "/ev\"il\\path",
+		})
+		assert.NotContains(cfg.BasePath, "\"")
+		assert.NotContains(cfg.BasePath, "\\")
+	})
+
+	t.Run("trust_reverse_proxy only for truthy values", func(t *testing.T) {
+		truthy := []string{"1", "true", "TRUE", "yes"}
+		for _, v := range truthy {
+			cfg := seedConfig(t, t.TempDir(), map[string]string{
+				"MIDDLEMAN_ALLOWED_HOSTS":       "proxy.example",
+				"MIDDLEMAN_TRUST_REVERSE_PROXY": v,
+			})
+			assert.Truef(t, cfg.TrustReverseProxy, "value %q should enable trust", v)
+		}
+		for _, v := range []string{"", "0", "false", "no"} {
+			cfg := seedConfig(t, t.TempDir(), map[string]string{
+				"MIDDLEMAN_ALLOWED_HOSTS":       "proxy.example",
+				"MIDDLEMAN_TRUST_REVERSE_PROXY": v,
+			})
+			assert.Falsef(t, cfg.TrustReverseProxy, "value %q should not enable trust", v)
+		}
+	})
+
+	t.Run("hostile allowed_hosts still produce valid TOML", func(t *testing.T) {
+		assert := assert.New(t)
+		// Quotes, backslashes, and a newline must not break the generated TOML;
+		// they are stripped, leaving bare host tokens. config.Load succeeding is
+		// the core assertion (a broken file would error).
+		cfg := seedConfig(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":          "18091",
+			"MIDDLEMAN_ALLOWED_HOSTS": "ev\"il, na\\me, line\nbreak",
+		})
+		assert.Contains(cfg.AllowedHosts, "evil")
+		assert.Contains(cfg.AllowedHosts, "name")
+		// No residual quote/backslash survived into any entry.
+		for _, h := range cfg.AllowedHosts {
+			assert.NotContains(h, "\"")
+			assert.NotContains(h, "\\")
+		}
+	})
+
+	t.Run("existing config is not overwritten", func(t *testing.T) {
+		home := t.TempDir()
+		sentinel := "host = \"127.0.0.1\"\nport = 9999\n"
+		require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"), []byte(sentinel), 0o600))
+		cfg := seedConfig(t, home, map[string]string{
+			"MIDDLEMAN_PORT":          "18091",
+			"MIDDLEMAN_INTERNAL_PORT": "18092",
+		})
+		assert.Equal(t, 9999, cfg.Port, "entrypoint must not clobber an existing config")
+		assert.False(t, slices.Contains(cfg.AllowedHosts, "127.0.0.1:18091"))
+	})
+}
+
+// seedKataCatalog runs the entrypoint (which seeds both the middleman config and
+// the kata daemon catalog at $KATA_HOME/config.toml) and reads the catalog back
+// through the real kata loader. A bad seeded daemon entry fails here rather than
+// silently breaking the front-door kata proxy at container startup.
+func seedKataCatalog(t *testing.T, home string, env map[string]string) kata.Catalog {
+	t.Helper()
+	seedConfig(t, home, env) // also asserts the middleman config itself loads
+	t.Setenv("KATA_HOME", filepath.Join(home, "kata"))
+	cat, err := kata.LoadCatalog()
+	require.NoErrorf(t, err, "seeded kata catalog did not load")
+	return cat
+}
+
+// runEntrypoint runs docker-entrypoint.sh in seed-only mode and returns its
+// combined output, for asserting operator warnings and that files are (not) written.
+func runEntrypoint(t *testing.T, home string, env map[string]string) string {
+	t.Helper()
+	cmd := exec.Command("sh", entrypointScript(t))
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"MIDDLEMAN_SEED_ONLY=1",
+		"MIDDLEMAN_HOME=" + home,
+	}
+	for k, v := range env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	out, err := cmd.CombinedOutput()
+	require.NoErrorf(t, err, "entrypoint failed: %s", out)
+	return string(out)
+}
+
+func TestDockerEntrypointSeedsProxyTargets(t *testing.T) {
+	t.Run("roborev endpoint is seeded and loads", func(t *testing.T) {
+		assert := assert.New(t)
+		cfg := seedConfig(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":             "18091",
+			"MIDDLEMAN_INTERNAL_PORT":    "18092",
+			"MIDDLEMAN_ROBOREV_ENDPOINT": "http://roborev:7373",
+		})
+		assert.Equal("http://roborev:7373", cfg.Roborev.Endpoint)
+		assert.Equal("http://roborev:7373", cfg.RoborevEndpoint())
+	})
+
+	t.Run("no roborev endpoint leaves the panel unconfigured", func(t *testing.T) {
+		assert := assert.New(t)
+		cfg := seedConfig(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":          "18091",
+			"MIDDLEMAN_INTERNAL_PORT": "18092",
+		})
+		assert.Empty(cfg.Roborev.Endpoint)
+	})
+
+	t.Run("hostile roborev endpoint still produces valid TOML", func(t *testing.T) {
+		assert := assert.New(t)
+		// Quotes/backslashes/newlines must not break the [roborev] table;
+		// config.Load succeeding (inside seedConfig) is the core assertion.
+		cfg := seedConfig(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":             "18091",
+			"MIDDLEMAN_ROBOREV_ENDPOINT": "http://ev\"il\\:7373\nbreak",
+		})
+		assert.NotEmpty(cfg.Roborev.Endpoint)
+		assert.NotContains(cfg.Roborev.Endpoint, "\"")
+		assert.NotContains(cfg.Roborev.Endpoint, "\\")
+		assert.NotContains(cfg.Roborev.Endpoint, "\n")
+	})
+
+	t.Run("kata catalog is seeded and loads", func(t *testing.T) {
+		assert := assert.New(t)
+		cat := seedKataCatalog(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":     "18091",
+			"MIDDLEMAN_KATA_URL": "http://kata:7777",
+			"KATA_AUTH_TOKEN":    "test-token",
+		})
+		require.Len(t, cat.Daemons, 1)
+		d := cat.Daemons[0]
+		assert.Equal("http://kata:7777", d.URL)
+		assert.Equal("KATA_AUTH_TOKEN", d.TokenEnv)
+		assert.True(d.Default, "seeded daemon should be the active_daemon")
+		assert.True(d.AllowInsecure)
+		assert.Empty(d.Token, "catalog carries token_env, never the secret itself")
+	})
+
+	t.Run("hostile kata url still produces a loadable catalog", func(t *testing.T) {
+		assert := assert.New(t)
+		// LoadCatalog succeeding (inside seedKataCatalog) is the core assertion.
+		cat := seedKataCatalog(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":     "18091",
+			"MIDDLEMAN_KATA_URL": "http://ka\"ta\\:7777\nbreak",
+			"KATA_AUTH_TOKEN":    "test-token",
+		})
+		require.Len(t, cat.Daemons, 1)
+		u := cat.Daemons[0].URL
+		assert.NotEmpty(u)
+		assert.NotContains(u, "\"")
+		assert.NotContains(u, "\\")
+		assert.NotContains(u, "\n")
+	})
+
+	t.Run("kata url without auth token warns", func(t *testing.T) {
+		// A catalog with no usable token would fail the proxy at runtime; the
+		// entrypoint must surface that at seed time, not silently.
+		out := runEntrypoint(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":     "18091",
+			"MIDDLEMAN_KATA_URL": "http://kata:7777",
+			// KATA_AUTH_TOKEN intentionally unset
+		})
+		assert.Contains(t, out, "KATA_AUTH_TOKEN is empty")
+	})
+
+	t.Run("no kata url writes no catalog", func(t *testing.T) {
+		home := t.TempDir()
+		runEntrypoint(t, home, map[string]string{
+			"MIDDLEMAN_PORT": "18091",
+			// MIDDLEMAN_KATA_URL intentionally unset
+		})
+		_, err := os.Stat(filepath.Join(home, "kata", "config.toml"))
+		assert.Truef(t, os.IsNotExist(err),
+			"no kata catalog should be written without MIDDLEMAN_KATA_URL (stat err: %v)", err)
+	})
+}
+
+// TestDockerEntrypointStartsKennForgeOnTheMiddlemanVolume pins the rename:
+// forge reads none of the MIDDLEMAN_* variables, so without KENN_FORGE_HOME it
+// would ignore the seeded /data/config.toml and start empty under
+// /data/.kenn/forge, losing base_path and with it the Console route.
+func TestDockerEntrypointStartsKennForgeOnTheMiddlemanVolume(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX entrypoint")
+	}
+	home := t.TempDir()
+	bin := t.TempDir()
+	record := filepath.Join(t.TempDir(), "kenn-forge.calls")
+	// A stub server that records how it was started, and a socat that just
+	// waits to be stopped.
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "kenn-forge"), []byte(
+		"#!/bin/sh\n"+
+			"echo \"args=$*\" >> "+record+"\n"+
+			"echo \"KENN_FORGE_HOME=${KENN_FORGE_HOME:-}\" >> "+record+"\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "socat"), []byte("#!/bin/sh\nexec sleep 30\n"), 0o755))
+
+	cmd := exec.Command("sh", entrypointScript(t))
+	cmd.Env = []string{
+		"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"MIDDLEMAN_HOME=" + home,
+		"MIDDLEMAN_PORT=18091",
+		"MIDDLEMAN_INTERNAL_PORT=18092",
+	}
+	out, err := cmd.CombinedOutput()
+	require.NoErrorf(t, err, "entrypoint failed: %s", out)
+
+	calls, err := os.ReadFile(record)
+	require.NoError(t, err, "kenn-forge was never started")
+	assert.Contains(t, string(calls), "KENN_FORGE_HOME="+home)
+	assert.Contains(t, string(calls), "args=serve")
+}
+
+// TestLegacyMiddlemanVolumeMigratesInPlace is what the image relies on: with
+// KENN_FORGE_HOME on the volume and the seeded data_dir, forge's first start
+// renames middleman.db to forge.db where it lies. The rename is one way, so an
+// upgrade snapshots the volume first.
+func TestLegacyMiddlemanVolumeMigratesInPlace(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("KENN_FORGE_HOME", home)
+	seedConfig(t, home, map[string]string{"MIDDLEMAN_INTERNAL_PORT": "18092"})
+	require.NoError(t, os.WriteFile(filepath.Join(home, "middleman.db"), []byte("legacy"), 0o600))
+
+	_, err := config.LoadOrCreate(filepath.Join(home, "config.toml"))
+	require.NoError(t, err)
+
+	got, err := os.ReadFile(filepath.Join(home, "forge.db"))
+	require.NoError(t, err, "middleman.db was not carried over")
+	assert.Equal(t, "legacy", string(got))
+	assert.NoFileExists(t, filepath.Join(home, "middleman.db"))
+}

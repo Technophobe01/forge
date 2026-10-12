@@ -1,0 +1,21 @@
+# Keep the build context small and reproducible.
+.git
+.github
+node_modules
+**/node_modules
+frontend/dist
+internal/web/dist
+internal/githubapp/ui/dist
+packages/*/dist
+target
+*.db
+*.db-*
+.DS_Store
+test-results
+playwright-report
+*.log
+kenn-forge
+kenn-forge-github-app
+# Binaries left over from the middleman name.
+middleman
+middleman-github-app
