@@ -111,50 +111,62 @@ done
 # forge's first start renames middleman.db to forge.db in that config's
 # data_dir, and nothing renames it back: the old image would then start on an
 # empty database. Keep a copy to roll back to, while the database is closed.
-#   - The copy goes to a temporary directory and is moved into place only once
-#     it is whole, the database file last since it is what this check looks
-#     for; an interrupted copy is cleared on the next start.
-#   - A database or WAL newer than the latest backup gets a new one, so a
-#     rollback followed by another upgrade does not leave a stale copy.
-#   - It is copied under middleman.lock, the lock forge's migration takes; a
-#     middleman still holding it means the database is in use.
+#   - Everything happens under middleman.lock, the lock forge's migration
+#     takes. A middleman still holding it means the database is in use, and
+#     the container stops rather than copy files mid-write.
+#   - A backup is a directory, middleman.db.pre-forge.<UTC time>.<pid>, holding
+#     the database with its WAL and SHM. It is filled under a temporary name
+#     and published with one rename, so it is either whole or absent, and
+#     never shares a name with another. Leftovers of a cut-off copy are
+#     cleared.
+#   - A database or WAL newer than the latest backup, by name, gets a new one,
+#     so a rollback followed by another upgrade keeps the newer data.
 backup_middleman_db() {
   dir="$1"
   [ -f "${dir}/middleman.db" ] && [ ! -e "${dir}/forge.db" ] || return 0
-  rm -rf "${dir}"/.pre-forge-tmp.* 2>/dev/null || true
-  newest="$(ls -t "${dir}"/middleman.db.pre-forge.* 2>/dev/null | grep -Ev -- '-(wal|shm)$' | head -n 1 || true)"
-  if [ -n "${newest}" ] && [ ! "${dir}/middleman.db" -nt "${newest}" ]; then
-    if [ ! -f "${dir}/middleman.db-wal" ] \
-       || { [ -f "${newest}-wal" ] && [ ! "${dir}/middleman.db-wal" -nt "${newest}-wal" ]; }; then
-      return 0
-    fi
-  fi
+  locked=""
   if command -v flock >/dev/null 2>&1; then
     exec 9>>"${dir}/middleman.lock"
     if ! flock -n 9; then
       echo "kenn-forge: ${dir}/middleman.db is in use by another process (middleman.lock is held); not copying or migrating it" >&2
       exit 1
     fi
+    locked=1
   fi
-  tmp="${dir}/.pre-forge-tmp.$$"
-  mkdir "${tmp}"
-  for suffix in "" -wal -shm; do
-    if [ -f "${dir}/middleman.db${suffix}" ]; then
-      cp -p "${dir}/middleman.db${suffix}" "${tmp}/middleman.db${suffix}"
+  rm -rf "${dir}"/.pre-forge-tmp.* 2>/dev/null || true
+  latest="$(ls -d "${dir}"/middleman.db.pre-forge.* 2>/dev/null | sort | tail -n 1 || true)"
+  current=""
+  if [ -n "${latest}" ] && [ -f "${latest}/middleman.db" ] && [ ! "${dir}/middleman.db" -nt "${latest}/middleman.db" ]; then
+    if [ ! -f "${dir}/middleman.db-wal" ] \
+       || { [ -f "${latest}/middleman.db-wal" ] && [ ! "${dir}/middleman.db-wal" -nt "${latest}/middleman.db-wal" ]; }; then
+      current=1
     fi
-  done
-  backup="${dir}/middleman.db.pre-forge.$(date -u +%Y%m%dT%H%M%SZ)"
-  for suffix in -wal -shm ""; do
-    if [ -f "${tmp}/middleman.db${suffix}" ]; then
-      mv "${tmp}/middleman.db${suffix}" "${backup}${suffix}"
-    fi
-  done
-  rmdir "${tmp}"
-  if command -v flock >/dev/null 2>&1; then exec 9>&-; fi
-  echo "kenn-forge: kept the middleman database as ${backup} before its one-way migration" >&2
+  fi
+  if [ -z "${current}" ]; then
+    tmp="${dir}/.pre-forge-tmp.$$"
+    mkdir "${tmp}"
+    for suffix in "" -wal -shm; do
+      if [ -f "${dir}/middleman.db${suffix}" ]; then
+        cp -p "${dir}/middleman.db${suffix}" "${tmp}/middleman.db${suffix}"
+      fi
+    done
+    backup="${dir}/middleman.db.pre-forge.$(date -u +%Y%m%dT%H%M%SZ).$$"
+    mv "${tmp}" "${backup}"
+    echo "kenn-forge: kept the middleman database as ${backup} before its one-way migration" >&2
+  fi
+  if [ -n "${locked}" ]; then exec 9>&-; fi
 }
-data_dir="$(kenn-forge config read --config "${serve_config}" data_dir 2>/dev/null || true)"
-[ -n "${data_dir}" ] || data_dir="${MIDDLEMAN_HOME}"
+
+# The data_dir forge migrates, resolved as forge does (configuredDataDir): an
+# absolute value as is, a relative one against the working directory, and
+# none at all as KENN_FORGE_HOME. kenn-forge's `config read` knows only the
+# port, so the value is read from the file.
+config_data_dir="$(sed -n "s/^[[:space:]]*data_dir[[:space:]]*=[[:space:]]*[\"']\([^\"']*\)[\"'].*/\1/p" "${serve_config}" 2>/dev/null | head -n 1)"
+case "${config_data_dir}" in
+  "") data_dir="${KENN_FORGE_HOME}" ;;
+  /*) data_dir="${config_data_dir}" ;;
+  *)  data_dir="$(pwd)/${config_data_dir}" ;;
+esac
 backup_middleman_db "${data_dir}"
 
 # Seed-only mode: write the config and exit (used by tests to validate the

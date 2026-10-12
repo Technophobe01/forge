@@ -1,12 +1,12 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -383,23 +383,16 @@ func TestDockerEntrypointKeepsTheMiddlemanDatabaseBeforeForgeRenamesIt(t *testin
 	}
 	runEntrypoint(t, home, nil)
 
-	backups, err := filepath.Glob(filepath.Join(home, "middleman.db.pre-forge.*"))
-	require.NoError(t, err)
-	require.Len(t, backups, 2, "the database and its WAL") // sorted: base first
-	got, err := os.ReadFile(backups[0])
-	require.NoError(t, err)
-	assert.Equal(t, "db", string(got))
-	wal, err := os.ReadFile(backups[0] + "-wal")
-	require.NoError(t, err, "the WAL is kept with it")
-	assert.Equal(t, "wal", string(wal))
+	backups := preForgeBackups(t, home)
+	require.Len(t, backups, 1, "one backup")
+	assertFile(t, filepath.Join(backups[0], "middleman.db"), "db")
+	assertFile(t, filepath.Join(backups[0], "middleman.db-wal"), "wal")
 
 	// Once forge has migrated, there is nothing left to keep.
 	require.NoError(t, os.Rename(filepath.Join(home, "middleman.db"), filepath.Join(home, "forge.db")))
 	require.NoError(t, os.Remove(filepath.Join(home, "middleman.db-wal")))
 	runEntrypoint(t, home, nil)
-	backups, err = filepath.Glob(filepath.Join(home, "middleman.db.pre-forge.*"))
-	require.NoError(t, err)
-	assert.Len(t, backups, 2, "the database and its WAL, from the first run only") // db + -wal
+	assert.Len(t, preForgeBackups(t, home), 1, "no new backup once migrated")
 }
 
 // TestDockerEntrypointBridgesThePortOfTheConfigServeUses: a --config passed
@@ -431,18 +424,19 @@ func TestDockerEntrypointBridgesThePortOfTheConfigServeUses(t *testing.T) {
 	}
 }
 
-// pre-forge backups of the database file itself, without -wal/-shm.
+// preForgeBackups lists the backup directories the entrypoint published.
 func preForgeBackups(t *testing.T, dir string) []string {
 	t.Helper()
 	all, err := filepath.Glob(filepath.Join(dir, "middleman.db.pre-forge.*"))
 	require.NoError(t, err)
-	var bases []string
-	for _, p := range all {
-		if !strings.HasSuffix(p, "-wal") && !strings.HasSuffix(p, "-shm") {
-			bases = append(bases, p)
-		}
-	}
-	return bases
+	return all
+}
+
+func assertFile(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	require.NoError(t, err, path)
+	assert.Equal(t, want, string(got), path)
 }
 
 // An interrupted copy (disk full, a killed container) leaves only a temporary
@@ -458,21 +452,20 @@ func TestDockerEntrypointDoesNotTakeAnInterruptedCopyForABackup(t *testing.T) {
 
 	backups := preForgeBackups(t, home)
 	require.Len(t, backups, 1, "a complete backup is taken despite the leftover")
-	got, err := os.ReadFile(backups[0])
-	require.NoError(t, err)
-	assert.Equal(t, "db", string(got))
+	assertFile(t, filepath.Join(backups[0], "middleman.db"), "db")
 	assert.NoDirExists(t, partial, "the leftover of the interrupted copy is cleared")
 }
 
 // Forge migrates the data_dir of the config serve uses; that is the database
-// to keep, wherever it lives.
+// to keep, wherever it lives. No stub here: kenn-forge's own `config read`
+// knows only the port, so the entrypoint must find data_dir itself.
 func TestDockerEntrypointBacksUpTheDataDirForgeMigrates(t *testing.T) {
-	home, other, bin := t.TempDir(), t.TempDir(), t.TempDir()
+	home, other := t.TempDir(), t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(other, "middleman.db"), []byte("db"), 0o600))
-	require.NoError(t, os.WriteFile(filepath.Join(bin, "kenn-forge"), []byte(
-		"#!/bin/sh\n[ \"$1 $2\" = \"config read\" ] && [ \"$5\" = data_dir ] && echo "+other+"\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"),
+		[]byte("host = \"127.0.0.1\"\nport = 8092\ndata_dir = \""+other+"\"\n"), 0o600))
 
-	runEntrypoint(t, home, map[string]string{"PATH": bin + string(os.PathListSeparator) + os.Getenv("PATH")})
+	runEntrypoint(t, home, nil)
 
 	assert.Len(t, preForgeBackups(t, other), 1, "the configured data_dir is backed up")
 	assert.Empty(t, preForgeBackups(t, home))
@@ -487,16 +480,42 @@ func TestDockerEntrypointBacksUpADatabaseNewerThanItsLastBackup(t *testing.T) {
 	runEntrypoint(t, home, nil)
 	require.Len(t, preForgeBackups(t, home), 1)
 
-	// An unchanged database is not copied again.
 	runEntrypoint(t, home, nil)
 	require.Len(t, preForgeBackups(t, home), 1, "an unchanged database keeps its one backup")
 
 	require.NoError(t, os.WriteFile(db, []byte("v2"), 0o600))
 	later := time.Now().Add(2 * time.Minute)
 	require.NoError(t, os.Chtimes(db, later, later))
-	time.Sleep(1100 * time.Millisecond) // the backup name has one-second resolution
 	runEntrypoint(t, home, nil)
 	assert.Len(t, preForgeBackups(t, home), 2, "the newer database gets its own backup")
+}
+
+// Two backups in the same second must not land on one name: the second,
+// without a WAL, would otherwise leave the first one's WAL beside its own
+// database, a set that cannot be restored.
+func TestDockerEntrypointKeepsBackupsFromTheSameSecondApart(t *testing.T) {
+	home := t.TempDir()
+	db, wal := filepath.Join(home, "middleman.db"), filepath.Join(home, "middleman.db-wal")
+	require.NoError(t, os.WriteFile(db, []byte("v1"), 0o600))
+	require.NoError(t, os.WriteFile(wal, []byte("w1"), 0o600))
+	runEntrypoint(t, home, nil)
+
+	require.NoError(t, os.WriteFile(db, []byte("v2"), 0o600))
+	later := time.Now().Add(2 * time.Minute)
+	require.NoError(t, os.Chtimes(db, later, later))
+	require.NoError(t, os.Remove(wal))
+	runEntrypoint(t, home, nil)
+
+	backups := preForgeBackups(t, home)
+	require.Len(t, backups, 2)
+	sets := map[string]bool{}
+	for _, b := range backups {
+		body, err := os.ReadFile(filepath.Join(b, "middleman.db"))
+		require.NoError(t, err)
+		_, walErr := os.Stat(filepath.Join(b, "middleman.db-wal"))
+		sets[string(body)+"+wal="+fmt.Sprint(walErr == nil)] = true
+	}
+	assert.Equal(t, map[string]bool{"v1+wal=true": true, "v2+wal=false": true}, sets)
 }
 
 // A middleman still holding the database (two containers on one volume) must
@@ -506,12 +525,15 @@ func TestDockerEntrypointWillNotCopyADatabaseInUse(t *testing.T) {
 		t.Skip("needs util-linux flock, as in the image")
 	}
 	home := t.TempDir()
+	lock := filepath.Join(home, "middleman.lock")
 	require.NoError(t, os.WriteFile(filepath.Join(home, "middleman.db"), []byte("db"), 0o600))
-	holder := exec.Command("flock", filepath.Join(home, "middleman.lock"), "sleep", "30")
+	// -o: the lock stays with flock itself, so killing it releases the lock
+	// rather than leaving it with an orphaned child.
+	holder := exec.Command("flock", "-o", lock, "sleep", "30")
 	require.NoError(t, holder.Start())
 	t.Cleanup(func() { _ = holder.Process.Kill(); _ = holder.Wait() })
 	require.Eventually(t, func() bool {
-		return exec.Command("flock", "-n", filepath.Join(home, "middleman.lock"), "true").Run() != nil
+		return exec.Command("flock", "-n", lock, "true").Run() != nil
 	}, 5*time.Second, 20*time.Millisecond)
 
 	cmd := exec.Command("sh", entrypointScript(t))
