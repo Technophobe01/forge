@@ -114,13 +114,15 @@ done
 #   - Everything happens under middleman.lock, the lock forge's migration
 #     takes. A middleman still holding it means the database is in use, and
 #     the container stops rather than copy files mid-write.
-#   - A backup is a directory, middleman.db.pre-forge.<UTC time>.<pid>, holding
-#     the database with its WAL and SHM. It is filled under a temporary name
-#     and published with one rename, so it is either whole or absent, and
-#     never shares a name with another. Leftovers of a cut-off copy are
+#   - A backup is a directory, middleman.db.pre-forge.<sequence>.<UTC time>,
+#     holding the database with its WAL and SHM. The sequence is one past the
+#     highest so far, taken under the lock, so names never repeat (time and
+#     pid do: the entrypoint is PID 1 in every container) and sort in the
+#     order taken. It is filled under a temporary name and published with one
+#     rename, so it is either whole or absent. Leftovers of a cut-off copy are
 #     cleared.
-#   - A database or WAL newer than the latest backup, by name, gets a new one,
-#     so a rollback followed by another upgrade keeps the newer data.
+#   - A database or WAL newer than the latest backup gets a new one, so a
+#     rollback followed by another upgrade keeps the newer data.
 backup_middleman_db() {
   dir="$1"
   [ -f "${dir}/middleman.db" ] && [ ! -e "${dir}/forge.db" ] || return 0
@@ -134,7 +136,7 @@ backup_middleman_db() {
     locked=1
   fi
   rm -rf "${dir}"/.pre-forge-tmp.* 2>/dev/null || true
-  latest="$(ls -d "${dir}"/middleman.db.pre-forge.* 2>/dev/null | sort | tail -n 1 || true)"
+  latest="$(ls -d "${dir}"/middleman.db.pre-forge.[0-9]* 2>/dev/null | sort | tail -n 1 || true)"
   current=""
   if [ -n "${latest}" ] && [ -f "${latest}/middleman.db" ] && [ ! "${dir}/middleman.db" -nt "${latest}/middleman.db" ]; then
     if [ ! -f "${dir}/middleman.db-wal" ] \
@@ -150,7 +152,16 @@ backup_middleman_db() {
         cp -p "${dir}/middleman.db${suffix}" "${tmp}/middleman.db${suffix}"
       fi
     done
-    backup="${dir}/middleman.db.pre-forge.$(date -u +%Y%m%dT%H%M%SZ).$$"
+    seq=1
+    if [ -n "${latest}" ]; then
+      seq="${latest##*/middleman.db.pre-forge.}"
+      seq="$(( ${seq%%.*} + 1 ))"
+    fi
+    backup="${dir}/middleman.db.pre-forge.$(printf '%06d' "${seq}").$(date -u +%Y%m%dT%H%M%SZ)"
+    if [ -e "${backup}" ]; then
+      echo "kenn-forge: ${backup} already exists; not overwriting a backup" >&2
+      exit 1
+    fi
     mv "${tmp}" "${backup}"
     echo "kenn-forge: kept the middleman database as ${backup} before its one-way migration" >&2
   fi
@@ -161,7 +172,10 @@ backup_middleman_db() {
 # absolute value as is, a relative one against the working directory, and
 # none at all as KENN_FORGE_HOME. kenn-forge's `config read` knows only the
 # port, so the value is read from the file.
-config_data_dir="$(sed -n "s/^[[:space:]]*data_dir[[:space:]]*=[[:space:]]*[\"']\([^\"']*\)[\"'].*/\1/p" "${serve_config}" 2>/dev/null | head -n 1)"
+# A double-quoted value may hold a single quote and the reverse, as TOML
+# allows; escape sequences in a path are not handled.
+config_data_dir="$(sed -n -e "s/^[[:space:]]*data_dir[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" \
+  -e "s/^[[:space:]]*data_dir[[:space:]]*=[[:space:]]*'\([^']*\)'.*/\1/p" "${serve_config}" 2>/dev/null | head -n 1)"
 case "${config_data_dir}" in
   "") data_dir="${KENN_FORGE_HOME}" ;;
   /*) data_dir="${config_data_dir}" ;;

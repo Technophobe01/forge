@@ -543,3 +543,39 @@ func TestDockerEntrypointWillNotCopyADatabaseInUse(t *testing.T) {
 	assert.Contains(t, string(out), "in use")
 	assert.Empty(t, preForgeBackups(t, home))
 }
+
+// In a container the entrypoint is PID 1 every time and two starts can share
+// a second, so a name built from time and pid repeats. Pin both and check
+// three backups still land as three sets, the last sorting last.
+func TestDockerEntrypointNamesBackupsApartWithTheSameTimeAndPid(t *testing.T) {
+	home, bin := t.TempDir(), t.TempDir()
+	// A date that always answers with the same second.
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "date"), []byte("#!/bin/sh\necho 20261011T120000Z\n"), 0o755))
+	env := map[string]string{"PATH": bin + string(os.PathListSeparator) + os.Getenv("PATH")}
+	db := filepath.Join(home, "middleman.db")
+	for i, body := range []string{"v1", "v2", "v3"} {
+		require.NoError(t, os.WriteFile(db, []byte(body), 0o600))
+		later := time.Now().Add(time.Duration(i+1) * time.Minute)
+		require.NoError(t, os.Chtimes(db, later, later))
+		runEntrypoint(t, home, env)
+	}
+	backups := preForgeBackups(t, home) // Glob sorts by name
+	require.Len(t, backups, 3)
+	for i, want := range []string{"v1", "v2", "v3"} {
+		assertFile(t, filepath.Join(backups[i], "middleman.db"), want)
+	}
+}
+
+// data_dir may hold the other quote character, as TOML allows.
+func TestDockerEntrypointReadsAQuotedDataDirWhole(t *testing.T) {
+	home, base := t.TempDir(), t.TempDir()
+	other := filepath.Join(base, "user's-state")
+	require.NoError(t, os.MkdirAll(other, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(other, "middleman.db"), []byte("db"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(home, "config.toml"),
+		[]byte("port = 8092\ndata_dir = \""+other+"\"\n"), 0o600))
+
+	runEntrypoint(t, home, nil)
+
+	assert.Len(t, preForgeBackups(t, other), 1)
+}
