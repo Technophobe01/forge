@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -19,6 +21,11 @@ import (
 // resolved from this test file's location so it works regardless of CWD.
 func entrypointScript(t *testing.T) string {
 	t.Helper()
+	// The container entrypoint is a POSIX sh script for a Linux image; on
+	// Windows there may be no sh, and a temp path would not survive the TOML.
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX container entrypoint")
+	}
 	_, thisFile, _, ok := runtime.Caller(0)
 	require.True(t, ok, "runtime.Caller failed")
 	p := filepath.Join(filepath.Dir(thisFile), "..", "..", "docker-entrypoint.sh")
@@ -318,4 +325,65 @@ func TestLegacyMiddlemanVolumeMigratesInPlace(t *testing.T) {
 	require.NoError(t, err, "middleman.db was not carried over")
 	assert.Equal(t, "legacy", string(got))
 	assert.NoFileExists(t, filepath.Join(home, "middleman.db"))
+}
+
+// TestDockerEntrypointLetsKennForgeFinishShuttingDown: on docker stop the
+// shell's wait returns as soon as the trapped TERM arrives. If the entrypoint
+// then exits, it is PID 1 and the kernel kills kenn-forge mid-shutdown,
+// cutting off its writes to a database it may have just migrated.
+func TestDockerEntrypointLetsKennForgeFinishShuttingDown(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX entrypoint")
+	}
+	home, bin := t.TempDir(), t.TempDir()
+	done := filepath.Join(t.TempDir(), "shutdown-finished")
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "kenn-forge"), []byte(
+		"#!/bin/sh\n"+
+			"[ \"$1\" = serve ] || exit 0\n"+
+			"trap 'sleep 1; touch "+done+"; exit 0' TERM\n"+
+			"while :; do sleep 0.1; done\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "socat"), []byte("#!/bin/sh\nexec sleep 30\n"), 0o755))
+
+	cmd := exec.Command("sh", entrypointScript(t))
+	cmd.Env = []string{
+		"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"MIDDLEMAN_HOME=" + home,
+		"MIDDLEMAN_PORT=18091",
+		"MIDDLEMAN_INTERNAL_PORT=18092",
+	}
+	require.NoError(t, cmd.Start())
+	time.Sleep(500 * time.Millisecond) // let it start the server
+	require.NoError(t, cmd.Process.Signal(syscall.SIGTERM))
+	_ = cmd.Wait()
+
+	assert.FileExists(t, done, "the entrypoint exited before kenn-forge finished shutting down")
+}
+
+// TestDockerEntrypointBridgesThePortOfTheConfigServeUses: a --config passed
+// through to serve must also be the one the bridge reads its port from, or
+// the published port forwards to a listener nothing is on.
+func TestDockerEntrypointBridgesThePortOfTheConfigServeUses(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX entrypoint")
+	}
+	home, bin := t.TempDir(), t.TempDir()
+	record := filepath.Join(t.TempDir(), "calls")
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "kenn-forge"), []byte(
+		"#!/bin/sh\necho \"$*\" >> "+record+"\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "socat"), []byte("#!/bin/sh\nexec sleep 30\n"), 0o755))
+	custom := filepath.Join(t.TempDir(), "custom.toml")
+
+	for _, args := range [][]string{{"--config", custom}, {"--config=" + custom}} {
+		require.NoError(t, os.WriteFile(record, nil, 0o600))
+		cmd := exec.Command("sh", append([]string{entrypointScript(t)}, args...)...)
+		cmd.Env = []string{
+			"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"),
+			"MIDDLEMAN_HOME=" + home,
+		}
+		out, err := cmd.CombinedOutput()
+		require.NoErrorf(t, err, "entrypoint failed: %s", out)
+		calls, err := os.ReadFile(record)
+		require.NoError(t, err)
+		assert.Contains(t, string(calls), "config read --config "+custom+" port", args)
+	}
 }

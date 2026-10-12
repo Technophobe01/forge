@@ -104,8 +104,17 @@ if [ "${MIDDLEMAN_SEED_ONLY:-}" = "1" ]; then
   exit 0
 fi
 
-# Honor a hand-edited config: read the port kenn-forge will actually bind.
-backend_port="$(kenn-forge config read --config "${CONFIG}" port 2>/dev/null || true)"
+# Honor a hand-edited config: read the port kenn-forge will actually bind,
+# from the config serve will use. A --config passed to the container is handed
+# to serve below, so it is the one to read when present.
+serve_config="${CONFIG}"
+prev=""
+for arg in "$@"; do
+  case "${prev}" in --config|-config) serve_config="${arg}" ;; esac
+  case "${arg}" in --config=*|-config=*) serve_config="${arg#*=}" ;; esac
+  prev="${arg}"
+done
+backend_port="$(kenn-forge config read --config "${serve_config}" port 2>/dev/null || true)"
 case "${backend_port}" in
   ''|*[!0-9]*) backend_port="${MIDDLEMAN_INTERNAL_PORT}" ;;
 esac
@@ -123,9 +132,16 @@ terminate() { kill -TERM "${mm_pid}" "${socat_pid}" 2>/dev/null || true; }
 trap terminate INT TERM
 
 # Disable errexit around wait so a non-zero kenn-forge exit still runs cleanup.
+# A trapped TERM makes wait return at once, while kenn-forge is still shutting
+# down; this script is PID 1, and leaving now would have the kernel kill it
+# mid-shutdown. So wait again until it has really exited.
 set +e
 wait "${mm_pid}"
 status=$?
+while kill -0 "${mm_pid}" 2>/dev/null; do
+  wait "${mm_pid}"
+  status=$?
+done
 set -e
 kill -TERM "${socat_pid}" 2>/dev/null || true
 wait "${socat_pid}" 2>/dev/null || true
