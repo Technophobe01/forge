@@ -15,7 +15,8 @@
 #
 # On first run we seed a minimal config under MIDDLEMAN_HOME. An existing
 # config is left untouched (edit it and restart to customize: repos, providers,
-# allowed_hosts, etc.).
+# allowed_hosts, etc.), with one exception: MIDDLEMAN_FLEET_ORIGIN turns an
+# existing standalone config into a fleet hub once (see make_fleet_hub).
 set -eu
 
 : "${MIDDLEMAN_HOME:=/data}"
@@ -29,6 +30,32 @@ export KENN_FORGE_HOME="${MIDDLEMAN_HOME}"
 toml_safe() { printf '%s' "$1" | tr -d '"\\\n\r'; }
 
 mkdir -p "${MIDDLEMAN_HOME}"
+
+# Fleet hub. MIDDLEMAN_FLEET_ORIGIN is the private HTTPS origin spokes reach
+# this forge at (for example a Tailscale Serve URL). forge's federation needs
+# that origin as fleet.base_url, its authority as an allowed Host, the root
+# base_path, and bearer auth on the API, which is what `kenn-forge fleet setup
+# hub --origin` writes; setup itself cannot run here, since it installs a host
+# service. A sub-path cannot coexist with it, so asking for both is an error.
+fleet_origin="$(toml_safe "${MIDDLEMAN_FLEET_ORIGIN:-}")"
+fleet_host=""
+if [ -n "${fleet_origin}" ]; then
+  fleet_origin="${fleet_origin%/}"
+  fleet_host="${fleet_origin#https://}"
+  case "${fleet_origin}" in
+    https://*) ;;
+    *) echo "kenn-forge: MIDDLEMAN_FLEET_ORIGIN must be an https:// origin, got '${fleet_origin}'" >&2; exit 1 ;;
+  esac
+  case "${fleet_host}" in
+    ""|*/*|*\?*|*#*|*@*|*[[:space:]]*)
+      echo "kenn-forge: MIDDLEMAN_FLEET_ORIGIN must be a bare origin (scheme and host[:port]), got '${fleet_origin}'" >&2
+      exit 1 ;;
+  esac
+  case "${MIDDLEMAN_BASE_PATH:-}" in
+    ""|/) ;;
+    *) echo "kenn-forge: a fleet hub serves at the root path; unset MIDDLEMAN_BASE_PATH ('${MIDDLEMAN_BASE_PATH}') or MIDDLEMAN_FLEET_ORIGIN" >&2; exit 1 ;;
+  esac
+fi
 
 if [ ! -f "${CONFIG}" ]; then
   echo "middleman: seeding default config at ${CONFIG} (loopback :${MIDDLEMAN_INTERNAL_PORT})" >&2
@@ -107,6 +134,79 @@ for arg in "$@"; do
   case "${arg}" in --config=*|-config=*) serve_config="${arg#*=}" ;; esac
   prev="${arg}"
 done
+
+# Make the config a fleet hub, once. A config with a [fleet] table is forge's
+# from then on: enrollment writes its members there, so it is never edited
+# again, only checked against the origin asked for. Otherwise, in one pass:
+#   - base_path goes (the root is the default), and the origin's authority
+#     joins allowed_hosts, keeping the hosts already there;
+#   - [api] gets require_auth = true, replacing any value it had;
+#   - a [fleet] table names this forge the hub at the origin.
+# The result is checked with kenn-forge's own loader before it replaces the
+# config, and the old file stays beside it as config.toml.pre-fleet.<UTC time>.
+# allowed_hosts must be a one-line array, as forge writes it; a hand-written
+# multi-line one stops the container rather than be edited by guesswork.
+make_fleet_hub() {
+  cfg="$1"
+  if grep -Eq '^[[:space:]]*\[fleet\][[:space:]]*(#.*)?$' "${cfg}"; then
+    if ! grep -Eq "^[[:space:]]*base_url[[:space:]]*=[[:space:]]*\"${fleet_origin}/?\"" "${cfg}"; then
+      echo "kenn-forge: warning: ${cfg} already has a [fleet] table whose base_url is not ${fleet_origin}; leaving it as it is" >&2
+    fi
+    return 0
+  fi
+  tmp="${cfg}.fleet-tmp.$$"
+  if ! awk -v host="${fleet_host}" -v origin="${fleet_origin}" '
+    function allowed_line() { return "allowed_hosts = [\"" host "\"]" }
+    BEGIN { top = 1 }
+    /^[[:space:]]*\[/ {
+      if (top && !allowed) { print allowed_line(); allowed = 1 }
+      top = 0
+      inapi = ($0 ~ /^[[:space:]]*\[api\][[:space:]]*(#.*)?$/)
+      print
+      if (inapi) { api = 1; print "  require_auth = true" }
+      next
+    }
+    top && /^[[:space:]]*base_path[[:space:]]*=/ { next }
+    top && /^[[:space:]]*allowed_hosts[[:space:]]*=/ {
+      allowed = 1
+      if ($0 !~ /\]/) { multiline = 1; next }
+      if (index($0, "\"" host "\"") == 0) {
+        if ($0 ~ /\[[[:space:]]*\]/) sub(/\[[[:space:]]*\]/, "[\"" host "\"]")
+        else sub(/\][^]]*$/, ", \"" host "\"]")
+      }
+      print
+      next
+    }
+    inapi && /^[[:space:]]*require_auth[[:space:]]*=/ { next }
+    { print }
+    END {
+      if (multiline) exit 3
+      if (top && !allowed) print allowed_line()
+      if (!api) { print ""; print "[api]"; print "  require_auth = true" }
+      print ""
+      print "[fleet]"
+      print "  enabled = true"
+      print "  role = \"hub\""
+      print "  base_url = \"" origin "\""
+    }
+  ' "${cfg}" > "${tmp}"; then
+    rm -f "${tmp}"
+    echo "kenn-forge: cannot make ${cfg} a fleet hub: its allowed_hosts spans several lines; put it on one line and restart" >&2
+    exit 1
+  fi
+  if command -v kenn-forge >/dev/null 2>&1 \
+     && ! kenn-forge config read --config "${tmp}" port >/dev/null; then
+    rm -f "${tmp}"
+    echo "kenn-forge: the fleet hub config made from ${cfg} does not load; ${cfg} is unchanged" >&2
+    exit 1
+  fi
+  cp -p "${cfg}" "${cfg}.pre-fleet.$(date -u +%Y%m%dT%H%M%SZ)"
+  mv "${tmp}" "${cfg}"
+  echo "kenn-forge: ${cfg} is now a fleet hub at ${fleet_origin}" >&2
+}
+if [ -n "${fleet_origin}" ]; then
+  make_fleet_hub "${serve_config}"
+fi
 
 # forge's first start renames middleman.db to forge.db in that config's
 # data_dir, and nothing renames it back: the old image would then start on an
