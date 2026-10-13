@@ -58,6 +58,9 @@ COPY --from=frontend /app/internal/githubapp/ui/dist ./internal/githubapp/ui/dis
 RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false \
       -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}" \
       -o /out/kenn-forge ./cmd/kenn-forge
+# The entrypoint's fleet-hub conversion (MIDDLEMAN_FLEET_ORIGIN).
+RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "-s -w" \
+      -o /out/kenn-forge-fleet-hub ./docker/fleethub
 
 # ---- Stage 3: runtime -------------------------------------------------------
 FROM debian:bookworm-slim
@@ -70,6 +73,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/kenn-forge /usr/local/bin/kenn-forge
+COPY --from=build /out/kenn-forge-fleet-hub /usr/local/bin/kenn-forge-fleet-hub
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
