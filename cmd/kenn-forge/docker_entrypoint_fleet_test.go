@@ -4,7 +4,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -28,30 +27,16 @@ allowed_hosts = ["127.0.0.1:8091", "localhost:8091", "forge-team:8091"]
   name = "widget"
 `
 
-var (
-	fleetHubOnce sync.Once
-	fleetHubDir  string
-	fleetHubErr  error
-)
-
-// fleetHubPath builds the image's kenn-forge-fleet-hub once and returns a PATH
-// that finds it first, as the image's /usr/local/bin does.
+// fleetHubPath builds the image's kenn-forge-fleet-hub into a directory the
+// test owns and returns a PATH that finds it first, as the image's
+// /usr/local/bin does. The build cache keeps repeat builds quick.
 func fleetHubPath(t *testing.T) string {
 	t.Helper()
-	fleetHubOnce.Do(func() {
-		fleetHubDir, fleetHubErr = os.MkdirTemp("", "fleethub-bin")
-		if fleetHubErr != nil {
-			return
-		}
-		out, err := exec.Command("go", "build", "-o",
-			filepath.Join(fleetHubDir, "kenn-forge-fleet-hub"), "go.kenn.io/forge/docker/fleethub").CombinedOutput()
-		if err != nil {
-			fleetHubErr = err
-			t.Logf("build kenn-forge-fleet-hub: %s", out)
-		}
-	})
-	require.NoError(t, fleetHubErr, "build kenn-forge-fleet-hub")
-	return fleetHubDir + string(os.PathListSeparator) + os.Getenv("PATH")
+	dir := t.TempDir()
+	out, err := exec.Command("go", "build", "-o",
+		filepath.Join(dir, "kenn-forge-fleet-hub"), "go.kenn.io/forge/docker/fleethub").CombinedOutput()
+	require.NoErrorf(t, err, "build kenn-forge-fleet-hub: %s", out)
+	return dir + string(os.PathListSeparator) + os.Getenv("PATH")
 }
 
 // fleetEnv is env plus the PATH that finds kenn-forge-fleet-hub. runEntrypoint

@@ -144,3 +144,38 @@ func TestMakeHubTurnsOnAuthInAnExistingAPITable(t *testing.T) {
 	assert.True(t, cfg.API.RequireAuth)
 	assert.Equal(t, []string{"hub.example.test"}, cfg.AllowedHosts)
 }
+
+func TestMakeHubLeavesAFleetTurnedOffAlone(t *testing.T) {
+	path := writeConfig(t, standalone)
+	require.NoError(t, makeHub(path, "https://hub.example.test:8448", fixedNow, &bytes.Buffer{}))
+	// Turn federation off as Settings does: the rest of [fleet] stays.
+	cfg, err := config.Load(path)
+	require.NoError(t, err)
+	cfg.Fleet.Enabled = false
+	require.NoError(t, cfg.Save(path))
+	off, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	var log bytes.Buffer
+	require.NoError(t, makeHub(path, "https://hub.example.test:8448", func() time.Time {
+		return fixedNow().Add(time.Hour)
+	}, &log))
+	after, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, string(off), string(after), "federation stays off")
+	assert.Contains(t, log.String(), "federation turned off")
+	matches, err := filepath.Glob(path + ".pre-fleet.*")
+	require.NoError(t, err)
+	assert.Len(t, matches, 1, "no second backup")
+}
+
+func TestMakeHubKeepsTailscaleServeIdentity(t *testing.T) {
+	path := writeConfig(t, "host = \"127.0.0.1\"\nport = 8092\n\n[api]\n  require_auth = true\n"+
+		"  [api.tailscale_serve]\n    enabled = true\n    allowed_users = [\"user@example.test\"]\n")
+	require.NoError(t, makeHub(path, "https://hub.example.test", fixedNow, &bytes.Buffer{}))
+	cfg, err := config.Load(path)
+	require.NoError(t, err)
+	assert.True(t, cfg.API.TailscaleServe.Enabled)
+	assert.Equal(t, []string{"user@example.test"}, cfg.API.TailscaleServe.AllowedUsers)
+	assert.True(t, cfg.Fleet.Enabled)
+}

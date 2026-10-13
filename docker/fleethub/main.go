@@ -8,16 +8,18 @@
 //
 // It reads the config with forge's own loader, applies the hub settings setup
 // applies, and writes the result with forge's own writer, so nothing here edits
-// TOML by hand. Two differences from setup are deliberate: the hosts already
+// TOML by hand. Three differences from setup are deliberate: the hosts already
 // allowed are kept (the container's healthcheck and in-network clients use
-// them), and the listener is left alone (the entrypoint's socat bridge dials it).
+// them), the listener is left alone (the entrypoint's socat bridge dials it),
+// and an existing api.tailscale_serve is kept rather than cleared, since setup
+// clears it only to write its own and this has none to write.
 //
-// A config whose fleet is already enabled belongs to forge, which records its
-// members there, so it is left unchanged.
+// A config with any fleet state (enabled or not, an origin, a role, a hub or
+// members) belongs to forge: enrollment and Settings write it there, and an
+// operator may have turned federation off on purpose. It is left unchanged.
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -64,15 +66,15 @@ func makeHub(path, rawOrigin string, now func() time.Time, log io.Writer) error 
 	if err != nil {
 		return fmt.Errorf("load %s: %w", path, err)
 	}
-	if cfg.Fleet.Enabled {
-		if cfg.Fleet.BaseURL != origin {
+	if hasFleetState(cfg.Fleet) {
+		switch {
+		case !cfg.Fleet.Enabled:
+			fmt.Fprintf(log, "kenn-forge: warning: %s has federation turned off; leaving it as it is\n", path)
+		case cfg.Fleet.BaseURL != origin:
 			fmt.Fprintf(log, "kenn-forge: warning: %s is already in a fleet at %s, not %s; leaving it as it is\n",
 				path, cfg.Fleet.BaseURL, origin)
 		}
 		return nil
-	}
-	if cfg.Fleet.RoleOrDefault() == config.FleetRoleSpoke || cfg.Fleet.Hub != nil {
-		return errors.New("an enrolled spoke must be revoked and restored to standalone state before it can be a hub")
 	}
 
 	cfg.BasePath = "/"
@@ -81,7 +83,6 @@ func makeHub(path, rawOrigin string, now func() time.Time, log io.Writer) error 
 	}
 	cfg.TrustReverseProxy = false
 	cfg.API.RequireAuth = true
-	cfg.API.TailscaleServe = config.TailscaleServeAPI{}
 	cfg.Fleet.Enabled = true
 	cfg.Fleet.Role = config.FleetRoleHub
 	cfg.Fleet.BaseURL = origin
@@ -106,6 +107,11 @@ func makeHub(path, rawOrigin string, now func() time.Time, log io.Writer) error 
 	}
 	fmt.Fprintf(log, "kenn-forge: %s is now a fleet hub at %s (the old file is %s)\n", path, origin, backup)
 	return nil
+}
+
+// hasFleetState reports whether forge has written anything to [fleet].
+func hasFleetState(f config.Fleet) bool {
+	return f.Enabled || f.BaseURL != "" || f.Role != "" || f.Hub != nil || len(f.Members) > 0
 }
 
 func copyFile(from, to string) error {
