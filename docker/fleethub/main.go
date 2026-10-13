@@ -8,11 +8,14 @@
 //
 // It reads the config with forge's own loader, applies the hub settings setup
 // applies, and writes the result with forge's own writer, so nothing here edits
-// TOML by hand. Three differences from setup are deliberate: the hosts already
+// TOML by hand. Two differences from setup are deliberate: the hosts already
 // allowed are kept (the container's healthcheck and in-network clients use
-// them), the listener is left alone (the entrypoint's socat bridge dials it),
-// and an existing api.tailscale_serve is kept rather than cleared, since setup
-// clears it only to write its own and this has none to write.
+// them), and the listener is left alone (the entrypoint's socat bridge dials it).
+//
+// Like setup's --origin mode, it clears api.tailscale_serve: the ingress is the
+// operator's, and forge trusts a Tailscale-User-Login header from loopback
+// peers, which behind the socat bridge is every peer. Browsers sign in with
+// forge's token instead.
 //
 // A config with any fleet state (enabled or not, an origin, a role, a hub or
 // members) belongs to forge: enrollment and Settings write it there, and an
@@ -83,6 +86,10 @@ func makeHub(path, rawOrigin string, now func() time.Time, log io.Writer) error 
 	}
 	cfg.TrustReverseProxy = false
 	cfg.API.RequireAuth = true
+	if cfg.API.TailscaleServe.Enabled {
+		fmt.Fprintf(log, "kenn-forge: %s trusted Tailscale Serve identities; a hub behind the container bridge cannot, so browsers sign in with forge's token\n", path)
+	}
+	cfg.API.TailscaleServe = config.TailscaleServeAPI{}
 	cfg.Fleet.Enabled = true
 	cfg.Fleet.Role = config.FleetRoleHub
 	cfg.Fleet.BaseURL = origin

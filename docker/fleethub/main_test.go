@@ -169,13 +169,15 @@ func TestMakeHubLeavesAFleetTurnedOffAlone(t *testing.T) {
 	assert.Len(t, matches, 1, "no second backup")
 }
 
-func TestMakeHubKeepsTailscaleServeIdentity(t *testing.T) {
+func TestMakeHubDropsTailscaleServeIdentity(t *testing.T) {
 	path := writeConfig(t, "host = \"127.0.0.1\"\nport = 8092\n\n[api]\n  require_auth = true\n"+
 		"  [api.tailscale_serve]\n    enabled = true\n    allowed_users = [\"user@example.test\"]\n")
-	require.NoError(t, makeHub(path, "https://hub.example.test", fixedNow, &bytes.Buffer{}))
+	var log bytes.Buffer
+	require.NoError(t, makeHub(path, "https://hub.example.test", fixedNow, &log))
 	cfg, err := config.Load(path)
 	require.NoError(t, err)
-	assert.True(t, cfg.API.TailscaleServe.Enabled)
-	assert.Equal(t, []string{"user@example.test"}, cfg.API.TailscaleServe.AllowedUsers)
-	assert.True(t, cfg.Fleet.Enabled)
+	assert.False(t, cfg.API.TailscaleServe.Enabled, "every peer is loopback behind the bridge")
+	assert.Empty(t, cfg.API.TailscaleServe.AllowedUsers)
+	assert.True(t, cfg.API.RequireAuth)
+	assert.Contains(t, log.String(), "trusted Tailscale Serve identities")
 }
