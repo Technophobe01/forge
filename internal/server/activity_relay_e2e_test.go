@@ -7,7 +7,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	jsonv2 "encoding/json/v2"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,19 +20,28 @@ import (
 	"testing"
 	"time"
 
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
+
+	jsonv2 "encoding/json/v2"
+
 	"github.com/cenkalti/backoff/v7"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"go.kenn.io/forge/internal/apiclient/generated"
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/gitclone"
+
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/procutil"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	"go.kenn.io/forge/platform"
 )
 
 func TestActivityRelayEndToEnd(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	if testing.Short() {
 		t.Skip("builds and launches the relay executable")
@@ -109,7 +117,7 @@ func TestActivityRelayEndToEnd(t *testing.T) {
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch strings.TrimPrefix(r.URL.Path, "/api/v3") {
-		case "/repos/team/project":
+		case "/repos/team/project", "/repositories/12345":
 			_, _ = io.WriteString(w, `{"id":12345,"node_id":"R_test_project","name":"project","full_name":"team/project","owner":{"login":"team"},"default_branch":"main","has_issues":true}`)
 		case "/repos/team/project/pulls/7":
 			detailReads.Add(1)
@@ -147,8 +155,8 @@ func TestActivityRelayEndToEnd(t *testing.T) {
 	}))
 	t.Cleanup(provider.Close)
 	database := dbtest.OpenWithMigrationsAt(t, filepath.Join(dir, "forge.db"))
-	repo := ghclient.RepoRef{Platform: "github", PlatformHost: "github.com", PlatformRepoID: 12345, PlatformExternalID: "R_test_project", Owner: "team", Name: "project"}
-	repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{Platform: "github", PlatformHost: "github.com", PlatformRepoID: "R_test_project", Owner: "team", Name: "project"})
+	repo := ghclient.RepoRef{Platform: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(12345), Owner: "team", Name: "project"}
+	repoID, err := reposeed.Seed(ctx, database, db.RepoIdentity{Platform: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(12345), Owner: "team", Name: "project"})
 	require.NoError(err)
 	_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
 		RepoID: repoID, Number: 8, PlatformID: 800, PlatformExternalID: "PR_test_8", Title: "Unrelated",
@@ -156,7 +164,7 @@ func TestActivityRelayEndToEnd(t *testing.T) {
 	})
 	require.NoError(err)
 	budget := ghclient.NewSyncBudget(1000)
-	upstream, err := ghclient.NewClient(testTokenSource("test-token"), "github.com", nil, budget, ghclient.WithBaseURLForTesting(provider.URL))
+	upstream, err := ghclient.NewClient(serverfake.TestTokenSource("test-token"), "github.com", nil, budget, ghclient.WithBaseURLForTesting(provider.URL))
 	require.NoError(err)
 	// A blocked clone directory produces a real non-fatal diff failure without
 	// contacting a remote. PR metadata and CI must still be published once.
@@ -168,11 +176,11 @@ func TestActivityRelayEndToEnd(t *testing.T) {
 	syncer := newConsumer()
 	t.Cleanup(syncer.Stop)
 	srv := New(database, syncer, nil, "/", &config.Config{}, ServerOptions{})
-	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, srv) })
 	client := &http.Client{Timeout: 10 * time.Second}
 	refreshed := make(chan int, 16)
 	syncer.SetOnRelayRefresh(func(ctx context.Context, repoID int64, target string, number int) {
-		srv.broadcastRelayRefresh(ctx, repoID, target, number)
+		srv.syncevents.BroadcastRelayRefresh(ctx, repoID, target, number)
 		refreshed <- number
 	})
 	statuses := make(chan *ghclient.RelayStatus, 64)
@@ -274,6 +282,7 @@ func TestActivityRelayEndToEnd(t *testing.T) {
 	assert.Equal(int32(2), detailReads.Load(), "PR comments must refresh details after a relay restart")
 	assert.Equal(int32(2), checkReads.Load())
 	deliver("check_run", `{"repository":{"id":12345,"node_id":"R_test_project"},"check_run":{"pull_requests":[{"number":7}]}}`)
+	deliver("workflow_run", `{"repository":{"id":12345,"node_id":"R_test_project"},"workflow_run":{"pull_requests":[]}}`)
 	issueHint := `{"repository":{"id":12345,"node_id":"R_test_project"},"issue":{"number":9}}`
 	for index, body := range []*string{new("Original comment"), new("Edited comment"), nil} {
 		issueComment.Store(body)
@@ -303,10 +312,28 @@ func TestActivityRelayEndToEnd(t *testing.T) {
 		}
 		require.NoError(database.UpsertHTTPEtag(ctx, "github", "github.com", "team", "project", "issue", 9, `"issue-stable"`))
 	}
-	// The ignored check event was delivered before the issue hints; refreshes
-	// run in order, so its absence here proves it never became a refresh.
-	assert.Equal(int32(2), checkReads.Load())
-	assert.Equal(int32(2), detailReads.Load(), "check events must not trigger refreshes")
+	// Actions wait in the relay while ordinary issue updates go straight through.
+	var actionRefreshes []int
+	for range 2 {
+		select {
+		case number := <-refreshed:
+			actionRefreshes = append(actionRefreshes, number)
+		case <-time.After(90 * time.Second):
+			require.FailNow("batched Actions hints did not reach Forge")
+		}
+	}
+	assert.ElementsMatch([]int{7, 0}, actionRefreshes)
+	assert.Equal(int32(3), checkReads.Load(), "check_run refreshes checks once")
+	assert.Equal(int32(2), detailReads.Load(), "Actions hints must not refetch PR details")
+	events, _, stale = srv.Hub().ReplaySnapshotSince(0)
+	require.False(stale)
+	var workflowChanged bool
+	for _, event := range events {
+		if event.Event.Type == "workflow_runs_changed" {
+			workflowChanged = true
+		}
+	}
+	assert.True(workflowChanged, "unassociated runs must reach an open Actions view")
 	unrelated, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 8)
 	require.NoError(err)
 	assert.Equal("pending", unrelated.CIStatus)

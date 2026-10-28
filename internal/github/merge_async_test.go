@@ -8,13 +8,15 @@ import (
 	"sync/atomic"
 	"testing"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	platformgithub "go.kenn.io/forge/platform/github"
 )
 
 func TestGitHubComMergeUsesAsyncAPI(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -58,6 +60,8 @@ func TestGitHubComMergeUsesAsyncAPI(t *testing.T) {
 }
 
 func TestGitHubComMergePollsPendingOperation(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -105,6 +109,8 @@ func TestGitHubComMergePollsPendingOperation(t *testing.T) {
 }
 
 func TestGitHubComMergePreservesTerminalFailure(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -136,6 +142,8 @@ func TestGitHubComMergePreservesTerminalFailure(t *testing.T) {
 }
 
 func TestGitHubComMergeHeadMoveIsConflict(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -166,6 +174,8 @@ func TestGitHubComMergeHeadMoveIsConflict(t *testing.T) {
 }
 
 func TestGitHubComMergeDoesNotAdoptExistingOperation(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	var calls atomic.Int32
 
@@ -200,6 +210,8 @@ func TestGitHubComMergeDoesNotAdoptExistingOperation(t *testing.T) {
 }
 
 func TestGitHubComMergeHonorsCancellationWhilePolling(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	var calls atomic.Int32
@@ -232,6 +244,8 @@ func TestGitHubComMergeHonorsCancellationWhilePolling(t *testing.T) {
 }
 
 func TestGitHubComMergeDoesNotTreatEnqueuedAsMerged(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -258,6 +272,8 @@ func TestGitHubComMergeDoesNotTreatEnqueuedAsMerged(t *testing.T) {
 }
 
 func TestGitHubEnterpriseMergeKeepsSynchronousAPI(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -293,4 +309,101 @@ func TestGitHubEnterpriseMergeKeepsSynchronousAPI(t *testing.T) {
 	require.NotNil(result)
 	assert.True(result.GetMerged())
 	assert.Equal("merge-sha", result.GetSHA())
+}
+
+func TestGitHubComEnqueueReportsPullRequestAlreadyQueued(t *testing.T) {
+	t.Parallel()
+
+	assert := assert.New(t)
+	require := require.New(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(http.MethodPut, r.Method)
+		assert.Equal("/api/v3/repos/acme/widget/pulls/7/merge-async", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"status":"enqueued",
+			"details":{"message":"Pull request is already in the merge queue."}
+		}`))
+	}))
+	t.Cleanup(server.Close)
+
+	client, err := NewClient(
+		testTokenSource("token"), "github.com", nil, nil,
+		WithBaseURLForTesting(server.URL),
+	)
+	require.NoError(err)
+	enqueuer, ok := client.(platformgithub.MergeQueueAPI)
+	require.True(ok)
+
+	result, err := enqueuer.EnqueuePullRequest(t.Context(), "acme", "widget", 7, "reviewed-head")
+	require.NoError(err)
+	assert.True(result.Queued)
+	assert.True(result.AlreadyQueued, "GitHub answers 200 without starting a new attempt")
+	assert.False(result.Merged)
+	assert.Equal("Pull request is already in the merge queue.", result.Message)
+}
+
+func TestGitHubComEnqueueStartsNewAttemptWhenAccepted(t *testing.T) {
+	t.Parallel()
+
+	assert := assert.New(t)
+	require := require.New(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPut {
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{
+				"status":"pending",
+				"details":{"message":"Merge request is in progress.","uuid":"operation-id"}
+			}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{
+			"status":"enqueued",
+			"details":{"message":"Pull request was added to the merge queue."}
+		}`))
+	}))
+	t.Cleanup(server.Close)
+
+	client, err := NewClient(
+		testTokenSource("token"), "github.com", nil, nil,
+		WithBaseURLForTesting(server.URL),
+	)
+	require.NoError(err)
+	enqueuer, ok := client.(platformgithub.MergeQueueAPI)
+	require.True(ok)
+
+	result, err := enqueuer.EnqueuePullRequest(t.Context(), "acme", "widget", 7, "reviewed-head")
+	require.NoError(err)
+	assert.True(result.Queued)
+	assert.False(result.AlreadyQueued)
+}
+
+func TestGitHubEnterpriseEnqueueFailsWithoutRequest(t *testing.T) {
+	t.Parallel()
+
+	assert := assert.New(t)
+	require := require.New(t)
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+
+	client, err := NewClient(
+		testTokenSource("token"), "github.example.com", nil, nil,
+		WithBaseURLForTesting(server.URL),
+	)
+	require.NoError(err)
+	enqueuer, ok := client.(platformgithub.MergeQueueAPI)
+	require.True(ok)
+
+	_, err = enqueuer.EnqueuePullRequest(t.Context(), "acme", "widget", 7, "reviewed-head")
+	require.Error(err)
+	assert.Contains(err.Error(), "asynchronous merge API")
+	assert.Zero(calls.Load())
 }

@@ -9,6 +9,7 @@ export interface ProviderCapabilitiesResponse {
   issue_mutation: boolean;
   label_mutation: boolean;
   merge_mutation: boolean;
+  merge_queue_mutation: boolean;
   mutation_head_binding: boolean;
   native_multiline_ranges: boolean;
   read_authenticated_user: boolean;
@@ -18,6 +19,7 @@ export interface ProviderCapabilitiesResponse {
   read_issues: boolean;
   read_labels: boolean;
   read_markdown_images: boolean;
+  read_markdown_media: boolean;
   read_merge_requests: boolean;
   read_releases: boolean;
   read_repositories: boolean;

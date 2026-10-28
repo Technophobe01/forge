@@ -38,7 +38,7 @@ func TestLandingEvidencePages(t *testing.T) {
 		default:
 			require.Fail("unexpected path", r.URL.String())
 		}
-		return &http.Response{StatusCode: 200, Header: header, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
 	})}
 	c, err := github.NewClient(github.ClientConfig{Read: hc, Write: hc, Notifications: hc, Clock: time.Now})
 	require.NoError(err)
@@ -72,7 +72,7 @@ func TestLandingEvidencePages(t *testing.T) {
 
 func TestLandingMissingHeadStaysAbsent(t *testing.T) {
 	hc := &http.Client{Transport: platform.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"id":7,"number":3,"merged":true,"base":{"repo":{"id":12}}}`)), Request: req}, nil
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"id":7,"number":3,"merged":true,"base":{"repo":{"id":12}}}`)), Request: req}, nil
 	})}
 	c, err := github.NewClient(github.ClientConfig{Read: hc, Write: hc, Notifications: hc, Clock: time.Now})
 	require.NoError(t, err)
@@ -83,7 +83,7 @@ func TestLandingMissingHeadStaysAbsent(t *testing.T) {
 
 func TestLandingRejectsCrossInstanceSource(t *testing.T) {
 	hc := &http.Client{Transport: platform.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"id":7,"number":3,"merged":true,"base":{"repo":{"id":12}},"head":{"repo":{"id":12,"html_url":"https://other.example/project"}}}`)), Request: req}, nil
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"id":7,"number":3,"merged":true,"base":{"repo":{"id":12}},"head":{"repo":{"id":12,"html_url":"https://other.example/project"}}}`)), Request: req}, nil
 	})}
 	c, err := github.NewClient(github.ClientConfig{Read: hc, Write: hc, Notifications: hc, Clock: time.Now})
 	require.NoError(t, err)
@@ -96,18 +96,26 @@ func TestLandingRoles(t *testing.T) {
 		name, fields   string
 		author, merger *platform.Account
 	}{
-		{"human author bot merger", `"user":{"id":21,"login":"user-a","type":"User"},"merged_by":{"id":22,"login":"merge-app","type":"Bot"}`,
+		{
+			"human author bot merger", `"user":{"id":21,"login":"user-a","type":"User"},"merged_by":{"id":22,"login":"merge-app","type":"Bot"}`,
 			&platform.Account{ID: new(int64(21)), Login: new("user-a"), Type: platform.AccountTypeUser},
-			&platform.Account{ID: new(int64(22)), Login: new("merge-app"), Type: platform.AccountTypeBot}},
-		{"same ID distinct roles", `"user":{"id":21,"type":"User"},"merged_by":{"id":21,"login":"user-a","type":"User"}`,
+			&platform.Account{ID: new(int64(22)), Login: new("merge-app"), Type: platform.AccountTypeBot},
+		},
+		{
+			"same ID distinct roles", `"user":{"id":21,"type":"User"},"merged_by":{"id":21,"login":"user-a","type":"User"}`,
 			&platform.Account{ID: new(int64(21)), Type: platform.AccountTypeUser},
-			&platform.Account{ID: new(int64(21)), Login: new("user-a"), Type: platform.AccountTypeUser}},
+			&platform.Account{ID: new(int64(21)), Login: new("user-a"), Type: platform.AccountTypeUser},
+		},
 		{"absent roles", `"user":null,"merged_by":null`, nil, nil},
-		{"missing ID empty login", `"user":{"login":"","type":"Organization"}`,
-			&platform.Account{Login: new(""), Type: platform.AccountTypeOrganization}, nil},
-		{"invalid IDs unknown types", `"user":{"id":0,"login":"robot[bot]"},"merged_by":{"id":-1,"type":"FutureType"}`,
+		{
+			"missing ID empty login", `"user":{"login":"","type":"Organization"}`,
+			&platform.Account{Login: new(""), Type: platform.AccountTypeOrganization}, nil,
+		},
+		{
+			"invalid IDs unknown types", `"user":{"id":0,"login":"robot[bot]"},"merged_by":{"id":-1,"type":"FutureType"}`,
 			&platform.Account{ID: new(int64(0)), Login: new("robot[bot]"), Type: platform.AccountTypeUnknown},
-			&platform.Account{ID: new(int64(-1)), Type: platform.AccountTypeUnknown}},
+			&platform.Account{ID: new(int64(-1)), Type: platform.AccountTypeUnknown},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			assert, require := assert.New(t), require.New(t)
@@ -116,7 +124,7 @@ func TestLandingRoles(t *testing.T) {
 				calls++
 				assert.Equal("/repos/example/project/pulls/3", req.URL.Path)
 				body := `{"id":7,"number":3,` + tc.fields + `}`
-				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
 			})}
 			c, err := github.NewClient(github.ClientConfig{Read: hc, Write: hc, Notifications: hc, Clock: time.Now})
 			require.NoError(err)
@@ -135,7 +143,7 @@ func TestLandingTimes(t *testing.T) {
 	assert, require := assert.New(t), require.New(t)
 	hc := &http.Client{Transport: platform.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		body := `{"id":7,"number":3,"created_at":"2026-01-02T03:04:05+02:00","merged_at":"2026-01-03T18:04:05-07:00"}`
-		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
 	})}
 	c, err := github.NewClient(github.ClientConfig{Read: hc, Write: hc, Notifications: hc, Clock: time.Now})
 	require.NoError(err)
@@ -143,4 +151,42 @@ func TestLandingTimes(t *testing.T) {
 	require.NoError(err)
 	assert.Equal(new(time.Date(2026, 1, 2, 1, 4, 5, 0, time.UTC)), d.OpenedAt)
 	assert.Equal(new(time.Date(2026, 1, 4, 1, 4, 5, 0, time.UTC)), d.MergedAt)
+}
+
+func TestLandingTitle(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		want       *string
+	}{
+		{"reported", `{"id":7,"number":3,"title":"Synthetic change"}`, new("Synthetic change")},
+		{"absent", `{"id":7,"number":3}`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hc := &http.Client{Transport: platform.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(tc.body)), Request: req}, nil
+			})}
+			c, err := github.NewClient(github.ClientConfig{Read: hc, Write: hc, Notifications: hc, Clock: time.Now})
+			require.NoError(t, err)
+			d, err := c.GetLandingChange(t.Context(), platform.RepoRef{Platform: platform.KindGitHub, Host: "github.com", Owner: "example", Name: "project"}, platform.LandingChangeRef{ID: 7, Number: 3})
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, d.Title)
+		})
+	}
+}
+
+func TestLandingSourceRangeRequiresObjectIDs(t *testing.T) {
+	calls := 0
+	hc := &http.Client{Transport: platform.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"commits":[]}`)), Request: req}, nil
+	})}
+	c, err := github.NewClient(github.ClientConfig{Read: hc, Write: hc, Notifications: hc, Clock: time.Now})
+	require.NoError(t, err)
+	route := platform.RepoRef{Platform: platform.KindGitHub, Host: "github.com", Owner: "example", Name: "project"}
+	sha := strings.Repeat("a", 40)
+	for _, pair := range [][2]string{{"main", sha}, {sha, "topic"}, {sha + "...main", sha}, {strings.ToUpper(sha), sha}} {
+		_, err := c.ListLandingSourceRange(t.Context(), route, platform.LandingChangeRef{ID: 7, Number: 3}, pair[0], pair[1], "")
+		require.Error(t, err, pair)
+	}
+	assert.Zero(t, calls, "branch names and ranges must not reach the comparison path")
 }

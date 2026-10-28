@@ -46,8 +46,8 @@ The CI workflow classifies changed paths once in `.github/workflows/ci.yml::dete
 and uses that result to gate expensive test jobs. Keep the path buckets
 runtime-oriented rather than extension-only: the backend bucket includes Go
 files, Go modules, migrations, generated API client inputs, embedded web
-assets, and integration fixtures; the Rust bucket includes root Cargo manifests
-and the Rust workspace; the e2e bucket includes Playwright config, e2e tests,
+assets, and integration fixtures; the Rust bucket includes root Cargo manifests,
+the `rust-toolchain.toml` pin, and the Rust workspace; the e2e bucket includes Playwright config, e2e tests,
 scripts, and integration fixtures. Frontend unit, browser, and Playwright e2e
 jobs run when either frontend paths change or backend paths change, because
 backend/API behavior can affect the SPA contract even when no TypeScript files
@@ -69,6 +69,22 @@ leave cross-file version lockstep to a dedicated checker such as
 `scripts/check-playwright-version.mjs`, which reads the current pin instead of
 hardcoding one.
 
+## Library-owned behavior
+
+Forge tests must not assert behavior that an imported library owns, such as
+kit-ui's MediaViewer panel size, control placement, hover reveal, or focus
+order. Those values change in the library, and its own suite covers them.
+Test Forge's wiring: which content gets the control, the URLs Forge builds,
+modal-frame and layer stacking, and that the flow opens and closes
+(`frontend/tests/e2e/edit-pr-content.spec.ts`).
+The same applies to Go kit: telemetry tests cover only the install identity
+and event routing Forge hands kit, not kit's property stamping, filtering,
+install-age tagging, or env opt-out (`internal/telemetry/telemetry_kit_test.go`).
+For kwt, drive Forge entry points such as checkout creation, refresh, and
+cleanup; do not call kwt scope or repository methods with hand-built requests
+to re-test its locking, claiming, base-sync, or error classification
+(`internal/workspace/manager.go::createWorkspaceCheckout`).
+
 ## Provider work
 
 When adding or changing a provider, pick tests at the boundary where users would
@@ -86,7 +102,7 @@ notice the regression:
 
 Provider container fixture image bumps must keep every launch default and baked
 image tag on one release, or local e2e and bake paths can test different
-provider versions (`internal/server/gitlab_container_e2e_test.go::TestGitLabContainerE2E`).
+provider versions (`internal/server/settingstest/gitlab_container_e2e_test.go::TestGitLabContainerE2E`).
 
 - Container fixtures must advertise the host-mapped port in canonical provider URLs while
   keeping the service listener on its internal container port (`scripts/e2e/gitlab/docker-compose.yml:10`).
@@ -99,6 +115,9 @@ must never inspect or mutate the live daemon, service manager, network ingress,
 or credentials (`internal/fleetsetup/setup_test.go`).
 
 ## Frontend test lane selection
+
+- Upgrade Vite and Vitest together through a Vite+ release that bundles both;
+  do not upgrade Vitest independently (`frontend/package.json`).
 
 Do not treat Playwright or full-stack e2e as a universal "must have" for every
 visible frontend fix. Pick the narrowest lane that observes the behavior's real
@@ -151,16 +170,22 @@ owner:
 - Real-tmux Playwright tests observe user-visible state through the per-instance socket;
   never replace global key bindings, which can leak into developer sessions and prove only event receipt
   (`frontend/tests/e2e-full/00-inline-workspace-continuity.spec.ts::expectWheelScroll`).
+- Browser terminal input tests must wait for the active session's `claim_resize` before
+  typing; focus and visibility can come before the app completes socket setup and drop keystrokes
+  (`frontend/tests/e2e-full/support/terminalReadiness.ts::waitForTerminalInputReady`).
 - Real-tmux websocket tests retry asynchronous resize probes on a bounded timer, never per repaint; repaint-coupled
   input creates a feedback loop that can overflow subscriber buffers
   (`internal/server/api_test.go::TestWorkspaceRuntimeSessionTerminalTmuxBackedWebSocketE2E`).
 - PTY-owner quick-exit coverage must assert the exact nonzero status through the
   HTTP-launched runtime WebSocket and confirm SQLite session cleanup. Order process
   exit before PTY EOF in the fixture; accepting unknown `-1` does not cover the handoff
-  (`internal/server/api_test.go::TestWorkspaceRuntimePtyOwnerQuickExitReportsExactStatusE2E`).
+  (`internal/server/workspacetest/pty_owner_e2e_test.go::TestWorkspaceRuntimePtyOwnerQuickExitReportsExactStatusE2E`).
 - Retiring or shutting down e2e state must stop its private tmux server before slower
   asynchronous cleanup; interrupted runners otherwise leave test-owned daemons behind
   (`cmd/e2e-server/main.go::run`).
+- The e2e fixture provider serves each ID at its seeded route. A scenario that moves
+  a repository must forget the moved ID, or a background sync observes it back at the
+  old route (`internal/testutil/fixture_client.go::FixtureClient.ForgetRepository`).
 - Clipboard-race tests must emit OSC 52 through the attached tmux client, not print
   an application OSC 52 sequence that tmux blocks, and must assert the socket observed
   OSC 52 before trusting clipboard ordering (`frontend/tests/e2e-full/00-tmux-browser-clipboard.spec.ts::typeScheduledTmuxClipboardWrite`).
@@ -227,10 +252,10 @@ Playwright, Bun, and Vite+ pins in the recipe, cache only `/usr/local/install/ca
 and materialize `node_modules` from the lockfile before invoking baked `vp`
 (`.github/workflows/ci.yml::ensure_playwright_image`, `.github/docker/playwright/Dockerfile:3`).
 Vite+ owns its bundled test-tool versions; update direct Vite/Vitest pins only
-alongside a Vite+ toolchain upgrade, never through independent Renovate updates
-(`renovate.json:31`).
-Frontend unit tests use the runner's 14 guaranteed cores; the previous single-worker
-cap was for the retired memory-constrained runner (`frontend/vite.config.ts::resolveUnitTestWorkers`).
+alongside a Vite+ toolchain upgrade, never through independent Renovate updates;
+Renovate tracks the `vite` alias as `@voidzero-dev/vite-plus-core` (`renovate.json:31`).
+Set frontend CI concurrency for the selected runner; do not treat the fallback
+worker count as its budget (`frontend/vite.config.ts::resolveUnitTestWorkers`).
 Run CI Vitest unit and browser projects separately: their worker limits differ,
 which Vitest rejects in the same execution group
 (`frontend/vite.config.ts::resolveBrowserTestWorkers`).
@@ -261,6 +286,9 @@ cleanup targets the server instead of a `go run` wrapper. An explicit binary rem
 externally owned
 and must not be rebuilt or removed (`frontend/tests/e2e-full/support/e2eServer.ts::ensureE2EServerBinary`).
 
+Run every full-stack shard for both Chromium and Firefox; the GitHub App setup
+suite runs once alongside Chromium (`.github/workflows/ci.yml::e2e`).
+
 - E2E provider decorators must embed concrete fixtures rather than base interfaces;
   narrowing erases optional capability interfaces (`cmd/e2e-server/main_test.go::TestE2EWorkflowClientExercisesProviderWorkflowContract`).
 
@@ -272,6 +300,15 @@ and must not be rebuilt or removed (`frontend/tests/e2e-full/support/e2eServer.t
   for an admitted creation before killing the private server (`cmd/e2e-server/main.go::tmuxCreationGate`).
 - Keep explicit PTY-owner test mode unwrapped so its missing tmux command remains
   unavailable to backend selection (`cmd/e2e-server/main.go::buildAppState`).
+- e2e-server never calls `gitsafe.RunIsolatedMain`, so its fixture Git reads the developer's
+  global config and each `git commit` may sign or run hooks. Every worker builds fixtures at
+  startup under a 60s readiness timeout; create bulk fixture commits with plumbing such as
+  `git fast-import` (`internal/testutil/diff_repo.go::appendSeededPR1Commits`).
+- Markdown video browser tests use a committed synthetic VP9 WebM clip, which
+  every Playwright browser decodes, on a dedicated e2e server; the clip's extra
+  seeded items would change other specs' lists
+  (`frontend/tests/e2e-full/markdown-video.spec.ts`,
+  `cmd/e2e-server/markdown_video.go::markdownVideoContentType`).
 
 Playwright regressions that require a non-loopback listener must be opt-in only
 in the isolated CI container; local runs must skip before binding because the
@@ -284,6 +321,9 @@ per-task error isolation rather than duplicating Kata's component suite.
 
 Roborev `hide_classify_jobs` e2e fixtures must cover skipped design rows and classify-typed auto-design rows.
 Seed classify rows terminal unless testing worker mutation; live workers can rewrite queued/running rows during browser assertions (`internal/testutil/roborev_fixtures.go::seedRoborevMutationFixtures`).
+Real Roborev mutation fixtures need an available fixture agent. Pause the queue while asserting a queued rerun;
+`--workers 0` retains the daemon's default worker count
+(`frontend/tests/e2e-full/roborev-e2e.spec.ts:969`).
 Keep injected Roborev `panel_run` failures controlled until the assertion observes them; drawer/list refresh demand can immediately retry member fetches and clear transient panel errors (`frontend/src/lib/stores/roborev/jobs.svelte.ts::wantsPanelMembers`).
 Roborev `/api/stream/events` is NDJSON, not SSE: use an abortable Fetch reader with bounded reconnects, and abort both pre-header and active-body requests on teardown (`frontend/src/lib/stores/roborev/jobs.svelte.ts::connectEventStream`).
 Playwright retries that write to a persistent authority must use per-attempt mutation identities or reset state; a committed first attempt otherwise poisons its retry (`frontend/tests/e2e-full/roborev-e2e.spec.ts:923`).
@@ -294,6 +334,11 @@ a fake hook writer cannot validate linked-worktree registration
 Container fixtures must not fetch operating-system packages from public mirrors
 during CI. Build small fixture-only helpers from the repository and reuse an
 already-required toolchain base image instead (`tests/integration/roborev/Dockerfile`).
+The Docker reboot simulation needs real tmux, so it installs Debian packages and stays
+an opt-in local target outside CI (`scripts/reboot-sim.sh`, `tools/rebootsim/Dockerfile`).
+Its fake agent must send hook payloads the pinned decoder accepts (SessionStart
+`source`, SessionEnd `reason`); a rejected hook silently skips the path under test
+(`tools/rebootsim/fake-agent.sh`).
 
 Playwright waits must observe the state consumed by the next assertion. Direct API reads after an optimistic
 mutation wait for its response; rendered assertions wait for rendered state, since route refinement can pair new
@@ -360,7 +405,7 @@ metadata at the route registration site:
 - stable kebab-case `OperationID`;
 - short imperative `Summary`;
 - exactly one tag from the API tag taxonomy enforced in
-  `internal/server/route_metadata_test.go`.
+  `internal/server/settingstest/route_metadata_test.go`.
 
 Use `httpapi.DocumentOperation(...)` for Huma convenience helpers such as `huma.Get`
 and `huma.Post`. Use inline `Summary`, `Tags`, and `OperationID` fields for
@@ -368,6 +413,18 @@ and `huma.Post`. Use inline `Summary`, `Tags`, and `OperationID` fields for
 ID; those names feed checked-in generated clients, so changing an
 `OperationID` is a generated-client API change even when the HTTP path is
 unchanged.
+
+Generated Go clients encode path and query parameters through
+`paramcodec.Map`, never the generator's `runtime.AsMap`, which routes numbers
+through float64 and sends large IDs in exponent form. Cover new integer
+parameters with real-size values (`internal/apiclient/generated/templates/client-options.tmpl`,
+`internal/apiclient/generated/client_query_test.go`).
+
+The client-with-response templates are local copies of upstream oapi-codegen-dd
+templates and still call its built-in ones, such as `decodeBody`. A generator
+version bump must rebase those copies onto the new upstream versions and
+regenerate in the same change; otherwise the generated clients stop compiling
+(`internal/apiclient/generated/templates/client-with-response.tmpl`).
 
 Health routes on the separate health Huma API intentionally disable OpenAPI and
 docs output. Terminal and proxy routes registered through `Adapter().Handle`
@@ -410,15 +467,21 @@ concern. The main levers are:
   short polling loops that check immediately before waiting;
 - reuse migrated SQLite template databases for isolated non-migration tests;
 - prepare SQLite fixtures before starting a subprocess timeout and pass the file
-  to the child; process-local template caches are cold after exec (`internal/workspace/manager_test.go::TestSyncWorkspaceBaseBranchSurvivesQueuedReconciliationWriter`);
+  to the child; process-local template caches are cold after exec;
 - add `t.Parallel` only after proving the test does not touch process-global
   state, fixed external resources, shared tmux sessions, or shared database
   files.
 
 Use `make race-times` to get a local package timing baseline for the current
 slow packages. CI also writes race timing JSON and summarizes slow packages and
-tests in the `go test -race` job summary. When a PR regresses race runtime, use
-the CI timing artifact rather than guessing from local timings alone.
+tests in the `go test -race` job summaries. When a PR regresses race runtime, use
+the CI timing artifacts rather than guessing from local timings alone.
+
+Keep Go shards exhaustive: server descendants in `server`, CLI/DB/GitHub in
+`core`, and everything else in `rest`, including the server root. Race jobs split
+each group into two disjoint parts. Run live GraphQL and integration suites once
+in the ordinary `core` job. Rebalance from per-shard timing artifacts
+(`.github/workflows/ci.yml::test_go`, `.github/workflows/ci.yml::race`).
 
 New full-stack server tests should default to `t.Parallel()` when they build
 their own `t.TempDir` filesystem, SQLite fixture, provider fake, and server
@@ -433,13 +496,19 @@ removal. Black-box tests use `internal/testutil/servertest`; same-package tests
 register shutdown cleanup after DB creation (`internal/testutil/servertest/servertest.go::New`,
 `internal/server/api_test.go::gracefulShutdown`).
 
-Disable Git auto-GC and auto-maintenance in synthetic repositories under
-`t.TempDir`; detached maintenance can recreate files during fixture cleanup
-(`internal/gitclone/commits_test.go::commitTestRun`).
+Git auto-GC and auto-maintenance stay off in synthetic repositories under
+`t.TempDir`; detached maintenance can recreate files during fixture cleanup.
+The shared test config disables them (`internal/testutil/gitsafe/gitsafe.go::SharedConfig`):
+a push into a local bare repository runs receive-pack without the pusher's `-c`
+options, so per-command flags alone do not reach it.
 
-Real-Git test packages use `gitsafe.RunIsolatedMain` in `TestMain`: one empty config per binary.
+Real-Git test packages use `gitsafe.RunIsolatedMain` in `TestMain`: one config per binary
+holding only `SharedConfig`.
 Use `Runner` where code strips Git variables, and `MutableRunner` only for global config
 mutations (`internal/testutil/gitsafe/gitsafe.go::RunIsolatedMain`).
+`gitcmd.New()` is not a substitute: it probes user `safe.directory` settings.
+Commit fixtures must also reject temp directories inside existing repositories
+(`internal/gitclone/commit_stats_test.go::isolatedCommitFixtureDir`).
 Script tests that launch Git from repository hooks must strip Git's repository-local
 environment first; a nested `git init` can otherwise rewrite shared worktree config
 (`scripts/context-sync.test.mjs::isolatedGitEnv`).
@@ -472,6 +541,10 @@ Windows test binaries that launch restart-durable PTY processes must contain
 their descendants in a kill-on-close Job Object; test timeouts bypass normal
 Go cleanup (`internal/testutil/processjob/processjob_windows.go::ContainCurrentProcessTree`).
 
+Windows CI runs only the packages and tests named in its job; a new
+`*_windows_test.go` never runs in CI until a step there selects it
+(`.github/workflows/ci.yml::pty-windows`).
+
 Keep splitting new high-volume tests into the existing black-box packages when
 they do not need unexported internals:
 
@@ -501,6 +574,9 @@ migration state, dirty database handling, or other internal invariants.
   equality cannot prove stasis. (`internal/db/queries_archive_test.go::TestArchivePromptReopensEqualOrNewerObservations`)
 - Snapshot race coverage must include equal provider timestamps through a real sync workflow and generated HTTP client; helper-only tests miss ordering gaps where child I/O begins before the parent revision is committed. (`internal/server/e2etest/archive_snapshot_race_test.go::TestIssueSyncCannotReplaceEqualTimestampArchiveSnapshotE2E`)
 - Seeded full-stack provider fakes must return every child family represented as provider-owned seed data. Complete mirroring legitimately deletes absent comments/reviews, so a DB-only synthetic child row is not stable across background or explicit sync. (`internal/testutil/fixtures.go::SeedFixtures`)
+- The standalone e2e server runs outside Go's test-only public-API guard. Every provider
+  client it constructs must prevent remote I/O explicitly, including clients used for rate
+  display (`cmd/e2e-server/main.go::newE2EGraphQLFetcher`).
 
 ### SQLite Fixtures
 
@@ -516,6 +592,10 @@ need a fresh migrated schema:
 
 The template fixture migrates once, checkpoints WAL, copies the database file
 into each test's `t.TempDir`, and opens the copy with `OpenPreparedForTest`.
+
+Outside `internal/workspace`, build workspace managers with
+`internal/testutil/workspacetest.NewManager`, which wires a repository coordinator
+as the daemon does; do not copy a local helper.
 That preserves per-test isolation without paying migration setup for every
 fixture.
 
@@ -531,6 +611,10 @@ Async cache tests must observe the baseline through the consumer boundary
 before mutating inputs or advancing a fake clock; initial in-flight work can
 otherwise publish stale data at the new time. (`internal/server/workspacetest/workspace_enrichment_wire_test.go::TestWorkspaceListReportsCommitsAheadBehindE2E`)
 
+Workspace enrichment clocks must advance through failed attempts during polling;
+the retry TTL uses the same injected clock
+(`internal/server/workspacetest/workspace_enrichment_wire_test.go::waitForWorkspaceEnrichment`).
+
 When server e2e tests chain `POST /api/v1/sync` with another ad-hoc sync
 trigger, treat the HTTP 202 and DB row timestamps as intermediate observations.
 `TriggerRun` is non-blocking and single-flight; wait for `/api/v1/sync/status`
@@ -545,16 +629,33 @@ and await the fake's observation instead of reading its counter synchronously
 
 Workspace fixtures with background monitors must seed observer inputs before
 `server.New`; the pushed-head observer runs an immediate first pass and can
-capture transitional fixture state (`internal/server/server.go::runWorkspacePushedHeadObserverLoop`).
+capture transitional fixture state (`internal/server/workspaceapi/background.go::Handler.runWorkspacePushedHeadObserverLoop`).
 
 `testing/synctest` is appropriate only when all goroutines and timers under test
-are pure in-process work created inside the `synctest.Run` bubble. Good
+are pure in-process work created inside the `synctest.Test` bubble. Good
 candidates include fake-client backoff, cooldown, cancellation, and event-hub
 tests. Do not use `synctest` around `httptest.Server`, WebSockets, tmux, PTYs,
 git, shell commands, filesystem polling driven by external processes, or tests
 that call `t.Run`, `t.Parallel`, or `t.Deadline` inside the bubble.
 `synctest.Wait` is race-detector synchronization, so it is useful under
 `go test -race` when the test is structurally eligible.
+
+kennlint's `deadlinetest`, run by `make lint-check`, rejects constant budgets
+below one second in tests outside a `synctest.Test` bubble: `context.WithTimeout`,
+`context.WithDeadline`, `time.After`, `time.NewTimer`, `time.AfterFunc`, and the
+`waitFor` of testify's `Eventually` family. Wait on a real event or run the test
+in a bubble. Only two cases take `//nolint:kennlint // reason`, with a reason
+that names the case and what holds the wait: the asserted result is the deadline
+expiring, or a `select` on a timer shows that an event does not happen. Short
+positive `Never` windows are allowed because they cannot fail.
+
+`sleeptest` rejects `time.Sleep` outside synctest bubbles, including test helpers.
+A helper that advances fake time with `time.Sleep` needs one
+`//nolint:kennlint` explaining that it's only called in a bubble. Retain a sleep
+only for a real subprocess, HTTP, tmux, or container wait, with
+`//nolint:kennlint // reason` naming the external boundary and budget. For absence
+checks, select on the event and a timer, with a reason naming the event that must
+remain absent.
 
 ## HTTP testing discipline
 
@@ -633,3 +734,7 @@ a 409 through `generated.ErrorModel` alongside the in-package original.
 - [`context/github-sync-invariants.md`](./github-sync-invariants.md) documents
   timeline freshness, SHA-sensitive CI, and fallback rules that usually
   determine which tests belong on a GitHub-specific sync change.
+
+Archive integration scenarios seed persisted collection coverage and read the
+production HTTP export; response stubs cannot prove consumers handle missing
+coverage (`cmd/e2e-server/archive_context.go::seedArchiveContext`).

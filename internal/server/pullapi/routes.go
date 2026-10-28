@@ -17,8 +17,9 @@ import (
 	"go.kenn.io/forge/internal/platformdb"
 
 	"github.com/danielgtaylor/huma/v2"
-	gh "github.com/google/go-github/v91/github"
-	gitlabapi "gitlab.com/gitlab-org/api/client-go/v2"
+	gh "github.com/google/go-github/v92/github"
+	gitlabapi "gitlab.com/gitlab-org/api/client-go/v3"
+
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/federationauth"
 	"go.kenn.io/forge/internal/gitclone"
@@ -39,6 +40,7 @@ const (
 )
 
 type listPullsInput struct {
+	Attributes string `query:"attributes" doc:"Comma-separated PR inclusion filters: approved, draft, ready, merge_conflicts, failed_ci, passed_ci. Matches any selected inclusion filter, including involves_me and unassigned, before pagination."`
 	Label      string `query:"label" doc:"Exact case-sensitive label name; applied before pagination."`
 	Repo       string `query:"repo" doc:"Repository filter. Accepts provider|platform_host/repo_path, with comma-separated values for multiple repositories."`
 	State      string `query:"state"`
@@ -309,7 +311,10 @@ type mergePRInputBody struct {
 }
 
 type mergePRBody struct {
-	Merged                  bool   `json:"merged"`
+	Merged bool `json:"merged"`
+	// Queued reports that the pull request was added to its base branch's
+	// merge queue instead of merging; the queue merges it later.
+	Queued                  bool   `json:"queued,omitempty"`
 	SHA                     string `json:"sha"`
 	Message                 string `json:"message"`
 	WorkspaceCleanupPending bool   `json:"workspace_cleanup_pending,omitempty"`
@@ -364,7 +369,7 @@ func (s *Handler) listPulls(ctx context.Context, input *listPullsInput) (*listPu
 	query := ListQuery{
 		Repo: input.Repo, State: input.State, Kanban: input.Kanban,
 		Starred: input.Starred, InvolvesMe: input.InvolvesMe, Unassigned: input.Unassigned, Text: input.Q,
-		Label: input.Label, Limit: input.Limit, Offset: input.Offset,
+		Label: input.Label, Attributes: input.Attributes, Limit: input.Limit, Offset: input.Offset,
 	}
 	var rows []MergeRequestResponse
 	var err error
@@ -379,7 +384,9 @@ func (s *Handler) listPulls(ctx context.Context, input *listPullsInput) (*listPu
 	return &listPullsOutput{Body: rows}, nil
 }
 
-func (s *Handler) listPullsRouteCore(ctx context.Context, input *listPullsInput) (*listPullsOutput, error) {
+func (s *Handler) listPullsRouteCore(
+	ctx context.Context, input *listPullsInput, items []db.RepoItemNumber,
+) (*listPullsOutput, error) {
 	if input.State != "" {
 		valid := map[string]bool{
 			"open": true, "closed": true, "all": true,
@@ -394,6 +401,18 @@ func (s *Handler) listPullsRouteCore(ctx context.Context, input *listPullsInput)
 	}
 	if hasInvalidRepoFilter(input.Repo) {
 		return nil, httpapi.Validation("query.repo", "repo filter must be provider|platform_host/repo_path")
+	}
+
+	var attributes []string
+	if input.Attributes != "" {
+		attributes = strings.Split(input.Attributes, ",")
+		for _, attribute := range attributes {
+			switch attribute {
+			case "approved", "draft", "ready", "merge_conflicts", "failed_ci", "passed_ci":
+			default:
+				return nil, httpapi.Validation("query.attributes", "unknown PR inclusion filter")
+			}
+		}
 	}
 
 	snapshot := workspaceapi.WorkspaceSubjectSnapshot{
@@ -418,7 +437,16 @@ func (s *Handler) listPullsRouteCore(ctx context.Context, input *listPullsInput)
 			}
 		}
 	}
+	repoByID, err := s.lookupRepoMap(ctx)
+	if err != nil {
+		return nil, httpapi.Internal("repo lookup failed")
+	}
+	allowedRepoIDs := make([]int64, 0, len(repoByID))
+	for id := range repoByID {
+		allowedRepoIDs = append(allowedRepoIDs, id)
+	}
 	opts := db.ListMergeRequestsOpts{
+		AllowedRepoIDs:    allowedRepoIDs,
 		State:             input.State,
 		KanbanState:       input.Kanban,
 		Starred:           input.Starred,
@@ -429,6 +457,7 @@ func (s *Handler) listPullsRouteCore(ctx context.Context, input *listPullsInput)
 		Offset:            input.Offset,
 		RepoFilters:       parseRepoFilters(input.Repo),
 		WorkspaceActivity: overrides,
+		Items:             items,
 	}
 	if input.InvolvesMe {
 		if s.viewerLogins == nil {
@@ -440,14 +469,24 @@ func (s *Handler) listPullsRouteCore(ctx context.Context, input *listPullsInput)
 		}
 	}
 
+	visibilityMatches := make(map[int64]bool)
+	if len(attributes) > 0 {
+		opts.Limit, opts.Offset = 0, 0
+		if opts.ViewerLogins != nil || opts.Unassigned {
+			matches, err := s.db.ListMergeRequests(ctx, opts)
+			if err != nil {
+				return nil, httpapi.Internal("list pulls failed")
+			}
+			for _, mr := range matches {
+				visibilityMatches[mr.ID] = true
+			}
+		}
+		opts.ViewerLogins, opts.Unassigned = nil, false
+	}
+
 	mrs, err := s.db.ListMergeRequests(ctx, opts)
 	if err != nil {
 		return nil, httpapi.Internal("list pulls failed")
-	}
-
-	repoByID, err := s.lookupRepoMap(ctx)
-	if err != nil {
-		return nil, httpapi.Internal("repo lookup failed")
 	}
 
 	mrIDs := make([]int64, len(mrs))
@@ -462,6 +501,10 @@ func (s *Handler) listPullsRouteCore(ctx context.Context, input *listPullsInput)
 	if err != nil {
 		return nil, httpapi.Internal("load stack placements failed")
 	}
+	mergeQueueStates, err := s.db.ListMergeQueueStatesForMRs(ctx, mrIDs)
+	if err != nil {
+		return nil, httpapi.Internal("load merge queue states failed")
+	}
 	links, err := s.db.GetWorktreeLinksForMRs(ctx, mrIDs)
 	if err != nil {
 		return nil, httpapi.Internal("load worktree links failed")
@@ -469,24 +512,24 @@ func (s *Handler) listPullsRouteCore(ctx context.Context, input *listPullsInput)
 	linksByMR := indexWorktreeLinksByMR(links, s.selfFleetKey(""))
 	out := make([]MergeRequestResponse, 0, len(mrs))
 	for _, mr := range mrs {
-		rp, ok := repoByID[mr.RepoID]
-		if !ok {
-			continue
-		}
+		rp := repoByID[mr.RepoID]
 		wl := linksByMR[mr.ID]
 		if wl == nil {
 			wl = []worktreeLinkResponse{}
 		}
 		responseMR := mr
 		if stackConflictBlocked[mr.ID] {
-			responseMR.MergeableState = "dirty"
+			overrideMergeableStateForStackConflict(&responseMR)
 		}
 		responseMR = mergeRequestResponseModel(responseMR)
+		if len(attributes) > 0 && !visibilityMatches[mr.ID] && !matchesPullAttributes(responseMR, attributes) {
+			continue
+		}
 		key := db.WorkspaceSubjectKey{RepoID: mr.RepoID, ItemType: db.WorkspaceItemTypePullRequest, ItemNumber: mr.Number}
 		var workspaceRef *workspaceapi.WorkspaceRef
 		if activity, ok := snapshot.Subjects[key]; ok {
-			copy := activity.Workspace
-			workspaceRef = &copy
+			workspaceCopy := activity.Workspace
+			workspaceRef = &workspaceCopy
 		}
 		resp := MergeRequestResponse{
 			MergeRequest:  responseMR,
@@ -505,11 +548,20 @@ func (s *Handler) listPullsRouteCore(ctx context.Context, input *listPullsInput)
 			resp.DetailFetchedAt = formatUTCRFC3339(*mr.DetailFetchedAt)
 		}
 		if placement, ok := stackPlacements[mr.ID]; ok && placement.Size > 1 {
-			resp.Stack = &StackPlacementResponse{Position: placement.Position, Size: placement.Size}
+			resp.Stack = &StackPlacementResponse{StackID: placement.StackID, Position: placement.Position, Size: placement.Size}
+		}
+		if state, ok := mergeQueueStates[mr.ID]; ok {
+			resp.MergeQueue, resp.MergeQueueRemoval = mergeQueueStateResponses(state)
 		}
 		out = append(out, resp)
 	}
 
+	if len(attributes) > 0 {
+		out = out[min(max(input.Offset, 0), len(out)):]
+		if input.Limit > 0 {
+			out = out[:min(input.Limit, len(out))]
+		}
+	}
 	return &listPullsOutput{Body: out}, nil
 }
 
@@ -618,11 +670,25 @@ func (s *Handler) buildPullDetailResponse(
 		stackContext := stackContextForPR(mr.Number, stack, members)
 		resp.Stack = &stackContext
 	}
+	mergeQueueState, err := s.db.GetMergeQueueState(ctx, mr.RepoID, mr.Number)
+	if err != nil {
+		return MergeRequestDetailResponse{}, httpapi.Internal("load merge queue state failed")
+	}
+	if mergeQueueState != nil {
+		resp.MergeQueue, resp.MergeQueueRemoval = mergeQueueStateResponses(*mergeQueueState)
+		if mergeQueueState.Enabled && mergeQueueState.BaseBranch == mr.BaseBranch &&
+			s.capabilitiesForRepo(*repo).MergeQueueMutation {
+			resp.MergeQueueTarget = &MergeQueueTargetResponse{
+				Branch:      mergeQueueState.BaseBranch,
+				MergeMethod: mergeQueueState.MergeMethod,
+			}
+		}
+	}
 	responseMR := *mr
 	if stack != nil {
 		blockedBy := computeConflictBlockedBy(members)
 		if _, ok := blockedBy[mr.Number]; ok && mr.State == db.MergeRequestStateOpen {
-			responseMR.MergeableState = "dirty"
+			overrideMergeableStateForStackConflict(&responseMR)
 		}
 	}
 	responseMR = mergeRequestResponseModel(responseMR)
@@ -682,6 +748,18 @@ func (s *Handler) BuildDetail(
 	mr *db.MergeRequest,
 ) (MergeRequestDetailResponse, error) {
 	return s.buildPullDetailResponse(ctx, mr)
+}
+
+// overrideMergeableStateForStackConflict reports a PR blocked by a
+// conflict lower in its stack as dirty. The PR's own mergeable observation
+// time does not date that derived state, so it is dropped when the value
+// changes.
+func overrideMergeableStateForStackConflict(mr *db.MergeRequest) {
+	if mr.MergeableState == "dirty" {
+		return
+	}
+	mr.MergeableState = "dirty"
+	mr.MergeableStateObservedAt = nil
 }
 
 func mergeRequestResponseModel(mr db.MergeRequest) db.MergeRequest {
@@ -939,15 +1017,15 @@ func (s *Handler) editPRContent(
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSyncerCapability(*repo, capabilityStateMutation); err != nil {
+	if err := s.requireSyncerCapability(repo.Repo, capabilityStateMutation); err != nil {
 		return nil, err
 	}
 
 	mutator, err := s.syncer.MergeRequestContentMutator(
-		repoProviderKind(*repo), repoProviderHost(*repo),
+		repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
 	)
 	if err != nil {
-		return nil, unsupportedCapabilityProblem(*repo, capabilityStateMutation)
+		return nil, unsupportedCapabilityProblem(repo.Repo, capabilityStateMutation)
 	}
 
 	mr, err := s.visibleMergeRequest(ctx, repo.ID, input.Number)
@@ -959,12 +1037,12 @@ func (s *Handler) editPRContent(
 	}
 
 	updatedMR, err := mutator.EditMergeRequestContent(
-		ctx, platformRepoRefFromDB(*repo), input.Number, input.Body.Title, input.Body.Body,
+		ctx, platformRepoRefFromDB(repo.Repo), input.Number, input.Body.Title, input.Body.Body,
 	)
 	if err != nil {
 		return nil, httpapi.ProviderCallProblemWithDetail(
 			err,
-			string(repoProviderKind(*repo)), repoProviderHost(*repo),
+			string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 			"provider API error: "+err.Error(),
 		)
 	}
@@ -983,11 +1061,11 @@ func (s *Handler) editPRContent(
 	}
 	updatedAt := updatedMR.UpdatedAt.UTC()
 	if updatedAt.IsZero() {
-		updatedAt, err = s.providerMergeRequestUpdatedAt(ctx, *repo, input.Number)
+		updatedAt, err = s.providerMergeRequestUpdatedAt(ctx, repo.Repo, input.Number)
 		if err != nil {
 			return nil, httpapi.ProviderCallProblemWithDetail(
 				err,
-				string(repoProviderKind(*repo)), repoProviderHost(*repo),
+				string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 				"provider omitted merge request updated time and refresh failed",
 			)
 		}
@@ -1024,28 +1102,28 @@ func (s *Handler) postComment(ctx context.Context, input *postCommentInput) (*po
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSyncerCapability(*repo, capabilityCommentMutation); err != nil {
+	if err := s.requireSyncerCapability(repo.Repo, capabilityCommentMutation); err != nil {
 		return nil, err
 	}
-	mr, err := s.requireVisibleMergeRequest(ctx, repo, input.Number)
+	mr, err := s.requireVisibleMergeRequest(ctx, repo.Row(), input.Number)
 	if err != nil {
 		return nil, err
 	}
 
 	mutator, err := s.syncer.CommentMutator(
-		repoProviderKind(*repo), repoProviderHost(*repo),
+		repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
 	)
 	if err != nil {
-		return nil, unsupportedCapabilityProblem(*repo, capabilityCommentMutation)
+		return nil, unsupportedCapabilityProblem(repo.Repo, capabilityCommentMutation)
 	}
 
 	platformEvent, err := mutator.CreateMergeRequestComment(
-		ctx, platformRepoRefFromDB(*repo), input.Number, input.Body.Body,
+		ctx, platformRepoRefFromDB(repo.Repo), input.Number, input.Body.Body,
 	)
 	if err != nil {
 		return nil, httpapi.ProviderCallProblemWithDetail(
 			err,
-			string(repoProviderKind(*repo)), repoProviderHost(*repo),
+			string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 			"create comment on provider failed",
 		)
 	}
@@ -1071,15 +1149,15 @@ func (s *Handler) editComment(ctx context.Context, input *editCommentInput) (*ed
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSyncerCapability(*repo, capabilityCommentMutation); err != nil {
+	if err := s.requireSyncerCapability(repo.Repo, capabilityCommentMutation); err != nil {
 		return nil, err
 	}
 
 	mutator, err := s.syncer.CommentMutator(
-		repoProviderKind(*repo), repoProviderHost(*repo),
+		repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
 	)
 	if err != nil {
-		return nil, unsupportedCapabilityProblem(*repo, capabilityCommentMutation)
+		return nil, unsupportedCapabilityProblem(repo.Repo, capabilityCommentMutation)
 	}
 
 	ref := repoNumberPathRef{
@@ -1103,12 +1181,12 @@ func (s *Handler) editComment(ctx context.Context, input *editCommentInput) (*ed
 	}
 
 	platformEvent, err := mutator.EditMergeRequestComment(
-		ctx, platformRepoRefFromDB(*repo), input.Number, input.CommentID, input.Body.Body,
+		ctx, platformRepoRefFromDB(repo.Repo), input.Number, input.CommentID, input.Body.Body,
 	)
 	if err != nil {
 		return nil, httpapi.ProviderCallProblemWithDetail(
 			err,
-			string(repoProviderKind(*repo)), repoProviderHost(*repo),
+			string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 			"edit comment on provider failed",
 		)
 	}
@@ -1144,12 +1222,12 @@ func (s *Handler) deleteComment(ctx context.Context, input *deleteCommentInput) 
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSyncerCapability(*repo, capabilityCommentMutation); err != nil {
+	if err := s.requireSyncerCapability(repo.Repo, capabilityCommentMutation); err != nil {
 		return nil, err
 	}
-	mutator, err := s.syncer.CommentMutator(repoProviderKind(*repo), repoProviderHost(*repo))
+	mutator, err := s.syncer.CommentMutator(repoProviderKind(repo.Repo), repoProviderHost(repo.Repo))
 	if err != nil {
-		return nil, unsupportedCapabilityProblem(*repo, capabilityCommentMutation)
+		return nil, unsupportedCapabilityProblem(repo.Repo, capabilityCommentMutation)
 	}
 	ref := repoNumberPathRef{
 		repoID: repo.ID, owner: repo.Owner, name: repo.Name,
@@ -1167,10 +1245,10 @@ func (s *Handler) deleteComment(ctx context.Context, input *deleteCommentInput) 
 		return nil, httpapi.NotFound(httpapi.CodeCommentNotFound, "comment not found for pull request", nil)
 	}
 	if err := mutator.DeleteMergeRequestComment(
-		ctx, platformRepoRefFromDB(*repo), input.Number, input.CommentID,
+		ctx, platformRepoRefFromDB(repo.Repo), input.Number, input.CommentID,
 	); err != nil {
 		return nil, httpapi.ProviderCallProblemWithDetail(
-			err, string(repoProviderKind(*repo)), repoProviderHost(*repo),
+			err, string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 			"delete comment on provider failed",
 		)
 	}
@@ -1190,7 +1268,7 @@ func (s *Handler) replyToDiscussion(ctx context.Context, input *replyToDiscussio
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSyncerCapability(*repo, capabilityThreadReply); err != nil {
+	if err := s.requireSyncerCapability(repo.Repo, capabilityThreadReply); err != nil {
 		return nil, err
 	}
 
@@ -1204,7 +1282,7 @@ func (s *Handler) replyToDiscussion(ctx context.Context, input *replyToDiscussio
 		return nil, httpapi.NotFound(httpapi.CodePullNotFound, "pull request not found", nil)
 	}
 
-	provider, err := s.syncer.Registry().Provider(repoProviderKind(*repo), repoProviderHost(*repo))
+	provider, err := s.syncer.Registry().Provider(repoProviderKind(repo.Repo), repoProviderHost(repo.Repo))
 	if err != nil {
 		return nil, httpapi.Internal("provider lookup failed")
 	}
@@ -1213,7 +1291,7 @@ func (s *Handler) replyToDiscussion(ctx context.Context, input *replyToDiscussio
 	if !ok {
 		caps := provider.Capabilities()
 		if !caps.ThreadReply {
-			return nil, unsupportedCapabilityProblem(*repo, capabilityThreadReply)
+			return nil, unsupportedCapabilityProblem(repo.Repo, capabilityThreadReply)
 		}
 		return nil, httpapi.Internal("provider does not implement ThreadReplier")
 	}
@@ -1226,13 +1304,13 @@ func (s *Handler) replyToDiscussion(ctx context.Context, input *replyToDiscussio
 			return nil, httpapi.Internal("get review thread failed")
 		}
 		if thread == nil {
-			if repoProviderKind(*repo) == platform.KindGitHub {
+			if repoProviderKind(repo.Repo) == platform.KindGitHub {
 				return nil, httpapi.NotFound(httpapi.CodeNotFound, "review thread not found", nil)
 			}
 			if err := validateDiscussionID(input.DiscussionID); err != nil {
 				return nil, err
 			}
-		} else if repoProviderKind(*repo) == platform.KindGitHub {
+		} else if repoProviderKind(repo.Repo) == platform.KindGitHub {
 			if strings.TrimSpace(thread.ProviderCommentID) == "" {
 				return nil, httpapi.Internal("review thread is missing provider comment id")
 			}
@@ -1247,7 +1325,7 @@ func (s *Handler) replyToDiscussion(ctx context.Context, input *replyToDiscussio
 			}
 			providerDiscussionID = thread.ProviderThreadID
 		}
-	} else if repoProviderKind(*repo) == platform.KindGitHub {
+	} else if repoProviderKind(repo.Repo) == platform.KindGitHub {
 		if _, err := parseReviewLocalID(input.DiscussionID, "review thread"); err != nil {
 			return nil, err
 		}
@@ -1258,12 +1336,12 @@ func (s *Handler) replyToDiscussion(ctx context.Context, input *replyToDiscussio
 	}
 
 	platformEvent, err := replier.ReplyToThread(
-		ctx, platformRepoRefFromDB(*repo), input.Number, providerDiscussionID, input.Body.Body,
+		ctx, platformRepoRefFromDB(repo.Repo), input.Number, providerDiscussionID, input.Body.Body,
 	)
 	if err != nil {
 		return nil, httpapi.ProviderCallProblemWithDetail(
 			err,
-			string(repoProviderKind(*repo)), repoProviderHost(*repo),
+			string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 			"reply to discussion on provider failed",
 		)
 	}
@@ -1272,7 +1350,7 @@ func (s *Handler) replyToDiscussion(ctx context.Context, input *replyToDiscussio
 	}
 
 	event := platformdb.DBMREvent(mr.ID, platformEvent)
-	providerUpdatedAt, activityErr := s.providerMergeRequestUpdatedAt(ctx, *repo, input.Number)
+	providerUpdatedAt, activityErr := s.providerMergeRequestUpdatedAt(ctx, repo.Repo, input.Number)
 	if activityErr != nil {
 		slog.WarnContext(ctx, "failed to refresh pull request activity after discussion reply",
 			"mr_id", mr.ID, "discussion_id", input.DiscussionID, "error", activityErr)
@@ -1281,7 +1359,7 @@ func (s *Handler) replyToDiscussion(ctx context.Context, input *replyToDiscussio
 				"mr_id", mr.ID, "discussion_id", input.DiscussionID, "error", err)
 			return nil, httpapi.Internal("failed to persist reply event")
 		}
-		s.syncAfterReviewDraftPublish(*repo, input.Number)
+		s.syncAfterReviewDraftPublish(repo.Repo, input.Number)
 		return &replyToDiscussionOutput{Status: http.StatusCreated, Body: mergeRequestEventResponseFromDB(event)}, nil
 	}
 	applied, err := s.db.CommitMergeRequestChildSnapshot(ctx, db.MergeRequestChildSnapshot{
@@ -1296,7 +1374,7 @@ func (s *Handler) replyToDiscussion(ctx context.Context, input *replyToDiscussio
 		return nil, httpapi.Internal("failed to persist reply event")
 	}
 	if !applied {
-		s.syncAfterReviewDraftPublish(*repo, input.Number)
+		s.syncAfterReviewDraftPublish(repo.Repo, input.Number)
 	}
 
 	return &replyToDiscussionOutput{Status: http.StatusCreated, Body: mergeRequestEventResponseFromDB(event)}, nil
@@ -1315,7 +1393,7 @@ func (s *Handler) resolveDiscussion(ctx context.Context, input *resolveDiscussio
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSyncerCapability(*repo, capabilityThreadResolve); err != nil {
+	if err := s.requireSyncerCapability(repo.Repo, capabilityThreadResolve); err != nil {
 		return nil, err
 	}
 
@@ -1329,7 +1407,7 @@ func (s *Handler) resolveDiscussion(ctx context.Context, input *resolveDiscussio
 		return nil, httpapi.NotFound(httpapi.CodePullNotFound, "pull request not found", nil)
 	}
 
-	provider, err := s.syncer.Registry().Provider(repoProviderKind(*repo), repoProviderHost(*repo))
+	provider, err := s.syncer.Registry().Provider(repoProviderKind(repo.Repo), repoProviderHost(repo.Repo))
 	if err != nil {
 		return nil, httpapi.Internal("provider lookup failed")
 	}
@@ -1338,17 +1416,17 @@ func (s *Handler) resolveDiscussion(ctx context.Context, input *resolveDiscussio
 	if !ok {
 		caps := provider.Capabilities()
 		if !caps.ThreadResolve {
-			return nil, unsupportedCapabilityProblem(*repo, capabilityThreadResolve)
+			return nil, unsupportedCapabilityProblem(repo.Repo, capabilityThreadResolve)
 		}
 		return nil, httpapi.Internal("provider does not implement ThreadResolver")
 	}
 
 	if err := resolver.ResolveThread(
-		ctx, platformRepoRefFromDB(*repo), input.Number, input.DiscussionID, input.Body.Resolved,
+		ctx, platformRepoRefFromDB(repo.Repo), input.Number, input.DiscussionID, input.Body.Resolved,
 	); err != nil {
 		return nil, httpapi.ProviderCallProblemWithDetail(
 			err,
-			string(repoProviderKind(*repo)), repoProviderHost(*repo),
+			string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 			"resolve discussion on provider failed",
 		)
 	}
@@ -1373,14 +1451,14 @@ func (s *Handler) approvePR(ctx context.Context, input *approvePRInput) (*action
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSyncerCapability(*repo, capabilityReviewMutation); err != nil {
+	if err := s.requireSyncerCapability(repo.Repo, capabilityReviewMutation); err != nil {
 		return nil, err
 	}
 	mutator, err := s.syncer.ReviewMutator(
-		repoProviderKind(*repo), repoProviderHost(*repo),
+		repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
 	)
 	if err != nil {
-		return nil, unsupportedCapabilityProblem(*repo, capabilityReviewMutation)
+		return nil, unsupportedCapabilityProblem(repo.Repo, capabilityReviewMutation)
 	}
 
 	mr, err := s.visibleMergeRequest(ctx, repo.ID, input.Number)
@@ -1390,14 +1468,14 @@ func (s *Handler) approvePR(ctx context.Context, input *approvePRInput) (*action
 	if mr == nil {
 		return nil, httpapi.NotFound(httpapi.CodePullNotFound, "pull request not found", nil)
 	}
-	if s.mergeRequestAuthoredByViewer(ctx, *repo, *mr) {
-		return nil, selfApprovalProblem(*repo)
+	if s.mergeRequestAuthoredByViewer(ctx, repo.Repo, *mr) {
+		return nil, selfApprovalProblem(repo.Repo)
 	}
 
 	expectedHeadSHA := approvalReviewHeadSHA(mr, input.Body.ExpectedHeadSHA)
 
 	platformEvent, err := mutator.ApproveMergeRequest(
-		ctx, platformRepoRefFromDB(*repo), input.Number, input.Body.Body,
+		ctx, platformRepoRefFromDB(repo.Repo), input.Number, input.Body.Body,
 		expectedHeadSHA,
 	)
 	if err != nil {
@@ -1407,7 +1485,7 @@ func (s *Handler) approvePR(ctx context.Context, input *approvePRInput) (*action
 			s.runBackground(func(bgCtx context.Context) {
 				if syncErr := s.syncer.SyncMROnProvider(
 					bgCtx,
-					repoProviderKind(*repo), repoProviderHost(*repo),
+					repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
 					repo.Owner, repo.Name, input.Number,
 				); syncErr != nil {
 					slog.Warn("background sync after stale approval", "err", syncErr)
@@ -1416,7 +1494,7 @@ func (s *Handler) approvePR(ctx context.Context, input *approvePRInput) (*action
 		}
 		return nil, httpapi.ProviderCallProblemWithDetail(
 			err,
-			string(repoProviderKind(*repo)), repoProviderHost(*repo),
+			string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 			"provider API error",
 		)
 	}
@@ -1426,7 +1504,7 @@ func (s *Handler) approvePR(ctx context.Context, input *approvePRInput) (*action
 
 	if syncErr := s.syncer.SyncMROnProvider(
 		ctx,
-		repoProviderKind(*repo), repoProviderHost(*repo),
+		repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
 		repo.Owner, repo.Name, input.Number,
 	); syncErr != nil {
 		slog.Warn("sync after approval", "err", syncErr)
@@ -1444,12 +1522,12 @@ func (s *Handler) requestChangesPR(ctx context.Context, input *requestChangesPRI
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSyncerCapability(*repo, capabilityReviewMutation); err != nil {
+	if err := s.requireSyncerCapability(repo.Repo, capabilityReviewMutation); err != nil {
 		return nil, err
 	}
-	caps := s.capabilitiesForRepo(*repo)
+	caps := s.capabilitiesForRepo(repo.Repo)
 	if !reviewActionSupported(caps, platform.ReviewActionRequestChanges) {
-		return nil, httpapi.UnsupportedCapability(*repo, "review_action_request_changes")
+		return nil, httpapi.UnsupportedCapability(repo.Repo, "review_action_request_changes")
 	}
 	body := strings.TrimSpace(input.Body.Body)
 	if body == "" {
@@ -1463,34 +1541,34 @@ func (s *Handler) requestChangesPR(ctx context.Context, input *requestChangesPRI
 	if mr == nil {
 		return nil, httpapi.NotFound(httpapi.CodePullNotFound, "pull request not found", nil)
 	}
-	if s.mergeRequestAuthoredByViewer(ctx, *repo, *mr) {
+	if s.mergeRequestAuthoredByViewer(ctx, repo.Repo, *mr) {
 		return nil, httpapi.Forbidden(
 			"You cannot request changes on your own pull request",
-			map[string]any{"reason": availabilityCodeSelfApproval, "provider": string(repoProviderKind(*repo)), "platformHost": repoProviderHost(*repo)},
+			map[string]any{"reason": availabilityCodeSelfApproval, "provider": string(repoProviderKind(repo.Repo)), "platformHost": repoProviderHost(repo.Repo)},
 		)
 	}
 	mutator, err := s.syncer.RequestChangesMutator(
-		repoProviderKind(*repo), repoProviderHost(*repo),
+		repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
 	)
 	if err != nil {
-		return nil, httpapi.UnsupportedCapability(*repo, "review_action_request_changes")
+		return nil, httpapi.UnsupportedCapability(repo.Repo, "review_action_request_changes")
 	}
 	expectedHeadSHA := approvalReviewHeadSHA(mr, input.Body.ExpectedHeadSHA)
-	err = mutator.RequestChanges(ctx, platformRepoRefFromDB(*repo), input.Number, body, expectedHeadSHA)
+	err = mutator.RequestChanges(ctx, platformRepoRefFromDB(repo.Repo), input.Number, body, expectedHeadSHA)
 	if err != nil {
 		if errors.Is(err, platform.ErrStaleState) {
-			s.syncAfterReviewDraftPublish(*repo, input.Number)
+			s.syncAfterReviewDraftPublish(repo.Repo, input.Number)
 		}
 		return nil, httpapi.ProviderCallProblemWithDetail(
 			err,
-			string(repoProviderKind(*repo)), repoProviderHost(*repo),
+			string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 			"provider API error",
 		)
 	}
 
 	if syncErr := s.syncer.SyncMROnProvider(
 		ctx,
-		repoProviderKind(*repo), repoProviderHost(*repo),
+		repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
 		repo.Owner, repo.Name, input.Number,
 	); syncErr != nil {
 		slog.Warn("sync after requesting changes", "err", syncErr)
@@ -1532,7 +1610,7 @@ func (s *Handler) approveWorkflows(ctx context.Context, input *repoNumberInput) 
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSyncerCapability(*repo, capabilityWorkflowApproval); err != nil {
+	if err := s.requireSyncerCapability(repo.Repo, capabilityWorkflowApproval); err != nil {
 		return nil, err
 	}
 	mr, err := s.visibleMergeRequest(ctx, repo.ID, input.Number)
@@ -1545,20 +1623,20 @@ func (s *Handler) approveWorkflows(ctx context.Context, input *repoNumberInput) 
 
 	client, err := s.syncer.DirectClientForHost(repo.PlatformHost)
 	if err != nil {
-		return nil, unsupportedCapabilityProblem(*repo, capabilityWorkflowApproval)
+		return nil, unsupportedCapabilityProblem(repo.Repo, capabilityWorkflowApproval)
 	}
 	mutator, err := s.syncer.WorkflowApprovalMutator(
-		repoProviderKind(*repo), repoProviderHost(*repo),
+		repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
 	)
 	if err != nil {
-		return nil, unsupportedCapabilityProblem(*repo, capabilityWorkflowApproval)
+		return nil, unsupportedCapabilityProblem(repo.Repo, capabilityWorkflowApproval)
 	}
 
 	pr, err := client.GetPullRequest(ctx, input.Owner, input.Name, input.Number)
 	if err != nil {
 		return nil, httpapi.ProviderCallProblemWithDetail(
 			err,
-			string(repoProviderKind(*repo)), repoProviderHost(*repo),
+			string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 			"GitHub API error",
 		)
 	}
@@ -1575,7 +1653,7 @@ func (s *Handler) approveWorkflows(ctx context.Context, input *repoNumberInput) 
 	if err != nil {
 		return nil, httpapi.ProviderCallProblemWithDetail(
 			err,
-			string(repoProviderKind(*repo)), repoProviderHost(*repo),
+			string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 			"GitHub API error",
 		)
 	}
@@ -1589,12 +1667,12 @@ func (s *Handler) approveWorkflows(ctx context.Context, input *repoNumberInput) 
 	approvedCount := 0
 	for _, run := range pending {
 		if err := mutator.ApproveWorkflow(
-			ctx, platformRepoRefFromDB(*repo), strconv.FormatInt(run.GetID(), 10),
+			ctx, platformRepoRefFromDB(repo.Repo), strconv.FormatInt(run.GetID(), 10),
 		); err != nil {
 			if approvedCount > 0 {
 				if syncErr := s.syncer.SyncMROnProvider(
 					context.WithoutCancel(ctx),
-					repoProviderKind(*repo), repoProviderHost(*repo),
+					repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
 					repo.Owner, repo.Name, input.Number,
 				); syncErr != nil {
 					slog.Warn("sync after workflow approval failure", "err", syncErr)
@@ -1602,7 +1680,7 @@ func (s *Handler) approveWorkflows(ctx context.Context, input *repoNumberInput) 
 			}
 			return nil, httpapi.ProviderCallProblemWithDetail(
 				err,
-				string(repoProviderKind(*repo)), repoProviderHost(*repo),
+				string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 				err.Error(),
 			)
 		}
@@ -1611,7 +1689,7 @@ func (s *Handler) approveWorkflows(ctx context.Context, input *repoNumberInput) 
 
 	if syncErr := s.syncer.SyncMROnProvider(
 		context.WithoutCancel(ctx),
-		repoProviderKind(*repo), repoProviderHost(*repo),
+		repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
 		repo.Owner, repo.Name, input.Number,
 	); syncErr != nil {
 		slog.Warn("sync after workflow approval", "err", syncErr)
@@ -1641,35 +1719,41 @@ func (s *Handler) readyForReview(ctx context.Context, input *repoNumberInput) (*
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSyncerCapability(*repo, capabilityReadyForReview); err != nil {
+	if err := s.requireSyncerCapability(repo.Repo, capabilityReadyForReview); err != nil {
 		return nil, err
 	}
-	if _, err := s.requireVisibleMergeRequest(ctx, repo, input.Number); err != nil {
+	stored, err := s.requireVisibleMergeRequest(ctx, repo.Row(), input.Number)
+	if err != nil {
 		return nil, err
 	}
 	mutator, err := s.syncer.ReadyForReviewMutator(
-		repoProviderKind(*repo), repoProviderHost(*repo),
+		repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
 	)
 	if err != nil {
-		return nil, unsupportedCapabilityProblem(*repo, capabilityReadyForReview)
+		return nil, unsupportedCapabilityProblem(repo.Repo, capabilityReadyForReview)
 	}
-	pr, err := mutator.MarkReadyForReview(ctx, platformRepoRefFromDB(*repo), input.Number)
+	requestedAt := s.now().UTC()
+	pr, err := mutator.MarkReadyForReview(ctx, platformRepoRefFromDB(repo.Repo), input.Number)
 	if err != nil {
 		type readyForReviewFailure interface {
+			error
 			StatusCode() int
 			IsStaleState() bool
 		}
 
-		var readyErr readyForReviewFailure
-		var ghErr *gh.ErrorResponse
-		staleState := errors.As(err, &readyErr) && readyErr != nil && readyErr.IsStaleState()
+		staleState := false
+		if readyErr, ok := errors.AsType[readyForReviewFailure](err); ok && readyErr != nil && readyErr.IsStaleState() {
+			staleState = true
+		}
 		if !staleState {
-			staleState = errors.As(err, &ghErr) && ghErr != nil && ghErr.Response != nil && ghErr.Response.StatusCode == http.StatusNotFound
+			if ghErr, ok := errors.AsType[*gh.ErrorResponse](err); ok && ghErr != nil && ghErr.Response != nil && ghErr.Response.StatusCode == http.StatusNotFound {
+				staleState = true
+			}
 		}
 		if staleState {
 			if syncErr := s.syncer.SyncMROnProvider(
 				context.WithoutCancel(ctx),
-				repoProviderKind(*repo), repoProviderHost(*repo),
+				repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
 				repo.Owner, repo.Name, input.Number,
 			); syncErr != nil {
 				slog.Warn(
@@ -1692,20 +1776,24 @@ func (s *Handler) readyForReview(ctx context.Context, input *repoNumberInput) (*
 		)
 		return nil, httpapi.ProviderCallProblemWithDetail(
 			err,
-			string(repoProviderKind(*repo)), repoProviderHost(*repo),
+			string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 			err.Error(),
 		)
 	}
 	if pr.Number == 0 {
 		return nil, httpapi.Upstream(
 			"provider API returned no pull request",
-			string(repoProviderKind(*repo)), repoProviderHost(*repo),
+			string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 		)
 	}
 
 	normalized := platformdb.DBMergeRequest(repo.ID, pr)
+	normalized.MergeableStateObservedAt = &requestedAt
+	// The mutation response cannot represent sync-derived review and CI
+	// state; carry them so marking a PR ready does not erase them.
+	ghclient.CarryMergeRequestDerivedFields(normalized, stored)
 	if mrID, _, accepted, upsertErr := s.syncer.CommitMergeRequestParentSnapshot(
-		ctx, mergeRequestRepoRef(*repo), normalized,
+		ctx, mergeRequestRepoRef(repo.Repo), normalized,
 	); upsertErr == nil && accepted {
 		_ = s.db.EnsureKanbanState(ctx, mrID)
 	}
@@ -1730,6 +1818,27 @@ func (s *Handler) mergePRWithBody(
 	number int,
 	body mergePRInputBody,
 ) (mergePRBody, error) {
+	return s.mergePRWithBodyAdmitted(ctx, provider, platformHost, owner, name, number, body, nil)
+}
+
+// errMergeNotAdmitted reports that admit declined the provider mutation.
+var errMergeNotAdmitted = errors.New("merge was not admitted")
+
+// mergePRWithBodyAdmitted merges or enqueues while holding the pull request's
+// merge lock. admit, when set, runs under that lock immediately before the
+// provider mutation; returning false aborts with errMergeNotAdmitted. A
+// deferred worker uses it to check supersession without racing an immediate
+// merge or enqueue of the same pull request.
+func (s *Handler) mergePRWithBodyAdmitted(
+	ctx context.Context,
+	provider string,
+	platformHost string,
+	owner string,
+	name string,
+	number int,
+	body mergePRInputBody,
+	admit func() bool,
+) (mergePRBody, error) {
 	body.bindWorkspaceHost(ctx)
 	repo, err := s.requireRepoRouteCapability(
 		ctx,
@@ -1739,15 +1848,17 @@ func (s *Handler) mergePRWithBody(
 	if err != nil {
 		return mergePRBody{}, err
 	}
-	if err := s.requireSyncerCapability(*repo, capabilityMergeMutation); err != nil {
+	if err := s.requireSyncerCapability(repo.Repo, capabilityMergeMutation); err != nil {
 		return mergePRBody{}, err
 	}
 	mutator, err := s.syncer.MergeMutator(
-		repoProviderKind(*repo), repoProviderHost(*repo),
+		repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
 	)
 	if err != nil {
-		return mergePRBody{}, unsupportedCapabilityProblem(*repo, capabilityMergeMutation)
+		return mergePRBody{}, unsupportedCapabilityProblem(repo.Repo, capabilityMergeMutation)
 	}
+	release := s.mergeLocks.Lock(deferredMergeKey(repo.Repo, number))
+	defer release()
 
 	mr, err := s.visibleMergeRequest(ctx, repo.ID, number)
 	if err != nil {
@@ -1759,20 +1870,53 @@ func (s *Handler) mergePRWithBody(
 	if err := s.requireMidStackMergeAllowed(ctx, repo.ID, number); err != nil {
 		return mergePRBody{}, err
 	}
-	expectedHeadSHA, err := s.preflightMergePR(repo, mr, number, body)
+	expectedHeadSHA, err := s.preflightMergePR(repo.Row(), mr, number, body)
 	if err != nil {
 		return mergePRBody{}, err
 	}
 
-	result, err := mutator.MergeMergeRequest(
-		ctx,
-		platformRepoRefFromDB(*repo),
-		number,
-		body.CommitTitle,
-		body.CommitMessage,
-		body.Method,
-		expectedHeadSHA,
-	)
+	queueMutator, err := s.mergeQueueMutatorFor(ctx, repo.Repo, mr)
+	if err != nil {
+		return mergePRBody{}, err
+	}
+	if admit != nil && !admit() {
+		return mergePRBody{}, errMergeNotAdmitted
+	}
+	// Queue reads made from here on reflect this merge, so they may drop a
+	// workspace cleanup it keeps for the merge queue.
+	requestedAt := s.now().UTC()
+	var result platform.MergeResult
+	enqueue := func(queueMutator platform.MergeQueueMutator) (platform.MergeResult, error) {
+		return queueMutator.EnqueueMergeRequest(
+			ctx, platformRepoRefFromDB(repo.Repo), number, expectedHeadSHA,
+		)
+	}
+	if queueMutator != nil {
+		result, err = enqueue(queueMutator)
+	} else {
+		result, err = mutator.MergeMergeRequest(
+			ctx,
+			platformRepoRefFromDB(repo.Repo),
+			number,
+			body.CommitTitle,
+			body.CommitMessage,
+			body.Method,
+			expectedHeadSHA,
+		)
+		// Forge may not know the branch requires a merge queue: reading the
+		// queue can be forbidden to the sync credential while the merge
+		// credential may still enqueue. The provider's refusal is the
+		// authoritative signal, so add the pull request to the queue instead.
+		if errors.Is(err, platform.ErrMergeQueueRequired) {
+			if fallback, mutatorErr := s.syncer.MergeQueueMutator(
+				repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
+			); mutatorErr == nil {
+				slog.Info("branch requires the merge queue; adding pull request to it",
+					"owner", owner, "repo", name, "number", number)
+				result, err = enqueue(fallback)
+			}
+		}
+	}
 	if err != nil {
 		if status, message, ok := mergeHTTPErrorStatus(err); ok {
 			slog.Error("provider merge failed",
@@ -1793,11 +1937,11 @@ func (s *Handler) mergePRWithBody(
 				// head-binding providers a generic-conflict resync would
 				// persist a newer head and let a retry from the same stale
 				// UI mutate a commit nobody reviewed.
-				if reason == "stale_state" || !s.capabilitiesForRepo(*repo).MutationHeadBinding {
+				if reason == "stale_state" || !s.capabilitiesForRepo(repo.Repo).MutationHeadBinding {
 					s.runBackground(func(bgCtx context.Context) {
 						if syncErr := s.syncer.SyncMROnProvider(
 							bgCtx,
-							repoProviderKind(*repo), repoProviderHost(*repo),
+							repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
 							repo.Owner, repo.Name, number,
 						); syncErr != nil {
 							slog.Warn("background sync after merge failure", "err", syncErr)
@@ -1814,7 +1958,7 @@ func (s *Handler) mergePRWithBody(
 			}
 			return mergePRBody{}, httpapi.Upstream(
 				"provider merge error: "+message,
-				string(repoProviderKind(*repo)), repoProviderHost(*repo),
+				string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 			)
 		}
 		slog.Error("provider merge transport error",
@@ -1823,7 +1967,7 @@ func (s *Handler) mergePRWithBody(
 			"err", err)
 		return mergePRBody{}, httpapi.ProviderCallProblemWithDetail(
 			err,
-			string(repoProviderKind(*repo)), repoProviderHost(*repo),
+			string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 			"provider merge error: "+err.Error(),
 		)
 	}
@@ -1854,14 +1998,40 @@ func (s *Handler) mergePRWithBody(
 		// later reporting a failure for a pull request that is already merged.
 		// (A deferred worker completing through this same path supersedes its
 		// own handle, which is a no-op by the time it broadcasts completion.)
-		s.supersedeDeferredMerge(deferredMergeKey(*repo, number))
+		s.supersedeDeferredMerge(deferredMergeKey(repo.Repo, number))
 		workspaceCleanup = s.queueMergedWorkspaceCleanup(
 			ctx, body.workspaceHostKey, body.DeleteWorkspaceID,
 		)
 	}
 
+	if result.Queued {
+		// The queue now owns this merge, so a waiting "merge after CI"
+		// worker must not later enqueue again or report a failure.
+		s.supersedeDeferredMerge(deferredMergeKey(repo.Repo, number))
+		// The workspace outlives the enqueue: it is deleted once sync records
+		// the queue's merge. The provider already accepted the enqueue, so
+		// keep the request even if the call that made it was cancelled.
+		if body.DeleteWorkspaceID != "" {
+			if err := s.db.SaveMergeWorkspaceCleanup(context.WithoutCancel(ctx), db.MergeWorkspaceCleanup{
+				RepoID: repo.ID, Number: number,
+				WorkspaceID: body.DeleteWorkspaceID, HostKey: body.workspaceHostKey,
+				RequestedAt: requestedAt,
+			}); err != nil {
+				slog.Error("keep workspace cleanup for merge queue failed",
+					"repo_id", repo.ID, "number", number,
+					"workspace_id", body.DeleteWorkspaceID, "err", err)
+			}
+		}
+		// Record the pull request's queue state now so the detail refresh
+		// that follows this response shows it queued.
+		s.syncer.RecordPullRequestEnqueued(
+			ctx, mergeRequestRepoRef(repo.Repo), repo.ID, number, mr.BaseBranch,
+		)
+	}
+
 	return mergePRBody{
 		Merged:                  result.Merged,
+		Queued:                  result.Queued,
 		SHA:                     result.SHA,
 		Message:                 result.Message,
 		WorkspaceCleanupPending: workspaceCleanup.Pending,
@@ -2038,16 +2208,13 @@ func verifyClientReviewedHeadWithoutRefresh(clientSHA, boundSHA string) error {
 }
 
 func mergeHTTPErrorStatus(err error) (int, string, bool) {
-	var ghErr *gh.ErrorResponse
-	if errors.As(err, &ghErr) && ghErr != nil && ghErr.Response != nil {
+	if ghErr, ok := errors.AsType[*gh.ErrorResponse](err); ok && ghErr != nil && ghErr.Response != nil {
 		return ghErr.Response.StatusCode, githubErrorResponseMessage(err, ghErr), true
 	}
-	var httpErr *gitealike.HTTPError
-	if errors.As(err, &httpErr) && httpErr != nil && httpErr.StatusCode != 0 {
+	if httpErr, ok := errors.AsType[*gitealike.HTTPError](err); ok && httpErr != nil && httpErr.StatusCode != 0 {
 		return httpErr.StatusCode, httpErr.Error(), true
 	}
-	var gitlabErr *gitlabapi.ErrorResponse
-	if errors.As(err, &gitlabErr) && gitlabErr != nil && gitlabErr.Response != nil {
+	if gitlabErr, ok := errors.AsType[*gitlabapi.ErrorResponse](err); ok && gitlabErr != nil && gitlabErr.Response != nil {
 		return gitlabErr.Response.StatusCode, gitlabErr.Message, true
 	}
 	return 0, "", false
@@ -2118,7 +2285,7 @@ func (s *Handler) setPRGitHubState(
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSyncerCapability(*repo, requiredCapability); err != nil {
+	if err := s.requireSyncerCapability(repo.Repo, requiredCapability); err != nil {
 		return nil, err
 	}
 
@@ -2138,18 +2305,18 @@ func (s *Handler) setPRGitHubState(
 	}
 	if input.Body.State == "draft" {
 		mutator, err := s.syncer.DraftMutator(
-			repoProviderKind(*repo), repoProviderHost(*repo),
+			repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
 		)
 		if err != nil {
-			return nil, unsupportedCapabilityProblem(*repo, capabilityDraftMutation)
+			return nil, unsupportedCapabilityProblem(repo.Repo, capabilityDraftMutation)
 		}
 		providerUpdatedAt, err := mutator.ConvertMergeRequestToDraft(
-			ctx, platformRepoRefFromDB(*repo), input.Number,
+			ctx, platformRepoRefFromDB(repo.Repo), input.Number,
 		)
 		if err != nil {
 			return nil, httpapi.ProviderCallProblemWithDetail(
 				err,
-				string(repoProviderKind(*repo)), repoProviderHost(*repo),
+				string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 				"Provider API error: "+err.Error(),
 			)
 		}
@@ -2164,17 +2331,17 @@ func (s *Handler) setPRGitHubState(
 	}
 
 	mutator, err := s.syncer.StateMutator(
-		repoProviderKind(*repo), repoProviderHost(*repo),
+		repoProviderKind(repo.Repo), repoProviderHost(repo.Repo),
 	)
 	if err != nil {
-		return nil, unsupportedCapabilityProblem(*repo, capabilityStateMutation)
+		return nil, unsupportedCapabilityProblem(repo.Repo, capabilityStateMutation)
 	}
+	mutationRequestedAt := s.now().UTC()
 	updatedMR, err := mutator.SetMergeRequestState(
-		ctx, platformRepoRefFromDB(*repo), input.Number, input.Body.State,
+		ctx, platformRepoRefFromDB(repo.Repo), input.Number, input.Body.State,
 	)
 	if err != nil {
-		var ghErr *gh.ErrorResponse
-		if errors.As(err, &ghErr) && ghErr != nil && ghErr.Response != nil &&
+		if ghErr, ok := errors.AsType[*gh.ErrorResponse](err); ok && ghErr != nil && ghErr.Response != nil &&
 			ghErr.Response.StatusCode == http.StatusUnprocessableEntity {
 			// Re-fetch to sync local state and determine the real cause.
 			repoID := repo.ID
@@ -2182,10 +2349,11 @@ func (s *Handler) setPRGitHubState(
 				client, clientErr := s.syncer.ClientForHost(repo.PlatformHost)
 				if clientErr != nil {
 					return nil, httpapi.ProviderCallProblemWithDetail(
-						clientErr, string(repoProviderKind(*repo)), repoProviderHost(*repo),
+						clientErr, string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 						"GitHub API error: "+err.Error(),
 					)
 				}
+				refetchRequestedAt := s.now().UTC()
 				ghPR, fetchErr := client.GetPullRequest(
 					ctx, input.Owner, input.Name, input.Number,
 				)
@@ -2193,23 +2361,24 @@ func (s *Handler) setPRGitHubState(
 					if ghPR == nil {
 						return nil, httpapi.Upstream(
 							"GitHub API returned no pull request",
-							string(repoProviderKind(*repo)), repoProviderHost(*repo),
+							string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 						)
 					}
 					normalized, normalizeErr := ghclient.NormalizePR(repoID, ghPR)
 					if normalizeErr != nil {
 						return nil, httpapi.Upstream(
 							"GitHub API error: "+normalizeErr.Error(),
-							string(repoProviderKind(*repo)), repoProviderHost(*repo),
+							string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 						)
 					}
+					normalized.MergeableStateObservedAt = &refetchRequestedAt
 					// Refetched snapshots cannot represent sync-derived
 					// columns either; carry them like the success path so
 					// a concurrent close recovered here does not erase
 					// them from a row no later sync will refetch.
 					ghclient.CarryMergeRequestDerivedFields(normalized, mr)
 					_, _, _, _ = s.syncer.CommitMergeRequestParentSnapshot(
-						ctx, mergeRequestRepoRef(*repo), normalized,
+						ctx, mergeRequestRepoRef(repo.Repo), normalized,
 					)
 					s.markClosedLinkedNotificationsDone(ctx)
 					if ghPR.GetMerged() {
@@ -2230,7 +2399,7 @@ func (s *Handler) setPRGitHubState(
 		}
 		return nil, httpapi.ProviderCallProblemWithDetail(
 			err,
-			string(repoProviderKind(*repo)), repoProviderHost(*repo),
+			string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo),
 			"GitHub API error: "+err.Error(),
 		)
 	}
@@ -2245,13 +2414,14 @@ func (s *Handler) setPRGitHubState(
 	// itself succeeded.
 	if updatedMR.Number == input.Number {
 		normalized := platformdb.DBMergeRequest(repo.ID, updatedMR)
+		normalized.MergeableStateObservedAt = &mutationRequestedAt
 		// Edit responses cannot represent sync-derived columns (CI state,
 		// review decision, comment count); carry them from the stored row
 		// so a UI close does not erase them from a row no later sync will
 		// ever refetch.
 		ghclient.CarryMergeRequestDerivedFields(normalized, mr)
 		if _, _, _, commitErr := s.syncer.CommitMergeRequestParentSnapshot(
-			ctx, mergeRequestRepoRef(*repo), normalized,
+			ctx, mergeRequestRepoRef(repo.Repo), normalized,
 		); commitErr != nil {
 			slog.Warn("record state change snapshot",
 				"owner", repo.Owner, "repo", repo.Name,
@@ -2306,8 +2476,8 @@ func (s *Handler) resolvePullCloneSnapshot(
 			)
 		}
 		return &resolvedPullCloneSnapshot{
-			ctx:  gitclone.WithRepositoryIdentity(ctx, repo.PlatformRepoID),
-			repo: repo, shas: shas, stale: shas.Stale(),
+			ctx:  gitclone.WithRepositoryIdentity(ctx, repo.Identity()),
+			repo: repo.Row(), shas: shas, stale: shas.Stale(),
 		}, nil
 	}
 	if s.clones == nil {
@@ -2328,45 +2498,24 @@ func (s *Handler) resolvePullCloneSnapshot(
 	if err != nil {
 		return nil, providerRouteLookupError(err)
 	}
-	if repo.PlatformRepoID != repository.PlatformRepoID {
+	if repo.Key != repository.Key {
 		return nil, httpapi.Upstream(
 			"hub descriptor did not resolve to its stable repository",
 			repository.Provider, repository.PlatformHost,
 		)
 	}
-	fence, found, err := s.resolver.CaptureRepositoryRouteFence(ctx, *repo)
-	if err != nil {
-		return nil, httpapi.Internal("capture repository route failed")
-	}
-	if !found {
-		return nil, httpapi.NotFound(
-			httpapi.CodeRepoNotFound, "repository route changed", nil,
-		)
-	}
-	if err := s.clones.RequireCredentialRoute(
+	if err := s.clones.RequireReadCredentialRoute(
 		ctx, repository.Provider, repository.PlatformHost,
 		repository.Owner, repository.Name,
 	); err != nil {
 		return nil, pullClonePreparationProblem(err, repository)
 	}
 	cloneCtx := gitclone.WithRequiredCredential(
-		gitclone.WithRepositoryIdentity(ctx, repository.PlatformRepoID),
+		gitclone.WithRepositoryIdentity(ctx, repo.Identity()),
 	)
-	validate := func(validationCtx context.Context) error {
-		matches, err := s.resolver.RepositoryRouteFenceMatches(
-			validationCtx, *repo, fence,
-		)
-		if err != nil {
-			return err
-		}
-		if !matches {
-			return db.ErrRepositoryRouteFenceChanged
-		}
-		return nil
-	}
 	if err := s.clones.EnsureCloneValidated(
 		cloneCtx, repository.Provider, repository.PlatformHost,
-		repository.Owner, repository.Name, repository.CloneURL, validate,
+		repository.Owner, repository.Name, repository.CloneURL, nil,
 	); err != nil {
 		return nil, pullClonePreparationProblem(err, repository)
 	}
@@ -2377,13 +2526,10 @@ func (s *Handler) resolvePullCloneSnapshot(
 		); err != nil {
 			return nil, pullClonePreparationProblem(err, repository)
 		}
-		if err := validate(ctx); err != nil {
-			return nil, pullClonePreparationProblem(err, repository)
-		}
 	}
 	return &resolvedPullCloneSnapshot{
 		ctx:  cloneCtx,
-		repo: repo,
+		repo: repo.Row(),
 		shas: &db.DiffSHAs{
 			PlatformHeadSHA: descriptor.PlatformHeadSHA,
 			PlatformBaseSHA: descriptor.PlatformBaseSHA,
@@ -2404,7 +2550,7 @@ func pullClonePreparationProblem(
 			repository.Owner+"/"+repository.Name,
 		)
 	}
-	if errors.Is(err, db.ErrRepositoryRouteFenceChanged) {
+	if errors.Is(err, db.ErrRepositoryIdentityChanged) {
 		return httpapi.NotFound(
 			httpapi.CodeRepoNotFound, "repository route changed", nil,
 		)
@@ -2443,10 +2589,16 @@ func (s *Handler) getCommits(ctx context.Context, input *repoNumberInput) (*getC
 		)
 	}
 
+	stats, statsErr := s.clones.CommitStats(resolved.ctx, string(repoProviderKind(*repo)), host, repo.Owner, repo.Name, commits)
+	if statsErr != nil {
+		slog.Warn("failed to read pull request commit stats", "err", statsErr)
+	}
+
 	resp := commitsResponse{Commits: make([]commitResponse, len(commits))}
 	for i, c := range commits {
 		resp.Commits[i] = commitResponse{
 			SHA:        c.SHA,
+			Stats:      stats[c.SHA],
 			Message:    c.Message,
 			AuthorName: c.AuthorName,
 			AuthoredAt: c.AuthoredAt.UTC(),
@@ -2883,6 +3035,7 @@ func stackContextForPR(number int, stack *db.Stack, members []db.StackMemberWith
 		Position:  position,
 		Size:      len(members),
 		Health:    computeStackHealth(members),
+		Native:    stack.Native,
 		Members:   toStackMemberResponses(members),
 	}
 }
@@ -2916,4 +3069,58 @@ func (s *Handler) getStackForPRRouteCore(ctx context.Context, input *repoNumberI
 	return &getStackForPROutput{
 		Body: stackContextForPR(input.Number, stack, members),
 	}, nil
+}
+
+// mergeQueueStateResponses converts stored queue state into the queued entry
+// or the removal a reader shows, whichever applies.
+func mergeQueueStateResponses(
+	state db.MergeQueueState,
+) (*MergeQueueEntryResponse, *MergeQueueRemovalResponse) {
+	if state.Queued {
+		entry := &MergeQueueEntryResponse{
+			Position:   state.Position,
+			State:      strings.ToLower(state.State),
+			ObservedAt: formatUTCRFC3339(state.ObservedAt),
+		}
+		if state.EnqueuedAt != nil {
+			entry.EnqueuedAt = formatUTCRFC3339(*state.EnqueuedAt)
+		} else {
+			entry.EnqueuedAt = formatUTCRFC3339(state.ObservedAt)
+		}
+		if state.EstimatedTimeToMerge != nil {
+			entry.EstimatedTimeToMergeSeconds = new(int64(state.EstimatedTimeToMerge.Seconds()))
+		}
+		return entry, nil
+	}
+	if state.RemovalReason != "" && state.RemovedAt != nil {
+		return nil, &MergeQueueRemovalResponse{
+			RemovedAt: formatUTCRFC3339(*state.RemovedAt),
+			Reason:    state.RemovalReason,
+		}
+	}
+	return nil, nil
+}
+
+// mergeQueueMutatorFor returns the provider's merge queue mutator when sync
+// last saw mr's base branch with a merge queue, so merging adds it to the
+// queue. It returns nil for a direct merge; a direct merge GitHub refuses
+// because the branch requires the queue still enqueues.
+func (s *Handler) mergeQueueMutatorFor(
+	ctx context.Context, repo db.Repo, mr *db.MergeRequest,
+) (platform.MergeQueueMutator, error) {
+	if !s.capabilitiesForRepo(repo).MergeQueueMutation {
+		return nil, nil
+	}
+	state, err := s.db.GetMergeQueueState(ctx, repo.ID, mr.Number)
+	if err != nil {
+		return nil, httpapi.Internal("load merge queue state failed")
+	}
+	if state == nil || !state.Enabled || state.BaseBranch != mr.BaseBranch {
+		return nil, nil
+	}
+	mutator, err := s.syncer.MergeQueueMutator(repoProviderKind(repo), repoProviderHost(repo))
+	if err != nil {
+		return nil, unsupportedCapabilityProblem(repo, capabilityMergeQueueMutation)
+	}
+	return mutator, nil
 }

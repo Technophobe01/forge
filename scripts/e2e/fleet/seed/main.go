@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/procutil"
+	"go.kenn.io/forge/platform"
 )
 
 func main() {
@@ -31,20 +33,26 @@ func run(ctx context.Context, args []string) error {
 	cloneURL := fs.String("clone-url", "", "clone URL recorded in provider repository metadata")
 	platformHost := fs.String("platform-host", "github.com", "provider host recorded in fixture state")
 	startTmux := fs.Bool("start-tmux", false, "start the seeded workspace tmux session")
+	pullState := fs.String("pull-state", string(db.MergeRequestStateOpen), "state of the seeded pull request: open, closed, or merged")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *dbPath == "" {
-		return fmt.Errorf("-db is required")
+		return errors.New("-db is required")
 	}
 	if !*providerOnly && *projectPath == "" {
-		return fmt.Errorf("-project-path is required")
+		return errors.New("-project-path is required")
 	}
 	if !*providerOnly && *worktreePath == "" {
-		return fmt.Errorf("-worktree-path is required")
+		return errors.New("-worktree-path is required")
 	}
 	if *providerOnly && *cloneURL == "" {
-		return fmt.Errorf("-clone-url is required with -provider-only")
+		return errors.New("-clone-url is required with -provider-only")
+	}
+	switch db.MergeRequestState(*pullState) {
+	case db.MergeRequestStateOpen, db.MergeRequestStateClosed, db.MergeRequestStateMerged:
+	default:
+		return fmt.Errorf("-pull-state must be open, closed, or merged")
 	}
 	if *cloneURL == "" {
 		*cloneURL = filepath.Join(filepath.Dir(*worktreePath), "origin.git")
@@ -75,7 +83,9 @@ func run(ctx context.Context, args []string) error {
 	}
 	defer database.Close()
 
-	if err := seedProviderState(ctx, database, *platformHost, *cloneURL); err != nil {
+	if err := seedProviderState(
+		ctx, database, *platformHost, *cloneURL, db.MergeRequestState(*pullState),
+	); err != nil {
 		return err
 	}
 	if *providerOnly {
@@ -132,26 +142,31 @@ func run(ctx context.Context, args []string) error {
 	return nil
 }
 
+// fleetWidgetRepoID is the synthetic provider repository ID of the seeded
+// fleet repository.
+const fleetWidgetRepoID = 7101
+
 func seedProviderState(
 	ctx context.Context, database *db.DB, platformHost, cloneURL string,
+	pullState db.MergeRequestState,
 ) error {
-	repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
-		Platform:       "github",
-		PlatformHost:   platformHost,
-		PlatformRepoID: "e2e-fleet-widget",
-		Owner:          "acme",
-		Name:           "fleet-widget",
-		RepoPath:       "acme/fleet-widget",
+	entry, err := database.ObserveRepository(ctx, db.RepoIdentity{
+		Platform:     "github",
+		PlatformHost: platformHost,
+		Key:          platform.RepositoryIDKey(fleetWidgetRepoID),
+		Owner:        "acme",
+		Name:         "fleet-widget",
+		RepoPath:     "acme/fleet-widget",
 	})
 	if err != nil {
 		return fmt.Errorf("upsert repo: %w", err)
 	}
-	if err := database.UpdateRepoProviderMetadata(ctx, repoID, db.RepoProviderMetadata{
-		PlatformRepoID: "e2e-fleet-widget",
-		WebURL:         "https://" + platformHost + "/acme/fleet-widget",
-		CloneURL:       cloneURL,
-		DefaultBranch:  "main",
-	}); err != nil {
+	repoID := entry.Repository.ID
+	if err := database.UpdateRepoProviderObservation(ctx, repoID, db.RepoProviderMetadata{
+		WebURL:        "https://" + platformHost + "/acme/fleet-widget",
+		CloneURL:      cloneURL,
+		DefaultBranch: "main",
+	}, nil, nil); err != nil {
 		return fmt.Errorf("update repo provider metadata: %w", err)
 	}
 	now := time.Now().UTC()
@@ -161,7 +176,7 @@ func seedProviderState(
 		URL:             "https://github.com/acme/fleet-widget/pull/7",
 		Title:           "Fleet widget",
 		Author:          "fleet",
-		State:           db.MergeRequestStateOpen,
+		State:           pullState,
 		HeadBranch:      "feature/fleet-read",
 		BaseBranch:      "main",
 		PlatformHeadSHA: "fleet-head",
@@ -275,11 +290,11 @@ func startWorkspaceTmux(ctx context.Context, session, worktreePath string) error
 	// seeded sessions must land on the same dedicated kenn-forge
 	// server the fleet monitor reads, not the global tmux server.
 	tmuxCmd := config.DefaultTmuxCommand()
-	killArgs := append(tmuxCmd[1:], "kill-session", "-t", session)
+	killArgs := slices.Concat(tmuxCmd[1:], []string{"kill-session", "-t", session})
 	_ = procutil.CommandContext(ctx, tmuxCmd[0], killArgs...).Run()
-	newArgs := append(
+	newArgs := slices.Concat(
 		config.DefaultTmuxCommand()[1:],
-		"new-session", "-d", "-s", session, "-c", worktreePath, "sh",
+		[]string{"new-session", "-d", "-s", session, "-c", worktreePath, "sh"},
 	)
 	cmd := procutil.CommandContext(ctx, tmuxCmd[0], newArgs...)
 	output, err := cmd.CombinedOutput()

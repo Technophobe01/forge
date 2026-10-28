@@ -23,7 +23,10 @@ import (
 	"go.kenn.io/forge/internal/db"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
+	"go.kenn.io/forge/internal/testutil"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/testutil/servertest"
 	"go.kenn.io/forge/internal/tokenauth"
 	"go.kenn.io/forge/platform"
@@ -32,6 +35,7 @@ import (
 )
 
 func TestTokenFileRotationE2EConfigStartupAndHTTPSync(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
@@ -106,28 +110,26 @@ token_file = %q
 
 	database := dbtest.Open(t)
 	ref := ghclient.RepoRef{
-		Platform:           platform.KindGitLab,
-		Owner:              "group",
-		Name:               "project",
-		PlatformHost:       "gitlab.example.com",
-		RepoPath:           "group/project",
-		PlatformRepoID:     42,
-		PlatformExternalID: "42",
-		WebURL:             "https://gitlab.example.com/group/project",
-		CloneURL:           "https://gitlab.example.com/group/project.git",
-		DefaultBranch:      "main",
+		Platform:      platform.KindGitLab,
+		Owner:         "group",
+		Name:          "project",
+		PlatformHost:  "gitlab.example.com",
+		RepoPath:      "group/project",
+		Key:           platform.RepositoryIDKey(42),
+		WebURL:        "https://gitlab.example.com/group/project",
+		CloneURL:      "https://gitlab.example.com/group/project.git",
+		DefaultBranch: "main",
 	}
-	repoID, err := database.UpsertRepo(ctx, platformdb.DBRepoIdentity(platform.RepoRef{
-		Platform:           platform.KindGitLab,
-		Host:               "gitlab.example.com",
-		Owner:              "group",
-		Name:               "project",
-		RepoPath:           "group/project",
-		PlatformID:         42,
-		PlatformExternalID: "42",
-		WebURL:             "https://gitlab.example.com/group/project",
-		CloneURL:           "https://gitlab.example.com/group/project.git",
-		DefaultBranch:      "main",
+	repoID, err := reposeed.Seed(ctx, database, platformdb.DBRepoIdentity(platform.RepoRef{
+		Platform:      platform.KindGitLab,
+		Host:          "gitlab.example.com",
+		Owner:         "group",
+		Name:          "project",
+		RepoPath:      "group/project",
+		Key:           platform.RepositoryIDKey(42),
+		WebURL:        "https://gitlab.example.com/group/project",
+		CloneURL:      "https://gitlab.example.com/group/project.git",
+		DefaultBranch: "main",
 	}))
 	require.NoError(err)
 	syncer := ghclient.NewSyncerWithRegistry(
@@ -178,7 +180,7 @@ token_file = %q
 	)
 }
 
-func TestInvalidReloadKeepsLiveTokenSourceE2E(t *testing.T) {
+func TestInvalidReloadKeepsLiveTokenSourceE2E(t *testing.T) { //nolint:paralleltest // t.Setenv writes KENN_FORGE_INVALID_RELOAD_E2E_REPO_TOKEN, KENN_FORGE_INVALID_RELOAD_E2E_MISSING_REPO_TOKEN
 	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
@@ -341,6 +343,7 @@ func requireMissingTokenBadRequest(t *testing.T, resp *http.Response) {
 }
 
 func TestMissingRuntimeTokenSyncReturnsBadRequestE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	httpServer := startMissingGitLabTokenServerE2E(t)
 
 	resp := doServerJSON(
@@ -348,10 +351,16 @@ func TestMissingRuntimeTokenSyncReturnsBadRequestE2E(t *testing.T) {
 		httpServer.URL+"/api/v1/host/gitlab.example.com/pulls/gl/group/project/7/sync",
 		nil,
 	)
+	t.Cleanup(func() {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	})
 	requireMissingTokenBadRequest(t, resp)
 }
 
 func TestMissingTokenRepoPreviewReturnsBadRequestE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	httpServer := startMissingGitLabTokenServerE2E(t)
 
 	resp := doServerJSON(
@@ -364,10 +373,16 @@ func TestMissingTokenRepoPreviewReturnsBadRequestE2E(t *testing.T) {
 			"pattern":       "*",
 		},
 	)
+	t.Cleanup(func() {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	})
 	requireMissingTokenBadRequest(t, resp)
 }
 
 func TestMissingTokenBulkAddReposReturnsBadRequestE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	httpServer := startMissingGitLabTokenServerE2E(t)
 
 	resp := doServerJSON(
@@ -382,6 +397,11 @@ func TestMissingTokenBulkAddReposReturnsBadRequestE2E(t *testing.T) {
 			}},
 		},
 	)
+	t.Cleanup(func() {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	})
 	requireMissingTokenBadRequest(t, resp)
 }
 
@@ -399,7 +419,7 @@ host = "gitlab.example.com"
 `, tokenEnvLine)
 }
 
-func TestPlatformTokenRemovalAppliesWithoutRestartE2E(t *testing.T) {
+func TestPlatformTokenRemovalAppliesWithoutRestartE2E(t *testing.T) { //nolint:paralleltest // t.Setenv writes KENN_FORGE_E2E_PLATFORM_TOKEN
 	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
@@ -463,12 +483,17 @@ func TestPlatformTokenRemovalAppliesWithoutRestartE2E(t *testing.T) {
 		t, httpServer.Client(), http.MethodPost,
 		httpServer.URL+"/api/v1/repos/preview", previewBody,
 	)
+	t.Cleanup(func() {
+		if secondResp != nil && secondResp.Body != nil {
+			_ = secondResp.Body.Close()
+		}
+	})
 	requireMissingTokenBadRequest(t, secondResp)
 	assert.Len(tokens, firstCallCount,
 		"no provider request may carry the removed credential")
 }
 
-func TestRuntimeLaunchStripsReloadedAndImplicitTokenEnvsE2E(t *testing.T) {
+func TestRuntimeLaunchStripsReloadedAndImplicitTokenEnvsE2E(t *testing.T) { //nolint:paralleltest // t.Setenv writes KENN_FORGE_OLD_REPO_TOKEN, KENN_FORGE_NEW_REPO_TOKEN, KENN_FORGE_FORGEJO_TOKEN, KENN_FORGE_GITEA_TOKEN, KENN_FORGE_VISIBLE_VALUE
 	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
@@ -568,6 +593,7 @@ token_env = "SHARED"
 `
 
 func TestEquivalentCloneTokenChainsReloadStaysValidE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
@@ -625,7 +651,7 @@ host = "code.example.com"
 `, tokenLine)
 }
 
-func TestForgejoHostCloneAuthFollowsRotatedTokenE2E(t *testing.T) {
+func TestForgejoHostCloneAuthFollowsRotatedTokenE2E(t *testing.T) { //nolint:paralleltest // t.Setenv writes KENN_FORGE_E2E_FORGEJO_TOKEN, KENN_FORGE_E2E_ROTATED_TOKEN
 	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
@@ -758,17 +784,16 @@ func startGitLabTokenSyncServer(
 	require.NoError(t, err)
 	database := dbtest.Open(t)
 	ref := gitLabTokenRepoRef()
-	repoID, err := database.UpsertRepo(t.Context(), platformdb.DBRepoIdentity(platform.RepoRef{
-		Platform:           platform.KindGitLab,
-		Host:               "gitlab.example.com",
-		Owner:              "group",
-		Name:               "project",
-		RepoPath:           "group/project",
-		PlatformID:         42,
-		PlatformExternalID: "42",
-		WebURL:             "https://gitlab.example.com/group/project",
-		CloneURL:           "https://gitlab.example.com/group/project.git",
-		DefaultBranch:      "main",
+	repoID, err := reposeed.Seed(t.Context(), database, platformdb.DBRepoIdentity(platform.RepoRef{
+		Platform:      platform.KindGitLab,
+		Host:          "gitlab.example.com",
+		Owner:         "group",
+		Name:          "project",
+		RepoPath:      "group/project",
+		Key:           platform.RepositoryIDKey(42),
+		WebURL:        "https://gitlab.example.com/group/project",
+		CloneURL:      "https://gitlab.example.com/group/project.git",
+		DefaultBranch: "main",
 	}))
 	require.NoError(t, err)
 	syncer := ghclient.NewSyncerWithRegistry(
@@ -787,16 +812,15 @@ func startGitLabTokenSyncServer(
 
 func gitLabTokenRepoRef() ghclient.RepoRef {
 	return ghclient.RepoRef{
-		Platform:           platform.KindGitLab,
-		Owner:              "group",
-		Name:               "project",
-		PlatformHost:       "gitlab.example.com",
-		RepoPath:           "group/project",
-		PlatformRepoID:     42,
-		PlatformExternalID: "42",
-		WebURL:             "https://gitlab.example.com/group/project",
-		CloneURL:           "https://gitlab.example.com/group/project.git",
-		DefaultBranch:      "main",
+		Platform:      platform.KindGitLab,
+		Owner:         "group",
+		Name:          "project",
+		PlatformHost:  "gitlab.example.com",
+		RepoPath:      "group/project",
+		Key:           platform.RepositoryIDKey(42),
+		WebURL:        "https://gitlab.example.com/group/project",
+		CloneURL:      "https://gitlab.example.com/group/project.git",
+		DefaultBranch: "main",
 	}
 }
 
@@ -894,6 +918,11 @@ func streamTokenRotationConfigEvents(
 	setAcceptedHostForE2ETest(req)
 	resp, err := httpServer.Client().Do(req)
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	})
 	stream := &tokenRotationConfigEventStream{
 		resp:   resp,
 		cancel: cancel,
@@ -967,9 +996,9 @@ func waitForTokenRotationConfigEvent(
 func seedReadyRuntimeWorkspace(t *testing.T, database *db.DB, worktreePath string) {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
-	_, err := database.UpsertRepo(t.Context(), db.RepoIdentity{
+	_, err := reposeed.Seed(t.Context(), database, db.RepoIdentity{
 		Platform: "github", PlatformHost: "github.com",
-		PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget",
+		Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")), Owner: "acme", Name: "widget",
 	})
 	require.NoError(t, err)
 	require.NoError(t, os.MkdirAll(worktreePath, 0o755))
@@ -998,7 +1027,7 @@ func seedReadyRuntimeWorkspace(t *testing.T, database *db.DB, worktreePath strin
 			Version: db.WorkspaceLaunchSpecVersion,
 			Repository: db.WorkspaceLaunchRepository{
 				Provider: "github", PlatformHost: "github.com",
-				PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget",
+				Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")), Owner: "acme", Name: "widget",
 				CloneURL: "https://github.com/acme/widget.git", DefaultBranch: "main",
 			},
 			ItemType: db.WorkspaceItemTypePullRequest, ItemNumber: 1,

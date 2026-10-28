@@ -19,13 +19,16 @@ import (
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/gitsafe"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/testutil/servertest"
 	"go.kenn.io/forge/platform"
 	"go.kenn.io/forge/platform/forgejo"
-	gitcmd "go.kenn.io/kit/git/cmd"
 )
 
 func TestForgejoSyncRouteStampsObsoleteCommitEventsAcrossForcePushes(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
@@ -34,7 +37,7 @@ func TestForgejoSyncRouteStampsObsoleteCommitEventsAcrossForcePushes(t *testing.
 	require.NoError(os.MkdirAll(work, 0o755))
 	runGit := func(dir string, args ...string) string {
 		t.Helper()
-		out, stderr, err := gitcmd.New().Run(ctx, dir, nil, args...)
+		out, stderr, err := gitsafe.Runner().Run(ctx, dir, nil, args...)
 		require.NoError(err, "git %v: %s%s", args, out, stderr)
 		return strings.TrimSpace(string(out))
 	}
@@ -106,7 +109,7 @@ func TestForgejoSyncRouteStampsObsoleteCommitEventsAcrossForcePushes(t *testing.
 		current.commits = append([]string(nil), state.commits...)
 		stateMu.RUnlock()
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/owner/repo":
+		case r.Method == http.MethodGet && (r.URL.Path == "/api/v1/repos/owner/repo" || r.URL.Path == "/api/v1/repositories/1"):
 			assert.NoError(json.NewEncoder(w).Encode(map[string]any{
 				"id": 1, "name": "repo", "full_name": "owner/repo",
 				"html_url": "https://codeberg.org/owner/repo", "clone_url": origin,
@@ -169,24 +172,24 @@ func TestForgejoSyncRouteStampsObsoleteCommitEventsAcrossForcePushes(t *testing.
 	registry, err := platform.NewRegistry(provider)
 	require.NoError(err)
 	database := dbtest.Open(t)
-	_, err = database.UpsertRepo(ctx, db.RepoIdentity{
-		Platform:       string(platform.KindForgejo),
-		PlatformHost:   platform.DefaultForgejoHost,
-		PlatformRepoID: "1",
-		Owner:          "owner",
-		Name:           "repo",
-		RepoPath:       "owner/repo",
+	_, err = reposeed.Seed(ctx, database, db.RepoIdentity{
+		Platform:     string(platform.KindForgejo),
+		PlatformHost: platform.DefaultForgejoHost,
+		Key:          platform.RepositoryIDKey(1),
+		Owner:        "owner",
+		Name:         "repo",
+		RepoPath:     "owner/repo",
 	})
 	require.NoError(err)
 	clones := gitclone.New(t.TempDir(), nil)
 	repo := ghclient.RepoRef{
-		Platform:           platform.KindForgejo,
-		PlatformHost:       platform.DefaultForgejoHost,
-		PlatformExternalID: "1",
-		Owner:              "owner",
-		Name:               "repo",
-		RepoPath:           "owner/repo",
-		CloneURL:           origin,
+		Platform:     platform.KindForgejo,
+		PlatformHost: platform.DefaultForgejoHost,
+		Key:          platform.RepositoryIDKey(1),
+		Owner:        "owner",
+		Name:         "repo",
+		RepoPath:     "owner/repo",
+		CloneURL:     origin,
 	}
 	syncer := ghclient.NewSyncerWithRegistry(
 		registry, database, clones, []ghclient.RepoRef{repo}, time.Minute, nil, nil,
@@ -194,7 +197,7 @@ func TestForgejoSyncRouteStampsObsoleteCommitEventsAcrossForcePushes(t *testing.
 	t.Cleanup(syncer.Stop)
 	srv := servertest.New(t, database, syncer, nil, "/", nil, server.ServerOptions{})
 	t.Cleanup(func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
 		defer cancel()
 		require.NoError(srv.Shutdown(shutdownCtx))
 	})

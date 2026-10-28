@@ -11,6 +11,7 @@ import (
 )
 
 func TestConfigSnapshotIsImmutableAndApplyConfigPublishesCommittedState(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	enabled := true
 	initial := ConfigSnapshot{
@@ -46,10 +47,11 @@ func TestConfigSnapshotIsImmutableAndApplyConfigPublishesCommittedState(t *testi
 }
 
 func TestLifecycleShutdownHonorsContextAndCanBeWaitedAgain(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	h := New(Deps{})
-	h.Start(context.Background(), true)
-	h.Start(context.Background(), true)
+	h.Start(t.Context(), true)
+	h.Start(t.Context(), true)
 
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -59,11 +61,11 @@ func TestLifecycleShutdownHonorsContextAndCanBeWaitedAgain(t *testing.T) {
 	}))
 	<-started
 
-	cancelled, cancel := context.WithCancel(context.Background())
+	cancelled, cancel := context.WithCancel(t.Context())
 	cancel()
 	require.ErrorIs(h.Shutdown(cancelled), context.Canceled)
 
 	close(release)
-	require.NoError(h.Shutdown(context.Background()))
+	require.NoError(h.Shutdown(t.Context()))
 	require.False(h.runBackground(func(context.Context) {}))
 }

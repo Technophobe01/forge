@@ -1,3 +1,6 @@
+import { getStoreDevboxPasteImageUrl } from "../../api/generated/devboxes/devboxes.js";
+import { getStoreFleetTerminalPasteImageUrl } from "../../api/generated/fleet/fleet.js";
+import { getStoreTerminalPasteImageUrl } from "../../api/generated/system/system.js";
 import { configuredAPIBaseURL } from "../../api/runtime-base.js";
 
 export const MAX_TERMINAL_PASTE_IMAGE_BYTES = 20 * 1024 * 1024;
@@ -22,10 +25,11 @@ export async function uploadTerminalPasteImage(image: Blob, fleetHostKey?: strin
   if (image.size > MAX_TERMINAL_PASTE_IMAGE_BYTES) {
     throw new Error("Terminal paste images must be 20 MiB or smaller.");
   }
-  const target =
-    fleetHostKey === undefined
-      ? "/terminal/paste-image"
-      : `/fleet/hosts/${encodeURIComponent(fleetHostKey)}/terminal/paste-image`;
+  const target = !fleetHostKey
+    ? getStoreTerminalPasteImageUrl()
+    : fleetHostKey.startsWith("devbox:")
+      ? getStoreDevboxPasteImageUrl({ connectionId: fleetHostKey.slice(7) })
+      : getStoreFleetTerminalPasteImageUrl({ hostKey: fleetHostKey });
   const response = await fetch(`${configuredAPIBaseURL()}${target}`, {
     method: "POST",
     headers: { "Content-Type": "application/octet-stream" },

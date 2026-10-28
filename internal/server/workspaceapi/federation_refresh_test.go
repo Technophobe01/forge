@@ -13,7 +13,8 @@ import (
 	"go.kenn.io/forge/internal/providerplane"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/testutil/dbtest"
-	"go.kenn.io/forge/internal/workspace"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	"go.kenn.io/forge/internal/testutil/workspacetest"
 	"go.kenn.io/forge/platform"
 )
 
@@ -27,7 +28,7 @@ func TestRefreshProviderWorkspaceFactsSyncsOnlyRequestedItem(t *testing.T) {
 		currentName    string
 		requestOwner   string
 		requestName    string
-		platformRepoID string
+		platformRepoID int64
 	}{
 		{
 			name: "pull request", itemType: db.WorkspaceItemTypePullRequest, number: 7,
@@ -44,7 +45,7 @@ func TestRefreshProviderWorkspaceFactsSyncsOnlyRequestedItem(t *testing.T) {
 			itemType: db.WorkspaceItemTypePullRequest, number: 7,
 			currentOwner: "renamed", currentName: "widget-next",
 			requestOwner: "acme", requestName: "widget",
-			platformRepoID: "repo-acme-widget",
+			platformRepoID: 1001,
 		},
 	}
 	for _, test := range tests {
@@ -55,16 +56,16 @@ func TestRefreshProviderWorkspaceFactsSyncsOnlyRequestedItem(t *testing.T) {
 			database := dbtest.Open(t)
 			repoIdentity := db.RepoIdentity{
 				Platform: string(platform.KindGitLab), PlatformHost: "git.example.test",
-				PlatformRepoID: "repo-acme-widget",
-				Owner:          test.currentOwner, Name: test.currentName,
+				Key:   platform.RepositoryIDKey(1001),
+				Owner: test.currentOwner, Name: test.currentName,
 			}
-			repoID, err := database.UpsertRepo(t.Context(), repoIdentity)
+			repoID, err := reposeed.Seed(t.Context(), database, repoIdentity)
 			require.NoError(err)
 			now := time.Now().UTC().Truncate(time.Second)
 			providerRef := platform.RepoRef{
 				Platform: platform.KindGitLab, Host: "git.example.test",
 				Owner: test.currentOwner, Name: test.currentName,
-				PlatformExternalID: "repo-acme-widget",
+				Key: platform.RepositoryIDKey(1001),
 			}
 			provider := &autoAssignProvider{
 				pull: platform.MergeRequest{
@@ -86,8 +87,8 @@ func TestRefreshProviderWorkspaceFactsSyncsOnlyRequestedItem(t *testing.T) {
 				registry, database, nil, []ghclient.RepoRef{{
 					Platform: platform.KindGitLab, RepoID: repoID,
 					Owner: test.currentOwner, Name: test.currentName,
-					PlatformHost:       "git.example.test",
-					PlatformExternalID: "repo-acme-widget",
+					PlatformHost: "git.example.test",
+					Key:          platform.RepositoryIDKey(1001),
 				}}, time.Hour, nil, nil,
 			)
 			t.Cleanup(syncer.Stop)
@@ -101,8 +102,8 @@ func TestRefreshProviderWorkspaceFactsSyncsOnlyRequestedItem(t *testing.T) {
 					Provider: string(platform.KindGitLab), PlatformHost: "git.example.test",
 					Owner: test.requestOwner, Name: test.requestName,
 				},
-				PlatformRepoID: test.platformRepoID,
-				ItemType:       test.itemType, ItemNumber: test.number,
+				RepoKey:  platform.RepositoryIDKey(test.platformRepoID),
+				ItemType: test.itemType, ItemNumber: test.number,
 			})
 
 			require.NoError(err)
@@ -120,13 +121,14 @@ func TestRefreshProviderWorkspaceFactsSyncsOnlyRequestedItem(t *testing.T) {
 }
 
 func TestRefreshWorkspaceUsesHubProjectionWithoutLocalSyncer(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	database := dbtest.Open(t)
 	issuedAt := time.Now().UTC().Truncate(time.Second)
-	_, err := database.UpsertRepo(t.Context(), db.RepoIdentity{
+	_, err := reposeed.Seed(t.Context(), database, db.RepoIdentity{
 		Platform: "github", PlatformHost: "github.com",
-		PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget",
+		Owner: "acme", Name: "widget",
 	})
 	require.NoError(err)
 	ws := &db.Workspace{
@@ -155,13 +157,13 @@ func TestRefreshWorkspaceUsesHubProjectionWithoutLocalSyncer(t *testing.T) {
 		current.SourceVisibleUntil = current.IssuedAt.Add(db.WorkspaceLaunchSpecVisibilityLease)
 		return current, nil
 	}}
-	manager := workspace.NewManager(database, t.TempDir())
+	manager := workspacetest.NewManager(t, database, t.TempDir())
 	handler := New(Deps{
 		DB: database, Workspaces: manager, LaunchSpecResolver: resolver,
 		Now: func() time.Time { return issuedAt.Add(time.Minute) },
 	})
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Second)
 		defer cancel()
 		require.NoError(handler.Shutdown(ctx))
 	})

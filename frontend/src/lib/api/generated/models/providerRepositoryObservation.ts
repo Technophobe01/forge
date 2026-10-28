@@ -3,11 +3,11 @@
  */
 
 export interface ProviderRepositoryObservation {
+  bitbucket_repository_uuid?: string;
   name: string;
-  observed_at: string;
   owner: string;
   platform_host: string;
-  platform_repo_id: string;
+  platform_repo_id: number;
   provider: string;
   repo_path: string;
 }

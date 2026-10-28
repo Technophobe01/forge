@@ -2,9 +2,12 @@
 // app shell so both entry points — the Workspaces sidebar button and the
 // command palette, which can fire from any page — drive the same instance.
 
+import type { RepositoryKey } from "../api/repository-key.js";
+
 export type NewWorkspaceRepoSeed = {
   provider: string;
   platformHost: string;
+  repositoryKey?: RepositoryKey | undefined;
   owner: string;
   name: string;
 };
@@ -49,8 +52,9 @@ export function getNewWorkspaceSource(): NewWorkspaceSource {
   return source;
 }
 
-// Repository key (`provider/host/owner/name`) of the last created workspace,
-// or an empty string when nothing was created on this machine yet.
+// Stable repository identity key of the last created workspace, or an empty
+// string when nothing was created on this machine yet. Route-only saved values
+// cannot restore a selection; the dialog requires a new choice.
 export function getLastUsedNewWorkspaceRepoKey(): string {
   try {
     return localStorage.getItem(LAST_REPO_STORAGE_KEY) ?? "";

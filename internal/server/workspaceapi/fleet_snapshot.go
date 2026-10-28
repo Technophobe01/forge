@@ -70,8 +70,8 @@ func rawWorkspaceFromSummary(
 		ID: summary.ID,
 		Repository: fleet.RepositoryIdentity{
 			Provider: summary.Platform, PlatformHost: summary.PlatformHost,
-			PlatformRepoID: summary.RepoPlatformID,
-			Owner:          summary.RepoOwner, Name: summary.RepoName,
+			Key:   summary.RepoKey,
+			Owner: summary.RepoOwner, Name: summary.RepoName,
 		},
 		ItemType: summary.ItemType, ItemNumber: summary.ItemNumber,
 		SourceItemVisible: summary.SourceItemVisible,
@@ -116,6 +116,14 @@ func fleetWorkspaceSessionBackend(backend string) string {
 	default:
 		return ""
 	}
+}
+
+// RuntimeExited reports whether the session's process is known to be gone:
+// the runtime saw it exit on its own, or its chat agent refused to reload, as
+// when its owner died while the daemon was away. A supervised chat's stored
+// record outlives either, so a coordinator can still restore it.
+func (h *Handler) RuntimeExited(sessionKey string) bool {
+	return h != nil && h.runtime != nil && (h.runtime.Exited(sessionKey) || h.chatCannotReload(sessionKey))
 }
 
 // RuntimeSnapshot returns a detached view of runtime sessions for a workspace

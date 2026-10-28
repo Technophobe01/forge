@@ -7,6 +7,7 @@ import type { WorkflowDefinitionResponse } from "../../api/generated/models/work
 import { makeAppRuntime, type OwnedAppRuntime } from "../../app/runtime.js";
 import { STORES_KEY } from "../../context.js";
 import { createWorkflowActionsStore } from "../../stores/workflow-actions.svelte.js";
+import type { WorkspaceEventsNotification } from "../../stores/events.svelte.js";
 import { setGlobalRepo } from "../../stores/filter.svelte.js";
 import {
   createMockApiFetch,
@@ -35,6 +36,7 @@ const capabilities = {
   workflow_dispatch: true,
   read_labels: true,
   read_markdown_images: true,
+  read_markdown_media: true,
   read_authenticated_user: true,
   comment_mutation: true,
   state_mutation: true,
@@ -60,6 +62,8 @@ const capabilities = {
 
 const available = { available: true };
 
+const repoIds: Record<string, number> = { alpha: 1003, beta: 1004, legacy: 1020, "filtered-out": 1021 };
+
 function repoSummary(name: string, supported = true) {
   return {
     owner: "acme",
@@ -72,7 +76,7 @@ function repoSummary(name: string, supported = true) {
       owner: "acme",
       name,
       repo_path: `acme/${name}`,
-      platform_repo_id: `${name}-repo-id`,
+      platform_repo_id: repoIds[name] ?? 0,
       capabilities: supported
         ? capabilities
         : {
@@ -205,16 +209,32 @@ describe("ActionsPage", () => {
   let runtime: OwnedAppRuntime;
   let api: MockApiHandle;
   let originalFetch: typeof globalThis.fetch;
+  const listeners = new Set<(event: WorkspaceEventsNotification) => void>();
+  const events = {
+    subscribeWorkspaceEvents(listener: (event: WorkspaceEventsNotification) => void) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+  };
 
   function renderPage() {
     const workflowActions = createWorkflowActionsStore({ runtime });
     render(ActionsPage, {
-      context: new Map([[STORES_KEY, { workflowActions }]]),
+      context: new Map([
+        [
+          STORES_KEY,
+          {
+            workflowActions,
+            events,
+          },
+        ],
+      ]),
     });
     return workflowActions;
   }
 
   beforeEach(() => {
+    listeners.clear();
     originalFetch = globalThis.fetch;
     api = createMockApiFetch([workflowFixtures()]);
     globalThis.fetch = api.fetch;
@@ -229,6 +249,53 @@ describe("ActionsPage", () => {
     globalThis.fetch = originalFetch;
     runtimeHolder.value = undefined;
     await Effect.runPromise(runtime.disposeEffect);
+  });
+
+  it("refreshes only the visible repository's runs from workflow activity and preserves the form", async () => {
+    let reads = 0;
+    api = createMockApiFetch([
+      (request) => {
+        if (request.url.pathname !== "/api/v1/actions/github/acme/alpha/runs") return null;
+        reads++;
+        return jsonResponse({
+          repo: repoSummary("alpha").repo,
+          items: [
+            workflowRun("alpha", {
+              status: reads === 1 ? "in_progress" : "completed",
+              conclusion: reads === 1 ? "" : "success",
+            }),
+          ],
+          exhausted: true,
+        });
+      },
+      workflowFixtures(),
+    ]);
+    globalThis.fetch = api.fetch;
+    const store = renderPage();
+    await fireEvent.click(await screen.findByRole("button", { name: /alpha deploy/ }));
+    await screen.findByRole("button", { name: /Run 7 alpha deploy/ });
+    const refInput = screen.getByRole("textbox", { name: "Git ref" }) as HTMLInputElement;
+    await fireEvent.input(refInput, { target: { value: "feature/draft" } });
+    const payload = { provider: "github", platform_host: "github.com", platform_repo_id: 1003 };
+    for (const identity of [
+      { ...payload, platform_repo_id: 1004 },
+      { ...payload, platform_host: "github.example.com" },
+      payload,
+    ]) {
+      for (const listener of listeners) listener({ type: "workflow_runs_changed", payload: identity });
+    }
+    const ref = {
+      provider: "github",
+      platformHost: "github.com",
+      owner: "acme",
+      name: "alpha",
+      repositoryKey: { kind: "id", id: 1003 },
+    };
+    await waitFor(() => expect(store.getRuns(ref)[0]?.status).toBe("completed"));
+    expect(reads).toBe(2);
+    expect(refInput.value).toBe("feature/draft");
+    cleanup();
+    expect(listeners.size).toBe(0);
   });
 
   it("filters repository summaries, distinguishes unsupported repos, and demands only the selected capable repo", async () => {
@@ -287,7 +354,7 @@ describe("ActionsPage", () => {
       platformHost: "github.com",
       owner: "acme",
       name: "beta",
-      platformRepoId: "beta-repo-id",
+      repositoryKey: { kind: "id", id: 1004 },
     };
     store.loadCatalog(betaRef);
     await waitFor(() => expect(store.getCatalog(betaRef)).not.toBeNull());
@@ -297,7 +364,7 @@ describe("ActionsPage", () => {
     );
 
     expect(document.querySelector<HTMLInputElement>('input[aria-label="Git ref"]')?.value).toBe("trunk");
-    expect(store.getSnapshot(betaRef)?.ref.platformRepoId).toBe("beta-repo-id");
+    expect(store.getSnapshot(betaRef)?.ref.repositoryKey).toEqual({ kind: "id", id: 1004 });
   });
 
   it("retries an initial catalog failure in place", async () => {
@@ -323,7 +390,7 @@ describe("ActionsPage", () => {
     const workflowActions = createWorkflowActionsStore({ runtime });
     const loadJobs = vi.spyOn(workflowActions, "loadJobs");
     render(ActionsPage, {
-      context: new Map([[STORES_KEY, { workflowActions }]]),
+      context: new Map([[STORES_KEY, { workflowActions, events }]]),
     });
 
     await fireEvent.click(await screen.findByRole("button", { name: /alpha deploy/ }));
@@ -524,7 +591,7 @@ describe("ActionsPage", () => {
       platformHost: "github.com",
       owner: "acme",
       name: "alpha",
-      platformRepoId: "alpha-repo-id",
+      repositoryKey: { kind: "id", id: 1003 },
     };
     await fireEvent.click(await screen.findByRole("button", { name: /alpha deploy/ }));
     await fireEvent.click(await screen.findByRole("button", { name: /Run 7 alpha deploy/ }));

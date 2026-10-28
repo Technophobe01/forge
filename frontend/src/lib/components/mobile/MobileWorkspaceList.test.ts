@@ -1,5 +1,8 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { Effect } from "effect";
+import { createDetailStore } from "../../stores/detail.svelte.js";
+import { makeTestAppRuntime } from "../../testing/effect-layers.js";
 import { getTopFrame, resetModalStack } from "../../stores/keyboard/modal-stack.svelte.js";
 import { isNewWorkspaceDialogOpen, resetNewWorkspaceDialogState } from "../../stores/new-workspace.svelte.js";
 import * as workspaceHost from "../../stores/workspace-host.svelte.js";
@@ -9,6 +12,9 @@ const mockGet = vi.fn();
 const mockPost = vi.fn();
 const mockDelete = vi.fn();
 let workspaceEventListener: EventListener | null = null;
+let detailStore: Pick<ReturnType<typeof createDetailStore>, "isPullMerging">;
+
+vi.mock("../../context.js", () => ({ getStores: () => ({ detail: detailStore }) }));
 
 vi.mock("../../app/runtime.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../app/runtime.js")>();
@@ -63,6 +69,7 @@ describe("MobileWorkspaceList", () => {
     mockPost.mockReset();
     mockDelete.mockReset();
     workspaceEventListener = null;
+    detailStore = { isPullMerging: () => false };
     localStorage.clear();
     resetModalStack();
     resetNewWorkspaceDialogState();
@@ -96,6 +103,137 @@ describe("MobileWorkspaceList", () => {
     });
     await fireEvent.click(screen.getByRole("button", { name: "Open workspace Build mobile workspaces" }));
     expect(onOpen).toHaveBeenCalledWith("ws-1", undefined);
+  });
+
+  it("filters workspace rows by author and clears the selection", async () => {
+    mockGet.mockResolvedValue({
+      data: {
+        hosts: [],
+        workspaces: [
+          { ...fixture, item_author: "alice" },
+          { ...fixture, id: "ws-2", item_number: 43, item_author: "bob", mr_title: "Repair widget" },
+        ],
+      },
+    });
+    render(MobileWorkspaceList, { props: { onOpen: vi.fn(), onOpenItem: vi.fn() } });
+    await screen.findByText("Repair widget");
+    await fireEvent.click(screen.getByRole("button", { name: "Workspace filters" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Filter authors: Anyone" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "alice" }));
+    expect(screen.queryByText("Repair widget")).toBeNull();
+    expect(screen.getByText("Build mobile workspaces")).toBeTruthy();
+    mockGet.mockResolvedValue({
+      data: {
+        hosts: [],
+        workspaces: [{ ...fixture, id: "ws-2", item_number: 43, item_author: "bob", mr_title: "Repair widget" }],
+      },
+    });
+    await waitFor(() => expect(workspaceEventListener).not.toBeNull());
+    workspaceEventListener?.(new MessageEvent("workspace_status"));
+    await screen.findByText("No matching workspaces");
+    await fireEvent.click(screen.getByRole("button", { name: "Filter authors: alice" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "Anyone" }));
+    expect(screen.getByText("Repair widget")).toBeTruthy();
+  });
+
+  it("shows a pending merge only on workspaces linked to the verified repository", async () => {
+    const merge = Promise.withResolvers<{ data: { merged: boolean } }>();
+    const ref = {
+      provider: "github",
+      platformHost: "github.com",
+      repositoryKey: { kind: "id", id: 7101 },
+      owner: "acme",
+      name: "renamed-widgets",
+      repoPath: "acme/renamed-widgets",
+    };
+    const runtime = makeTestAppRuntime({
+      GET: vi.fn(async () => ({
+        data: {
+          repo_owner: "acme",
+          repo_name: "renamed-widgets",
+          repo: {
+            ...fixture.repo,
+            name: "renamed-widgets",
+            repo_path: "acme/renamed-widgets",
+            platform_repo_id: 7101,
+          },
+          merge_request: { Number: 42 },
+          events: [],
+        },
+      })),
+      POST: vi.fn(() => merge.promise),
+    });
+    const store = createDetailStore({ runtime });
+    detailStore = store;
+    const linked = { ...fixture, repo: { ...fixture.repo, platform_repo_id: 7101 } };
+    mockGet.mockResolvedValue({
+      data: {
+        hosts: [],
+        workspaces: [
+          linked,
+          {
+            ...linked,
+            id: "ws-associated",
+            item_type: "adhoc",
+            item_number: 0,
+            associated_pr_number: 42,
+            mr_title: "Associated pull request",
+          },
+          {
+            ...linked,
+            id: "ws-replacement",
+            mr_title: "Replacement repository",
+            repo: { ...linked.repo, platform_repo_id: 7999 },
+          },
+          { ...fixture, id: "ws-unverified", mr_title: "Unverified repository" },
+        ],
+      },
+    });
+    const onOpen = vi.fn();
+    try {
+      store.loadDetail("acme", "renamed-widgets", 42, { ...ref, sync: false });
+      await waitFor(() => expect(store.isDetailLoading()).toBe(false));
+      render(MobileWorkspaceList, { props: { onOpen, onOpenItem: vi.fn() } });
+      await screen.findByText("Build mobile workspaces");
+      store.mergePull(ref, 42, { method: "squash", commit_title: "Merge", commit_message: "" }, false);
+
+      const row = await screen.findByRole("button", { name: "Open workspace Build mobile workspaces, merging" });
+      expect(within(row).getByText("Merging")).toBeTruthy();
+      expect(
+        within(screen.getByRole("button", { name: /Open workspace Associated pull request, merging/ })).getByText(
+          "Merging",
+        ),
+      ).toBeTruthy();
+      expect(
+        within(screen.getByRole("button", { name: "Open workspace Replacement repository" })).queryByText("Merging"),
+      ).toBeNull();
+      expect(
+        within(screen.getByRole("button", { name: "Open workspace Unverified repository" })).queryByText("Merging"),
+      ).toBeNull();
+      await fireEvent.click(row);
+      expect(onOpen).toHaveBeenCalledWith("ws-1", undefined);
+
+      merge.resolve({ data: { merged: true } });
+      await waitFor(() => expect(screen.queryByText("Merging")).toBeNull());
+      expect(screen.getByRole("button", { name: "Open workspace Build mobile workspaces" })).toBeTruthy();
+    } finally {
+      cleanup();
+      await Effect.runPromise(runtime.disposeEffect);
+    }
+  });
+
+  it.each([undefined, "peer-a", "devbox:compute-a"])("offers Reveal only for supported hosts (%s)", async (hostKey) => {
+    mockGet.mockImplementation((path: string) =>
+      Promise.resolve({
+        data: path === "/snapshot" ? { hosts: [], workspaces: [{ ...fixture, fleet_host_key: hostKey }] } : {},
+      }),
+    );
+    render(MobileWorkspaceList, { props: { onOpen: vi.fn(), onOpenItem: vi.fn() } });
+    await screen.findByText("Build mobile workspaces");
+    await fireEvent.click(screen.getByRole("button", { name: "Workspace actions for Build mobile workspaces" }));
+    const actions = within(await screen.findByRole("dialog", { name: "Workspace actions" }));
+    expect(Boolean(actions.queryByRole("button", { name: "Reveal worktree" }))).toBe(!hostKey?.startsWith("devbox:"));
+    expect(actions.getByRole("button", { name: "Copy worktree path" })).toBeTruthy();
   });
 
   it("offers the first push when the configured upstream branch is missing", async () => {
@@ -275,8 +413,8 @@ describe("MobileWorkspaceList", () => {
     render(MobileWorkspaceList, { props: { onOpen: vi.fn(), onOpenItem: vi.fn() } });
     await screen.findByText("Build mobile workspaces");
 
-    await fireEvent.click(screen.getByRole("button", { name: "View workspace options" }));
-    expect(screen.getByRole("dialog", { name: "View workspace options" })).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Workspace filters" }));
+    expect(screen.getByRole("dialog", { name: "Workspace filters" })).toBeTruthy();
     expect(getTopFrame()?.frameId).toBe("mobile-workspace-view-options");
     expect(screen.getByRole("radio", { name: /^Terminal activity/ })).toBeTruthy();
 
@@ -327,6 +465,48 @@ describe("MobileWorkspaceList", () => {
       });
     });
     notifyWorkspaceDeleted.mockRestore();
+  });
+
+  it("keeps a confirmed deletion out of the remounted list while preserving the same ID on another host", async () => {
+    const remote = { ...fixture, mr_title: "Remote workspace", fleet_host_key: "peer-a" };
+    mockGet.mockResolvedValue({
+      data: {
+        hosts: [
+          {
+            configKey: "peer-a",
+            diagnostics: [],
+            id: "peer-a",
+            kind: "remote",
+            name: "Peer A",
+            operationAvailability: { workspaceWrite: { available: true } },
+            platform: "linux",
+            preferredTransport: "http",
+            reachable: true,
+            tmuxSessions: [],
+          },
+        ],
+        workspaces: [fixture, remote],
+      },
+    });
+    mockDelete.mockResolvedValue({ response: { ok: true, status: 204 } });
+    const view = render(MobileWorkspaceList, { props: { onOpen: vi.fn(), onOpenItem: vi.fn() } });
+    await screen.findByText("Remote workspace");
+    mockGet.mockReturnValue(new Promise(() => {}));
+
+    await fireEvent.click(screen.getByRole("button", { name: "Workspace actions for Remote workspace" }));
+    const actions = await screen.findByRole("dialog", { name: "Workspace actions" });
+    await fireEvent.click(within(actions).getByRole("button", { name: "Delete workspace…" }));
+    const confirmation = await screen.findByRole("dialog", { name: "Delete workspace?" });
+    await fireEvent.click(within(confirmation).getByRole("button", { name: "Delete workspace" }));
+    await waitFor(() => expect(screen.queryByText("Remote workspace")).toBeNull());
+    expect(screen.getByText("Build mobile workspaces")).toBeTruthy();
+
+    await view.rerender({ showList: false });
+    mockGet.mockClear();
+    await view.rerender({ showList: true });
+    await waitFor(() => expect(mockGet).toHaveBeenCalledWith("/snapshot", expect.anything()));
+    expect(await screen.findByText("Build mobile workspaces")).toBeTruthy();
+    expect(screen.queryByText("Remote workspace")).toBeNull();
   });
 
   it("requires separate confirmation before forcing a dirty workspace deletion", async () => {

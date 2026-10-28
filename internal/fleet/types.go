@@ -1,5 +1,9 @@
 package fleet
 
+import (
+	"go.kenn.io/forge/platform"
+)
+
 // NodeID is one daemon's stable federation identity.
 type NodeID string
 
@@ -7,18 +11,37 @@ type NodeID string
 type Role string
 
 const (
-	RoleHub   Role = "hub"
-	RoleSpoke Role = "spoke"
+	RoleHub    Role = "hub"
+	RoleSpoke  Role = "spoke"
+	RoleDevbox Role = "devbox"
 )
 
 // RepositoryIdentity is the provider-verified cross-spoke repository key.
-// Local numeric repository IDs never enter a federation payload.
+// Local database repository IDs never enter a federation payload.
+// Its JSON form flattens the key; see platform.MarshalKeyedJSON.
 type RepositoryIdentity struct {
-	Provider       string `json:"provider"`
-	PlatformHost   string `json:"platformHost"`
-	PlatformRepoID string `json:"platformRepoID"`
-	Owner          string `json:"owner,omitempty"`
-	Name           string `json:"name,omitempty"`
+	Provider     string                 `json:"provider"`
+	PlatformHost string                 `json:"platformHost"`
+	Key          platform.RepositoryKey `json:"-" repokey:"platformRepoID,bitbucketRepositoryUUID"`
+	Owner        string                 `json:"owner,omitempty"`
+	Name         string                 `json:"name,omitempty"`
+}
+
+func (r RepositoryIdentity) MarshalJSON() ([]byte, error) {
+	type plain RepositoryIdentity
+	return platform.MarshalKeyedJSON(plain(r))
+}
+
+func (r *RepositoryIdentity) UnmarshalJSON(data []byte) error {
+	type plain RepositoryIdentity
+	return platform.UnmarshalKeyedJSON(data, (*plain)(r))
+}
+
+// ProviderIdentity returns the comparable provider identity.
+func (r RepositoryIdentity) ProviderIdentity() platform.RepositoryIdentity {
+	return platform.RepositoryIdentity{
+		Provider: r.Provider, PlatformHost: r.PlatformHost, Key: r.Key,
+	}.Canonical()
 }
 
 // ---- raw layer (scoped keys, no UUIDs; spoke-to-hub wire shape) ----
@@ -201,6 +224,7 @@ type RawWorkspace struct {
 	EnrichmentError       *string            `json:"enrichmentError,omitempty"`
 	AssociatedPRNumber    *int               `json:"associatedPRNumber,omitempty"`
 	Kata                  *RawWorkspaceKata  `json:"kata,omitempty"`
+	ItemAuthor            *string            `json:"itemAuthor,omitempty"`
 	ItemLastActivityAt    *string            `json:"itemLastActivityAt,omitempty"`
 	MRTitle               *string            `json:"mrTitle,omitempty"`
 	MRState               *string            `json:"mrState,omitempty"`
@@ -224,6 +248,7 @@ type RawWorkspaceKata struct {
 // NeutralHost is one host record in the hub's observer-independent
 // aggregate. It carries source facts, never projected kind or permissions.
 type NeutralHost struct {
+	Maintenance           bool              `json:"maintenance,omitempty"`
 	NodeID                NodeID            `json:"nodeID"`
 	FederationRole        Role              `json:"federationRole"`
 	Name                  string            `json:"name"`
@@ -260,6 +285,9 @@ type NeutralSnapshot struct {
 type Observer struct {
 	NodeID NodeID
 	Role   Role
+	// LocalProviderState reports that the observer's own workspace rows
+	// already carry provider state, so the aggregate copy must not replace it.
+	LocalProviderState bool
 }
 
 // ---- capabilities + diagnostics ----
@@ -333,7 +361,7 @@ type HostSummary struct {
 	NodeID                string                               `json:"nodeID"`
 	Name                  string                               `json:"name"`
 	Kind                  string                               `json:"kind"`
-	FederationRole        Role                                 `json:"federationRole" enum:"hub,spoke"`
+	FederationRole        Role                                 `json:"federationRole" enum:"hub,spoke,devbox"`
 	BaseURL               string                               `json:"baseURL,omitempty" format:"uri"`
 	Platform              string                               `json:"platform"`
 	PreferredTransport    string                               `json:"preferredTransport"`
@@ -425,13 +453,25 @@ type CheckDetail struct {
 	Conclusion string `json:"conclusion,omitempty"`
 }
 
+// WorkspaceRepositorySummary names a fleet workspace's repository. Its JSON
+// encoding is WorkspaceRepositorySummaryJSON.
 type WorkspaceRepositorySummary struct {
-	Provider       string `json:"provider"`
-	PlatformHost   string `json:"platform_host"`
-	PlatformRepoID string `json:"platform_repo_id,omitempty"`
-	RepoPath       string `json:"repo_path"`
-	Owner          string `json:"owner"`
-	Name           string `json:"name"`
+	Provider     string                 `json:"provider"`
+	PlatformHost string                 `json:"platform_host"`
+	Key          platform.RepositoryKey `json:"-" repokey:"platform_repo_id,bitbucket_repository_uuid,omitempty"`
+	RepoPath     string                 `json:"repo_path"`
+	Owner        string                 `json:"owner"`
+	Name         string                 `json:"name"`
+}
+
+func (r WorkspaceRepositorySummary) MarshalJSON() ([]byte, error) {
+	type plain WorkspaceRepositorySummary
+	return platform.MarshalKeyedJSON(plain(r))
+}
+
+func (r *WorkspaceRepositorySummary) UnmarshalJSON(data []byte) error {
+	type plain WorkspaceRepositorySummary
+	return platform.UnmarshalKeyedJSON(data, (*plain)(r))
 }
 
 type WorkspaceKataSummary struct {
@@ -468,6 +508,7 @@ type WorkspaceSummary struct {
 	Status                string                     `json:"status"`
 	ErrorMessage          *string                    `json:"error_message,omitempty"`
 	CreatedAt             string                     `json:"created_at"`
+	ItemAuthor            *string                    `json:"item_author,omitempty"`
 	ItemLastActivityAt    *string                    `json:"item_last_activity_at,omitempty"`
 	MRTitle               *string                    `json:"mr_title,omitempty"`
 	MRState               *string                    `json:"mr_state,omitempty"`

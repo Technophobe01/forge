@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math"
 	"net"
 	"net/url"
@@ -18,8 +19,11 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+	"uuid"
 
 	"github.com/BurntSushi/toml"
+	"go.kenn.io/kit/atomicfile"
+
 	"go.kenn.io/forge/internal/federation"
 	"go.kenn.io/forge/internal/procutil"
 	"go.kenn.io/forge/internal/tokenauth"
@@ -35,7 +39,7 @@ const (
 	defaultActivePRHotWindow               = "0s"
 	defaultActivePRWarmRefreshInterval     = "10m"
 	defaultActivePRWindow                  = "4h"
-	defaultNotificationSyncInterval        = "2m"
+	defaultNotificationSyncInterval        = "1h"
 	defaultNotificationPropagationInterval = "1m"
 	defaultHost                            = "127.0.0.1"
 	defaultPort                            = 8091
@@ -54,6 +58,14 @@ const (
 	defaultMCPDiffCacheMB                  = 128
 	minSSEBufferSize                       = 16
 	maxSSEBufferSize                       = 16384
+)
+
+// Bounds for sync_budget_per_hour. The maximum matches the largest hourly REST
+// quota GitHub grants one identity (an Enterprise Cloud App installation); a
+// higher local ceiling could never bind before the provider quota does.
+const (
+	MinSyncBudgetPerHour = 50
+	MaxSyncBudgetPerHour = 15000
 )
 
 func githubAppRole(app GitHubAppConfig) string {
@@ -86,15 +98,19 @@ const (
 )
 
 type Repo struct {
-	Owner            string `toml:"owner" json:"owner"`
-	Name             string `toml:"name" json:"name"`
-	RepoPath         string `toml:"repo_path,omitempty" json:"repo_path,omitempty"`
-	Platform         string `toml:"platform,omitempty" json:"platform,omitempty"`
-	PlatformHost     string `toml:"platform_host,omitempty" json:"platform_host,omitempty"`
-	PlatformRepoID   string `toml:"platform_repo_id,omitempty" json:"platform_repo_id,omitempty"`
-	TokenEnv         string `toml:"token_env,omitempty" json:"token_env,omitempty"`
-	TokenFile        string `toml:"token_file,omitempty" json:"token_file,omitempty"`
-	WorktreeBasePath string `toml:"worktree_base_path,omitempty" json:"worktree_base_path,omitempty"`
+	Owner        string `toml:"owner" json:"owner"`
+	Name         string `toml:"name" json:"name"`
+	RepoPath     string `toml:"repo_path,omitempty" json:"repo_path,omitempty"`
+	Platform     string `toml:"platform,omitempty" json:"platform,omitempty"`
+	PlatformHost string `toml:"platform_host,omitempty" json:"platform_host,omitempty"`
+	// PlatformRepoID and BitbucketRepositoryUUID are the file encoding of
+	// the entry's pinned repository key; read and write them only through
+	// RepositoryKey and SetRepositoryKey.
+	PlatformRepoID          int64  `toml:"platform_repo_id,omitempty" json:"platform_repo_id,omitempty"`
+	BitbucketRepositoryUUID string `toml:"bitbucket_repository_uuid,omitempty" json:"bitbucket_repository_uuid,omitempty"`
+	TokenEnv                string `toml:"token_env,omitempty" json:"token_env,omitempty"`
+	TokenFile               string `toml:"token_file,omitempty" json:"token_file,omitempty"`
+	WorktreeBasePath        string `toml:"worktree_base_path,omitempty" json:"worktree_base_path,omitempty"`
 }
 
 type KataProjectRepoMapping struct {
@@ -114,11 +130,68 @@ type RepoPreset struct {
 
 // RepoPresetRepository stores provider-verified identity alongside the
 // last-known route used for display.
+//
+// PlatformRepoID and BitbucketRepositoryUUID are the file encoding of the
+// member's repository key; read and write them only through RepositoryKey
+// and SetRepositoryKey.
 type RepoPresetRepository struct {
-	Provider       string `toml:"provider" json:"provider"`
-	PlatformHost   string `toml:"platform_host" json:"platform_host"`
-	PlatformRepoID string `toml:"platform_repo_id" json:"platform_repo_id"`
-	RepoPath       string `toml:"repo_path" json:"repo_path"`
+	Provider                string `toml:"provider" json:"provider"`
+	PlatformHost            string `toml:"platform_host" json:"platform_host"`
+	PlatformRepoID          int64  `toml:"platform_repo_id" json:"platform_repo_id"`
+	BitbucketRepositoryUUID string `toml:"bitbucket_repository_uuid,omitempty" json:"bitbucket_repository_uuid,omitempty"`
+	RepoPath                string `toml:"repo_path" json:"repo_path"`
+}
+
+// RepositoryKey returns the member's repository key. Load validation
+// guarantees it decodes.
+func (r *RepoPresetRepository) RepositoryKey() platformpkg.RepositoryKey {
+	key, _ := repositoryKeyFromConfig(r.PlatformRepoID, r.BitbucketRepositoryUUID)
+	return key
+}
+
+// SetRepositoryKey stores key in the member's file encoding.
+func (r *RepoPresetRepository) SetRepositoryKey(key platformpkg.RepositoryKey) {
+	r.PlatformRepoID, r.BitbucketRepositoryUUID = repositoryKeyToConfig(key)
+}
+
+// RepositoryKey returns the entry's pinned repository key, zero when the
+// entry pins none. Load validation guarantees it decodes.
+func (r *Repo) RepositoryKey() platformpkg.RepositoryKey {
+	key, _ := repositoryKeyFromConfig(r.PlatformRepoID, r.BitbucketRepositoryUUID)
+	return key
+}
+
+// SetRepositoryKey stores key in the entry's file encoding.
+func (r *Repo) SetRepositoryKey(key platformpkg.RepositoryKey) {
+	r.PlatformRepoID, r.BitbucketRepositoryUUID = repositoryKeyToConfig(key)
+}
+
+// repositoryKeyFromConfig decodes an entry's key fields, naming the field to
+// fix in each error.
+func repositoryKeyFromConfig(id int64, repositoryUUID string) (platformpkg.RepositoryKey, error) {
+	if id < 0 {
+		return platformpkg.RepositoryKey{}, errors.New(
+			"platform_repo_id must be the provider's positive integer repository ID",
+		)
+	}
+	parsed, err := platformpkg.ParseRepositoryUUID(repositoryUUID)
+	if err != nil {
+		return platformpkg.RepositoryKey{}, fmt.Errorf("bitbucket_repository_uuid: %w", err)
+	}
+	if id > 0 && parsed != uuid.Nil() {
+		return platformpkg.RepositoryKey{}, errors.New(
+			"set platform_repo_id or bitbucket_repository_uuid, not both",
+		)
+	}
+	return platformpkg.RepositoryKeyFromWire(id, parsed)
+}
+
+func repositoryKeyToConfig(key platformpkg.RepositoryKey) (int64, string) {
+	id, repositoryUUID := key.Wire()
+	if repositoryUUID == uuid.Nil() {
+		return id, ""
+	}
+	return id, repositoryUUID.String()
 }
 
 func cloneRepoPresets(presets []RepoPreset) []RepoPreset {
@@ -169,11 +242,13 @@ func normalizeRepoPresets(presets []RepoPreset) error {
 			}
 			host := strings.TrimSpace(raw.PlatformHost)
 			repoPath := cleanPath(strings.TrimSpace(raw.RepoPath))
-			platformRepoID := strings.TrimSpace(raw.PlatformRepoID)
-			if platformRepoID == "" {
-				return fmt.Errorf(
-					"repo_presets[%d].repos[%d]: platform_repo_id is required", i, j,
-				)
+			// A negative ID is no key at all; the required-key check below
+			// reports it. Other decode errors name their own field.
+			key := platformpkg.RepositoryKey{}
+			if raw.PlatformRepoID >= 0 {
+				if key, err = repositoryKeyFromConfig(raw.PlatformRepoID, raw.BitbucketRepositoryUUID); err != nil {
+					return fmt.Errorf("repo_presets[%d].repos[%d]: %w", i, j, err)
+				}
 			}
 			host, err = normalizePlatformHost(provider, host)
 			if err != nil {
@@ -190,15 +265,23 @@ func normalizeRepoPresets(presets []RepoPreset) error {
 					"repo_presets[%d].repos[%d]: repository identity must be provider|platform_host/repo_path", i, j,
 				)
 			}
-			canonical := provider + "|" + host + "|" + platformRepoID
+			if !(platformpkg.RepositoryIdentity{Provider: provider, PlatformHost: host, Key: key}).Valid() {
+				field := "platform_repo_id"
+				if platformpkg.IsBitbucketCloud(provider, host) {
+					field = "bitbucket_repository_uuid"
+				}
+				return fmt.Errorf("repo_presets[%d].repos[%d]: %s is required", i, j, field)
+			}
+			canonical := provider + "|" + host + "|" + key.String()
 			if _, exists := seenRepos[canonical]; exists {
 				continue
 			}
 			seenRepos[canonical] = struct{}{}
-			repos = append(repos, RepoPresetRepository{
-				Provider: provider, PlatformHost: host,
-				PlatformRepoID: platformRepoID, RepoPath: repoPath,
-			})
+			member := RepoPresetRepository{
+				Provider: provider, PlatformHost: host, RepoPath: repoPath,
+			}
+			member.SetRepositoryKey(key)
+			repos = append(repos, member)
 		}
 		if len(repos) == 0 {
 			return fmt.Errorf("repo_presets[%d]: at least one repository is required", i)
@@ -274,17 +357,17 @@ type GitHubAppConfig struct {
 	SelectedRepos []string `toml:"selected_repos,omitempty" json:"selected_repos,omitempty"`
 }
 
-func (r Repo) FullName() string {
+func (r *Repo) FullName() string {
 	return r.Owner + "/" + r.Name
 }
 
-func (r Repo) HasNameGlob() bool {
+func (r *Repo) HasNameGlob() bool {
 	return strings.ContainsAny(r.Name, "*?[")
 }
 
 // PlatformHostOrDefault returns the configured platform host,
 // defaulting to the provider's public host when empty.
-func (r Repo) PlatformHostOrDefault() string {
+func (r *Repo) PlatformHostOrDefault() string {
 	if r.PlatformHost == "" {
 		if host, ok := platformpkg.DefaultHost(platformpkg.Kind(r.PlatformOrDefault())); ok {
 			return host
@@ -294,7 +377,7 @@ func (r Repo) PlatformHostOrDefault() string {
 	return r.PlatformHost
 }
 
-func (r Repo) PlatformOrDefault() string {
+func (r *Repo) PlatformOrDefault() string {
 	if r.Platform == "" {
 		return defaultPlatform
 	}
@@ -304,7 +387,7 @@ func (r Repo) PlatformOrDefault() string {
 // ResolveToken returns the token for this repo. When TokenEnv is
 // set, it reads from that env var. Falls back to globalToken if
 // the env var is empty or TokenEnv is not set.
-func (r Repo) ResolveToken(globalToken string) string {
+func (r *Repo) ResolveToken(globalToken string) string {
 	if r.TokenEnv != "" {
 		if tok := os.Getenv(r.TokenEnv); tok != "" {
 			return tok
@@ -366,7 +449,11 @@ func (r *Repo) normalize(defaultGitHubHost string) error {
 	if r.Owner == "" || r.Name == "" {
 		return errors.New("must have owner and name")
 	}
-	r.PlatformRepoID = strings.TrimSpace(r.PlatformRepoID)
+	key, err := repositoryKeyFromConfig(r.PlatformRepoID, r.BitbucketRepositoryUUID)
+	if err != nil {
+		return err
+	}
+	r.SetRepositoryKey(key)
 	r.WorktreeBasePath = strings.TrimSpace(r.WorktreeBasePath)
 	if r.WorktreeBasePath != "" && r.HasNameGlob() {
 		return errors.New("worktree_base_path is only supported for exact repositories")
@@ -394,7 +481,7 @@ func (r *Repo) normalize(defaultGitHubHost string) error {
 	return nil
 }
 
-func (r Repo) ownerHasGlob() bool {
+func (r *Repo) ownerHasGlob() bool {
 	return strings.ContainsAny(r.Owner, "*?[")
 }
 
@@ -402,7 +489,7 @@ func (r Repo) ownerHasGlob() bool {
 // repository. A pattern's members are discovered at runtime, so its own
 // credential route is a discovery aid rather than the credential that serves
 // any particular repository.
-func (r Repo) nameHasGlob() bool {
+func (r *Repo) nameHasGlob() bool {
 	return strings.ContainsAny(r.Name, "*?[")
 }
 
@@ -462,6 +549,10 @@ func parseRepoRef(raw, configuredPlatform string) (parsedRepoRef, error) {
 	}
 
 	path = cleanPath(path)
+	if refPlatform == string(platformpkg.KindBitbucket) && host != platformpkg.DefaultBitbucketHost &&
+		(strings.HasPrefix(raw, "https://") || strings.HasPrefix(raw, "http://")) {
+		path = strings.TrimPrefix(path, "scm/")
+	}
 	if platformpkg.AllowsNestedOwner(platformpkg.Kind(refPlatform)) {
 		owner, name, err := splitGitLabPath(raw, path)
 		if err != nil {
@@ -532,6 +623,9 @@ func platformForRepoRefHost(host, configuredPlatform string) (string, bool) {
 	}
 	if matchHost == platformpkg.DefaultForgejoHost {
 		return string(platformpkg.KindForgejo), true
+	}
+	if matchHost == platformpkg.DefaultBitbucketHost {
+		return string(platformpkg.KindBitbucket), true
 	}
 	if matchHost == platformpkg.DefaultGiteaHost {
 		return string(platformpkg.KindGitea), true
@@ -690,14 +784,20 @@ func cleanPath(path string) string {
 }
 
 type Activity struct {
-	ViewMode                       string `toml:"view_mode" json:"view_mode" enum:"flat,threaded"`
-	TimeRange                      string `toml:"time_range" json:"time_range" enum:"24h,7d,30d,90d"`
-	HideClosed                     bool   `toml:"hide_closed" json:"hide_closed"`
-	HideBots                       bool   `toml:"hide_bots" json:"hide_bots"`
-	CollapseThreads                bool   `toml:"collapse_threads" json:"collapse_threads"`
-	UseWorkspaceActivityForRecency bool   `toml:"use_workspace_activity_for_recency" json:"use_workspace_activity_for_recency"`
-	DefaultBranchRetentionDays     int    `toml:"default_branch_retention_days" json:"default_branch_retention_days"`
-	DefaultBranchMaxCommits        int    `toml:"default_branch_max_commits" json:"default_branch_max_commits"`
+	ViewMode                       string   `toml:"view_mode" json:"view_mode" enum:"flat,threaded"`
+	TimeRange                      string   `toml:"time_range" json:"time_range" enum:"24h,7d,30d,90d"`
+	HideClosed                     bool     `toml:"hide_closed" json:"hide_closed"`
+	HideBots                       bool     `toml:"hide_bots" json:"hide_bots"`
+	HideDrafts                     bool     `toml:"hide_drafts" json:"hide_drafts"`
+	CollapseThreads                bool     `toml:"collapse_threads" json:"collapse_threads"`
+	ItemTypes                      []string `toml:"item_types" json:"item_types"`
+	EventTypes                     []string `toml:"event_types" json:"event_types"`
+	HideNotifications              bool     `toml:"hide_notifications" json:"hide_notifications"`
+	HideDefaultBranch              bool     `toml:"hide_default_branch" json:"hide_default_branch"`
+	RollUpCommits                  bool     `toml:"roll_up_commits" json:"roll_up_commits"`
+	UseWorkspaceActivityForRecency bool     `toml:"use_workspace_activity_for_recency" json:"use_workspace_activity_for_recency"`
+	DefaultBranchRetentionDays     int      `toml:"default_branch_retention_days" json:"default_branch_retention_days"`
+	DefaultBranchMaxCommits        int      `toml:"default_branch_max_commits" json:"default_branch_max_commits"`
 }
 
 // PullRequests configures safeguards around pull-request mutations.
@@ -724,6 +824,7 @@ type Detail struct {
 
 // Workspaces configures behavior shared by PR- and issue-backed workspaces.
 type Workspaces struct {
+	DefaultExecutionTarget string `toml:"default_execution_target,omitempty" json:"default_execution_target,omitempty"`
 	// ShowAgentStatusInLists displays linked agent states in item lists.
 	ShowAgentStatusInLists bool `toml:"show_agent_status_in_lists,omitempty" json:"show_agent_status_in_lists"`
 	// AutoAssignOnCreate adds the authenticated provider user to the source
@@ -732,6 +833,9 @@ type Workspaces struct {
 	// DefaultSidebarView selects the initial right-sidebar tab for a workspace
 	// created from a pull request or issue. A saved per-workspace choice wins.
 	DefaultSidebarView string `toml:"default_sidebar_view,omitempty" json:"default_sidebar_view" enum:"diff,item"`
+	// IdleRuntimeStopHours stops a pty-owner workspace's idle agents and
+	// shells after this many hours with no viewer; zero disables it.
+	IdleRuntimeStopHours int `toml:"idle_runtime_stop_hours,omitempty" json:"-"`
 }
 
 func (w Workspaces) withDefaults() Workspaces {
@@ -753,8 +857,16 @@ const (
 	DefaultTerminalCursorBlink      = true
 	DefaultTerminalGraphics         = true
 	DefaultTerminalTmuxMouse        = true
-	DefaultTerminalRetainedSessions = 10
+	DefaultTerminalRetainedSessions = 50
 )
+
+const DefaultACPFontSize = 13
+
+// ACP configures chat appearance independently of terminal appearance.
+type ACP struct {
+	FontFamily string `toml:"font_family,omitempty" json:"font_family"`
+	FontSize   int    `toml:"font_size,omitempty" json:"font_size" minimum:"8" maximum:"32"`
+}
 
 type Terminal struct {
 	FontFamily       string  `toml:"font_family,omitempty" json:"font_family"`
@@ -767,14 +879,15 @@ type Terminal struct {
 	HideTmuxStatus   bool    `toml:"hide_tmux_status,omitempty" json:"hide_tmux_status"`
 	Graphics         *bool   `toml:"graphics,omitempty" json:"graphics" nullable:"false"`
 	TmuxMouse        *bool   `toml:"tmux_mouse,omitempty" json:"tmux_mouse" nullable:"false"`
-	RetainedSessions *int    `toml:"retained_sessions,omitempty" json:"retained_sessions" nullable:"false"`
+	RetainedSessions *int    `toml:"retained_sessions,omitempty" json:"retained_sessions" nullable:"false" minimum:"0" maximum:"100"`
 }
 
 type Agent struct {
-	Key     string   `toml:"key" json:"key"`
-	Label   string   `toml:"label,omitempty" json:"label"`
-	Command []string `toml:"command,omitempty" json:"command,omitempty" nullable:"false"`
-	Enabled *bool    `toml:"enabled,omitempty" json:"enabled,omitempty"`
+	Protocol string   `toml:"protocol,omitempty" json:"protocol,omitempty" enum:"terminal,acp"`
+	Key      string   `toml:"key" json:"key"`
+	Label    string   `toml:"label,omitempty" json:"label"`
+	Command  []string `toml:"command,omitempty" json:"command,omitempty" nullable:"false"`
+	Enabled  *bool    `toml:"enabled,omitempty" json:"enabled,omitempty"`
 }
 
 func (a Agent) EnabledOrDefault() bool {
@@ -809,7 +922,6 @@ type ModeVisibility struct {
 	Actions    *bool `toml:"actions,omitempty" json:"actions" nullable:"false"`
 	Pulls      *bool `toml:"pulls,omitempty" json:"pulls" nullable:"false"`
 	Issues     *bool `toml:"issues,omitempty" json:"issues" nullable:"false"`
-	Reviews    *bool `toml:"reviews,omitempty" json:"reviews" nullable:"false"`
 	Workspaces *bool `toml:"workspaces,omitempty" json:"workspaces" nullable:"false"`
 }
 
@@ -821,7 +933,6 @@ func DefaultModeVisibility() ModeVisibility {
 		Actions:    new(false),
 		Pulls:      new(true),
 		Issues:     new(true),
-		Reviews:    new(true),
 		Workspaces: new(true),
 	}
 }
@@ -845,9 +956,6 @@ func (m ModeVisibility) WithDefaults() ModeVisibility {
 	}
 	if m.Issues != nil {
 		defaults.Issues = m.Issues
-	}
-	if m.Reviews != nil {
-		defaults.Reviews = m.Reviews
 	}
 	if m.Workspaces != nil {
 		defaults.Workspaces = m.Workspaces
@@ -878,10 +986,11 @@ type FleetHub struct {
 }
 
 type FleetMember struct {
-	NodeID  string                     `toml:"node_id" json:"node_id"`
-	Name    string                     `toml:"name,omitempty" json:"name,omitempty"`
-	BaseURL string                     `toml:"base_url" json:"base_url"`
-	State   federation.EnrollmentState `toml:"state" json:"state"`
+	NodeID           string                     `toml:"node_id" json:"node_id"`
+	Name             string                     `toml:"name,omitempty" json:"name,omitempty"`
+	BaseURL          string                     `toml:"base_url" json:"base_url"`
+	State            federation.EnrollmentState `toml:"state" json:"state"`
+	OutboundDisabled bool                       `toml:"outbound_disabled,omitempty" json:"outbound_disabled,omitempty"`
 }
 
 // Fleet configures this daemon's role and enrolled HTTP membership.
@@ -895,7 +1004,7 @@ type Fleet struct {
 	Sessions    FleetSessions `toml:"sessions" json:"sessions"`
 }
 
-func (f Fleet) RoleOrDefault() FleetRole {
+func (f *Fleet) RoleOrDefault() FleetRole {
 	role := FleetRole(strings.TrimSpace(string(f.Role)))
 	if role == "" {
 		return FleetRoleHub
@@ -905,7 +1014,7 @@ func (f Fleet) RoleOrDefault() FleetRole {
 
 // PeerTimeoutOrDefault returns the per-peer fetch timeout, defaulting to
 // 2s when unset or unparseable.
-func (f Fleet) PeerTimeoutOrDefault() time.Duration {
+func (f *Fleet) PeerTimeoutOrDefault() time.Duration {
 	if f.PeerTimeout == "" {
 		return 2 * time.Second
 	}
@@ -934,12 +1043,23 @@ type Shell struct {
 }
 
 type MCP struct {
-	Enabled     bool `toml:"enabled,omitempty" json:"enabled,omitempty"`
-	Port        int  `toml:"port,omitempty" json:"port,omitempty"`
-	DiffCacheMB int  `toml:"diff_cache_mb,omitempty" json:"diff_cache_mb,omitempty"`
+	Enabled     *bool `toml:"enabled,omitempty" json:"enabled,omitempty"`
+	Port        int   `toml:"port,omitempty" json:"port,omitempty"`
+	DiffCacheMB int   `toml:"diff_cache_mb,omitempty" json:"diff_cache_mb,omitempty"`
+}
+
+// ExternalContextSource is configured through TOML, never through settings writes.
+type ExternalContextSource struct {
+	ID      string   `toml:"id"`
+	Name    string   `toml:"name"`
+	Command []string `toml:"command"`
+	Timeout string   `toml:"timeout,omitempty"`
 }
 
 type Config struct {
+	runtime *runtimeOverlay
+
+	AirplaneMode                bool   `toml:"airplane_mode"`
 	SyncInterval                string `toml:"sync_interval"`
 	ActivePRRefreshInterval     string `toml:"active_pr_refresh_interval"`
 	ActivePRHotWindow           string `toml:"active_pr_hot_window"`
@@ -979,9 +1099,11 @@ type Config struct {
 	Notifications     Notifications            `toml:"notifications"`
 	Relay             Relay                    `toml:"relay"`
 	Terminal          Terminal                 `toml:"terminal"`
+	ACP               ACP                      `toml:"acp"`
 	Modes             ModeVisibility           `toml:"modes"`
 	Agents            []Agent                  `toml:"agents"`
 	QuickActions      []QuickAction            `toml:"quick_actions"`
+	ExternalContext   []ExternalContextSource  `toml:"external_context"`
 	DocFolders        []DocFolder              `toml:"doc_folders"`
 	Roborev           Roborev                  `toml:"roborev"`
 	Tmux              Tmux                     `toml:"tmux"`
@@ -989,6 +1111,8 @@ type Config struct {
 	Fleet             Fleet                    `toml:"fleet"`
 	API               API                      `toml:"api"`
 	MCP               MCP                      `toml:"mcp"`
+	ExecutionWorker   ExecutionWorker          `toml:"execution_worker"`
+	Devboxes          Devboxes                 `toml:"devboxes"`
 
 	// parsedAllowedHosts is the canonicalised form of AllowedHosts,
 	// populated by Validate so the server constructor does not have
@@ -999,6 +1123,9 @@ type Config struct {
 	// address, populated by Validate.
 	parsedBindKey      HostKey
 	dataDirWasRelative bool
+	// upgradedRepositoryIDs records that load converted text repository
+	// IDs from an older release, so the file should be saved once.
+	upgradedRepositoryIDs bool
 }
 
 // API configures the HTTP API surface.
@@ -1030,12 +1157,40 @@ func (c *Config) SSEBufferSizeOrDefault() int {
 	return c.SSEBufferSize
 }
 
+func (c *Config) MCPEnabled() bool {
+	if c == nil {
+		return false
+	}
+	if c.MCP.Enabled != nil {
+		return *c.MCP.Enabled
+	}
+	return c.mcpDefaultOn()
+}
+
+func (c *Config) mcpDefaultOn() bool {
+	return c.MCP.Port == 0 && !c.ExecutionWorker.Enabled && IsLoopbackHostname(c.Host)
+}
+
+func (c *Config) SetMCPEnabled(want bool) {
+	if want && c.MCPEnabled() {
+		return
+	}
+	if want && c.mcpDefaultOn() {
+		c.MCP.Enabled = nil
+	} else {
+		c.MCP.Enabled = new(want)
+	}
+}
+
 func (c *Config) MCPPort() int {
-	if c == nil || !c.MCP.Enabled {
+	if !c.MCPEnabled() {
 		return 0
 	}
 	if c.MCP.Port != 0 {
 		return c.MCP.Port
+	}
+	if c.MCP.Enabled == nil {
+		return c.Port
 	}
 	return c.Port + 1
 }
@@ -1045,7 +1200,36 @@ func (c *Config) MCPListenAddr() string {
 	if port == 0 {
 		return ""
 	}
-	return net.JoinHostPort(c.Host, strconv.Itoa(port))
+	// The companion stays local even when the main listener faces a network.
+	host := "127.0.0.1"
+	if ip := net.ParseIP(c.Host); ip != nil && ip.IsLoopback() {
+		host = ip.String()
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+// MCPURL returns the effective companion endpoint, or an empty string when off.
+func (c *Config) MCPURL() string {
+	addr := c.MCPListenAddr()
+	if addr == "" {
+		return ""
+	}
+	path := "/mcp"
+	if c.MCPSharesMainListener() {
+		path = c.BasePath + "mcp"
+	}
+	return "http://" + addr + path
+}
+
+// MCPSharesMainListener reports whether the companion's loopback address is
+// already served by the main listener, so /mcp is served there instead of
+// binding a second socket on the same port.
+func (c *Config) MCPSharesMainListener() bool {
+	if c.MCPPort() != c.Port {
+		return false
+	}
+	ip := net.ParseIP(c.Host)
+	return ip != nil && (ip.IsLoopback() || ip.Equal(net.IPv4zero))
 }
 
 func (c *Config) MCPDiffCacheBytes() int64 {
@@ -1144,11 +1328,10 @@ repos = true
 docs = false
 pulls = true
 issues = true
-reviews = true
 workspaces = true
 
 [notifications]
-sync_interval = "2m"
+sync_interval = "1h"
 propagation_interval = "1m"
 batch_size = 25
 
@@ -1162,78 +1345,34 @@ agent_sessions = true
 // The file contains sensible defaults. Repos can be added later through the
 // settings UI.
 //
-// Writes to a temp file first, then hard-links into place so the target
-// path is never left empty or partially written.
+// The contents are staged in a temp file and published without replacing
+// anything, so the target path is never left empty or partially written
+// and a config created concurrently is kept.
 func EnsureDefault(path string) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("creating config directory: %w", err)
 	}
 
-	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
-	if err != nil {
-		if _, statErr := os.Stat(path); statErr == nil {
-			return nil
-		}
-		return fmt.Errorf("creating temp config: %w", err)
+	err := atomicfile.WriteNew(path, []byte(defaultConfigContents()))
+	// ErrPublished means the default config is already in place and only
+	// a later fsync or cleanup step failed.
+	if err == nil || errors.Is(err, fs.ErrExist) || errors.Is(err, atomicfile.ErrPublished) {
+		return nil
 	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-
-	if _, err := tmp.WriteString(defaultConfigContents()); err != nil {
-		tmp.Close()
-		return fmt.Errorf("writing default config: %w", err)
+	if _, statErr := os.Stat(path); statErr == nil {
+		return nil
 	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("flushing default config: %w", err)
-	}
-
-	// Link fails atomically when path already exists, providing
-	// both atomic install and race-free existence check.
-	if err := os.Link(tmpPath, path); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return nil
-		}
-		// Hard links may not be supported (FAT/exFAT, network
-		// shares, cross-device). Fall back to O_EXCL create +
-		// write with cleanup on failure.
-		return writeExclusive(tmpPath, path)
-	}
-	return nil
-}
-
-// writeExclusive creates dst with O_EXCL (fails if it exists) and
-// copies the content from src. Partial files are removed on failure.
-func writeExclusive(src, dst string) error {
-	content, err := os.ReadFile(src)
-	if err != nil {
-		return fmt.Errorf("reading temp config: %w", err)
-	}
-
-	f, err := os.OpenFile(
-		dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600,
-	)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return nil
-		}
-		return fmt.Errorf("creating config %s: %w", dst, err)
-	}
-
-	if _, err := f.Write(content); err != nil {
-		f.Close()
-		os.Remove(dst)
-		return fmt.Errorf("writing config %s: %w", dst, err)
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(dst)
-		return fmt.Errorf("flushing config %s: %w", dst, err)
-	}
-	return nil
+	return fmt.Errorf("writing default config: %w", err)
 }
 
 func Load(path string) (*Config, error) {
-	cfg, err := load(path)
+	return LoadWithOverrides(path, Overrides{})
+}
+
+// LoadWithOverrides applies explicit listener flags above environment and file values.
+func LoadWithOverrides(path string, overrides Overrides) (*Config, error) {
+	cfg, err := load(path, overrides)
 	if err != nil {
 		// cfg is non-nil for post-decode rejections (deprecated keys);
 		// callers treat any error as failure but reload-side stripping
@@ -1244,7 +1383,7 @@ func Load(path string) (*Config, error) {
 }
 
 // load reads and normalizes path without running validation.
-func load(path string) (*Config, error) {
+func load(path string, overrides Overrides) (*Config, error) {
 	cfg := &Config{
 		SyncInterval:                defaultSyncInterval,
 		ActivePRRefreshInterval:     defaultActivePRRefreshInterval,
@@ -1268,7 +1407,12 @@ func load(path string) (*Config, error) {
 		return nil, fmt.Errorf("reading config %s: %w", path, err)
 	}
 
-	meta, err := toml.Decode(string(data), cfg)
+	text, upgraded, err := upgradeRepositoryIDs(string(data))
+	if err != nil {
+		return nil, fmt.Errorf("parsing config %s: %w", path, err)
+	}
+	cfg.upgradedRepositoryIDs = upgraded
+	meta, err := toml.Decode(text, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("parsing config %s: %w", path, err)
 	}
@@ -1277,6 +1421,10 @@ func load(path string) (*Config, error) {
 		// rejection: a reload must still see a rejected candidate's
 		// declared token env names to keep stripping them.
 		return cfg, fmt.Errorf("parsing config %s: %w", path, err)
+	}
+
+	if err := cfg.applyRuntimeOverrides(meta, overrides); err != nil {
+		return cfg, err
 	}
 
 	if cfg.Repos == nil {
@@ -1360,7 +1508,7 @@ func load(path string) (*Config, error) {
 // LoadForGitHubAppRepair loads path for GitHub App management commands while
 // retaining the ordinary structural validation rules.
 func LoadForGitHubAppRepair(path string) (*Config, error) {
-	cfg, err := load(path)
+	cfg, err := load(path, Overrides{})
 	if err != nil {
 		return nil, err
 	}
@@ -1397,6 +1545,9 @@ func (c *Config) DataDirWasRelative() bool {
 
 // validate runs every config rule.
 func (c *Config) validate() error {
+	if err := c.validateDevboxes(); err != nil {
+		return err
+	}
 	if err := c.Relay.Validate(); err != nil {
 		return err
 	}
@@ -1460,9 +1611,10 @@ func (c *Config) validate() error {
 	c.Modes = c.Modes.WithDefaults()
 	c.Workspaces = c.Workspaces.withDefaults()
 	if c.Workspaces.DefaultSidebarView != "diff" && c.Workspaces.DefaultSidebarView != "item" {
-		return fmt.Errorf(
-			"config: workspaces.default_sidebar_view must be one of diff or item",
-		)
+		return errors.New("config: workspaces.default_sidebar_view must be one of diff or item")
+	}
+	if c.Workspaces.IdleRuntimeStopHours < 0 || c.Workspaces.IdleRuntimeStopHours > 720 {
+		return errors.New("config: workspaces.idle_runtime_stop_hours must be between 0 and 720")
 	}
 
 	for i := range c.Repos {
@@ -1570,7 +1722,7 @@ func (c *Config) validate() error {
 
 	if ip := net.ParseIP(c.Host); ip == nil {
 		return fmt.Errorf("config: invalid host %q (must be an IP address)", c.Host)
-	} else if ip.IsUnspecified() {
+	} else if ip.IsUnspecified() && !c.API.RequireAuth {
 		return fmt.Errorf(
 			"config: host %q is unspecified; bind a specific address"+
 				" (loopback, or one interface such as a tailnet IP) so"+
@@ -1586,18 +1738,12 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: invalid MCP port %d", c.MCP.Port)
 	}
 	if c.MCP.DiffCacheMB < 0 || c.MCP.DiffCacheMB > math.MaxInt64>>20 {
-		return fmt.Errorf("config: MCP diff cache size is outside the supported range")
+		return errors.New("config: MCP diff cache size is outside the supported range")
 	}
-	if c.MCP.Enabled {
+	if c.MCPEnabled() {
 		mcpPort := c.MCPPort()
 		if mcpPort < 1 || mcpPort > 65535 {
 			return fmt.Errorf("config: invalid resolved MCP port %d", mcpPort)
-		}
-		if mcpPort == c.Port {
-			return fmt.Errorf("config: MCP port %d matches backend port", mcpPort)
-		}
-		if !IsLoopbackHostname(c.Host) {
-			return fmt.Errorf("config: MCP listener requires a loopback host, got %q", c.Host)
 		}
 	}
 
@@ -1616,9 +1762,12 @@ func (c *Config) validate() error {
 		c.parsedAllowedHosts = append(c.parsedAllowedHosts, key)
 	}
 
-	if c.SyncBudgetPerHour != 0 && c.SyncBudgetPerHour < 50 {
+	if c.SyncBudgetPerHour != 0 &&
+		(c.SyncBudgetPerHour < MinSyncBudgetPerHour || c.SyncBudgetPerHour > MaxSyncBudgetPerHour) {
 		return fmt.Errorf(
-			"config: sync_budget_per_hour must be >= 50 or omitted, got %d",
+			"config: sync_budget_per_hour must be between %d and %d or omitted, got %d",
+			MinSyncBudgetPerHour,
+			MaxSyncBudgetPerHour,
 			c.SyncBudgetPerHour,
 		)
 	}
@@ -1639,6 +1788,11 @@ func (c *Config) validate() error {
 			return fmt.Errorf("config: invalid base_path %q: dot segments are not allowed", c.BasePath)
 		}
 	}
+	// Trailing slashes do not change routing, so a base path named like a
+	// root route would make that route ambiguous.
+	if first, _, _ := strings.Cut(strings.Trim(c.BasePath, "/"), "/"); slices.Contains(rootRouteSegments, first) {
+		return fmt.Errorf("config: invalid base_path %q: %q is a reserved root route", c.BasePath, first)
+	}
 
 	validViewModes := map[string]bool{
 		"flat": true, "threaded": true,
@@ -1657,6 +1811,23 @@ func (c *Config) validate() error {
 			"config: invalid activity time_range %q",
 			c.Activity.TimeRange,
 		)
+	}
+	// Keep omitted selections distinct from an explicitly empty list.
+	if c.Activity.ItemTypes == nil {
+		c.Activity.ItemTypes = []string{"pr", "issue"}
+	}
+	if c.Activity.EventTypes == nil {
+		c.Activity.EventTypes = []string{"comment", "review", "commit", "force_push"}
+	}
+	for _, itemType := range c.Activity.ItemTypes {
+		if itemType != "pr" && itemType != "issue" {
+			return fmt.Errorf("config: invalid activity item_types value %q", itemType)
+		}
+	}
+	for _, eventType := range c.Activity.EventTypes {
+		if !slices.Contains([]string{"comment", "review", "commit", "force_push"}, eventType) {
+			return fmt.Errorf("config: invalid activity event_types value %q", eventType)
+		}
 	}
 	if c.Activity.DefaultBranchRetentionDays == 0 {
 		c.Activity.DefaultBranchRetentionDays = defaultBranchActivityRetentionDays
@@ -1704,6 +1875,13 @@ func (c *Config) validate() error {
 		)
 	}
 
+	c.ACP.FontFamily = strings.TrimSpace(c.ACP.FontFamily)
+	if c.ACP.FontSize == 0 {
+		c.ACP.FontSize = DefaultACPFontSize
+	}
+	if c.ACP.FontSize < 8 || c.ACP.FontSize > 32 {
+		return fmt.Errorf("config: invalid acp.font_size %d: must be between 8 and 32", c.ACP.FontSize)
+	}
 	c.Terminal.FontFamily = strings.TrimSpace(c.Terminal.FontFamily)
 	if c.Terminal.FontSize == 0 {
 		c.Terminal.FontSize = DefaultTerminalFontSize
@@ -1754,9 +1932,9 @@ func (c *Config) validate() error {
 		retainedSessions := DefaultTerminalRetainedSessions
 		c.Terminal.RetainedSessions = &retainedSessions
 	}
-	if *c.Terminal.RetainedSessions < 0 || *c.Terminal.RetainedSessions > 20 {
+	if *c.Terminal.RetainedSessions < 0 || *c.Terminal.RetainedSessions > 100 {
 		return fmt.Errorf(
-			"config: invalid terminal.retained_sessions %d: must be between 0 and 20",
+			"config: invalid terminal.retained_sessions %d: must be between 0 and 100",
 			*c.Terminal.RetainedSessions,
 		)
 	}
@@ -1766,21 +1944,47 @@ func (c *Config) validate() error {
 	if err := c.validateQuickActions(); err != nil {
 		return err
 	}
+	if err := c.validateExternalContext(); err != nil {
+		return err
+	}
 
 	if len(c.Tmux.Command) > 0 &&
 		strings.TrimSpace(c.Tmux.Command[0]) == "" {
-		return fmt.Errorf(
-			"config: invalid tmux.command: first element must be non-empty",
-		)
+		return errors.New("config: invalid tmux.command: first element must be non-empty")
 	}
 
 	if len(c.Shell.Command) > 0 &&
 		strings.TrimSpace(c.Shell.Command[0]) == "" {
-		return fmt.Errorf(
-			"config: invalid shell.command: first element must be non-empty",
-		)
+		return errors.New("config: invalid shell.command: first element must be non-empty")
 	}
 
+	return nil
+}
+
+func (c *Config) validateExternalContext() error {
+	seen := make(map[string]bool, len(c.ExternalContext))
+	for i := range c.ExternalContext {
+		source := &c.ExternalContext[i]
+		if len(source.ID) > 128 || source.ID == "." || source.ID == ".." || !docFolderIDPattern.MatchString(source.ID) {
+			return fmt.Errorf("config: external_context[%d]: id must be a URL-safe identifier of at most 128 bytes", i)
+		}
+		if seen[source.ID] {
+			return fmt.Errorf("config: external_context: duplicate id %q", source.ID)
+		}
+		seen[source.ID] = true
+		if strings.TrimSpace(source.Name) == "" || len(source.Name) > 256 {
+			return fmt.Errorf("config: external_context[%d]: name is required and must be at most 256 bytes", i)
+		}
+		if len(source.Command) == 0 || !filepath.IsAbs(source.Command[0]) {
+			return fmt.Errorf("config: external_context[%d]: command requires an absolute executable path", i)
+		}
+		if source.Timeout == "" {
+			source.Timeout = "10s"
+		}
+		if timeout, err := time.ParseDuration(source.Timeout); err != nil || timeout <= 0 {
+			return fmt.Errorf("config: external_context[%d]: timeout must be a positive duration", i)
+		}
+	}
 	return nil
 }
 
@@ -1788,7 +1992,7 @@ func normalizePlatformTransport(p *PlatformConfig) error {
 	p.BaseURL = strings.TrimSpace(p.BaseURL)
 	if p.Type != string(platformpkg.KindGitea) {
 		if p.BaseURL != "" || p.AllowInsecure {
-			return fmt.Errorf("base_url and allow_insecure are supported only for gitea")
+			return errors.New("base_url and allow_insecure are supported only for gitea")
 		}
 		return nil
 	}
@@ -1797,22 +2001,22 @@ func normalizePlatformTransport(p *PlatformConfig) error {
 	}
 	u, err := url.Parse(p.BaseURL)
 	if err != nil || u.Scheme == "" || u.Host == "" || u.Hostname() == "" {
-		return fmt.Errorf("base_url must be an absolute http(s) URL")
+		return errors.New("base_url must be an absolute http(s) URL")
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("base_url scheme must be http or https")
+		return errors.New("base_url scheme must be http or https")
 	}
 	if u.User != nil {
-		return fmt.Errorf("base_url must not include user info")
+		return errors.New("base_url must not include user info")
 	}
 	if u.RawQuery != "" || u.ForceQuery {
-		return fmt.Errorf("base_url must not include a query string")
+		return errors.New("base_url must not include a query string")
 	}
 	if u.Fragment != "" {
-		return fmt.Errorf("base_url must not include a fragment")
+		return errors.New("base_url must not include a fragment")
 	}
 	if u.Scheme == "http" && !p.AllowInsecure {
-		return fmt.Errorf("base_url uses plain HTTP; set allow_insecure = true to acknowledge that API tokens will be sent without TLS")
+		return errors.New("base_url uses plain HTTP; set allow_insecure = true to acknowledge that API tokens will be sent without TLS")
 	}
 	u.Path = strings.TrimRight(u.Path, "/")
 	p.BaseURL = u.String()
@@ -2239,6 +2443,9 @@ func (c *Config) validateAgents() error {
 		agent := &c.Agents[i]
 		agent.Key = strings.ToLower(strings.TrimSpace(agent.Key))
 		agent.Label = strings.TrimSpace(agent.Label)
+		if agent.Protocol != "" && agent.Protocol != "terminal" && agent.Protocol != "acp" {
+			return fmt.Errorf("config: agents[%d]: protocol must be terminal or acp", i)
+		}
 		if agent.Key == "" {
 			return fmt.Errorf("config: agents[%d]: key is required", i)
 		}
@@ -2411,7 +2618,10 @@ var reservedSystemLaunchTargetKeys = map[string]bool{
 }
 
 var (
-	validBasePathRe = regexp.MustCompile(`^/([a-zA-Z0-9._~-]+/)*$`)
+	// rootRouteSegments lead the probe and daemon ping routes, which are
+	// served at the root regardless of base_path.
+	rootRouteSegments = []string{"api", "healthz", "livez"}
+	validBasePathRe   = regexp.MustCompile(`^/([a-zA-Z0-9._~-]+/)*$`)
 	// Without scheme: require / so bare "github.com" (a valid repo
 	// name) is not falsely matched.
 	bareHostRepoRe = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9.-]*(?:\.[A-Za-z0-9.-]+|:[0-9]+))/(.*)$`)
@@ -2543,6 +2753,9 @@ func (c *Config) TokenForPlatformHost(platform, host, repoTokenEnv string) strin
 	if p == defaultPlatform {
 		return c.gitHubTokenForHost(h)
 	}
+	if p == string(platformpkg.KindBitbucket) {
+		return tokenauth.BitbucketEnvironmentToken(h)
+	}
 	// Non-GitHub hosts end on the same host-scoped CLI fallback their
 	// descriptor chain declares (glab for GitLab, fj for Forgejo and Gitea).
 	return providerCLITokenForHost(p, h)
@@ -2630,6 +2843,10 @@ func (c *Config) ConfiguredCredentialAvailable() bool {
 func descriptorCredentialAvailable(desc tokenauth.Descriptor) bool {
 	for _, candidate := range desc.Candidates {
 		switch candidate.Kind {
+		case tokenauth.SourceKindBitbucketEnv:
+			if tokenauth.BitbucketEnvironmentToken(candidate.Host) != "" {
+				return true
+			}
 		case tokenauth.SourceKindEnv:
 			if os.Getenv(candidate.EnvName) != "" {
 				return true
@@ -2639,6 +2856,7 @@ func descriptorCredentialAvailable(desc tokenauth.Descriptor) bool {
 			if err == nil && len(bytes.TrimSpace(data)) > 0 {
 				return true
 			}
+		case tokenauth.SourceKindGitHubCLI, tokenauth.SourceKindGitLabCLI, tokenauth.SourceKindForgejoCLI:
 		}
 	}
 	return false
@@ -3143,6 +3361,9 @@ func (c *Config) TokenSourceForPlatformHost(
 			EnvName: defaultTokenEnv,
 		})
 	}
+	if p == string(platformpkg.KindBitbucket) && h == platformpkg.DefaultBitbucketHost {
+		desc.Candidates = append(desc.Candidates, tokenauth.Candidate{Kind: tokenauth.SourceKindBitbucketEnv, Host: h})
+	}
 	// Every non-GitHub provider ends on its host-scoped CLI credential, so a
 	// user logged in with glab or fj needs no token_env for that host.
 	if kind := cliSourceKindForPlatform(p); kind != "" {
@@ -3174,6 +3395,8 @@ func (c *Config) TokenSourceForPlatformHost(
 
 func defaultTokenEnvForPlatformHost(platform, host string) (string, bool) {
 	switch platform {
+	case string(platformpkg.KindBitbucket):
+		return "KENN_FORGE_BITBUCKET_TOKEN", host == platformpkg.DefaultBitbucketHost
 	case string(platformpkg.KindForgejo):
 		return defaultForgejoTokenEnv, host == platformpkg.DefaultForgejoHost
 	case string(platformpkg.KindGitea):
@@ -3237,6 +3460,9 @@ func appendTokenEnvNamesFromDescriptor(
 	desc tokenauth.Descriptor,
 ) []string {
 	for _, candidate := range desc.Candidates {
+		if candidate.Kind == tokenauth.SourceKindBitbucketEnv {
+			names = appendTokenEnvName(names, "BKT_TOKEN")
+		}
 		if candidate.Kind == tokenauth.SourceKindEnv {
 			names = appendTokenEnvName(names, candidate.EnvName)
 		}
@@ -3356,7 +3582,13 @@ func isUnsupportedHostnameFlag(err error, stderr []byte) bool {
 		strings.Contains(text, "unknown shorthand flag")
 }
 
+// BudgetPerHour returns the effective hourly sync ceiling. Zero means unset,
+// including on a Config built without Load, so it resolves to the default
+// rather than a ceiling that refuses every request.
 func (c *Config) BudgetPerHour() int {
+	if c.SyncBudgetPerHour == 0 {
+		return defaultSyncBudgetPerHour
+	}
 	return c.SyncBudgetPerHour
 }
 
@@ -3570,6 +3802,7 @@ func reposForSave(repos []Repo) []Repo {
 
 // configFile is the subset of Config written to disk.
 type configFile struct {
+	AirplaneMode                bool                     `toml:"airplane_mode,omitempty"`
 	SyncInterval                string                   `toml:"sync_interval"`
 	ActivePRRefreshInterval     string                   `toml:"active_pr_refresh_interval"`
 	ActivePRHotWindow           string                   `toml:"active_pr_hot_window"`
@@ -3596,9 +3829,11 @@ type configFile struct {
 	Notifications               Notifications            `toml:"notifications,omitempty"`
 	Relay                       Relay                    `toml:"relay,omitempty"`
 	Terminal                    Terminal                 `toml:"terminal,omitempty"`
+	ACP                         ACP                      `toml:"acp,omitempty"`
 	Modes                       ModeVisibility           `toml:"modes,omitempty"`
 	Agents                      []Agent                  `toml:"agents,omitempty"`
 	QuickActions                []QuickAction            `toml:"quick_actions,omitempty"`
+	ExternalContext             []ExternalContextSource  `toml:"external_context,omitempty"`
 	DocFolders                  []DocFolder              `toml:"doc_folders,omitempty"`
 	Roborev                     Roborev                  `toml:"roborev,omitempty"`
 	PullRequests                PullRequests             `toml:"pull_requests,omitempty"`
@@ -3610,6 +3845,8 @@ type configFile struct {
 	Fleet                       Fleet                    `toml:"fleet,omitempty"`
 	API                         API                      `toml:"api,omitempty"`
 	MCP                         MCP                      `toml:"mcp,omitempty"`
+	ExecutionWorker             ExecutionWorker          `toml:"execution_worker,omitempty"`
+	Devboxes                    Devboxes                 `toml:"devboxes,omitempty"`
 }
 
 // Save writes the current config to the given path.
@@ -3618,7 +3855,11 @@ func (c *Config) Save(path string) error {
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("validating config: %w", err)
 	}
+	if err := cfg.restoreRuntimeFileValues(path); err != nil {
+		return err
+	}
 	f := configFile{
+		AirplaneMode:                cfg.AirplaneMode,
 		SyncInterval:                cfg.SyncInterval,
 		ActivePRRefreshInterval:     cfg.ActivePRRefreshInterval,
 		ActivePRHotWindow:           cfg.ActivePRHotWindow,
@@ -3640,9 +3881,11 @@ func (c *Config) Save(path string) error {
 		Notifications:               cfg.Notifications,
 		Relay:                       cfg.Relay,
 		Terminal:                    cfg.Terminal,
+		ACP:                         cfg.ACP,
 		Modes:                       cfg.Modes,
 		Agents:                      cfg.Agents,
 		QuickActions:                cfg.QuickActions,
+		ExternalContext:             cfg.ExternalContext,
 		DocFolders:                  cfg.DocFolders,
 		Roborev:                     cfg.Roborev,
 		PullRequests:                cfg.PullRequests,
@@ -3654,6 +3897,8 @@ func (c *Config) Save(path string) error {
 		Fleet:                       cfg.Fleet,
 		API:                         cfg.API,
 		MCP:                         cfg.MCP,
+		ExecutionWorker:             cfg.ExecutionWorker,
+		Devboxes:                    cfg.Devboxes,
 	}
 	if cfg.DefaultPlatformHost == defaultPlatformHost {
 		f.DefaultPlatformHost = ""
@@ -3693,25 +3938,19 @@ func (c *Config) Save(path string) error {
 		}
 	}
 
-	tmp, err := os.CreateTemp(dir, ".kenn-forge-config-*.toml")
+	// savePath is already resolved, so a symlinked config is written
+	// through to its target.
+	file, err := atomicfile.Create(savePath)
 	if err != nil {
 		return fmt.Errorf("creating temp config: %w", err)
 	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("chmod temp config: %w", err)
-	}
-	enc := toml.NewEncoder(tmp)
-	if err := enc.Encode(f); err != nil {
-		_ = tmp.Close()
+	defer func() { _ = file.Abort() }()
+	if err := toml.NewEncoder(file).Encode(f); err != nil {
 		return fmt.Errorf("encoding config: %w", err)
 	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("closing temp config: %w", err)
-	}
-	if err := os.Rename(tmpPath, savePath); err != nil {
+	// ErrPublished means the new config is already in place and only a
+	// later directory fsync failed; callers must not roll back.
+	if err := file.Commit(); err != nil && !errors.Is(err, atomicfile.ErrPublished) {
 		return fmt.Errorf("renaming temp config: %w", err)
 	}
 	return nil
@@ -3735,6 +3974,10 @@ func (c *Config) copyForSave() Config {
 	cfg.DocFolders = slices.Clone(c.DocFolders)
 	cfg.Agents = slices.Clone(c.Agents)
 	cfg.QuickActions = slices.Clone(c.QuickActions)
+	cfg.ExternalContext = slices.Clone(c.ExternalContext)
+	for i := range cfg.ExternalContext {
+		cfg.ExternalContext[i].Command = slices.Clone(c.ExternalContext[i].Command)
+	}
 	cfg.API.TailscaleServe.AllowedUsers = slices.Clone(c.API.TailscaleServe.AllowedUsers)
 	if c.Fleet.Hub != nil {
 		hub := *c.Fleet.Hub

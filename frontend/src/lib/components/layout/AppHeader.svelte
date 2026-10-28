@@ -28,6 +28,7 @@
     parseActivitySelection,
   } from "../../utils/activitySelection.js";
   import RepoTypeahead from "../RepoTypeahead.svelte";
+  import { buildWorklistsRoute } from "../../routes.js";
   import HeaderIconButton from "./HeaderIconButton.svelte";
   import ForgeSelector from "./ForgeSelector.svelte";
   import ThemeToggle from "./ThemeToggle.svelte";
@@ -85,7 +86,7 @@
     };
   });
 
-  const appIconSrc = `${getBasePath().replace(/\/$/, "")}/favicon.svg`;
+  const appIconSrc = __FORGE_APP_ICON__;
 
   const hasSidebarStrip = $derived(
     getPage() === "issues"
@@ -105,9 +106,8 @@
     | "actions"
     | "pulls"
     | "issues"
-    | "reviews"
     | "workspaces";
-  type NavValue = NavDestination | "settings" | "design-system";
+  type NavValue = NavDestination | "worklists" | "settings" | "design-system";
 
   const modeNavOptions: { value: NavDestination; label: string; mode: ModeKey }[] = [
     { value: "activity", label: "Activity", mode: "activity" },
@@ -116,7 +116,6 @@
     { value: "actions", label: "Actions", mode: "actions" },
     { value: "pulls", label: "PRs", mode: "pulls" },
     { value: "issues", label: "Issues", mode: "issues" },
-    { value: "reviews", label: "Reviews", mode: "reviews" },
     { value: "workspaces", label: "Workspaces", mode: "workspaces" },
   ];
 
@@ -254,23 +253,12 @@
   // Settings and the design-system gallery are not modes, but while one of
   // those pages is current it needs a tab entry: the collapsed dropdown
   // otherwise presents the first mode as the current page.
-  const reviewsDaemonUnavailable = $derived(
-    settings.isModeVisible("reviews")
-      && stores.roborevDaemon !== undefined
-      && !stores.roborevDaemon.isAvailable(),
-  );
-
   const tabs: TopBarTab[] = $derived.by(() => {
     const entries: TopBarTab[] = modeNavOptions
       .filter((option) => settings.isModeVisible(option.mode))
-      .map(({ value, label }) => {
-        const tab: TopBarTab = { id: value, label };
-        if (value === "reviews" && reviewsDaemonUnavailable) {
-          tab.indicator = { tone: "danger", title: "Reviews daemon unavailable" };
-        }
-        return tab;
-      });
+      .map(({ value, label }) => ({ id: value, label }));
 
+    entries.push({ id: "worklists", label: "Worklists" });
     if (getPage() === "design-system") {
       entries.push({ id: "design-system", label: "Design system" });
     }
@@ -341,11 +329,13 @@
     }
     else if (destination === "pulls" || destination === "issues") {
       navigate(routeForTab(destination));
-    } else if (destination === "reviews") navigate("/reviews");
-    else if (destination === "workspaces") {
+    } else if (destination === "workspaces") {
       if (getPage() !== "workspaces" && getPage() !== "terminal") {
         navigate(getLastWorkspaceRoute());
       }
+    }
+    else if (destination === "worklists") {
+      if (getPage() !== "worklists") navigate(buildWorklistsRoute());
     }
     else if (destination === "settings") navigate("/settings");
     else if (destination === "design-system") navigate("/design-system");
@@ -358,8 +348,8 @@
     else if (value === "actions") navigateTab("actions");
     else if (value === "pulls") navigateTab("pulls");
     else if (value === "issues") navigateTab("issues");
-    else if (value === "reviews") navigateTab("reviews");
     else if (value === "workspaces") navigateTab("workspaces");
+    else if (value === "worklists") navigateTab("worklists");
     else if (value === "settings") navigateTab("settings");
     else if (value === "design-system") navigateTab("design-system");
   }

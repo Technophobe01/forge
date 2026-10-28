@@ -3,11 +3,12 @@
  */
 
 export interface FederationWorkflowItemIdentity {
+  bitbucket_repository_uuid?: string;
   name: string;
   number: number;
   owner: string;
   platform_host: string;
-  platform_repo_id: string;
+  platform_repo_id: number;
   provider: string;
   type: string;
 }

@@ -17,9 +17,12 @@ declare module "@xterm/addon-ligatures/lib/addon-ligatures.mjs" {
 }
 
 interface Window {
+  ReactNativeWebView?: { postMessage: (message: string) => void };
   __BASE_PATH__?: string;
   __KENN_FORGE_DEV_API_URL__?: string;
   __KENN_FORGE_FORCE_MOBILE_ROUTES__?: boolean;
+  /** Set by an app embedding Forge when the page may offer kenn:// links. */
+  __KENN_EMBEDDED_KENN_LINKS__?: boolean;
   __kenn_forge_active_worktree_key?: string;
   __kenn_forge_event_source_counts?: () => {
     created: number;
@@ -68,3 +71,5 @@ interface Window {
     reset: () => void;
   };
 }
+
+declare const __FORGE_APP_ICON__: string;

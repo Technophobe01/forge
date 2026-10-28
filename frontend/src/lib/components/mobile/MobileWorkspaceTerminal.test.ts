@@ -1,32 +1,39 @@
-import { cleanup, render, waitFor } from "@testing-library/svelte";
+import { dismissFlash } from "../../stores/flash.svelte.js";
+import { startTestTelemetry } from "../../testing/telemetry.js";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { Effect } from "effect";
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import type { OwnedAppRuntime } from "../../app/runtime.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { makeAppRuntime, type OwnedAppRuntime } from "../../app/runtime.js";
 import { GeneratedProblemResponse } from "../../api/runtime.js";
 import { makeGeneratedClient } from "../../testing/generated-client.js";
 import { navigate } from "../../stores/router.svelte.js";
 import { getInlineWorkspaceController, resetWorkspaceHostForTest } from "../../stores/workspace-host.svelte.js";
 
+const coreActions = vi.hoisted(() => vi.fn(async (_body: unknown, _options?: unknown) => ({ status: "queued" })));
+
 const mocks = vi.hoisted(() => ({
   runtimeClient: {
     getWorkspace: vi.fn(),
+    getWorkspaceRuntime: vi.fn(),
+    launchWorkspaceRuntimeSession: vi.fn(),
+    launchWorkspaceAgentHandoff: vi.fn(),
+    retryWorkspace: vi.fn(),
+    getFleetWorkspace: vi.fn(),
+    getFleetWorkspaceRuntime: vi.fn(),
+    launchFleetWorkspaceRuntimeSession: vi.fn(),
   },
 }));
 const runtimeState = vi.hoisted<{ appRuntime?: OwnedAppRuntime }>(() => ({}));
+const events = vi.hoisted(() => ({ subscribeWorkspaceEvents: vi.fn() }));
 
-vi.mock("../../app/runtime-context.js", async () => {
-  const { makeAppRuntime } = await import("../../app/runtime.js");
-  runtimeState.appRuntime = makeAppRuntime(
-    makeGeneratedClient({ WorkspacesService: { getWorkspace: mocks.runtimeClient.getWorkspace } }),
-  );
-  return { getAppRuntime: () => runtimeState.appRuntime };
-});
+vi.mock("../../app/runtime-context.js", () => ({ getAppRuntime: () => runtimeState.appRuntime }));
 
 vi.mock("../../context.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../context.js")>();
   return {
     ...actual,
     getStores: () => ({
+      events,
       settings: {
         getTerminalSettings: () => ({
           font_family: "",
@@ -42,7 +49,45 @@ vi.mock("../../context.js", async (importOriginal) => {
   };
 });
 
+import {
+  runWorkspaceQuickAction,
+  quickActionWorkspaces,
+  quickActionLaunches,
+} from "../../stores/workspace-quick-actions.js";
+import type { RuntimeSession } from "../../api/types.js";
 import MobileWorkspaceTerminal from "./MobileWorkspaceTerminal.svelte";
+import MobileWorkspaceTerminalTestHarness from "./MobileWorkspaceTerminalTestHarness.svelte";
+import type { WorkspaceEventsNotification } from "../../stores/events.svelte.js";
+import {
+  markWorkspaceIdDeleted,
+  beginWorkspaceDeletion,
+  endWorkspaceDeletion,
+  pendingWorkspaceLaunch,
+  queueWorkspaceLaunch,
+  resetWorkspaceCreatePendingForTest,
+} from "../../stores/workspace-create-pending.svelte.js";
+import { resetSessionHostForTest } from "../../stores/session-host.svelte.js";
+
+const workspace = {
+  id: "ws-a",
+  status: "ready",
+  created_at: "2026-09-26T00:00:00Z",
+  enrichment_status: "fresh",
+  git_head_ref: "feature/test",
+  item_number: 7,
+  item_type: "pull_request",
+  platform_host: "github.com",
+  repo_owner: "acme",
+  repo_name: "widgets",
+  tmux_session: "forge-test",
+  worktree_path: "/tmp/test-worktree",
+  repo: { provider: "github", platform_host: "github.com", owner: "acme", name: "widgets", repo_path: "acme/widgets" },
+};
+const runtime = {
+  launch_targets: [{ key: "helper", label: "Helper", kind: "agent", available: true, source: "config" }],
+  sessions: [],
+};
+const props = { workspaceId: "ws-a", onBack: vi.fn(), onMissing: vi.fn(), onOpenItem: vi.fn() };
 
 const identity = {
   provider: "github",
@@ -56,22 +101,770 @@ const identity = {
 const workspaceRef = { id: "ws-a", status: "ready" };
 
 describe("MobileWorkspaceTerminal", () => {
-  afterAll(async () => {
-    if (runtimeState.appRuntime !== undefined) {
-      await Effect.runPromise(runtimeState.appRuntime.disposeEffect);
-    }
-  });
-
-  beforeEach(() => {
-    mocks.runtimeClient.getWorkspace.mockReset();
+  beforeEach(async () => {
+    coreActions.mockClear();
+    for (const mock of Object.values(mocks.runtimeClient)) mock.mockReset();
+    mocks.runtimeClient.getWorkspace.mockResolvedValue(workspace);
+    mocks.runtimeClient.getWorkspaceRuntime.mockResolvedValue(runtime);
+    mocks.runtimeClient.getFleetWorkspace.mockResolvedValue(workspace);
+    mocks.runtimeClient.getFleetWorkspaceRuntime.mockResolvedValue(runtime);
+    events.subscribeWorkspaceEvents.mockReset().mockReturnValue(() => {});
+    runtimeState.appRuntime = makeAppRuntime(
+      makeGeneratedClient({
+        WorkspacesService: mocks.runtimeClient,
+        FleetService: mocks.runtimeClient,
+      }),
+    );
     localStorage.clear();
+    await startTestTelemetry(runtimeState.appRuntime, coreActions).ready;
+    quickActionWorkspaces.clear();
+    quickActionLaunches.clear();
     resetWorkspaceHostForTest();
+    resetWorkspaceCreatePendingForTest();
+    resetSessionHostForTest();
     navigate("/pulls");
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     cleanup();
+    dismissFlash();
+    if (runtimeState.appRuntime) await Effect.runPromise(runtimeState.appRuntime.disposeEffect);
     resetWorkspaceHostForTest();
+    resetWorkspaceCreatePendingForTest();
+    resetSessionHostForTest();
+    vi.useRealTimers();
+  });
+
+  it.each(["ready", "error", "creating", "pending", "deleted", "deleting", "deletion_failed"] as const)(
+    "reports mobile workspace use only when usable: %s",
+    async (state) => {
+      if (state === "pending") beginWorkspaceDeletion("ws-a", undefined);
+      if (state === "deleted") markWorkspaceIdDeleted("ws-a");
+      mocks.runtimeClient.getWorkspace.mockResolvedValue({
+        ...workspace,
+        status: state === "pending" || state === "deleted" ? "ready" : state,
+      });
+      render(MobileWorkspaceTerminalTestHarness, { props });
+      if (state === "pending" || state === "deleted" || state === "deleting" || state === "deletion_failed") {
+        await screen.findByTitle("acme/widgets · feature/test");
+        expect(coreActions).not.toHaveBeenCalled();
+        if (state !== "pending") return;
+        endWorkspaceDeletion("ws-a", undefined);
+      }
+      await waitFor(() =>
+        expect(
+          coreActions.mock.calls.find(([event]) => (event as { event: string }).event === "workspace_opened")?.[0],
+        ).toMatchObject({
+          event: "workspace_opened",
+          properties: { item_type: "pull_request" },
+        }),
+      );
+      expect(
+        coreActions.mock.calls.filter(([event]) => (event as { event: string }).event === "workspace_opened"),
+      ).toHaveLength(1);
+    },
+  );
+
+  it("reports a hidden failed open when shown and counts a failed retry", async () => {
+    mocks.runtimeClient.getWorkspace.mockRejectedValue(
+      new GeneratedProblemResponse({ title: "Read denied", status: 403 }, new Response(null, { status: 403 })),
+    );
+    render(MobileWorkspaceTerminalTestHarness, { props: { ...props, initialVisible: false } });
+    await screen.findByText("Read denied");
+    expect(coreActions).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByRole("button", { name: "Toggle terminal visibility" }));
+    await waitFor(() =>
+      expect(coreActions).toHaveBeenCalledExactlyOnceWith(
+        { event: "error_shown", properties: { surface: "web", kind: "workspace_opened" } },
+        {},
+      ),
+    );
+    await fireEvent.click(screen.getByRole("button", { name: "Retry", exact: true }));
+    await screen.findByText("Read denied");
+    await waitFor(() => expect(coreActions).toHaveBeenCalledTimes(2));
+  });
+
+  it("reports runtime reads that block a queued launch, including reconnect failures", async () => {
+    mocks.runtimeClient.getWorkspaceRuntime.mockRejectedValue(
+      new GeneratedProblemResponse({ title: "Runtime denied", status: 403 }, new Response(null, { status: 403 })),
+    );
+    queueWorkspaceLaunch("ws-a", "helper", undefined);
+    render(MobileWorkspaceTerminal, { props });
+    await screen.findByText("Runtime denied");
+    await waitFor(() =>
+      expect(
+        coreActions.mock.calls.filter(([event]) => (event as { event: string }).event === "error_shown"),
+      ).toHaveLength(1),
+    );
+    expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).not.toHaveBeenCalled();
+    const retry = Promise.withResolvers<never>();
+    mocks.runtimeClient.getWorkspaceRuntime.mockReturnValueOnce(retry.promise);
+    const reads = mocks.runtimeClient.getWorkspaceRuntime.mock.calls.length;
+    await fireEvent.click(screen.getByRole("button", { name: "Retry runtime sessions" }));
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledTimes(reads + 1));
+    expect(screen.getByText("Runtime denied")).toBeTruthy();
+    expect(
+      coreActions.mock.calls.filter(([event]) => (event as { event: string }).event === "error_shown"),
+    ).toHaveLength(1);
+    retry.reject(
+      new GeneratedProblemResponse({ title: "Runtime denied", status: 403 }, new Response(null, { status: 403 })),
+    );
+    await screen.findByText("Runtime denied");
+    await waitFor(() =>
+      expect(
+        coreActions.mock.calls.filter(([event]) => (event as { event: string }).event === "error_shown"),
+      ).toHaveLength(2),
+    );
+  });
+
+  it.each(["creating", "error"])("counts another setup failure after retry returns %s", async (status) => {
+    let notify: ((event: WorkspaceEventsNotification) => void) | undefined;
+    events.subscribeWorkspaceEvents.mockImplementation((subscriber: (event: WorkspaceEventsNotification) => void) => {
+      notify = subscriber;
+      return () => {};
+    });
+    mocks.runtimeClient.getWorkspace.mockResolvedValue({ ...workspace, status: "error" });
+    mocks.runtimeClient.retryWorkspace.mockResolvedValue({ ...workspace, status });
+    render(MobileWorkspaceTerminal, { props });
+    await screen.findByText("Workspace setup failed");
+    await waitFor(() =>
+      expect(
+        coreActions.mock.calls.filter(([event]) => (event as { event: string }).event === "error_shown"),
+      ).toHaveLength(1),
+    );
+    await fireEvent.click(screen.getByRole("button", { name: "Retry", exact: true }));
+    if (status === "creating") {
+      await screen.findByText("Setting up workspace…");
+      notify?.({ type: "workspace_status", payload: { id: "ws-a", status: "error" } });
+    }
+    await screen.findByText("Workspace setup failed");
+    await waitFor(() =>
+      expect(
+        coreActions.mock.calls.filter(([event]) => (event as { event: string }).event === "error_shown"),
+      ).toHaveLength(2),
+    );
+  });
+
+  it.each(["failed", "unavailable"])("reports one shown mobile launch error: %s", async (failure) => {
+    if (failure === "unavailable") {
+      mocks.runtimeClient.getWorkspaceRuntime.mockResolvedValue({ ...runtime, launch_targets: [] });
+    } else {
+      mocks.runtimeClient.launchWorkspaceRuntimeSession.mockRejectedValue(
+        new GeneratedProblemResponse({ title: "Launch refused", status: 400 }, new Response(null, { status: 400 })),
+      );
+    }
+    queueWorkspaceLaunch("ws-a", "helper", undefined);
+    render(MobileWorkspaceTerminal, { props });
+    await waitFor(() =>
+      expect(coreActions.mock.calls.filter(([event]) => (event as { event: string }).event === "error_shown")).toEqual([
+        [{ event: "error_shown", properties: { surface: "web", kind: "workspace_opened" } }, {}],
+      ]),
+    );
+    if (failure === "unavailable") expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).not.toHaveBeenCalled();
+    else expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).toHaveBeenCalledOnce();
+  });
+
+  it("reports one launch error when an accepted mobile session expires", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    mocks.runtimeClient.launchWorkspaceRuntimeSession.mockResolvedValue({
+      key: "helper-session",
+      workspace_id: "ws-a",
+      target_key: "helper",
+      label: "Helper",
+      kind: "agent",
+      display_region: "workflow",
+      status: "running",
+      created_at: workspace.created_at,
+    });
+    queueWorkspaceLaunch("ws-a", "helper", undefined);
+    render(MobileWorkspaceTerminal, { props });
+    await waitFor(() => expect(pendingWorkspaceLaunch("ws-a", undefined)?.phase).toBe("awaiting_session"));
+    await vi.advanceTimersByTimeAsync(15_000);
+    await waitFor(() =>
+      expect(coreActions.mock.calls.filter(([event]) => (event as { event: string }).event === "error_shown")).toEqual([
+        [{ event: "error_shown", properties: { surface: "web", kind: "workspace_opened" } }, {}],
+      ]),
+    );
+  });
+
+  it("reports mobile workspace use again when the tab returns after the UTC day changes", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-17T23:59:59Z"));
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    const setVisibility = (state: DocumentVisibilityState) => {
+      visibility.mockReturnValue(state);
+      document.dispatchEvent(new Event("visibilitychange"));
+    };
+    try {
+      render(MobileWorkspaceTerminalTestHarness, { props });
+      await waitFor(() => expect(coreActions).toHaveBeenCalledTimes(1));
+
+      setVisibility("hidden");
+      vi.setSystemTime(new Date("2026-10-18T00:00:01Z"));
+      setVisibility("visible");
+      await waitFor(() => expect(coreActions).toHaveBeenCalledTimes(2));
+      expect(coreActions.mock.calls[1]?.[0]).toEqual({
+        event: "workspace_opened",
+        properties: { item_type: "pull_request", surface: "web" },
+      });
+    } finally {
+      visibility.mockRestore();
+    }
+  });
+
+  it.each([
+    [{ mr_state: "open" }, "var(--accent-green)"],
+    [{ mr_state: "merged" }, "var(--accent-purple)"],
+    [{ mr_state: "closed" }, "var(--accent-red)"],
+    [{ mr_state: "open", mr_is_draft: true }, "var(--accent-amber)"],
+    // An issue workspace's mr_state is the issue's state, not the PR's.
+    [{ item_type: "issue", associated_pr_number: 7, mr_state: "closed" }, "var(--text-muted)"],
+  ])("colors the linked PR pill by lifecycle state for %o", async (fields, accent) => {
+    mocks.runtimeClient.getWorkspace.mockResolvedValue({ ...workspace, ...fields });
+    render(MobileWorkspaceTerminal, { props });
+    const pill = await screen.findByRole("button", { name: "Open linked PR #7" });
+    expect(pill.style.getPropertyValue("--item-accent")).toBe(accent);
+  });
+
+  it("recolors the linked PR pill when synced PR data changes", async () => {
+    let notify: ((event: WorkspaceEventsNotification) => void) | undefined;
+    events.subscribeWorkspaceEvents.mockImplementation((subscriber: (event: WorkspaceEventsNotification) => void) => {
+      notify = subscriber;
+      return () => {};
+    });
+    mocks.runtimeClient.getWorkspace.mockResolvedValue({ ...workspace, mr_state: "open" });
+    render(MobileWorkspaceTerminal, { props });
+    const pill = await screen.findByRole("button", { name: "Open linked PR #7" });
+    expect(pill.style.getPropertyValue("--item-accent")).toBe("var(--accent-green)");
+
+    mocks.runtimeClient.getWorkspace.mockResolvedValue({ ...workspace, mr_state: "merged" });
+    await waitFor(() => expect(notify).toBeTypeOf("function"));
+    notify?.({ type: "data_changed" });
+
+    await waitFor(() => expect(pill.style.getPropertyValue("--item-accent")).toBe("var(--accent-purple)"));
+  });
+
+  it("recolors the linked PR pill for item changes that arrived while the terminal was hidden", async () => {
+    let notify: ((event: WorkspaceEventsNotification) => void) | undefined;
+    events.subscribeWorkspaceEvents.mockImplementation((subscriber: (event: WorkspaceEventsNotification) => void) => {
+      notify = subscriber;
+      return () => {};
+    });
+    mocks.runtimeClient.getWorkspace.mockResolvedValue({ ...workspace, mr_state: "open" });
+    render(MobileWorkspaceTerminalTestHarness, { props });
+    const pill = await screen.findByRole("button", { name: "Open linked PR #7" });
+    expect(pill.style.getPropertyValue("--item-accent")).toBe("var(--accent-green)");
+    await waitFor(() => expect(notify).toBeTypeOf("function"));
+
+    await fireEvent.click(screen.getByRole("button", { name: "Toggle terminal visibility" }));
+    mocks.runtimeClient.getWorkspace.mockResolvedValue({ ...workspace, mr_state: "open", mr_is_draft: true });
+    const loadsBeforeHiddenChange = mocks.runtimeClient.getWorkspace.mock.calls.length;
+    notify?.({ type: "data_changed" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mocks.runtimeClient.getWorkspace).toHaveBeenCalledTimes(loadsBeforeHiddenChange);
+    await fireEvent.click(screen.getByRole("button", { name: "Toggle terminal visibility" }));
+
+    await waitFor(() => expect(pill.style.getPropertyValue("--item-accent")).toBe("var(--accent-amber)"));
+    // A visibility change keeps the retained terminal's lifecycle running.
+    expect(events.subscribeWorkspaceEvents).toHaveBeenCalledOnce();
+  });
+
+  it("cancels the reload on return when the terminal unmounts", async () => {
+    const onMissing = vi.fn();
+    const view = render(MobileWorkspaceTerminalTestHarness, { props: { ...props, onMissing } });
+    await screen.findByRole("button", { name: "Open linked PR #7" });
+    const reload = Promise.withResolvers<never>();
+    mocks.runtimeClient.getWorkspace.mockReturnValue(reload.promise);
+    const loadsBefore = mocks.runtimeClient.getWorkspace.mock.calls.length;
+
+    await fireEvent.click(screen.getByRole("button", { name: "Toggle terminal visibility" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Toggle terminal visibility" }));
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspace).toHaveBeenCalledTimes(loadsBefore + 1));
+    view.unmount();
+    reload.reject(
+      new GeneratedProblemResponse(
+        { type: "about:blank", title: "Not found", status: 404, code: "workspaceNotFound" },
+        new Response(null, { status: 404 }),
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(onMissing).not.toHaveBeenCalled();
+  });
+
+  it("keeps a loaded terminal when a background item reload fails", async () => {
+    let notify: ((event: WorkspaceEventsNotification) => void) | undefined;
+    events.subscribeWorkspaceEvents.mockImplementation((subscriber: (event: WorkspaceEventsNotification) => void) => {
+      notify = subscriber;
+      return () => {};
+    });
+    render(MobileWorkspaceTerminal, { props });
+    await screen.findByRole("button", { name: "Open linked PR #7" });
+    await waitFor(() => expect(notify).toBeTypeOf("function"));
+    const loadsBefore = mocks.runtimeClient.getWorkspace.mock.calls.length;
+    mocks.runtimeClient.getWorkspace.mockRejectedValue(
+      new GeneratedProblemResponse(
+        { type: "about:blank", title: "Bad gateway", status: 502 },
+        new Response(null, { status: 502 }),
+      ),
+    );
+
+    notify?.({ type: "data_changed" });
+
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspace.mock.calls.length).toBeGreaterThan(loadsBefore));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(screen.queryByText("Workspace unavailable")).toBeNull();
+    expect(screen.getByRole("button", { name: "Open linked PR #7" })).toBeTruthy();
+  });
+
+  it("waits for a directly launched ACP session without showing the base terminal", async () => {
+    const session: RuntimeSession = {
+      key: "chat-a",
+      workspace_id: "ws-a",
+      target_key: "chat",
+      label: "Chat agent",
+      kind: "acp",
+      display_region: "workflow",
+      status: "running",
+      created_at: workspace.created_at,
+    };
+    const launch = Promise.withResolvers<RuntimeSession>();
+    let notify: ((event: WorkspaceEventsNotification) => void) | undefined;
+    events.subscribeWorkspaceEvents.mockImplementation((subscriber: (event: WorkspaceEventsNotification) => void) => {
+      notify = subscriber;
+      return () => {};
+    });
+    mocks.runtimeClient.getWorkspace
+      .mockResolvedValueOnce({ ...workspace, status: "creating" })
+      .mockResolvedValue(workspace);
+    mocks.runtimeClient.getWorkspaceRuntime.mockResolvedValue({
+      launch_targets: [{ key: "chat", label: "Chat agent", kind: "acp", available: true }],
+      sessions: [],
+    });
+    mocks.runtimeClient.launchWorkspaceRuntimeSession.mockReturnValue(launch.promise);
+    queueWorkspaceLaunch("ws-a", "chat", undefined);
+    render(MobileWorkspaceTerminal, { props });
+    await screen.findByText("Preparing worktree…");
+    expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).not.toHaveBeenCalled();
+    await waitFor(() => expect(notify).toBeTypeOf("function"));
+    notify?.({ type: "workspace_status", payload: { id: "ws-a", status: "ready" } });
+    await waitFor(() => expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).toHaveBeenCalledOnce());
+    expect(screen.getByText("Starting Chat agent…")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open terminal composer" })).toBeNull();
+    mocks.runtimeClient.getWorkspaceRuntime.mockResolvedValue({ launch_targets: [], sessions: [session] });
+    launch.resolve(session);
+    expect(await screen.findByRole("button", { name: "Chat options" })).toBeTruthy();
+    expect(screen.queryByText("Starting Chat agent…")).toBeNull();
+  });
+
+  it("selects the quick action's ACP session after an empty runtime selected the base terminal", async () => {
+    const session: RuntimeSession = {
+      key: "chat-a",
+      workspace_id: "ws-a",
+      target_key: "chat",
+      label: "Chat agent",
+      kind: "acp",
+      display_region: "workflow",
+      status: "running",
+      created_at: workspace.created_at,
+    };
+    const handoff = Promise.withResolvers<{ session: RuntimeSession; initial_message: { state: string } }>();
+    mocks.runtimeClient.launchWorkspaceAgentHandoff.mockReturnValue(handoff.promise);
+    const appRuntime = runtimeState.appRuntime;
+    if (!appRuntime) throw new Error("Missing test runtime");
+    runWorkspaceQuickAction(appRuntime, "ws-a", "pull_request", {
+      label: "Review",
+      agent: "chat",
+      prompt: "Review this change",
+    });
+    render(MobileWorkspaceTerminal, { props });
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce());
+    expect(screen.getByText("Starting chat…")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open terminal composer" })).toBeNull();
+    mocks.runtimeClient.getWorkspaceRuntime.mockResolvedValue({ ...runtime, sessions: [session] });
+    handoff.resolve({ session, initial_message: { state: "delivered" } });
+    expect(await screen.findByRole("button", { name: "Chat options" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open terminal composer" })).toBeNull();
+  });
+
+  it.each(["pending", "rejected"])(
+    "opens an acknowledged quick-action chat when the initial runtime read is %s",
+    async (state) => {
+      const session: RuntimeSession = {
+        key: "chat-a",
+        workspace_id: "ws-a",
+        target_key: "chat",
+        label: "Chat agent",
+        kind: "acp",
+        display_region: "workflow",
+        status: "running",
+        created_at: workspace.created_at,
+      };
+      const initialRead = Promise.withResolvers<typeof runtime>();
+      const handoff = Promise.withResolvers<{ session: RuntimeSession; initial_message: { state: string } }>();
+      mocks.runtimeClient.getWorkspaceRuntime.mockReturnValueOnce(initialRead.promise);
+      mocks.runtimeClient.launchWorkspaceAgentHandoff.mockReturnValue(handoff.promise);
+      const appRuntime = runtimeState.appRuntime;
+      if (!appRuntime) throw new Error("Missing test runtime");
+      runWorkspaceQuickAction(appRuntime, "ws-a", "pull_request", {
+        label: "Review",
+        agent: "chat",
+        prompt: "Review this change",
+      });
+      render(MobileWorkspaceTerminal, { props });
+      await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce());
+      if (state === "rejected") {
+        initialRead.reject(
+          new GeneratedProblemResponse(
+            { type: "about:blank", title: "Runtime unavailable", status: 500 },
+            new Response(null, { status: 500 }),
+          ),
+        );
+        await screen.findByRole("button", { name: "Retry runtime sessions" });
+      }
+      const refresh = Promise.withResolvers<typeof runtime>();
+      mocks.runtimeClient.getWorkspaceRuntime.mockReturnValue(refresh.promise);
+      handoff.resolve({ session, initial_message: { state: "delivered" } });
+      expect(await screen.findByRole("button", { name: "Chat options" })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Open terminal composer" })).toBeNull();
+      await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledTimes(2));
+    },
+  );
+
+  it.each([true, false])("shows only available launch choices (available: %s)", async (available) => {
+    mocks.runtimeClient.getWorkspaceRuntime.mockResolvedValue({
+      ...runtime,
+      launch_targets: [
+        { key: "helper", label: "Helper", kind: "agent", available, source: "config" },
+        {
+          key: "disabled",
+          label: "Disabled agent",
+          kind: "agent",
+          available: false,
+          disabled_reason: "disabled by config",
+        },
+        {
+          key: "missing",
+          label: "Missing agent",
+          kind: "acp",
+          available: false,
+          disabled_reason: "executable not found",
+        },
+      ],
+    });
+    render(MobileWorkspaceTerminal, { props });
+    await fireEvent.click(await screen.findByRole("button", { name: "Terminal options" }));
+    await fireEvent.click(await screen.findByRole("button", { name: /New terminal/ }));
+    const sheet = within(await screen.findByRole("dialog", { name: "Launch workspace session" }));
+    expect(sheet.queryByText("Disabled agent")).toBeNull();
+    expect(sheet.queryByText("Missing agent")).toBeNull();
+    if (available) {
+      expect(sheet.getByRole("button", { name: /Helper/ }).hasAttribute("disabled")).toBe(false);
+    } else {
+      expect(sheet.queryByRole("button", { name: /Helper/ })).toBeNull();
+      expect(sheet.getByText("No launch targets are available for this workspace.")).toBeTruthy();
+    }
+  });
+
+  it("tells the host it is viewing only while the page is shown", async () => {
+    const view = render(MobileWorkspaceTerminal, { props: { ...props, visible: false } });
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce());
+    expect(mocks.runtimeClient.getWorkspaceRuntime.mock.calls[0]?.[1]).toEqual({});
+    view.unmount();
+    mocks.runtimeClient.getWorkspaceRuntime.mockClear();
+    render(MobileWorkspaceTerminal, { props });
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce());
+    expect(mocks.runtimeClient.getWorkspaceRuntime.mock.calls[0]?.[1]).toEqual({ viewing: true });
+  });
+
+  it("starts runtime discovery while workspace details are held", async () => {
+    const detail = Promise.withResolvers<typeof workspace>();
+    mocks.runtimeClient.getWorkspace.mockReturnValue(detail.promise);
+    render(MobileWorkspaceTerminal, { props });
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce());
+    expect(screen.getByText("Loading workspace…")).toBeTruthy();
+    detail.resolve(workspace);
+    expect(await screen.findByRole("button", { name: "Terminal options" })).toBeTruthy();
+  });
+
+  it.each(["synchronous", "asynchronous"])(
+    "loads once when Open arrives %s and refreshes a stale reconnect",
+    async (delivery) => {
+      const detail = Promise.withResolvers<typeof workspace>();
+      const runtimeRead = Promise.withResolvers<typeof runtime>();
+      let notify: ((event: WorkspaceEventsNotification) => void) | undefined;
+      events.subscribeWorkspaceEvents.mockImplementation((subscriber: (event: WorkspaceEventsNotification) => void) => {
+        notify = subscriber;
+        if (delivery === "synchronous") subscriber({ type: "open" });
+        else queueMicrotask(() => subscriber({ type: "open" }));
+        return () => {};
+      });
+      mocks.runtimeClient.getWorkspace.mockReturnValue(detail.promise);
+      mocks.runtimeClient.getWorkspaceRuntime.mockReturnValue(runtimeRead.promise);
+      render(MobileWorkspaceTerminal, { props });
+      await waitFor(() => expect(notify).toBeTypeOf("function"));
+      detail.resolve(workspace);
+      runtimeRead.resolve(runtime);
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Terminal options" }).hasAttribute("disabled")).toBe(false),
+      );
+      expect(mocks.runtimeClient.getWorkspace).toHaveBeenCalledOnce();
+      expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce();
+
+      notify?.({ type: "reconnect.stale", payload: {} });
+      await waitFor(() => expect(mocks.runtimeClient.getWorkspace).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledTimes(2));
+    },
+  );
+
+  it("accepts a ready status while reconnect detail refresh is held", async () => {
+    const reconnectDetail = Promise.withResolvers<typeof workspace>();
+    const statusDetail = Promise.withResolvers<typeof workspace>();
+    let notify: ((event: WorkspaceEventsNotification) => void) | undefined;
+    events.subscribeWorkspaceEvents.mockImplementation((subscriber: (event: WorkspaceEventsNotification) => void) => {
+      notify = subscriber;
+      subscriber({ type: "open" });
+      return () => {};
+    });
+    mocks.runtimeClient.getWorkspace
+      .mockResolvedValueOnce({ ...workspace, status: "creating" })
+      .mockReturnValueOnce(reconnectDetail.promise)
+      .mockReturnValue(statusDetail.promise);
+    mocks.runtimeClient.launchWorkspaceRuntimeSession.mockReturnValue(new Promise(() => {}));
+    queueWorkspaceLaunch("ws-a", "helper", undefined);
+    render(MobileWorkspaceTerminal, { props });
+    await screen.findByText("Setting up workspace…");
+    await waitFor(() => expect(notify).toBeTypeOf("function"));
+    notify?.({ type: "reconnect.stale", payload: {} });
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspace).toHaveBeenCalledTimes(2));
+    notify?.({ type: "workspace_status", payload: { id: "ws-a", status: "ready" } });
+    await waitFor(() => expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).toHaveBeenCalledOnce());
+    expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce();
+  });
+
+  it("launches without another setup poll when older details arrive after readiness", async () => {
+    const reconnectDetail = Promise.withResolvers<typeof workspace>();
+    const admission = Promise.withResolvers<typeof runtime>();
+    let notify: ((event: WorkspaceEventsNotification) => void) | undefined;
+    events.subscribeWorkspaceEvents.mockImplementation((subscriber: typeof notify) => {
+      notify = subscriber;
+      return () => {};
+    });
+    mocks.runtimeClient.getWorkspace
+      .mockResolvedValueOnce({ ...workspace, status: "creating" })
+      .mockReturnValueOnce(reconnectDetail.promise)
+      .mockResolvedValue({ ...workspace, git_head_ref: "feature/fresh-response" });
+    mocks.runtimeClient.getWorkspaceRuntime.mockReturnValueOnce(admission.promise).mockResolvedValue(runtime);
+    mocks.runtimeClient.launchWorkspaceRuntimeSession.mockReturnValue(new Promise(() => {}));
+    queueWorkspaceLaunch("ws-a", "helper", undefined);
+    render(MobileWorkspaceTerminal, { props });
+    await screen.findByText("Setting up workspace…");
+    await waitFor(() => expect(notify).toBeTypeOf("function"));
+    notify?.({ type: "reconnect.stale", payload: {} });
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspace).toHaveBeenCalledTimes(2));
+    notify?.({ type: "workspace_status", payload: { id: "ws-a", status: "ready" } });
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspace).toHaveBeenCalledTimes(3));
+    await screen.findByText(/feature\/fresh-response/);
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce());
+    reconnectDetail.resolve({ ...workspace, status: "creating" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    admission.resolve(runtime);
+    await waitFor(() => expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).toHaveBeenCalledOnce());
+    expect(screen.queryByText("Setting up workspace…")).toBeNull();
+    expect(mocks.runtimeClient.getWorkspace).toHaveBeenCalledTimes(3);
+  });
+
+  it("rechecks pending enrichment after initial loading without rereading runtime", async () => {
+    const initial = Promise.withResolvers<typeof workspace>();
+    events.subscribeWorkspaceEvents.mockImplementation((subscriber: (event: WorkspaceEventsNotification) => void) => {
+      queueMicrotask(() => subscriber({ type: "open" }));
+      return () => {};
+    });
+    mocks.runtimeClient.getWorkspace.mockReturnValueOnce(initial.promise).mockResolvedValue(workspace);
+    render(MobileWorkspaceTerminal, { props });
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce());
+    expect(mocks.runtimeClient.getWorkspace).toHaveBeenCalledOnce();
+    initial.resolve({ ...workspace, enrichment_status: "pending" });
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspace).toHaveBeenCalledTimes(2));
+    expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce();
+  });
+
+  it("polls only details during setup and discovers runtime immediately when setup becomes ready", async () => {
+    const timeouts = vi.spyOn(globalThis, "setTimeout");
+    mocks.runtimeClient.getWorkspace.mockResolvedValue({ ...workspace, status: "creating" });
+    render(MobileWorkspaceTerminal, { props });
+    await screen.findByText("Setting up workspace…");
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce());
+    await waitFor(() => expect(timeouts.mock.calls.some(([, delay]) => delay === 5000)).toBe(true));
+    const poll = timeouts.mock.calls.find(([, delay]) => delay === 5000)?.[0];
+    if (typeof poll !== "function") throw new Error("missing readiness poll");
+    poll();
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspace).toHaveBeenCalledTimes(2));
+    expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce();
+    mocks.runtimeClient.getWorkspace.mockResolvedValue(workspace);
+    await waitFor(() => expect(timeouts.mock.calls.filter(([, delay]) => delay === 5000)).toHaveLength(2));
+    const nextPoll = timeouts.mock.calls.filter(([, delay]) => delay === 5000)[1]?.[0];
+    if (typeof nextPoll !== "function") throw new Error("missing second readiness poll");
+    nextPoll();
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("button", { name: "Terminal options" }).hasAttribute("disabled")).toBe(false);
+    timeouts.mockRestore();
+  });
+
+  it("uses one fresh queued-admission read after ready events while detail refresh is held", async () => {
+    const detail = Promise.withResolvers<typeof workspace>();
+    const admission = Promise.withResolvers<typeof runtime>();
+    let notify: ((event: WorkspaceEventsNotification) => void) | undefined;
+    events.subscribeWorkspaceEvents.mockImplementation((subscriber: typeof notify) => {
+      notify = subscriber;
+      return () => {};
+    });
+    mocks.runtimeClient.getWorkspace
+      .mockResolvedValueOnce({ ...workspace, status: "creating" })
+      .mockReturnValue(detail.promise);
+    mocks.runtimeClient.getWorkspaceRuntime
+      .mockReturnValueOnce(admission.promise)
+      .mockReturnValue(new Promise(() => {}));
+    mocks.runtimeClient.launchWorkspaceRuntimeSession.mockReturnValue(new Promise(() => {}));
+    queueWorkspaceLaunch("ws-a", "helper", undefined);
+    render(MobileWorkspaceTerminal, { props });
+    await screen.findByText("Setting up workspace…");
+    expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).not.toHaveBeenCalled();
+    await waitFor(() => expect(notify).toBeTypeOf("function"));
+    notify?.({ type: "workspace_status", payload: { id: "ws-a", status: "ready" } });
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce());
+    admission.resolve(runtime);
+    await waitFor(() => expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).toHaveBeenCalledOnce());
+    expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).toHaveBeenCalledWith(
+      { id: "ws-a" },
+      { target_key: "helper", display_region: "workflow" },
+      expect.anything(),
+    );
+    expect(mocks.runtimeClient.getWorkspaceRuntime).toHaveBeenCalledOnce();
+  });
+
+  it("waits for the owning Fleet host's readiness before queued launch", async () => {
+    const detail = Promise.withResolvers<typeof workspace>();
+    let notify: ((event: WorkspaceEventsNotification) => void) | undefined;
+    events.subscribeWorkspaceEvents.mockImplementation((subscriber: typeof notify) => {
+      notify = subscriber;
+      return () => {};
+    });
+    mocks.runtimeClient.getFleetWorkspace
+      .mockResolvedValueOnce({ ...workspace, status: "creating" })
+      .mockReturnValue(detail.promise);
+    mocks.runtimeClient.launchFleetWorkspaceRuntimeSession.mockReturnValue(new Promise(() => {}));
+    markWorkspaceIdDeleted("ws-a");
+    queueWorkspaceLaunch("ws-a", "helper", "peer-one");
+    render(MobileWorkspaceTerminal, { props: { ...props, hostKey: "peer-one" } });
+    await screen.findByText("Setting up workspace…");
+    await waitFor(() => expect(notify).toBeTypeOf("function"));
+    notify?.({ type: "workspace_status", payload: { id: "ws-a", status: "ready" } });
+    await waitFor(() => expect(mocks.runtimeClient.getFleetWorkspace).toHaveBeenCalledTimes(2));
+    expect(mocks.runtimeClient.launchFleetWorkspaceRuntimeSession).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Terminal options" }).hasAttribute("disabled")).toBe(true);
+    detail.resolve(workspace);
+    await waitFor(() => expect(mocks.runtimeClient.launchFleetWorkspaceRuntimeSession).toHaveBeenCalledOnce());
+    expect(mocks.runtimeClient.getFleetWorkspaceRuntime).toHaveBeenCalledOnce();
+    expect(mocks.runtimeClient.launchFleetWorkspaceRuntimeSession).toHaveBeenCalledWith(
+      { id: "ws-a", hostKey: "peer-one" },
+      { target_key: "helper", display_region: "workflow" },
+      expect.anything(),
+    );
+  });
+
+  it.each(["deleting", "deletion_failed"])("does not replace %s with a late ready event", async (status) => {
+    let notify: ((event: WorkspaceEventsNotification) => void) | undefined;
+    events.subscribeWorkspaceEvents.mockImplementation((subscriber: typeof notify) => {
+      notify = subscriber;
+      return () => {};
+    });
+    mocks.runtimeClient.getWorkspace
+      .mockResolvedValueOnce({ ...workspace, status })
+      .mockReturnValue(new Promise(() => {}));
+    queueWorkspaceLaunch("ws-a", "helper", undefined);
+    render(MobileWorkspaceTerminal, { props });
+    await screen.findByText(status === "deleting" ? "Deleting workspace…" : "Workspace deletion failed");
+    await waitFor(() => expect(notify).toBeTypeOf("function"));
+    notify?.({ type: "workspace_status", payload: { id: "ws-a", status: "ready" } });
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspace).toHaveBeenCalledTimes(2));
+    expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Terminal options" }).hasAttribute("disabled")).toBe(true);
+  });
+
+  it("opens an acknowledged chat after switching workspaces while the runtime read is held", async () => {
+    const view = render(MobileWorkspaceTerminal, { props });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Terminal options" }).hasAttribute("disabled")).toBe(false),
+    );
+    const held = Promise.withResolvers<typeof runtime>();
+    mocks.runtimeClient.getWorkspace.mockResolvedValue({ ...workspace, id: "ws-b" });
+    mocks.runtimeClient.getWorkspaceRuntime.mockReturnValue(held.promise);
+    const session: RuntimeSession = {
+      key: "chat-b",
+      workspace_id: "ws-b",
+      target_key: "chat",
+      label: "Chat agent",
+      kind: "acp",
+      display_region: "workflow",
+      status: "running",
+      created_at: workspace.created_at,
+    };
+    quickActionLaunches.set("ws-b", { targetKey: "chat", session });
+    await view.rerender({ ...props, workspaceId: "ws-b" });
+    expect(await screen.findByRole("button", { name: "Chat options" })).toBeTruthy();
+  });
+
+  it("keeps the next workspace terminal accessible while the previous workspace launch settles", async () => {
+    const session: RuntimeSession = {
+      key: "helper-a",
+      workspace_id: "ws-a",
+      target_key: "helper",
+      label: "Helper",
+      kind: "agent",
+      display_region: "workflow",
+      status: "running",
+      created_at: workspace.created_at,
+    };
+    const launch = Promise.withResolvers<RuntimeSession>();
+    mocks.runtimeClient.launchWorkspaceRuntimeSession.mockReturnValue(launch.promise);
+    queueWorkspaceLaunch("ws-a", "helper", undefined);
+    const view = render(MobileWorkspaceTerminal, { props });
+    await screen.findByText("Starting Helper…");
+    await waitFor(() => expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).toHaveBeenCalledOnce());
+
+    mocks.runtimeClient.getWorkspace.mockResolvedValue({ ...workspace, id: "ws-b" });
+    await view.rerender({ ...props, workspaceId: "ws-b" });
+    expect(await screen.findByRole("button", { name: "Open terminal composer" })).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Terminal options" }));
+    expect(screen.getByRole("button", { name: /^New terminal/ }).hasAttribute("disabled")).toBe(false);
+
+    launch.resolve(session);
+    await waitFor(() => expect(pendingWorkspaceLaunch("ws-a", undefined)?.phase).toBe("awaiting_session"));
+    expect(screen.getByRole("button", { name: "Open terminal composer" })).toBeTruthy();
+    expect(screen.queryByText("Starting Helper…")).toBeNull();
+  });
+
+  it("rechecks runtime for queued intent after returning to the same workspace", async () => {
+    const view = render(MobileWorkspaceTerminal, { props });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Terminal options" }).hasAttribute("disabled")).toBe(false),
+    );
+    const held = Promise.withResolvers<typeof runtime>();
+    mocks.runtimeClient.getWorkspace.mockResolvedValue({ ...workspace, id: "ws-b" });
+    await view.rerender({ ...props, workspaceId: "ws-b" });
+    await waitFor(() =>
+      expect(mocks.runtimeClient.getWorkspace).toHaveBeenCalledWith({ id: "ws-b" }, expect.anything()),
+    );
+    mocks.runtimeClient.getWorkspace.mockResolvedValue(workspace);
+    mocks.runtimeClient.getWorkspaceRuntime.mockReturnValue(held.promise);
+    mocks.runtimeClient.launchWorkspaceRuntimeSession.mockReturnValue(new Promise(() => {}));
+    queueWorkspaceLaunch("ws-a", "helper", undefined);
+    await view.rerender(props);
+    await waitFor(() => expect(mocks.runtimeClient.getWorkspace).toHaveBeenCalledTimes(3));
+    expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).not.toHaveBeenCalled();
+    held.resolve(runtime);
+    await waitFor(() => expect(mocks.runtimeClient.launchWorkspaceRuntimeSession).toHaveBeenCalledOnce());
   });
 
   it("returns to the workspace list without treating a lookup miss as deletion", async () => {

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +40,7 @@ func (s *Handler) buildFleetSnapshot(
 	role := fleet.RoleHub
 	aggregate := fleet.BuildNeutralAggregate(local, nil)
 	aggregateIncomplete := false
+	localProviderState := false
 
 	if fleetConfig.RoleOrDefault() == config.FleetRoleHub {
 		aggregate, err = s.buildHubAggregate(
@@ -48,6 +51,15 @@ func (s *Handler) buildFleetSnapshot(
 		}
 	} else {
 		role = fleet.RoleSpoke
+		var providerState sync.WaitGroup
+		var pulled []fleet.RawWorkspace
+		if fleetConfig.Enabled && fleetConfig.Hub != nil && s.federationActive {
+			workspaces := slices.Clone(local.Workspaces)
+			timeout := hubAggregateTimeout(fleetConfig.PeerTimeoutOrDefault())
+			providerState.Go(func() {
+				pulled, localProviderState = s.pullHubProviderState(ctx, workspaces, timeout)
+			})
+		}
 		if includePeers && fleetConfig.Enabled && fleetConfig.Hub != nil {
 			if !s.federationActive {
 				aggregateIncomplete = true
@@ -83,15 +95,42 @@ func (s *Handler) buildFleetSnapshot(
 				}
 			}
 		}
+		providerState.Wait()
+		if localProviderState {
+			local.Workspaces = pulled
+		}
 	}
 
 	snapshot := fleet.ProjectForObserver(
 		aggregate,
 		local,
-		fleet.Observer{NodeID: local.NodeID, Role: role},
+		fleet.Observer{
+			NodeID: local.NodeID, Role: role, LocalProviderState: localProviderState,
+		},
 	)
 	snapshot.AggregateIncomplete = aggregateIncomplete
 	return snapshot, nil
+}
+
+// pullHubProviderState asks the hub for the provider state of this spoke's own
+// workspaces. The hub may be unable to reach the spoke, so the spoke cannot
+// rely on the hub's aggregate to carry that state. It runs alongside the
+// aggregate fetch within the same budget; on failure the caller falls back to
+// whatever state the aggregate carries.
+func (s *Handler) pullHubProviderState(
+	ctx context.Context, workspaces []fleet.RawWorkspace, timeout time.Duration,
+) ([]fleet.RawWorkspace, bool) {
+	if s.workspaceProviderState == nil {
+		return nil, false
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	enriched, err := s.workspaceProviderState(ctx, workspaces)
+	if err != nil {
+		slog.Warn("load hub provider state for local workspaces", "err", err)
+		return nil, false
+	}
+	return enriched, true
 }
 
 func hubAggregateTimeout(memberTimeout time.Duration) time.Duration {
@@ -104,13 +143,33 @@ func (s *Handler) buildHubAggregate(
 	includeMembers bool,
 	memberTimeout time.Duration,
 ) (fleet.NeutralSnapshot, error) {
-	fleetConfig := s.configSnapshot().Fleet
 	var results []fleet.PeerResult
-	if includeMembers && fleetConfig.Enabled && len(fleetConfig.Members) > 0 {
-		results = s.fetchMemberResults(ctx, fleetConfig, memberTimeout)
+	if includeMembers {
+		results = s.fetchPeerResults(ctx, s.configSnapshot().Fleet, memberTimeout)
 	}
 	aggregate := fleet.BuildNeutralAggregate(local, results)
 	return fleet.EnrichProviderState(ctx, s.db, aggregate)
+}
+
+// fetchPeerResults fans out to enrolled members and execution targets.
+func (s *Handler) fetchPeerResults(
+	ctx context.Context,
+	fleetConfig config.Fleet,
+	memberTimeout time.Duration,
+) []fleet.PeerResult {
+	var results []fleet.PeerResult
+	var members sync.WaitGroup
+	if fleetConfig.Enabled && len(fleetConfig.Members) > 0 {
+		members.Go(func() {
+			results = s.fetchMemberResults(ctx, fleetConfig, memberTimeout)
+		})
+	}
+	var targets []fleet.PeerResult
+	if s.executionTargets != nil {
+		targets = s.executionTargets(ctx, memberTimeout)
+	}
+	members.Wait()
+	return append(results, targets...)
 }
 
 // fetchMemberResults fans out to each active member's raw endpoint.
@@ -119,9 +178,15 @@ func (s *Handler) fetchMemberResults(
 	fleetConfig config.Fleet,
 	timeout time.Duration,
 ) []fleet.PeerResult {
-	results := make([]fleet.PeerResult, len(fleetConfig.Members))
+	members := make([]config.FleetMember, 0, len(fleetConfig.Members))
+	for _, member := range fleetConfig.Members {
+		if !member.OutboundDisabled {
+			members = append(members, member)
+		}
+	}
+	results := make([]fleet.PeerResult, len(members))
 	var wait sync.WaitGroup
-	for index, member := range fleetConfig.Members {
+	for index, member := range members {
 		wait.Add(1)
 		go func(index int, member config.FleetMember) {
 			defer wait.Done()
@@ -201,7 +266,7 @@ func (s *Handler) fetchHubAggregate(
 	}
 	target, ok := s.resolveEnrolledMember(member)
 	if !ok {
-		return fleet.NeutralSnapshot{}, fmt.Errorf("federation credential unavailable")
+		return fleet.NeutralSnapshot{}, errors.New("federation credential unavailable")
 	}
 	var aggregate fleet.NeutralSnapshot
 	request, err := generated.NewGetSnapshotAggregateRequest(ctx, target.member.BaseURL+"/api/v1", &generated.GetSnapshotAggregateRequestOptions{Query: &generated.GetSnapshotAggregateQuery{MemberTimeout: new(memberTimeout.String())}})
@@ -220,9 +285,7 @@ func (s *Handler) fetchHubAggregate(
 		)
 	}
 	if !neutralSnapshotContainsNode(aggregate, fleet.NodeID(hub.NodeID)) {
-		return fleet.NeutralSnapshot{}, fmt.Errorf(
-			"hub aggregate does not contain its enrolled node ID",
-		)
+		return fleet.NeutralSnapshot{}, errors.New("hub aggregate does not contain its enrolled node ID")
 	}
 	return aggregate, nil
 }
@@ -254,7 +317,7 @@ func (s *Handler) fetchFederationJSON(
 		return fmt.Errorf("read federation snapshot: %w", err)
 	}
 	if len(body) > maxFederationSnapshotBytes {
-		return fmt.Errorf("federation snapshot exceeds response limit")
+		return errors.New("federation snapshot exceeds response limit")
 	}
 	if err := json.Unmarshal(body, destination); err != nil {
 		return fmt.Errorf("decode federation snapshot: %w", err)

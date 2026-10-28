@@ -1,9 +1,11 @@
 import {
   buildRoutedItemRoute,
+  parseWorklistSelection,
   type IssueRouteRef,
   type NumberedRouteItemRef,
   type RepositoryRouteRef,
   type RoutedItemRef,
+  type WorklistItemSelection,
 } from "../routes.js";
 import { canonicalProvider } from "../api/provider-routes.js";
 
@@ -12,7 +14,9 @@ export type NumberedItemRef = NumberedRouteItemRef;
 export type HostedItemRef = IssueRouteRef;
 export type RoutableItemRef = RoutedItemRef;
 
-export type Route =
+export type Route = RoutePage & { commentAnchor?: string };
+
+type RoutePage =
   | { page: "activity" }
   | { page: "actions" }
   | { page: "mobile-activity" }
@@ -49,6 +53,13 @@ export type Route =
     }
   | { page: "workspaces" }
   | {
+      page: "worklists";
+      worklistId: number | null;
+      selected?: WorklistItemSelection;
+      // The fragment of a worklist link opened at /worklists/import.
+      importFragment?: string;
+    }
+  | {
       page: "pulls";
       view: "list";
       selected?: NumberedItemRef;
@@ -64,7 +75,6 @@ export type Route =
   | ({ page: "focus" } & IssueRouteRef & { itemType: "issue" })
   | { page: "focus"; itemType: "mrs"; repo?: string }
   | { page: "focus"; itemType: "issues"; repo?: string }
-  | { page: "reviews"; jobId?: number }
   | { page: "project-intake"; hostKey?: string }
   | { page: "terminal"; workspaceId: string; hostKey?: string };
 
@@ -86,11 +96,13 @@ export function withBasePath(path: string): string {
   return basePrefix + path;
 }
 
+// Trailing slashes never change the route: "/base", "/base/", "/base?x" and
+// "/base#x" all map to the app root.
 function stripBase(path: string): string {
-  if (basePrefix && path.startsWith(basePrefix)) {
-    return path.slice(basePrefix.length) || "/";
-  }
-  return path;
+  if (!basePrefix || !path.startsWith(basePrefix)) return path;
+  const rest = path.slice(basePrefix.length);
+  if (rest === "" || rest.startsWith("?") || rest.startsWith("#")) return `/${rest}`;
+  return rest.startsWith("/") ? rest : path;
 }
 
 function currentLocationPath(): string {
@@ -181,6 +193,21 @@ function splitRepoPath(repoPath: string): { owner: string; name: string } | unde
 }
 
 function parseRoute(fullPath: string): Route {
+  const parsed = parseRoutePage(fullPath);
+  const hash = fullPath.indexOf("#");
+  const anchor = hash >= 0 ? decodeRouteHash(fullPath.slice(hash + 1)) : undefined;
+  if (anchor && /^(?:issuecomment-|discussion_r|pullrequestreview-)\d+$/.test(anchor)) {
+    if ((parsed.page === "pulls" || parsed.page === "issues") && parsed.selected) {
+      return { ...parsed, commentAnchor: anchor };
+    }
+    if (parsed.page === "focus" && (parsed.itemType === "pr" || parsed.itemType === "issue")) {
+      return { ...parsed, commentAnchor: anchor };
+    }
+  }
+  return parsed;
+}
+
+function parseRoutePage(fullPath: string): RoutePage {
   const hashIdx = fullPath.indexOf("#");
   const routePath = hashIdx >= 0 ? fullPath.slice(0, hashIdx) : fullPath;
   const anchor = hashIdx >= 0 ? decodeRouteHash(fullPath.slice(hashIdx + 1)) : undefined;
@@ -349,16 +376,6 @@ function parseRoute(fullPath: string): Route {
       };
     }
   }
-  const reviewsMatch = path.match(/^\/reviews(?:\/(\d+))?$/);
-  if (reviewsMatch) {
-    if (reviewsMatch[1]) {
-      return {
-        page: "reviews",
-        jobId: parseInt(reviewsMatch[1], 10),
-      };
-    }
-    return { page: "reviews" };
-  }
   if (path === "/project-intake") {
     const sp = new URLSearchParams(search);
     const hostKey = emptyToNull(sp.get("host"));
@@ -385,6 +402,14 @@ function parseRoute(fullPath: string): Route {
   if (path === "/workspaces" || path.startsWith("/workspaces/")) {
     return { page: "workspaces" };
   }
+  if (path === "/worklists") return { page: "worklists", worklistId: null };
+  if (path === "/worklists/import") return { page: "worklists", worklistId: null, importFragment: anchor ?? "" };
+  const worklistMatch = path.match(/^\/worklists\/([1-9]\d*)$/);
+  if (worklistMatch) {
+    const selected = parseWorklistSelection(search);
+    return { page: "worklists", worklistId: parseInt(worklistMatch[1]!, 10), ...(selected && { selected }) };
+  }
+  if (path.startsWith("/worklists/")) return { page: "worklists", worklistId: null };
   return { page: "activity" };
 }
 
@@ -535,13 +560,35 @@ function rememberWorkspaceRoute(): void {
 // Seed the cache when the app loads directly on a workspace URL.
 rememberWorkspaceRoute();
 
+function nativeHistoryState(data: unknown, url?: string | URL | null): unknown {
+  if (!window.ReactNativeWebView) return data;
+  // Android's loadDataWithBaseURL restores entry state but not pushState URLs.
+  return {
+    ...(typeof data === "object" && data !== null ? data : {}),
+    __forgeURL: new URL(url ?? window.location.href, window.location.href).href,
+  };
+}
+
+// Counts every URL change the router observes, including a return to an
+// earlier URL, so async work started by a click can tell whether the user has
+// moved on since. A replaceState write that leaves the URL as it was does not
+// count.
+let urlChangeCount = 0;
+
+export function getURLChangeCount(): number {
+  return urlChangeCount;
+}
+
 if (typeof window !== "undefined") {
   const originalReplaceState = history.replaceState.bind(history);
   history.replaceState = ((data: unknown, unused: string, url?: string | URL | null) => {
-    originalReplaceState(data, unused, url);
+    const before = window.location.href;
+    originalReplaceState(nativeHistoryState(data, url), unused, url);
+    if (window.location.href !== before) urlChangeCount += 1;
     rememberActivityRoute();
     rememberWorkspaceRoute();
   }) as History["replaceState"];
+  if (window.ReactNativeWebView) history.replaceState(history.state, "", window.location.href);
 }
 
 export function getRoute(): Route {
@@ -565,7 +612,8 @@ export function navigate(path: string, state?: Record<string, unknown>): void {
   rememberActivityRoute();
   rememberWorkspaceRoute();
   const fullPath = basePrefix + path;
-  history.pushState(state ?? null, "", fullPath);
+  urlChangeCount += 1;
+  history.pushState(nativeHistoryState(state ?? null, fullPath), "", fullPath);
   route = parseRoute(fullPath);
   restoreMissingActivityFilters();
   // Record the workspace destination too: leaving it via browser
@@ -631,6 +679,10 @@ export function replaceUrl(path: string, state?: Record<string, unknown>): void 
 // Listen for browser back/forward.
 if (typeof window !== "undefined") {
   window.addEventListener("popstate", () => {
+    urlChangeCount += 1;
+    if (window.ReactNativeWebView && typeof history.state?.__forgeURL === "string") {
+      history.replaceState(history.state, "", history.state.__forgeURL);
+    }
     route = parseRoute(currentLocationPath());
     restoreMissingActivityFilters();
     rememberActivityRoute();
@@ -679,4 +731,35 @@ export function setTab(t: Tab): void {
 
 export function isDiffView(): boolean {
   return getDetailTab() === "files";
+}
+
+// Return the route object as the request identity: opening the same URL again
+// is a new navigation, while a background discussion refresh is not.
+export function getCommentNavigation(item: {
+  provider?: string | undefined;
+  platformHost?: string | undefined;
+  repoPath?: string | undefined;
+  number?: number | undefined;
+  itemType?: "pull" | "issue" | undefined;
+}): (Route & { commentAnchor: string }) | null {
+  const current = getRoute();
+  if (!current.commentAnchor || canonicalProvider(item.provider ?? "") !== "github") return null;
+  const selected =
+    current.page === "pulls" || current.page === "issues"
+      ? current.selected
+      : current.page === "focus" && (current.itemType === "pr" || current.itemType === "issue")
+        ? current
+        : undefined;
+  const kind = current.page === "pulls" || (current.page === "focus" && current.itemType === "pr") ? "pull" : "issue";
+  if (
+    !selected ||
+    kind !== item.itemType ||
+    canonicalProvider(selected.provider) !== "github" ||
+    selected.platformHost !== (item.platformHost ?? "github.com") ||
+    selected.repoPath !== item.repoPath ||
+    selected.number !== item.number ||
+    ("tab" in current && current.tab === "files")
+  )
+    return null;
+  return current as Route & { commentAnchor: string };
 }

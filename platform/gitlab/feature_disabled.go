@@ -5,7 +5,7 @@ import (
 	"errors"
 	"net/http"
 
-	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
+	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 	"go.kenn.io/forge/platform"
 )
 
@@ -48,8 +48,8 @@ func (c *Client) classifyRepositoryFeatureError(
 		return c.mapGitLabError(capability, err), false
 	}
 
-	var responseErr *gitlab.ErrorResponse
-	if !errors.As(err, &responseErr) || responseErr == nil ||
+	responseErr, ok := errors.AsType[*gitlab.ErrorResponse](err)
+	if !ok || responseErr == nil ||
 		(!responseErr.HasStatusCode(http.StatusForbidden) &&
 			!responseErr.HasStatusCode(http.StatusNotFound) &&
 			!responseErr.HasStatusCode(http.StatusGone)) {

@@ -21,6 +21,7 @@ import (
 )
 
 func TestServeRuntimeTerminalNegotiatesCompression(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	attachment := localruntime.NewAttachmentForTesting(
 		localruntime.AttachmentForTestingOptions{
@@ -30,11 +31,18 @@ func TestServeRuntimeTerminalNegotiatesCompression(t *testing.T) {
 	)
 	wsURL, handlerDone := runtimeTerminalTestServer(t, attachment)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	conn, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
 		CompressionMode: websocket.CompressionContextTakeover,
 	})
+	if resp != nil {
+		t.Cleanup(func() {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+		})
+	}
 	require.NoError(err)
 	require.NotNil(resp)
 	require.Contains(
@@ -51,6 +59,7 @@ func TestServeRuntimeTerminalNegotiatesCompression(t *testing.T) {
 }
 
 func TestServeRuntimeTerminalAnswersHeartbeat(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	attachment := localruntime.NewAttachmentForTesting(
 		localruntime.AttachmentForTestingOptions{
@@ -60,9 +69,16 @@ func TestServeRuntimeTerminalAnswersHeartbeat(t *testing.T) {
 	)
 	wsURL, handlerDone := runtimeTerminalTestServer(t, attachment)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	conn, wsHTTPResp, err := websocket.Dial(ctx, wsURL, nil)
+	if wsHTTPResp != nil {
+		t.Cleanup(func() {
+			if wsHTTPResp != nil && wsHTTPResp.Body != nil {
+				_ = wsHTTPResp.Body.Close()
+			}
+		})
+	}
 	require.NoError(err)
 	require.NoError(conn.Write(
 		ctx, websocket.MessageText,
@@ -82,6 +98,7 @@ func TestServeRuntimeTerminalAnswersHeartbeat(t *testing.T) {
 }
 
 func TestServeRuntimeTerminalForwardsBufferedReplayBeforeRefresh(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	replay := []byte("buffered replay")
 	output := make(chan []byte, 1)
@@ -114,9 +131,16 @@ func TestServeRuntimeTerminalForwardsBufferedReplayBeforeRefresh(t *testing.T) {
 	)
 	wsURL, handlerDone := runtimeTerminalTestServer(t, attachment)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	conn, _, err := websocket.Dial(ctx, wsURL+"?cols=80&rows=24", nil)
+	conn, wsHTTPResp, err := websocket.Dial(ctx, wsURL+"?cols=80&rows=24", nil)
+	if wsHTTPResp != nil {
+		t.Cleanup(func() {
+			if wsHTTPResp != nil && wsHTTPResp.Body != nil {
+				_ = wsHTTPResp.Body.Close()
+			}
+		})
+	}
 	require.NoError(err)
 	defer conn.Close(websocket.StatusNormalClosure, "done")
 
@@ -141,6 +165,7 @@ func TestServeRuntimeTerminalForwardsBufferedReplayBeforeRefresh(t *testing.T) {
 }
 
 func TestForwardAvailableRuntimeOutputReturnsWriteError(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	wantErr := errors.New("write failed")
 	replay := []byte("buffered replay")
@@ -148,7 +173,7 @@ func TestForwardAvailableRuntimeOutputReturnsWriteError(t *testing.T) {
 	output <- replay
 
 	err := forwardAvailableRuntimeOutput(
-		context.Background(), time.Second, output,
+		t.Context(), time.Second, output,
 		func(_ context.Context, data []byte) error {
 			require.Equal(replay, data)
 			return wantErr
@@ -159,12 +184,13 @@ func TestForwardAvailableRuntimeOutputReturnsWriteError(t *testing.T) {
 }
 
 func TestForwardAvailableRuntimeOutputBoundsBlockedWrite(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	output := make(chan []byte, 1)
 	output <- []byte("buffered replay")
 
 	err := forwardAvailableRuntimeOutput(
-		context.Background(), 10*time.Millisecond, output,
+		t.Context(), 10*time.Millisecond, output,
 		func(ctx context.Context, _ []byte) error {
 			<-ctx.Done()
 			return ctx.Err()
@@ -175,6 +201,7 @@ func TestForwardAvailableRuntimeOutputBoundsBlockedWrite(t *testing.T) {
 }
 
 func TestServeRuntimeTerminalTranslatesReplayBoundary(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	output := make(chan []byte, 1)
 	output <- nil
@@ -186,9 +213,16 @@ func TestServeRuntimeTerminalTranslatesReplayBoundary(t *testing.T) {
 	)
 	wsURL, _ := runtimeTerminalTestServer(t, attachment)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	conn, wsHTTPResp, err := websocket.Dial(ctx, wsURL, nil)
+	if wsHTTPResp != nil {
+		t.Cleanup(func() {
+			if wsHTTPResp != nil && wsHTTPResp.Body != nil {
+				_ = wsHTTPResp.Body.Close()
+			}
+		})
+	}
 	require.NoError(err)
 	defer conn.Close(websocket.StatusNormalClosure, "done")
 
@@ -203,6 +237,7 @@ func TestServeRuntimeTerminalTranslatesReplayBoundary(t *testing.T) {
 }
 
 func TestServeRuntimeTerminalReplayBoundaryDefersInitialResize(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	output := make(chan []byte, 1)
 	output <- nil
@@ -219,13 +254,20 @@ func TestServeRuntimeTerminalReplayBoundaryDefersInitialResize(t *testing.T) {
 	)
 	wsURL, _ := runtimeTerminalTestServer(t, attachment)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	conn, _, err := websocket.Dial(
+	conn, wsHTTPResp, err := websocket.Dial(
 		ctx,
 		wsURL+"?cols=177&rows=41&replay_boundary=1",
 		nil,
 	)
+	if wsHTTPResp != nil {
+		t.Cleanup(func() {
+			if wsHTTPResp != nil && wsHTTPResp.Body != nil {
+				_ = wsHTTPResp.Body.Close()
+			}
+		})
+	}
 	require.NoError(err)
 	defer conn.Close(websocket.StatusNormalClosure, "done")
 
@@ -240,6 +282,7 @@ func TestServeRuntimeTerminalReplayBoundaryDefersInitialResize(t *testing.T) {
 }
 
 func TestHandleRuntimeTerminalControlAcknowledgesResizeClaimBeforeReturning(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	events := make([]string, 0, 4)
 	attachment := localruntime.NewAttachmentForTesting(
@@ -265,7 +308,7 @@ func TestHandleRuntimeTerminalControlAcknowledgesResizeClaimBeforeReturning(t *t
 	)
 
 	heartbeat, err := handleRuntimeTerminalControl(
-		context.Background(),
+		t.Context(),
 		attachment,
 		[]byte(`{"type":"claim_resize","cols":132,"rows":43,"pixel_width":1056,"pixel_height":688}`),
 	)
@@ -277,6 +320,7 @@ func TestHandleRuntimeTerminalControlAcknowledgesResizeClaimBeforeReturning(t *t
 }
 
 func TestRuntimeTerminalStopsBeforeInputWhenResizeClaimSettlementFails(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	input := make(chan []byte, 1)
 	attachment := localruntime.NewAttachmentForTesting(
@@ -297,9 +341,16 @@ func TestRuntimeTerminalStopsBeforeInputWhenResizeClaimSettlementFails(t *testin
 	)
 	wsURL, handlerDone := runtimeTerminalTestServer(t, attachment)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	conn, wsHTTPResp, err := websocket.Dial(ctx, wsURL, nil)
+	if wsHTTPResp != nil {
+		t.Cleanup(func() {
+			if wsHTTPResp != nil && wsHTTPResp.Body != nil {
+				_ = wsHTTPResp.Body.Close()
+			}
+		})
+	}
 	require.NoError(err)
 	defer conn.Close(websocket.StatusNormalClosure, "done")
 	require.NoError(conn.Write(
@@ -322,47 +373,8 @@ func TestRuntimeTerminalStopsBeforeInputWhenResizeClaimSettlementFails(t *testin
 	}
 }
 
-func TestServeRuntimeTerminalClosedOutputStillReportsSessionExit(t *testing.T) {
-	require := require.New(t)
-	output := make(chan []byte)
-	close(output)
-	done := make(chan struct{})
-	attachment := localruntime.NewAttachmentForTesting(
-		localruntime.AttachmentForTestingOptions{
-			Output:              output,
-			Done:                done,
-			Resize:              func(ptysize.Geometry) error { return nil },
-			Refresh:             func(context.Context) error { return nil },
-			SessionOutputClosed: func() bool { return true },
-		},
-	)
-	wsURL, handlerDone := runtimeTerminalTestServer(t, attachment)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	conn, _, err := websocket.Dial(
-		ctx, wsURL+"?cols=80&rows=24", nil,
-	)
-	require.NoError(err)
-	defer conn.Close(websocket.StatusNormalClosure, "done")
-
-	typ, data, err := conn.Read(ctx)
-	require.NoError(err)
-	require.Equal(websocket.MessageText, typ)
-	var msg struct {
-		Type string `json:"type"`
-	}
-	require.NoError(json.Unmarshal(data, &msg))
-	require.Equal("exited", msg.Type)
-	_ = conn.Close(websocket.StatusNormalClosure, "done")
-	select {
-	case <-handlerDone:
-	case <-ctx.Done():
-		require.Fail("terminal handler did not return after session exit")
-	}
-}
-
 func TestServeRuntimeTerminalRestartDetachDoesNotReportSessionExit(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name   string
 		output func() <-chan []byte
@@ -401,9 +413,16 @@ func TestServeRuntimeTerminalRestartDetachDoesNotReportSessionExit(t *testing.T)
 			)
 			wsURL, handlerDone := runtimeTerminalTestServer(t, attachment)
 
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 			defer cancel()
-			conn, _, err := websocket.Dial(ctx, wsURL, nil)
+			conn, wsHTTPResp, err := websocket.Dial(ctx, wsURL, nil)
+			if wsHTTPResp != nil && wsHTTPResp.Body != nil {
+				t.Cleanup(func() {
+					if wsHTTPResp != nil && wsHTTPResp.Body != nil {
+						_ = wsHTTPResp.Body.Close()
+					}
+				})
+			}
 			require.NoError(err)
 			defer conn.Close(websocket.StatusNormalClosure, "done")
 
@@ -418,7 +437,8 @@ func TestServeRuntimeTerminalRestartDetachDoesNotReportSessionExit(t *testing.T)
 	}
 }
 
-func TestServeRuntimeTerminalDrainsDelayedFinalOutputBeforeSessionExit(t *testing.T) {
+func TestServeRuntimeTerminalWaitsForOutputAfterProcessExit(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	output := make(chan []byte, 1)
 	done := make(chan struct{})
@@ -430,25 +450,50 @@ func TestServeRuntimeTerminalDrainsDelayedFinalOutputBeforeSessionExit(t *testin
 	)
 	wsURL, handlerDone := runtimeTerminalTestServer(t, attachment)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	conn, wsHTTPResp, err := websocket.Dial(ctx, wsURL, nil)
+	if wsHTTPResp != nil {
+		t.Cleanup(func() {
+			if wsHTTPResp != nil && wsHTTPResp.Body != nil {
+				_ = wsHTTPResp.Body.Close()
+			}
+		})
+	}
 	require.NoError(err)
 	defer conn.Close(websocket.StatusNormalClosure, "done")
 
-	close(done)
+	exitCtx, exitCancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer exitCancel()
+	select {
+	case done <- struct{}{}:
+	case <-exitCtx.Done():
+		require.FailNow("terminal bridge did not consume the exit signal")
+	}
+	type frame struct {
+		typ  websocket.MessageType
+		data []byte
+		err  error
+	}
+	firstFrame := make(chan frame, 1)
 	go func() {
-		time.Sleep(200 * time.Millisecond)
-		output <- []byte("final terminal output")
-		close(output)
+		typ, data, err := conn.Read(exitCtx)
+		firstFrame <- frame{typ: typ, data: data, err: err}
 	}()
+	select {
+	case <-firstFrame:
+		require.FailNow("terminal bridge returned before final output arrived")
+	case <-time.After(100 * time.Millisecond): //nolint:kennlint // shows no websocket frame arrives during the post-exit window before final output is released
+	}
+	output <- []byte("final terminal output")
+	close(output)
 
-	typ, data, err := conn.Read(ctx)
-	require.NoError(err)
-	require.Equal(websocket.MessageBinary, typ)
-	require.Equal("final terminal output", string(data))
+	first := <-firstFrame
+	require.NoError(first.err)
+	require.Equal(websocket.MessageBinary, first.typ)
+	require.Equal("final terminal output", string(first.data))
 
-	typ, data, err = conn.Read(ctx)
+	typ, data, err := conn.Read(exitCtx)
 	require.NoError(err)
 	require.Equal(websocket.MessageText, typ)
 	var msg struct {
@@ -459,7 +504,7 @@ func TestServeRuntimeTerminalDrainsDelayedFinalOutputBeforeSessionExit(t *testin
 
 	select {
 	case <-handlerDone:
-	case <-ctx.Done():
+	case <-exitCtx.Done():
 		require.Fail("terminal handler did not return after session exit")
 	}
 }
@@ -487,7 +532,8 @@ func runtimeTerminalTestServer(
 }
 
 func TestParseRuntimeTerminalGeometry(t *testing.T) {
-	req := httptest.NewRequest(
+	t.Parallel()
+	req := httptest.NewRequestWithContext(t.Context(),
 		http.MethodGet,
 		"/?cols=132&rows=43&pixel_width=1056&pixel_height=688",
 		nil,

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { TabbedPanelLeaf } from "../shared/tabbed-panel-layout.js";
   import SlidersHorizontalIcon from "@lucide/svelte/icons/sliders-horizontal";
   import { autoReposition, floatingPopoverStyle } from "@kenn-io/kit-ui";
   import { Effect } from "effect";
@@ -9,6 +10,7 @@
   import {
     hostedWorkspaceControls,
     workspaceControlsBusy,
+    type HostedWorkspaceControls,
   } from "../../stores/workspace-host.svelte.ts";
 
   interface Props {
@@ -21,15 +23,19 @@
      * the leaf holding the workspace pane itself.
      */
     showStripActions?: boolean;
+    leaf?: TabbedPanelLeaf | undefined;
+    controls?: HostedWorkspaceControls | null;
+    busy?: boolean;
   }
 
-  const { showStripActions = true }: Props = $props();
+  const { showStripActions = true, leaf, controls: providedControls, busy: providedBusy }: Props = $props();
   const runtime = getAppRuntime();
 
   // One button in a pane's tab strip, replacing the three bars that used to stack
   // above an embedded terminal. The contents come from the live view, which owns
   // every piece of state they act on.
-  const controls = $derived(hostedWorkspaceControls());
+  const controls = $derived(providedControls === undefined ? hostedWorkspaceControls() : providedControls);
+  const busy = $derived(providedBusy ?? workspaceControlsBusy());
 
   let open = $state(false);
   let triggerEl = $state<HTMLButtonElement | null>(null);
@@ -55,7 +61,7 @@
       if (triggerEl?.contains(event.target as Node) || panelEl?.contains(event.target as Node)) return;
       // A control with a write in flight owns its own pending feedback; dismissing
       // the popover under it would unmount that feedback mid-save.
-      if (workspaceControlsBusy()) return;
+      if (busy) return;
       close();
     }
     function onKeydown(event: KeyboardEvent): void {
@@ -64,7 +70,7 @@
       // owns Escape through the modal stack, and its handler runs after this one,
       // so the stack depth is the signal to stand down.
       if (getStackDepth() > 0) return;
-      if (workspaceControlsBusy()) return;
+      if (busy) return;
       close();
       triggerEl?.focus();
     }
@@ -147,7 +153,7 @@
 
 {#if controls}
   <div class="workspace-pane-controls">
-    {@render controls.paneActions?.()}
+    {@render controls.paneActions?.(leaf)}
     {#if showStripActions}
       {@render controls.stripActions?.()}
     {/if}

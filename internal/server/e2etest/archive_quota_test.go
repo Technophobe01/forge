@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,7 +19,10 @@ import (
 	"go.kenn.io/forge/internal/db"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
+	"go.kenn.io/forge/internal/testutil"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/testutil/servertest"
 	"go.kenn.io/forge/platform"
 )
@@ -54,6 +58,7 @@ func (s archiveQuotaBurstSource) SyncArchiveItem(
 }
 
 func TestArchiveAPIStopsProviderBurstAtObservedQuotaHeadroomE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	now := time.Now().UTC()
@@ -66,8 +71,8 @@ func TestArchiveAPIStopsProviderBurstAtObservedQuotaHeadroomE2E(t *testing.T) {
 		remaining := upstreamRemaining.Add(-2)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-RateLimit-Limit", "5000")
-		w.Header().Set("X-RateLimit-Remaining", fmt.Sprint(remaining))
-		w.Header().Set("X-RateLimit-Reset", fmt.Sprint(reset.Unix()))
+		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(int(remaining)))
+		w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(reset.Unix(), 10))
 		_, _ = fmt.Fprintf(w, `{
 			"id": %d,
 			"number": 1,
@@ -103,12 +108,12 @@ func TestArchiveAPIStopsProviderBurstAtObservedQuotaHeadroomE2E(t *testing.T) {
 	syncRef := ghclient.RepoRef{
 		Platform: platform.KindGitHub, PlatformHost: "github.com",
 		Owner: "acme", Name: "widget", RepoPath: "acme/widget",
-		PlatformExternalID: "repo-acme-widget",
+		Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")),
 	}
 	ref := platform.RepoRef{
 		Platform: platform.KindGitHub, Host: "github.com",
 		Owner: "acme", Name: "widget", RepoPath: "acme/widget",
-		PlatformExternalID: "repo-acme-widget",
+		Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")),
 	}
 	syncer := ghclient.NewSyncerWithRegistry(
 		registry,
@@ -140,6 +145,8 @@ func TestArchiveAPIStopsProviderBurstAtObservedQuotaHeadroomE2E(t *testing.T) {
 	archiveService, err := archive.NewService(
 		database, registry, syncer, source, nil, nil,
 	)
+	require.NoError(err)
+	_, err = reposeed.Seed(t.Context(), database, platformdb.DBRepoIdentity(ref))
 	require.NoError(err)
 	requireEnsureConfigured(t, archiveService, []platform.RepoRef{ref})
 	srv := servertest.New(t, database, syncer, nil, "/", nil, server.ServerOptions{
@@ -184,8 +191,11 @@ func TestArchiveAPIStopsProviderBurstAtObservedQuotaHeadroomE2E(t *testing.T) {
 		Exhausted:      true, Coverage: db.ArchiveCoverageSupported, Now: now,
 	}))
 
-	runErr := archiveService.RunEligible(t.Context())
-	require.ErrorIs(runErr, platform.ErrArchiveAttemptBudget)
+	// Exhausting admitted capacity is a normal wait, while the transport
+	// must still refuse the next upstream attempt.
+	worked, err := archiveService.RunPass(t.Context())
+	require.NoError(err)
+	assert.True(worked, "the completed provider request must prevent idle backoff")
 	assert.Equal(int32(1), upstreamCalls.Load())
 	// Provider-reserved attempts are metered by the quota registry, not the
 	// local sync budget.
@@ -197,7 +207,12 @@ func TestArchiveAPIStopsProviderBurstAtObservedQuotaHeadroomE2E(t *testing.T) {
 		t.Context(), repo.ID, db.ArchiveItemTypeIssue, 1, db.ArchiveDatasetLookup,
 	)
 	require.NoError(err)
-	assert.Equal(db.ArchiveDatasetProgressFailed, progress.Status)
+	assert.Equal(db.ArchiveDatasetProgressPending, progress.Status)
+	assert.Zero(progress.AttemptCount)
+	require.NotNil(progress.NextRetryAt)
+	assert.True(progress.NextRetryAt.After(now))
+	require.NotNil(progress.LastErrorCode)
+	assert.Equal(string(db.ArchiveErrorCodeBudgetExhausted), *progress.LastErrorCode)
 }
 
 // A large pool sitting at its own limit/5 reserve must stop hydration end to
@@ -205,6 +220,7 @@ func TestArchiveAPIStopsProviderBurstAtObservedQuotaHeadroomE2E(t *testing.T) {
 // transport — even though the smallest pool still has headroom, and the
 // persisted deferral must retry when that deficient pool resets.
 func TestArchiveAPIDefersHydrationAtLargerPoolReserveE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	now := time.Now().UTC()
@@ -239,12 +255,12 @@ func TestArchiveAPIDefersHydrationAtLargerPoolReserveE2E(t *testing.T) {
 	syncRef := ghclient.RepoRef{
 		Platform: platform.KindGitHub, PlatformHost: "github.com",
 		Owner: "acme", Name: "widget", RepoPath: "acme/widget",
-		PlatformExternalID: "repo-acme-widget",
+		Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")),
 	}
 	ref := platform.RepoRef{
 		Platform: platform.KindGitHub, Host: "github.com",
 		Owner: "acme", Name: "widget", RepoPath: "acme/widget",
-		PlatformExternalID: "repo-acme-widget",
+		Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")),
 	}
 	syncer := ghclient.NewSyncerWithRegistry(
 		registry,
@@ -278,6 +294,8 @@ func TestArchiveAPIDefersHydrationAtLargerPoolReserveE2E(t *testing.T) {
 	archiveService, err := archive.NewService(
 		database, registry, syncer, source, nil, nil,
 	)
+	require.NoError(err)
+	_, err = reposeed.Seed(t.Context(), database, platformdb.DBRepoIdentity(ref))
 	require.NoError(err)
 	requireEnsureConfigured(t, archiveService, []platform.RepoRef{ref})
 	srv := servertest.New(t, database, syncer, nil, "/", nil, server.ServerOptions{

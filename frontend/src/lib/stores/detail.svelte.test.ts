@@ -107,7 +107,7 @@ function pullDetail(headSHA: string): PullDetail {
       provider: "github",
       platform_host: "github.com",
       repo_path: "acme/widget",
-      platform_repo_id: "widget-repo-id",
+      platform_repo_id: 1001,
     },
     events: [],
     detail_loaded: true,
@@ -160,6 +160,253 @@ function mockClient(overrides: Partial<GeneratedClient> = {}): GeneratedClient {
 }
 
 describe("createDetailStore", () => {
+  it("does not install a response from a different repository", async () => {
+    const store = createDetailStore({
+      client: mockClient({ GET: vi.fn().mockResolvedValue({ data: pullDetail("old-head") }) }),
+    });
+    await loadDetail(store, "acme", "widget", 7, {
+      provider: "github",
+      repoPath: "acme/widget",
+      repositoryKey: { kind: "id", id: 1002 },
+      sync: false,
+    });
+    expect(store.getDetail()).toBeNull();
+  });
+
+  it("installs a Bitbucket Cloud pull only for its repository UUID", async () => {
+    const uuid = "0f5d2a4e-3b1c-4d7e-9a8b-1c2d3e4f5a6b";
+    const cloud = pullDetail("cloud-head");
+    cloud.repo.provider = "bitbucket";
+    cloud.repo.platform_host = "bitbucket.org";
+    cloud.repo.platform_repo_id = 0;
+    cloud.repo.bitbucket_repository_uuid = uuid;
+    const store = createDetailStore({ client: mockClient({ GET: vi.fn().mockResolvedValue({ data: cloud }) }) });
+    const options = { provider: "bitbucket", repoPath: "acme/widget", sync: false } as const;
+
+    await loadDetail(store, "acme", "widget", 7, {
+      ...options,
+      repositoryKey: { kind: "uuid", uuid: "11111111-2222-4333-8444-555555555555" },
+    });
+    expect(store.getDetail()).toBeNull();
+
+    await loadDetail(store, "acme", "widget", 7, { ...options, repositoryKey: { kind: "uuid", uuid } });
+    expect(store.getDetail()?.repo.bitbucket_repository_uuid).toBe(uuid);
+  });
+
+  it.each([1002, undefined])("does not restore a pull snapshot for repository %s", async (platformRepoId) => {
+    const repositoryKey = platformRepoId === undefined ? undefined : { kind: "id" as const, id: platformRepoId };
+    const failedRead = deferred<{ error: ProblemBody }>();
+    const get = vi
+      .fn()
+      .mockResolvedValueOnce({ data: pullDetail("old-head") })
+      .mockReturnValueOnce(failedRead.promise);
+    const store = createDetailStore({ client: mockClient({ GET: get }) });
+    const options = {
+      provider: "github",
+      repoPath: "acme/widget",
+      repositoryKey: { kind: "id", id: 1001 },
+      sync: false,
+    } as const;
+    await loadDetail(store, "acme", "widget", 7, options);
+    store.clearDetail();
+    store.loadDetail("acme", "widget", 7, { ...options, repositoryKey });
+    expect(store.getDetail()).toBeNull();
+    failedRead.resolve({ error: { code: ProblemCodes.forbidden, title: "Unavailable", detail: "Cannot refresh" } });
+    await vi.waitFor(() => expect(store.isDetailLoading()).toBe(false));
+    expect(store.getDetail()).toBeNull();
+  });
+
+  it("does not join an old repository read when the selected repository changes", async () => {
+    const oldRead = deferred<{ data: PullDetail }>();
+    const replacement = pullDetail("replacement-head");
+    replacement.repo.platform_repo_id = 1002;
+    const get = vi.fn().mockReturnValueOnce(oldRead.promise).mockResolvedValue({ data: replacement });
+    const store = createDetailStore({ client: mockClient({ GET: get }) });
+    const options = {
+      provider: "github",
+      repoPath: "acme/widget",
+      repositoryKey: { kind: "id", id: 1001 },
+      sync: false,
+    } as const;
+    store.loadDetail("acme", "widget", 7, options);
+    await vi.waitFor(() => expect(get).toHaveBeenCalledTimes(1));
+    store.loadDetail("acme", "widget", 7, { ...options, repositoryKey: { kind: "id", id: 1002 } });
+    oldRead.resolve({ data: pullDetail("old-head") });
+    await vi.waitFor(() => expect(store.isDetailLoading()).toBe(false));
+    expect(store.getDetail()?.repo.platform_repo_id).toBe(1002);
+  });
+
+  it("restores a pull after twenty other visits before its fresh read and retains its original workspace tick", async () => {
+    const freshRead = deferred<{ data: PullDetail }>();
+    const get = vi.fn().mockResolvedValueOnce({ data: pullDetail("cached-head") });
+    for (let number = 8; number < 28; number++) {
+      get.mockResolvedValueOnce({ data: pullDetailFor("widget", number, `head-${number}`) });
+    }
+    get.mockReturnValueOnce(freshRead.promise);
+    const store = createDetailStore({ client: mockClient({ GET: get }) });
+    const options = {
+      provider: "github",
+      repoPath: "acme/widget",
+      repositoryKey: { kind: "id", id: 1001 },
+      sync: false,
+    } as const;
+    await loadDetail(store, "acme", "widget", 7, options);
+    const originalTick = store.getDetailEnvelopeTick();
+    store.clearDetail();
+    for (let number = 8; number < 28; number++) {
+      await loadDetail(store, "acme", "widget", number, options);
+    }
+
+    store.loadDetail("acme", "widget", 7, options);
+
+    expect(store.getDetail()?.platform_head_sha).toBe("cached-head");
+    expect(store.getDetailEnvelopeTick()).toBe(originalTick);
+    expect(store.getDetailLoaded()).toBe(true);
+    expect(store.isDetailLoading()).toBe(true);
+    freshRead.resolve({ data: pullDetail("fresh-head") });
+    await vi.waitFor(() => expect(store.isDetailLoading()).toBe(false));
+    expect(store.getDetail()?.platform_head_sha).toBe("fresh-head");
+    expect(store.getDetailEnvelopeTick()).toBeGreaterThan(originalTick);
+  });
+
+  it("keeps a restored pull visible when revalidation fails without reusing it on another host", async () => {
+    const failedRead = deferred<{ error: ProblemBody }>();
+    const get = vi
+      .fn()
+      .mockResolvedValueOnce({ data: pullDetail("cached-head") })
+      .mockReturnValueOnce(failedRead.promise)
+      .mockImplementation(() => new Promise(() => {}));
+    const store = createDetailStore({ client: mockClient({ GET: get }) });
+    const options = {
+      provider: "github",
+      repoPath: "acme/widget",
+      repositoryKey: { kind: "id", id: 1001 },
+      sync: false,
+    } as const;
+    await loadDetail(store, "acme", "widget", 7, options);
+    store.clearDetail();
+    store.loadDetail("acme", "widget", 7, options);
+    failedRead.resolve({ error: { code: ProblemCodes.forbidden, title: "Unavailable", detail: "Cannot refresh" } });
+    await vi.waitFor(() => expect(store.isDetailLoading()).toBe(false));
+    expect(store.getDetail()?.platform_head_sha).toBe("cached-head");
+    expect(store.getDetailError()).toBe("Cannot refresh");
+
+    store.clearDetail();
+    store.loadDetail("acme", "widget", 7, { ...options, platformHost: "git.example.com" });
+    expect(store.getDetail()).toBeNull();
+  });
+
+  it("does not treat a restored optimistic snapshot as a confirmed mutation baseline", async () => {
+    const mutation = deferred<{ error: ProblemBody }>();
+    const freshRead = deferred<{ data: PullDetail }>();
+    const original = {
+      ...pullDetail("cached-head"),
+      merge_request: { ...pullDetail("cached-head").merge_request, Starred: false },
+    };
+    const get = vi.fn().mockResolvedValueOnce({ data: original }).mockReturnValueOnce(freshRead.promise);
+    const store = createDetailStore({
+      client: mockClient({ GET: get, PUT: vi.fn().mockReturnValue(mutation.promise) }),
+    });
+    const ref = {
+      provider: "github",
+      owner: "acme",
+      name: "widget",
+      repoPath: "acme/widget",
+      repositoryKey: { kind: "id", id: 1001 },
+    };
+    await loadDetail(store, "acme", "widget", 7, { ...ref, sync: false });
+    store.toggleDetailPRStar(ref, 7, false);
+    await vi.waitFor(() => expect(store.getDetail()?.merge_request.Starred).toBe(true));
+
+    store.clearDetail();
+    store.loadDetail("acme", "widget", 7, { ...ref, sync: false });
+    expect(store.getDetail()?.merge_request.Starred).toBe(true);
+    mutation.resolve({ error: { code: ProblemCodes.forbidden, detail: "Star rejected" } });
+    await vi.waitFor(() => expect(store.getDetail()?.merge_request.Starred).toBe(false));
+    freshRead.resolve({ data: original });
+    await vi.waitFor(() => expect(store.isDetailLoading()).toBe(false));
+  });
+
+  it("retains timeline readiness when returning before the next item finishes loading", async () => {
+    const get = vi
+      .fn()
+      .mockResolvedValueOnce({ data: pullDetail("cached-head") })
+      .mockImplementation(() => new Promise(() => {}));
+    const store = createDetailStore({ client: mockClient({ GET: get }) });
+    const options = {
+      provider: "github",
+      repoPath: "acme/widget",
+      repositoryKey: { kind: "id", id: 1001 },
+      sync: false,
+    } as const;
+    await loadDetail(store, "acme", "widget", 7, options);
+    store.loadDetail("acme", "widget", 8, options);
+    store.loadDetail("acme", "widget", 7, options);
+    expect(store.getDetailLoaded()).toBe(true);
+  });
+
+  it("keeps a restored pull read-only when an earlier body save finishes", async () => {
+    const initial = pullDetail("head");
+    const other = { ...pullDetail("head"), merge_request: { ...initial.merge_request, Number: 8 } };
+    const updated = { ...pullDetail("head"), merge_request: { ...initial.merge_request, Body: "local edit" } };
+    const mutation = Promise.withResolvers<{ data: PullDetail; error: undefined }>();
+    const freshRead = Promise.withResolvers<{ data: PullDetail }>();
+    const get = vi
+      .fn()
+      .mockResolvedValueOnce({ data: initial })
+      .mockResolvedValueOnce({ data: other })
+      .mockReturnValueOnce(freshRead.promise);
+    const patch = vi.fn(() => mutation.promise);
+    const store = createDetailStore({ client: mockClient({ GET: get, PATCH: patch }) });
+    const ref = {
+      provider: "github",
+      platformHost: "github.com",
+      owner: "acme",
+      name: "widget",
+      repoPath: "acme/widget",
+      repositoryKey: { kind: "id", id: 1001 },
+    };
+    await loadDetail(store, "acme", "widget", 7, { ...ref, sync: false });
+    store.setLocalPRBody("github", "github.com", "acme", "widget", 7, "local edit");
+    store.savePRBodyInBackground(ref, 7, "local edit");
+    await vi.waitFor(() => expect(patch).toHaveBeenCalledOnce());
+    await loadDetail(store, "acme", "widget", 8, { ...ref, sync: false });
+    store.loadDetail("acme", "widget", 7, { ...ref, sync: false });
+    await vi.waitFor(() => expect(get).toHaveBeenCalledTimes(3));
+    expect(store.isDetailFromCache()).toBe(true);
+
+    mutation.resolve({ data: updated, error: undefined });
+    await vi.waitFor(() => expect(store.hasUnsavedLocalBody()).toBe(false));
+
+    expect(store.isDetailLoading()).toBe(true);
+    expect(store.isDetailFromCache()).toBe(true);
+    freshRead.resolve({ data: updated });
+    await vi.waitFor(() => expect(store.isDetailLoading()).toBe(false));
+    expect(store.isDetailFromCache()).toBe(false);
+  });
+
+  it("discards a saved optimistic snapshot when its mutation fails while another pull is visible", async () => {
+    const mutation = deferred<{ error: ProblemBody }>();
+    const get = vi
+      .fn()
+      .mockResolvedValueOnce({ data: pullDetail("cached-head") })
+      .mockResolvedValueOnce({ data: pullDetailFor("widget", 8, "other-head") })
+      .mockImplementation(() => new Promise(() => {}));
+    const store = createDetailStore({
+      client: mockClient({ GET: get, PUT: vi.fn().mockReturnValue(mutation.promise) }),
+    });
+    const ref = { provider: "github", owner: "acme", name: "widget", repoPath: "acme/widget" };
+    await loadDetail(store, "acme", "widget", 7, { ...ref, sync: false });
+    store.toggleDetailPRStar(ref, 7, false);
+    await vi.waitFor(() => expect(store.getDetail()?.merge_request.Starred).toBe(true));
+    await loadDetail(store, "acme", "widget", 8, { ...ref, sync: false });
+    mutation.resolve({ error: { code: ProblemCodes.forbidden, detail: "Star rejected" } });
+    await vi.waitFor(() => expect(getFlash()?.message).toBe("Star rejected"));
+
+    store.loadDetail("acme", "widget", 7, { ...ref, sync: false });
+    expect(store.getDetail()?.platform_head_sha).toBe("other-head");
+  });
+
   beforeEach(() => {
     runtime = undefined;
   });
@@ -235,13 +482,21 @@ describe("createDetailStore", () => {
   });
 
   it("keeps discussion available through incomplete background snapshots but resets for another PR", async () => {
-    const identity = { provider: "github", platformHost: "github.com", repoPath: "acme/widget", sync: false as const };
+    const identity = {
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widget",
+      repositoryKey: { kind: "id", id: 1001 },
+      sync: false as const,
+    };
     const incomplete = { ...pullDetail("head"), detail_loaded: false };
+    const restoredRead = deferred<{ data: PullDetail }>();
     const get = vi
       .fn()
       .mockResolvedValueOnce({ data: pullDetail("head") })
       .mockResolvedValueOnce({ data: incomplete })
-      .mockResolvedValueOnce({ data: { ...pullDetailFor("widget", 8, "other-head"), detail_loaded: false } });
+      .mockResolvedValueOnce({ data: { ...pullDetailFor("widget", 8, "other-head"), detail_loaded: false } })
+      .mockReturnValueOnce(restoredRead.promise);
     const store = createDetailStore({ client: mockClient({ GET: get }) });
     await loadDetail(store, "acme", "widget", 7, identity);
     await refreshDetail(store, "acme", "widget", 7, identity);
@@ -254,6 +509,12 @@ describe("createDetailStore", () => {
     expect(store.getDiscussionLoaded()).toBe(false);
     await vi.waitFor(() => expect(store.isDetailLoading()).toBe(false));
     expect(store.getDetailLoaded()).toBe(false);
+
+    store.loadDetail("acme", "widget", 7, identity);
+    expect(store.getDetailLoaded()).toBe(false);
+    expect(store.getDiscussionLoaded()).toBe(true);
+    restoredRead.resolve({ data: incomplete });
+    await vi.waitFor(() => expect(store.isDetailLoading()).toBe(false));
   });
 
   it.each(["load", "refresh"])(
@@ -266,7 +527,7 @@ describe("createDetailStore", () => {
         sync: false as const,
       };
       const replacement = pullDetail("head");
-      replacement.repo.platform_repo_id = "replacement-repo-id";
+      replacement.repo.platform_repo_id = 1002;
       replacement.detail_loaded = false;
       const get = vi
         .fn()
@@ -296,7 +557,11 @@ describe("createDetailStore", () => {
       client: mockClient({ GET: get }),
       getPage: () => "pulls",
     });
-    await loadDetail(store, "acme", "widget", 7, { ...routeIdentity, sync: false });
+    await loadDetail(store, "acme", "widget", 7, {
+      ...routeIdentity,
+      repositoryKey: { kind: "id", id: 1001 },
+      sync: false,
+    });
     const displayed = store.getDetail();
 
     // Only the sync timestamp moved: the polling refresh must not swap
@@ -1020,6 +1285,26 @@ describe("createDetailStore", () => {
     expect(store.getDetail()).toBeNull();
   });
 
+  it("pauses scheduled detail sync in airplane mode while allowing an item visit", async () => {
+    vi.useFakeTimers();
+    let airplaneMode = true;
+    const post = vi.fn().mockResolvedValue({ data: undefined, error: undefined });
+    const get = vi.fn().mockResolvedValue({ data: pullDetail("cached-head") });
+    const store = createDetailStore({
+      client: mockClient({ GET: get, POST: post }),
+      getAirplaneMode: () => airplaneMode,
+    });
+    const identity = { provider: "github", platformHost: "github.com", repoPath: "acme/widget" };
+    store.startDetailPolling("acme", "widget", 7, identity);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(post).not.toHaveBeenCalled();
+    store.loadDetail("acme", "widget", 7, { ...identity, sync: "background" });
+    await vi.waitFor(() => expect(post).toHaveBeenCalledOnce());
+    airplaneMode = false;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(post.mock.calls.length).toBeGreaterThan(1);
+  });
+
   it("enqueues background sync when active detail polling fires", async () => {
     vi.useFakeTimers();
     const post = vi.fn().mockResolvedValue({ data: undefined, error: undefined });
@@ -1513,7 +1798,9 @@ describe("createDetailStore", () => {
 
     await expect(applying).resolves.toBe(true);
     expect(store.getDetail()?.repo_name).toBe("other-widget");
-    await load("widget", 7);
+    const reload = load("widget", 7);
+    expect(store.getDetail()?.repo_name).toBe("other-widget");
+    await reload;
     expect(store.getDetail()?.platform_head_sha).toBe("reviewed-head");
     expect(post.mock.calls.some(([path]) => String(path).endsWith("/sync"))).toBe(false);
     expect(getFlash()).toMatchObject({
@@ -1627,6 +1914,51 @@ describe("createDetailStore", () => {
     expect(store.getDetail()?.merge_request.Body).toBe("- [x] done");
     expect(store.hasUnsavedLocalBody()).toBe(true);
   });
+
+  it.each([
+    { repository: "same", saveState: "failed" },
+    { repository: "replacement", saveState: "failed" },
+    { repository: "replacement", saveState: "pending" },
+  ])(
+    "scopes a $saveState local body save to its repository on a $repository refresh",
+    async ({ repository, saveState }) => {
+      const initial = pullDetail("head");
+      const refreshed = pullDetail("head");
+      refreshed.merge_request.Body = "provider body";
+      if (repository === "replacement") refreshed.repo.platform_repo_id = 1002;
+      const saving = Promise.withResolvers<{ error: { detail: string } }>();
+      const patch = vi.fn(() => saving.promise);
+      const get = vi.fn().mockResolvedValueOnce({ data: initial }).mockResolvedValue({ data: refreshed });
+      const store = createDetailStore({ client: mockClient({ GET: get, PATCH: patch }) });
+      const routeRef = {
+        provider: "github",
+        platformHost: "github.com",
+        owner: "acme",
+        name: "widget",
+        repoPath: "acme/widget",
+      };
+      await loadDetail(store, "acme", "widget", 7, { ...routeRef, sync: false });
+      store.setLocalPRBody("github", "github.com", "acme", "widget", 7, "local edit");
+      store.savePRBodyInBackground(routeRef, 7, "local edit");
+      await vi.waitFor(() => expect(patch).toHaveBeenCalledOnce());
+      if (saveState === "failed") {
+        saving.resolve({ error: { detail: "save rejected" } });
+        await vi.waitFor(() => expect(getFlash()?.message).toBe("save rejected"));
+      }
+
+      await refreshDetail(store, "acme", "widget", 7, routeRef);
+
+      expect(store.getDetail()?.repo.platform_repo_id).toBe(refreshed.repo.platform_repo_id);
+      expect(store.getDetail()?.merge_request.Body).toBe(repository === "same" ? "local edit" : "provider body");
+      expect(store.hasUnsavedLocalBody()).toBe(repository === "same");
+      if (saveState === "pending") {
+        saving.resolve({ error: { detail: "save rejected" } });
+        await vi.waitFor(() => expect(getFlash()?.message).toBe("save rejected"));
+        expect(store.getDetail()?.merge_request.Body).toBe("provider body");
+        expect(store.hasUnsavedLocalBody()).toBe(false);
+      }
+    },
+  );
 
   it("clears the matching unsaved body after the server normalizes it", async () => {
     const initial = pullDetail("head");

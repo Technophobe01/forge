@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -12,12 +13,14 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v7"
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/activityrelay"
 	"go.kenn.io/forge/internal/db"
+	"go.kenn.io/forge/internal/testutil/reposeed"
 	"go.kenn.io/forge/platform"
+	platformgithub "go.kenn.io/forge/platform/github"
 )
 
 // relayStatuses forwards every published relay status so tests wait on the
@@ -55,9 +58,9 @@ func TestRelaySubscriptionStatusAndRecentActivity(t *testing.T) {
 	budget := NewSyncBudget(1)
 	budget.Spend(1) // Received events must be visible even while refreshes wait for budget.
 	repos := []RepoRef{
-		{Platform: platform.KindGitHub, PlatformHost: "github.com", PlatformExternalID: "R_project", Owner: "team", Name: "project"},
-		{Platform: platform.KindGitHub, PlatformHost: "github.com", PlatformExternalID: "R_archived", Archived: true},
-		{Platform: platform.KindGitLab, PlatformHost: "gitlab.example.com", PlatformExternalID: "123"},
+		{Platform: platform.KindGitHub, PlatformHost: "github.com", Key: platform.RepositoryIDKey(1001), Owner: "team", Name: "project"},
+		{Platform: platform.KindGitHub, PlatformHost: "github.com", Key: platform.RepositoryIDKey(1003), Archived: true},
+		{Platform: platform.KindGitLab, PlatformHost: "gitlab.example.com", Key: platform.RepositoryIDKey(123)},
 	}
 	syncer := NewSyncer(nil, database, nil, repos, time.Minute, nil, map[string]*SyncBudget{"github.com": budget})
 	assert.Nil(syncer.Status().Relay)
@@ -83,11 +86,11 @@ func TestRelaySubscriptionStatusAndRecentActivity(t *testing.T) {
 	assert.Empty(connected.Recent)
 	var hints []activityrelay.Hint
 	for number := 1; number <= 25; number++ {
-		hints = append(hints, activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: "R_project", Target: activityrelay.Issue, Number: number})
+		hints = append(hints, activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: 1001, Target: activityrelay.Issue, Number: number})
 	}
 	hints = append(hints,
-		activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: "R_untracked", Target: activityrelay.Issue, Number: 99},
-		activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: "R_archived", Target: activityrelay.Repository},
+		activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: 1099, Target: activityrelay.Issue, Number: 99},
+		activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: 1003, Target: activityrelay.Repository},
 	)
 	feed.Publish(hints)
 	status := awaitRelayStatus(t, statuses, func(status RelayStatus) bool {
@@ -111,14 +114,67 @@ func TestRelaySubscriptionStatusAndRecentActivity(t *testing.T) {
 	assert.Len(syncer.Status().Relay.Recent, 20, "reconnecting must not replay activity")
 }
 
+func TestRelayProtocolWarningSurvivesReconnectUntilValidHint(t *testing.T) {
+	t.Parallel()
+	for _, failure := range []string{"payload", "version"} {
+		t.Run(failure, func(t *testing.T) {
+			require := require.New(t)
+			database := openTestDB(t)
+			syncer := NewSyncer(nil, database, nil, nil, time.Minute, nil, nil)
+			statuses := relayStatuses(t, syncer)
+			var connections atomic.Int32
+			recoverFeed := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				if connections.Add(1) == 1 {
+					if failure == "version" {
+						w.Header().Set("X-Kenn-Forge-Relay-Protocol", "999")
+						fmt.Fprint(w, ": connected\n\n")
+						http.NewResponseController(w).Flush()
+						<-r.Context().Done()
+						return
+					}
+					fmt.Fprint(w, "event: hint\ndata: {\"provider\":\"github\",\"host\":\"github.com\",\"repository_id\":\"R_legacy\",\"target\":\"issue\",\"number\":7}\n\n")
+					return
+				}
+				fmt.Fprint(w, ": connected\n\n")
+				http.NewResponseController(w).Flush()
+				select {
+				case <-r.Context().Done():
+					return
+				case <-recoverFeed:
+				}
+				// A valid hint proves decoding works even for an untracked repository.
+				fmt.Fprint(w, "event: hint\ndata: {\"provider\":\"github\",\"host\":\"github.com\",\"repository_id\":1001,\"target\":\"issue\",\"number\":7}\n\n")
+				http.NewResponseController(w).Flush()
+				<-r.Context().Done()
+			}))
+			t.Cleanup(server.Close)
+			ctx, cancel := context.WithCancel(t.Context())
+			stopped := make(chan struct{})
+			go func() {
+				defer close(stopped)
+				syncer.RunRelay(ctx, RelayOptions{URL: server.URL, Client: server.Client(), Backoff: backoff.NewConstantBackOff(time.Millisecond)})
+			}()
+			t.Cleanup(func() { cancel(); <-stopped })
+			failed := awaitRelayStatus(t, statuses, func(status RelayStatus) bool { return status.Incompatible })
+			require.False(failed.Connected)
+			reconnected := awaitRelayStatus(t, statuses, func(status RelayStatus) bool { return status.Connected })
+			require.True(reconnected.Incompatible, "opening a new stream must not erase the decoding failure")
+			close(recoverFeed)
+			awaitRelayStatus(t, statuses, func(status RelayStatus) bool { return status.Connected && !status.Incompatible })
+		})
+	}
+}
+
 func TestRelayTargetedChecksAndBudgetGate(t *testing.T) {
 	require := require.New(t)
 	t.Parallel()
 	assert := assert.New(t)
 	database := openTestDB(t)
 	ctx := t.Context()
-	repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
-		Platform: "github", PlatformHost: "github.com", PlatformRepoID: "R_test_project", Owner: "team", Name: "project",
+	repoID, err := reposeed.Seed(ctx, database, db.RepoIdentity{
+		Platform: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(1002), Owner: "team", Name: "project",
 	})
 	require.NoError(err)
 	for _, number := range []int{7, 8} {
@@ -135,9 +191,10 @@ func TestRelayTargetedChecksAndBudgetGate(t *testing.T) {
 	}
 	budget := NewSyncBudget(100)
 	// A cached catalog ref need not carry GitHub's numeric REST ID.
-	repo := RepoRef{Platform: platform.KindGitHub, PlatformHost: "github.com", PlatformExternalID: "R_test_project", Owner: "team", Name: "project"}
+	repo := RepoRef{Platform: platform.KindGitHub, PlatformHost: "github.com", Key: platform.RepositoryIDKey(1002), Owner: "team", Name: "project"}
 	syncer := NewSyncer(map[string]Client{"github.com": provider}, database, nil, []RepoRef{repo}, time.Minute, nil, map[string]*SyncBudget{"github.com": budget})
-	hint := activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: "R_test_project", Target: activityrelay.PullRequestChecks, Number: 7}
+	syncer.SetAirplaneMode(true)
+	hint := activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: 1002, Target: activityrelay.PullRequestChecks, Number: 7}
 	budget.Spend(100)
 	require.NoError(syncer.refreshRelayHint(WithSyncBudget(ctx), hint))
 	assert.Zero(provider.getCombinedCalls.Load(), "an exhausted budget drops the hint instead of spending")
@@ -173,6 +230,36 @@ func TestRelayTargetedChecksAndBudgetGate(t *testing.T) {
 	assert.Equal(int32(1), provider.getCombinedCalls.Load(), "closed, unknown, and headless PRs do not spend CI budget")
 }
 
+func TestRelayWorkflowNotificationBypassesBackgroundReserve(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	database := openTestDB(t)
+	repo := RepoRef{Platform: platform.KindGitHub, PlatformHost: "github.com", Key: platform.RepositoryIDKey(1001), Owner: "team", Name: "project"}
+	repoID, err := reposeed.Seed(t.Context(), database, db.RepoIdentity{
+		Platform: "github", PlatformHost: repo.PlatformHost, Key: repo.Key, Owner: repo.Owner, Name: repo.Name,
+	})
+	require.NoError(err)
+	quota := NewQuotaRegistry()
+	quota.UpdateSnapshot(HostIdentity(repo.PlatformHost), QuotaResourceREST, Rate{
+		Limit: 5000, Remaining: RateReserveBuffer, Reset: time.Now().UTC().Add(time.Hour),
+	})
+	syncer := NewSyncer(nil, database, nil, []RepoRef{repo}, time.Minute, nil, nil)
+	syncer.SetQuotaRegistry(quota)
+	require.True(syncer.backgroundReserveExhausted(repo, QuotaResourceREST, false))
+	var notified []string
+	syncer.SetOnRelayRefresh(func(_ context.Context, id int64, target string, _ int) {
+		assert.Equal(repoID, id)
+		notified = append(notified, target)
+	})
+	for _, target := range []string{activityrelay.RepositoryRefs, activityrelay.WorkflowRuns} {
+		require.NoError(syncer.refreshRelayHint(WithSyncBudget(t.Context()), activityrelay.Hint{
+			Provider: "github", Host: repo.PlatformHost, RepositoryID: 1001, Target: target,
+		}))
+	}
+	assert.Equal([]string{activityrelay.WorkflowRuns}, notified, "only the notification bypasses the background quota gate")
+}
+
 func TestRelayChecksRefreshImmediatelyAndKeepEventsDuringRefresh(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
@@ -181,8 +268,8 @@ func TestRelayChecksRefreshImmediatelyAndKeepEventsDuringRefresh(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 		database := openTestDB(t)
-		repo := RepoRef{Platform: platform.KindGitHub, PlatformHost: "github.com", PlatformExternalID: "R_project", Owner: "team", Name: "project"}
-		repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{Platform: "github", PlatformHost: "github.com", PlatformRepoID: "R_project", Owner: "team", Name: "project"})
+		repo := RepoRef{Platform: platform.KindGitHub, PlatformHost: "github.com", Key: platform.RepositoryIDKey(1001), Owner: "team", Name: "project"}
+		repoID, err := reposeed.Seed(ctx, database, db.RepoIdentity{Platform: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(1001), Owner: "team", Name: "project"})
 		require.NoError(err)
 		_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
 			RepoID: repoID, Number: 7, PlatformID: 7, PlatformExternalID: "pr-7", State: "open", PlatformHeadSHA: "abcdef", CIStatus: "pending",
@@ -206,7 +293,7 @@ func TestRelayChecksRefreshImmediatelyAndKeepEventsDuringRefresh(t *testing.T) {
 		syncer.SetOnRelayRefresh(func(context.Context, int64, string, int) { refreshed <- struct{}{} })
 		queue := &relayQueue{signal: make(chan struct{}, 1)}
 		go syncer.drainRelayQueue(ctx, queue)
-		hint := activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: "R_project", Target: activityrelay.PullRequestChecks, Number: 7}
+		hint := activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: 1001, Target: activityrelay.PullRequestChecks, Number: 7}
 		begin := time.Now()
 		queue.push(hint)
 		first := <-started
@@ -233,7 +320,7 @@ func TestRelayQueueCoalescesAndSkipsDisabledSync(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	queue := &relayQueue{signal: make(chan struct{}, 1)}
-	hint := activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: "R_test_project", Target: activityrelay.Issue, Number: 9}
+	hint := activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: 1002, Target: activityrelay.Issue, Number: 9}
 	other := hint
 	other.Number = 10
 	queue.push(hint)
@@ -248,12 +335,41 @@ func TestRelayQueueCoalescesAndSkipsDisabledSync(t *testing.T) {
 	assert.Equal([]activityrelay.Hint{hint, other}, []activityrelay.Hint{first, second})
 
 	database := openTestDB(t)
-	syncer := NewSyncer(nil, database, nil, []RepoRef{{Platform: platform.KindGitHub, PlatformHost: "github.com", PlatformExternalID: "R_test_project", Owner: "team", Name: "project"}}, time.Minute, nil, nil)
+	syncer := NewSyncer(nil, database, nil, []RepoRef{{Platform: platform.KindGitHub, PlatformHost: "github.com", Key: platform.RepositoryIDKey(1002), Owner: "team", Name: "project"}}, time.Minute, nil, nil)
 	syncer.DisableSync()
 	syncer.receiveRelayHint(hint, 1, queue)
 	_, ok = queue.pop()
 	assert.False(ok, "hints are ignored while syncing is disabled")
 	assert.Nil(syncer.Status().Relay)
+}
+
+func TestRelayQueueReservesRoomForWorkflowUpdates(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	queue := &relayQueue{signal: make(chan struct{}, 1)}
+	for number := 1; number <= 1025; number++ {
+		queue.push(activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: 1001, Target: activityrelay.PullRequestChecks, Number: number})
+	}
+	var expected []activityrelay.Hint
+	for i := range 257 {
+		hint := activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: int64(2000 + i), Target: activityrelay.WorkflowRuns}
+		queue.push(hint)
+		queue.push(hint)
+		if i < 256 {
+			expected = append(expected, hint)
+		}
+	}
+	var workflows []activityrelay.Hint
+	var checks int
+	for hint, ok := queue.pop(); ok; hint, ok = queue.pop() {
+		if hint.Target == activityrelay.WorkflowRuns {
+			workflows = append(workflows, hint)
+		} else {
+			checks++
+		}
+	}
+	require.Equal(expected, workflows, "workflow updates have bounded, coalesced space beyond a full check queue")
+	require.Equal(1024, checks)
 }
 
 func TestRelayRepositoryHintsRespectBudgetAdmission(t *testing.T) {
@@ -265,9 +381,9 @@ func TestRelayRepositoryHintsRespectBudgetAdmission(t *testing.T) {
 			assert := assert.New(t)
 			ctx := WithSyncBudget(t.Context())
 			database := openTestDB(t)
-			repo := RepoRef{Platform: platform.KindGitHub, PlatformHost: "github.com", PlatformExternalID: "R_test_project", Owner: "team", Name: "project"}
-			_, err := database.UpsertRepo(ctx, db.RepoIdentity{
-				Platform: "github", PlatformHost: "github.com", PlatformRepoID: repo.PlatformExternalID, Owner: repo.Owner, Name: repo.Name,
+			repo := RepoRef{Platform: platform.KindGitHub, PlatformHost: "github.com", Key: platform.RepositoryIDKey(1002), Owner: "team", Name: "project"}
+			_, err := reposeed.Seed(ctx, database, db.RepoIdentity{
+				Platform: "github", PlatformHost: "github.com", Key: repo.Key, Owner: repo.Owner, Name: repo.Name,
 			})
 			require.NoError(err)
 			budget := NewSyncBudgetWithEssentialReserve(100)
@@ -275,8 +391,8 @@ func TestRelayRepositoryHintsRespectBudgetAdmission(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				requests.Add(1)
 				w.Header().Set("Content-Type", "application/json")
-				if r.URL.Path == "/api/v3/repos/team/project" {
-					_, _ = w.Write([]byte(`{"id":1,"node_id":"R_test_project","name":"project","owner":{"login":"team"},"default_branch":"main","has_issues":true}`))
+				if r.URL.Path == "/api/v3/repositories/1002" {
+					_, _ = w.Write([]byte(`{"id":1002,"name":"project","owner":{"login":"team"},"default_branch":"main","has_issues":true}`))
 					return
 				}
 				_, _ = w.Write([]byte(`[]`))
@@ -287,7 +403,7 @@ func TestRelayRepositoryHintsRespectBudgetAdmission(t *testing.T) {
 			syncer := NewSyncer(map[string]Client{"github.com": client}, database, nil, []RepoRef{repo}, time.Minute, nil, map[string]*SyncBudget{"github.com": budget})
 			var refreshed int
 			syncer.SetOnRelayRefresh(func(context.Context, int64, string, int) { refreshed++ })
-			hint := activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: repo.PlatformExternalID, Target: target}
+			hint := activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: 1002, Target: target}
 
 			// Both the reserve alone and less than the conservative refresh cost
 			// must leave the hint to ordinary syncing, without any provider I/O.
@@ -315,8 +431,8 @@ func TestRelayDisabledIssueRespectsCooldown(t *testing.T) {
 	assert := assert.New(t)
 	ctx := t.Context()
 	database := openTestDB(t)
-	ref := RepoRef{Platform: platform.KindGitHub, PlatformHost: "github.com", Owner: "team", Name: "project", PlatformExternalID: "repo-team-project"}
-	_, err := database.UpsertRepo(ctx, verifiedGitHubRepoIdentity("github.com", ref.Owner, ref.Name))
+	ref := RepoRef{Platform: platform.KindGitHub, PlatformHost: "github.com", Owner: "team", Name: "project", Key: platform.RepositoryIDKey(testRepoID("team", "project"))}
+	_, err := reposeed.Seed(ctx, database, verifiedGitHubRepoIdentity("github.com", ref.Owner, ref.Name))
 	require.NoError(err)
 	provider := &partialFailureMock{}
 	var calls int
@@ -327,11 +443,111 @@ func TestRelayDisabledIssueRespectsCooldown(t *testing.T) {
 	syncer := NewSyncer(map[string]Client{"github.com": provider}, database, nil, []RepoRef{ref}, time.Minute, nil, testBudget(1000))
 	now := time.Now().UTC()
 	syncer.now = func() time.Time { return now }
-	hint := activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: ref.PlatformExternalID, Target: activityrelay.Issue, Number: 9}
+	hint := activityrelay.Hint{Provider: "github", Host: "github.com", RepositoryID: testRepoID("team", "project"), Target: activityrelay.Issue, Number: 9}
 	require.NoError(syncer.refreshRelayHint(WithSyncBudget(ctx), hint))
 	require.NoError(syncer.refreshRelayHint(WithSyncBudget(ctx), hint))
 	assert.Equal(1, calls, "disabled features must not be retried for every hint")
 	now = now.Add(24*time.Hour + time.Second)
 	require.NoError(syncer.refreshRelayHint(WithSyncBudget(ctx), hint))
 	assert.Equal(2, calls)
+}
+
+func TestRelayRefsDoesNotConsumeNormalSyncListChange(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := t.Context()
+	database := openTestDB(t)
+	repo := RepoRef{Platform: platform.KindGitHub, PlatformHost: "github.com", Key: platform.RepositoryIDKey(1002), Owner: "team", Name: "project"}
+	repoID, err := reposeed.Seed(ctx, database, db.RepoIdentity{
+		Platform: "github", PlatformHost: "github.com", Key: repo.Key, Owner: repo.Owner, Name: repo.Name,
+	})
+	require.NoError(err)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v3/repositories/1002":
+			_, _ = fmt.Fprint(w, `{"id":1002,"name":"project","owner":{"login":"team"},"default_branch":"main","has_issues":true}`)
+		case "/api/v3/repos/team/project/pulls":
+			if r.Header.Get("If-None-Match") == `"new-base"` {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			w.Header().Set("ETag", `"new-base"`)
+			_, _ = fmt.Fprint(w, `[{"id":700,"number":7,"title":"Test PR","state":"open","head":{"sha":"head","ref":"feature"},"base":{"sha":"new-base","ref":"main","repo":{"id":1002,"name":"project","owner":{"login":"team"}}},"created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-01T00:00:00Z"}]`)
+		default:
+			http.Error(w, "unexpected provider request", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(provider.Close)
+	client, err := NewClient(testTokenSource("token"), "github.com", nil, nil, WithBaseURLForTesting(provider.URL))
+	require.NoError(err)
+	syncer := NewSyncer(map[string]Client{"github.com": client}, database, nil, []RepoRef{repo}, time.Minute, nil, testBudget(1000))
+	require.NoError(syncer.refreshRelayHint(WithSyncBudget(ctx), activityrelay.Hint{
+		Provider: "github", Host: "github.com", RepositoryID: 1002, Target: activityrelay.RepositoryRefs,
+	}))
+	stored, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 7)
+	require.NoError(err)
+	require.NotNil(stored)
+	assert.Equal("new-base", stored.PlatformBaseSHA)
+	assert.Empty(stored.MergeableState, "the relay list read has not observed mergeability")
+
+	// Normal sync must still see a changed list so it can run its GraphQL
+	// mergeability refresh. The relay only indexed the REST list fields.
+	prs, err := client.ListOpenPullRequests(ctx, repo.Owner, repo.Name)
+	require.NoError(err)
+	require.Len(prs, 1)
+	assert.Equal(7, prs[0].GetNumber())
+	_, err = client.ListOpenPullRequests(ctx, repo.Owner, repo.Name)
+	assert.True(platformgithub.IsNotModified(err), "normal sync still benefits from its own list ETag")
+}
+
+func TestSyncRefreshesMergeabilityAfterBaseChange(t *testing.T) {
+	t.Parallel()
+	for _, relay := range []bool{false, true} {
+		t.Run(fmt.Sprintf("relay=%v", relay), func(t *testing.T) {
+			t.Parallel()
+			require := require.New(t)
+			assert := assert.New(t)
+			ctx := t.Context()
+			database := openTestDB(t)
+			repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com", Key: platform.RepositoryIDKey(testRepoID("owner", "repo"))}
+			updated := time.Now().UTC().Add(-time.Hour)
+			pr := buildOpenPR(1, updated)
+			pr.Base.SHA = new("old-base")
+			pr.MergeableState = new("clean")
+			client := &mockClient{openPRs: []*gh.PullRequest{pr}}
+			syncer := NewSyncer(map[string]Client{"github.com": client}, database, nil, []RepoRef{repo}, time.Minute, nil, testBudget(1000))
+			syncer.RunOnce(ctx)
+			stored, err := database.GetMergeRequest(ctx, "github", "github.com", "owner", "repo", 1)
+			require.NoError(err)
+			require.NotNil(stored)
+			assert.Equal("clean", stored.MergeableState)
+			require.NotNil(stored.DetailFetchedAt)
+
+			// A push to main changes the base, not the PR head or updated_at.
+			listed := buildOpenPR(1, updated)
+			listed.Base.SHA = new("new-base")
+			client.openPRs = []*gh.PullRequest{listed}
+			client.getPullRequestFn = func(context.Context, string, string, int) (*gh.PullRequest, error) {
+				full := buildOpenPR(1, updated)
+				full.Base.SHA = new("new-base")
+				full.MergeableState = new("dirty")
+				return full, nil
+			}
+			if relay {
+				require.NoError(syncer.refreshRelayHint(WithSyncBudget(ctx), activityrelay.Hint{
+					Provider: "github", Host: "github.com", RepositoryID: testRepoID("owner", "repo"), Target: activityrelay.RepositoryRefs,
+				}))
+				// The scheduled pass may get a 304 after the hint indexed the list.
+				client.listOpenPRsErr = notModifiedErr()
+			}
+			syncer.RunOnce(ctx)
+			stored, err = database.GetMergeRequest(ctx, "github", "github.com", "owner", "repo", 1)
+			require.NoError(err)
+			require.NotNil(stored)
+			assert.Equal("new-base", stored.PlatformBaseSHA)
+			assert.Equal("dirty", stored.MergeableState)
+		})
+	}
 }

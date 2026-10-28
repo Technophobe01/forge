@@ -29,23 +29,45 @@ type QueueItem struct {
 	Score        float64
 
 	// Scoring inputs
-	UpdatedAt       time.Time
-	DetailFetchedAt *time.Time
-	CIHadPending    bool
-	Starred         bool
-	Watched         bool
-	IsOpen          bool
-	LargeRepo       bool
+	UpdatedAt           time.Time
+	DetailFetchedAt     *time.Time
+	CIHadPending        bool
+	MergeabilityPending bool
+	Starred             bool
+	Watched             bool
+	IsOpen              bool
+	LargeRepo           bool
+	dailyDue            bool
 }
 
 // WorstCaseCost returns the maximum wire attempts this item's
 // detail fetch could require, including authentication retry and
 // provider metadata confirmation allowances.
-func (qi *QueueItem) WorstCaseCost() int {
+func (qi QueueItem) WorstCaseCost() int {
 	return detailWorstCaseAttemptCost(qi.Platform, qi.Type)
 }
 
 func (qi QueueItem) Compare(other QueueItem) int {
+	// Once an item reaches the daily deadline, oldest checks go first.
+	// The separate watched/webhook paths still keep foreground work fast.
+	if qi.dailyDue != other.dailyDue {
+		if qi.dailyDue {
+			return -1
+		}
+		return 1
+	}
+	if qi.dailyDue {
+		left, right := qi.UpdatedAt, other.UpdatedAt
+		if qi.DetailFetchedAt != nil {
+			left = *qi.DetailFetchedAt
+		}
+		if other.DetailFetchedAt != nil {
+			right = *other.DetailFetchedAt
+		}
+		if order := left.Compare(right); order != 0 {
+			return order
+		}
+	}
 	return cmp.Compare(other.Score, qi.Score)
 }
 
@@ -53,11 +75,10 @@ func (qi QueueItem) Compare(other QueueItem) int {
 const (
 	defaultRefetchInterval = 30 * time.Minute
 	starWatchInterval      = 15 * time.Minute
-	closedRefetchInterval  = 24 * time.Hour
+	dailyRefetchInterval   = 24 * time.Hour
 )
 
-// BuildQueue filters items by staleness, scores eligible
-// ones, and returns them sorted by score descending.
+// BuildQueue orders overdue items oldest-first, then other eligible items by score.
 func BuildQueue(
 	items []QueueItem, now time.Time,
 ) []QueueItem {
@@ -67,6 +88,8 @@ func BuildQueue(
 			continue
 		}
 		items[i].Score = score(&items[i], now)
+		items[i].dailyDue = items[i].DetailFetchedAt == nil ||
+			now.Sub(*items[i].DetailFetchedAt) >= dailyRefetchInterval
 		eligible = append(eligible, items[i])
 	}
 	slices.SortFunc(eligible, QueueItem.Compare)
@@ -78,7 +101,19 @@ func updatedSinceLastFetch(qi *QueueItem) bool {
 		qi.UpdatedAt.After(*qi.DetailFetchedAt)
 }
 
+func commentRefreshDue(state string, updated, fetched time.Time, starred bool, now time.Time) bool {
+	// Fast comment checks remain useful for active conversations. Dormant
+	// items share the daily detail deadline instead of polling every pass.
+	return state == "open" && (starred || now.Sub(updated) < dailyRefetchInterval ||
+		now.Sub(fetched) >= dailyRefetchInterval)
+}
+
 func isEligible(qi *QueueItem, now time.Time) bool {
+	// Routine coverage is open-only. Detected changes may refresh a closed
+	// item; explicit user refreshes use the direct sync path.
+	if !qi.IsOpen && !updatedSinceLastFetch(qi) {
+		return false
+	}
 	// Never fetched — always eligible.
 	if qi.DetailFetchedAt == nil {
 		return true
@@ -91,15 +126,15 @@ func isEligible(qi *QueueItem, now time.Time) bool {
 		return true
 	}
 
-	// CI had pending checks — always eligible regardless of
-	// updated_at.
-	if qi.CIHadPending {
+	// CI and mergeability can resolve without changing updated_at.
+	if qi.CIHadPending || qi.MergeabilityPending {
 		return true
 	}
 
-	// Closed items: eligible only if fetched >24h ago.
-	if !qi.IsOpen {
-		return sinceLastFetch > closedRefetchInterval
+	// Even large repositories get a budgeted daily check. Previously their
+	// unchanged items could stay stale indefinitely.
+	if sinceLastFetch >= dailyRefetchInterval {
+		return true
 	}
 
 	// Starred or watched: eligible if >15min since fetch.
@@ -107,7 +142,7 @@ func isEligible(qi *QueueItem, now time.Time) bool {
 		return sinceLastFetch > starWatchInterval
 	}
 
-	if qi.LargeRepo {
+	if qi.LargeRepo || now.Sub(qi.UpdatedAt) >= dailyRefetchInterval {
 		return false
 	}
 

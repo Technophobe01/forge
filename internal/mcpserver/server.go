@@ -1,7 +1,8 @@
 package mcpserver
 
 import (
-	"fmt"
+	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -21,6 +22,8 @@ type Options struct {
 
 type Server struct {
 	backend                  Backend
+	kataToolMu               sync.Mutex
+	kataToolEnabled          bool
 	mcp                      *mcp.Server
 	agentHandoffPollInterval time.Duration
 	diffCacheBytes           int64
@@ -30,7 +33,7 @@ type Server struct {
 
 func New(opts Options) (*Server, error) {
 	if opts.Backend == nil {
-		return nil, fmt.Errorf("MCP backend is required")
+		return nil, errors.New("MCP backend is required")
 	}
 	diffCacheBytes := opts.DiffCacheBytes
 	if diffCacheBytes <= 0 {
@@ -63,22 +66,42 @@ func (s *Server) registerTools() {
 	s.registerDiffTools()
 	s.registerStackTools()
 	s.registerWorkflowTools()
+	s.registerWorklistTools()
 	s.registerAgentTools()
+	s.registerWorkspaceTargetTools()
+	s.syncKataTargetTool()
 	s.registerGuidance()
+	s.registerAppTools()
 }
 
 // HTTPHandler serves the single stateless Streamable HTTP MCP endpoint.
 func (s *Server) HTTPHandler() http.Handler {
+	return s.httpHandler(&mcp.StreamableHTTPOptions{Stateless: true})
+}
+
+// TailnetHTTPHandler serves the MCP endpoint behind Tailscale Serve. Serve
+// reaches the loopback listener with the public Host, which the SDK's
+// localhost DNS-rebinding guard rejects. The caller must validate Host
+// against the configured public authority before dispatching here.
+func (s *Server) TailnetHTTPHandler() http.Handler {
+	return s.httpHandler(&mcp.StreamableHTTPOptions{
+		Stateless: true, DisableLocalhostProtection: true,
+	})
+}
+
+func (s *Server) httpHandler(options *mcp.StreamableHTTPOptions) http.Handler {
 	stream := mcp.NewStreamableHTTPHandler(
 		func(*http.Request) *mcp.Server { return s.mcp },
-		&mcp.StreamableHTTPOptions{Stateless: true},
+		options,
 	)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/mcp" {
 			http.NotFound(w, r)
 			return
 		}
-		stream.ServeHTTP(w, r)
+		s.syncKataTargetTool()
+		ctx := context.WithValue(r.Context(), workspaceScopeKey{}, r.Header.Get("X-Kenn-Forge-Workspace-ID"))
+		stream.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 

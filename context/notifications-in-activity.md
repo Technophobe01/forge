@@ -18,7 +18,7 @@ Notifications are a built-in capability with no enable/disable setting. There is
 
 ```toml
 [notifications]
-sync_interval = "2m"
+sync_interval = "1h"
 propagation_interval = "1m"
 batch_size = 25
 ```
@@ -28,6 +28,9 @@ Rules:
 - `Config.NotificationsEnabled()` reports `c != nil`; the only "off" state is the absence of a loaded config, which callers use purely for nil-safety. There is no user-facing toggle.
 - A legacy config that still carries `[notifications] enabled = false` loads without error — the key is ignored (it is not a deprecated-key error) and notifications stay on.
 - The `[notifications]` section only tunes sync/propagation cadence and batch size.
+- Discovery defaults to hourly because notifications spend the user's quota even
+  with App-backed repo reads; explicit intervals remain unchanged. Read acknowledgements
+  stay prompt (`internal/config/config.go::defaultNotificationSyncInterval`).
 - The Settings API reports `notifications.enabled = true` as a read-only status, not a configurable knob.
 
 ## Repository Scope And Identity
@@ -42,7 +45,7 @@ Rules:
 - Queued-ack deferral matches linked rows by `repo_id` across renames; route owner/name matching is restricted to null-ID legacy rows (`internal/db/queries_notifications.go::DB.DeferQueuedNotificationAcksForRepos`).
 - `platform` is required. Blank provider/platform values are errors, not implicit GitHub defaults.
 - Show notifications only for current monitored repo set from config/syncer repo refs.
-- Capture the monitored-repository scope as stable internal IDs under the repository-reconciliation fence, then apply it inside Activity and actor-candidate SQL before ordering and limits; mutable routes or handler-side filtering can hide valid rows (`internal/server/huma_routes.go::Server.trackedActivityRepoIDsUnderRepositoryReconciliationRead`).
+- Capture the monitored-repository scope as stable internal IDs, then apply it inside Activity and actor-candidate SQL before ordering and limits; mutable routes or handler-side filtering can hide valid rows (`internal/server/activityapi/huma_routes.go::Handlers.trackedActivityRepoIDs`).
 - Historical notifications for removed repos may stay in SQLite but must not appear in `unread`, `active`, `read`, `done`, or `all` unless future explicit `include_unmonitored` contract exists.
 - `repo_id` is enrichment/optimization, not visibility authority.
 - Sync watermarks are keyed by full repository identity `(platform, platform_host, repo_owner, repo_name)`, never by host alone.
@@ -116,12 +119,11 @@ Rules:
 - The sync engine intentionally requires BOTH `ReadNotifications` and `NotificationMutation` to select a provider: listing and read-ack propagation are treated as one feature today. A future read-only provider (list without upstream mark-read) would split this — select listing on `ReadNotifications` and propagation on `NotificationMutation` separately. Until such a provider exists the coupling keeps the path simple.
 - Propagation workers must revalidate queued generation before calling provider.
 - Stale queued work must not mark newer provider activity read.
-- Advanced-activity refreshes resolve legacy unlinked rows to the active route and
-  commit under its fence; rejection reopens the acknowledgement and provider-unread
-  activity clears local completion (`internal/github/notifications_sync.go::Syncer.ProcessQueuedNotificationReads`).
-- Queued acknowledgements outlive route renames, including changes during
-  propagation: linked rows stay queued on fence rejection, and the next pass
-  resolves current owner/name by `repo_id` (`internal/github/notifications_sync.go::Syncer.ProcessQueuedNotificationReads`,
+- Advanced-activity refreshes resolve unlinked rows to the active route's
+  repository; provider-unread activity clears local completion
+  (`internal/github/notifications_sync.go::Syncer.ProcessQueuedNotificationReads`).
+- Read acknowledgements address the thread by its global ID, so they outlive
+  route renames; the next pass resolves current owner/name by `repo_id` (`internal/github/notifications_sync.go::Syncer.ProcessQueuedNotificationReads`,
   `internal/db/queries_notifications.go::DB.ListQueuedNotificationAcks`). Linked rows
   without a current route remain queued for future reactivation but are excluded before
   the bounded propagation batch limit so they cannot starve routable acknowledgements.
@@ -152,17 +154,18 @@ Rules:
 - These two filters are enforced at sync (new rows) and in the Activity union (existing rows). The notification list/summary APIs (`GET /notifications`, summaries) are not UI-surfaced today and intentionally still return any rows already in `forge_notification_items`; the Activity feed is the only filtered surface. If those APIs gain a UI, apply the same `item_type IN ('pr','issue') AND item_number IS NOT NULL AND reason != 'author'` filter there.
 - Notification sync should process each configured provider host independently; one provider-host failure must not block others.
 - Notification sync failures should update notification sync status so UI can surface them.
-- Every notification listing attempt must provider-verify the stable repository ID and persist
-  its metadata/settings only while that observation remains current; an occupied route is not
-  identity proof. Rejected observations and route- or observation-fenced commits retry before listing
-  (`internal/github/notifications_sync.go::Syncer.syncNotificationsForRepoAttempt`).
+- Every notification listing that can write a repository's rows must first provider-verify its
+  stable repository ID and persist its metadata/settings; an occupied route is not identity proof.
+  A 304 probe writes nothing and skips verification
+  (`internal/github/notifications_sync.go::Syncer.prepareNotificationRepo`).
 - Quota admission precedes identity verification against its read identity and any distinct
   write-permission overlay; a shared identity is checked once (`internal/github/notifications_sync.go::Syncer.ensureNotificationIdentityBudget`).
 - Top-level manual sync also triggers notification sync.
 - `/notifications/sync` triggers only notification sync and returns `202` once accepted.
 - Sync watermark identity is per repository: `(platform, platform_host, repo_owner, repo_name)`, with owner/name lowercased to match `notificationRepoKey`. One repository's failing or unroutable credential route must not hold back watermark advancement for healthy repositories on the same host.
-- A repository with no watermark yet full-syncs (GitHub `All: true`) without resetting siblings; later syncs use its persisted watermark/overlap to avoid full backlog scans.
-- GitHub notification pagination must run until the provider reports no next page; do not use a fixed page cap for either the primary repo notification list or the participating-only annotation scan. A fixed cap can pin the watermark forever on large backlogs. The guardrail is the shared sync budget/rate reserve (`internal/github/notifications_sync.go::Syncer.ensureNotificationBudget`), which should stop sync explicitly when upstream budget is exhausted (`internal/github/sync_test.go::TestSyncNotificationsReadsAllRepositoryNotificationPages`, `internal/github/sync_test.go::TestSyncNotificationsReadsAllParticipatingNotificationPages`).
+- GitHub notifications are listed host-wide once per user identity per pass, through a member repository's credential route (owner-scoped routes have no host fallback), never once per repository; threads for untracked or other-identity repositories are ignored. A group full-syncs when any member lacks a watermark or is due; otherwise it lists from the oldest member watermark minus overlap (`internal/github/notifications_sync.go::Syncer.syncNotificationsForIdentity`).
+- GitHub scopes notification `Last-Modified` to the user, not the URL, and a 304 costs no rate limit. Incremental passes send the validator from the last pass that advanced every member; a 304 skips identity checks and listing. Full syncs stay unconditional because read-state changes may not move the validator. GraphQL has no notification API.
+- GitHub notification pagination must run until the provider reports no next page; do not use a fixed page cap for either the primary notification list or the participating-only annotation scan. A fixed cap can pin the watermark forever on large backlogs. The guardrail is the shared sync budget/rate reserve (`internal/github/notifications_sync.go::Syncer.ensureNotificationBudget`), which should stop sync explicitly when upstream budget is exhausted (`internal/github/sync_test.go::TestSyncNotificationsReadsAllRepositoryNotificationPages`, `internal/github/sync_test.go::TestSyncNotificationsReadsAllParticipatingNotificationPages`).
 - Notification sync and read propagation should stop with server lifecycle before shared services are torn down.
 - Closed/merged linked notification completion must run after repo/detail/list paths that persist closed PR or issue state, not only after notification sync.
 - Per-item PR/issue sync paths close out only the item they just persisted; the full sweep is reserved for the repository sync pass, notification sync, and request handlers. Both sweep branches must stay on the item tables' `UNIQUE(repo_id, number)` index: legacy null-`repo_id` rows resolve the repository first, because one OR across linked and route-matched rows makes SQLite scan every merge request per active notification (`internal/db/queries_notifications.go::closedLinkedNotificationSubject.sweepStatements`).
@@ -195,6 +198,9 @@ Rules:
 - Activity applies "Hide closed/merged" before ordering and limits. Notifications use
   linked `subject_state`, and unknown lifecycle stays visible rather than being guessed
   from unread/read state (`internal/db/queries_activity.go::DB.ListActivity`).
+- Activity applies "Hide drafts" before ordering and limits; notification rows match
+  through their linked pull request, so unsynced subjects stay visible
+  (`internal/db/queries_activity.go::listActivityWithQueryer`).
 - Activity applies "Hide bots" before ordering and limits: events test the actor while
   parent summaries test the item author. Presentation filtering remains a defense for
   mixed workspace rows (`internal/db/activity_visibility.go::IsBotLogin`).

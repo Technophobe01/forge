@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -341,7 +342,7 @@ func TestStartTmuxAttachSessionKeepsBackingTmuxSession(t *testing.T) {
 	require.NoError(err)
 	go s.watch()
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 2*time.Second)
 		defer cancel()
 		require.NoError(s.stop(ctx))
 		waitSessionDone(s)
@@ -807,20 +808,7 @@ func TestManagerRestorePtyOwnerSessionIgnoresRemovedTarget(t *testing.T) {
 	assert.Equal(createdAt, sessions[0].CreatedAt)
 }
 
-func TestManagerRestorePtyOwnerSessionRetriesAttach(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	sessionKey := "ws-1_retry-attach"
-	owner := newFakeRuntimePtyOwner()
-	owner.startedSession = sessionKey
-	owner.startedPTY = &fakeRuntimePTY{
-		output: make(chan []byte, 64),
-		done:   make(chan struct{}),
-	}
-	owner.attachErrs = []error{
-		errors.New("owner socket not ready"),
-		errors.New("owner still starting"),
-	}
+func TestManagerRestorePtyOwnerAttachOutcomes(t *testing.T) {
 	previousBackOff := newPtyOwnerAttachBackOff
 	newPtyOwnerAttachBackOff = func() backoff.BackOff {
 		expo := backoff.NewExponentialBackOff()
@@ -830,72 +818,58 @@ func TestManagerRestorePtyOwnerSessionRetriesAttach(t *testing.T) {
 		return expo
 	}
 	t.Cleanup(func() { newPtyOwnerAttachBackOff = previousBackOff })
-	mgr := NewManager(Options{
-		PtyOwnerRuntime: owner,
-	})
-	t.Cleanup(mgr.Shutdown)
+	gone := fmt.Errorf("%w: connection refused", ptyowner.ErrOwnerGone)
+	for _, test := range []struct {
+		name       string
+		kind       LaunchTargetKind
+		attachErrs []error
+		attaches   int
+		check      func(*require.Assertions, error)
+	}{
+		{"transient then attached", LaunchTargetAgent, []error{errors.New("owner socket not ready"), errors.New("owner still starting")}, 3, func(require *require.Assertions, err error) {
+			require.NoError(err)
+		}},
+		{"retries exhausted", LaunchTargetAgent, []error{errors.New("a"), errors.New("b"), errors.New("c"), errors.New("d")}, 4, func(require *require.Assertions, err error) {
+			require.ErrorIs(err, ErrSessionUnavailable)
+			require.NotErrorIs(err, ErrSessionNotFound)
+		}},
+		{"owner gone", LaunchTargetAgent, []error{gone}, 1, func(require *require.Assertions, err error) {
+			require.ErrorIs(err, ErrSessionUnavailable)
+			require.ErrorIs(err, ptyowner.ErrOwnerGone)
+		}},
+		{"ACP owner gone", LaunchTargetACP, []error{gone}, 1, func(require *require.Assertions, err error) {
+			// Past the owner check, restore reads the saved configuration to start a replacement.
+			require.ErrorContains(err, "read ACP owner configuration")
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sessionKey := "ws-1_restore"
+			owner := newFakeRuntimePtyOwner()
+			owner.startedSession = sessionKey
+			owner.startedPTY = &fakeRuntimePTY{output: make(chan []byte, 64), done: make(chan struct{})}
+			owner.attachErrs = test.attachErrs
+			mgr := NewManager(Options{PtyOwnerRuntime: owner, ACPSessionsDir: t.TempDir()})
+			t.Cleanup(mgr.Shutdown)
 
-	err := mgr.RestoreRuntimeSessions(context.Background(), []RestoredRuntimeSession{{
-		WorkspaceID: "ws-1",
-		SessionKey:  sessionKey,
-		TargetKey:   "helper",
-		Label:       "Helper",
-		Kind:        LaunchTargetAgent,
-		CWD:         t.TempDir(),
-		CreatedAt:   time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC),
-	}})
-	require.NoError(err)
+			err := mgr.RestoreRuntimeSessions(context.Background(), []RestoredRuntimeSession{{
+				WorkspaceID: "ws-1",
+				SessionKey:  sessionKey,
+				TargetKey:   "helper",
+				Label:       "Helper",
+				Kind:        test.kind,
+				CWD:         t.TempDir(),
+				CreatedAt:   time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC),
+			}})
 
-	sessions := mgr.ListSessions("ws-1")
-	require.Len(sessions, 1)
-	assert.Equal(3, owner.attaches)
-	assert.Equal(sessionKey, sessions[0].Key)
-	assert.Equal(SessionStatusRunning, sessions[0].Status)
-}
-
-func TestManagerRestorePtyOwnerAttachFailureIsUnavailable(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	sessionKey := "ws-1_unavailable-attach"
-	owner := newFakeRuntimePtyOwner()
-	owner.startedSession = sessionKey
-	owner.startedPTY = &fakeRuntimePTY{
-		output: make(chan []byte, 64),
-		done:   make(chan struct{}),
+			test.check(require.New(t), err)
+			assert.Equal(t, test.attaches, owner.attaches)
+			if err == nil {
+				assert.Len(t, mgr.ListSessions("ws-1"), 1)
+			} else {
+				assert.Empty(t, mgr.ListSessions("ws-1"))
+			}
+		})
 	}
-	owner.attachErrs = []error{
-		errors.New("owner socket not ready"),
-		errors.New("owner still starting"),
-		errors.New("owner still absent"),
-		errors.New("owner gone"),
-	}
-	previousBackOff := newPtyOwnerAttachBackOff
-	newPtyOwnerAttachBackOff = func() backoff.BackOff {
-		expo := backoff.NewExponentialBackOff()
-		expo.InitialInterval = time.Millisecond
-		expo.MaxInterval = time.Millisecond
-		expo.RandomizationFactor = 0
-		return expo
-	}
-	t.Cleanup(func() { newPtyOwnerAttachBackOff = previousBackOff })
-	mgr := NewManager(Options{
-		PtyOwnerRuntime: owner,
-	})
-	t.Cleanup(mgr.Shutdown)
-
-	err := mgr.RestoreRuntimeSessions(context.Background(), []RestoredRuntimeSession{{
-		WorkspaceID: "ws-1",
-		SessionKey:  sessionKey,
-		TargetKey:   "helper",
-		Label:       "Helper",
-		Kind:        LaunchTargetAgent,
-		CWD:         t.TempDir(),
-		CreatedAt:   time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC),
-	}})
-	require.ErrorIs(err, ErrSessionUnavailable)
-	require.NotErrorIs(err, ErrSessionNotFound)
-	assert.Equal(4, owner.attaches)
-	assert.Empty(mgr.ListSessions("ws-1"))
 }
 
 func TestManagerRestoreTmuxSessionAttachesStoredSessionWithoutOwnerValidation(t *testing.T) {
@@ -1123,6 +1097,27 @@ func TestManagerLaunchCommandDoesNotEmbedEnvForWrappedAgent(t *testing.T) {
 	assert.NotContains(paneCommand, "secret-token")
 	assert.NotContains(paneCommand, "context7-secret")
 	assert.NotContains(paneCommand, "not-carried")
+}
+
+func TestManagerKillSessionWithEmptyTmuxServer(t *testing.T) {
+	if privateTmuxOwner == nil {
+		t.Skip("private tmux servers are unavailable")
+	}
+	tmuxPath, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skipf("tmux unavailable: %v", err)
+	}
+	require := require.New(t)
+	command := privateTmuxOwner.Command(t, tmuxPath)
+	cmd := procutil.Command(command[0], append(slices.Clone(command[1:]),
+		"new-session", "-d", "-s", "seed", "sleep 30", ";",
+		"set-option", "-s", "exit-empty", "off", ";",
+		"kill-session", "-t", "seed")...)
+	out, err := cmd.CombinedOutput()
+	require.NoError(err, string(out))
+	mgr := NewManager(Options{TmuxCommand: command})
+	t.Cleanup(mgr.Shutdown)
+	require.NoError(mgr.killTmuxSession(t.Context(), "seed"))
 }
 
 func TestTmuxLauncherCopiesClientEnvWithoutGlobalUpdateEnvironment(t *testing.T) {
@@ -1462,16 +1457,37 @@ func TestManagerStopFailedTmuxCleanupDoesNotSuppressExitCleanup(t *testing.T) {
 	}, 2*time.Second, 20*time.Millisecond)
 }
 
-func TestManagerStopIgnoresAbsentTmuxSession(t *testing.T) {
-	tmuxPath := filepath.Join(t.TempDir(), "tmux-absent")
-	require.NoError(t, os.WriteFile(
-		tmuxPath,
-		[]byte("#!/bin/sh\necho \"can't find session: nope\" >&2\nexit 1\n"),
-		0o755,
-	))
+func TestIsTmuxKillSessionGone(t *testing.T) {
+	for _, status := range []int{1, 2} {
+		cmd := procutil.CommandContext(t.Context(), "sh", "-c", fmt.Sprintf("exit %d", status))
+		err := procutil.Run(t.Context(), cmd, "test tmux exit status")
+		var exitErr *exec.ExitError
+		require.ErrorAs(t, err, &exitErr)
+		for _, message := range []string{
+			"can't find session: nope",
+			"no current target",
+			"no server running",
+			"error connecting to /tmp/socket (No such file or directory)",
+			"server exited unexpectedly",
+			"wrapper: server exited unexpectedly",
+			"permission denied",
+			"",
+		} {
+			t.Run(fmt.Sprintf("%s/status%d", message, status), func(t *testing.T) {
+				wrapped := fmt.Errorf("kill tmux session: %w", err)
+				want := status == 1 && message != "permission denied" && message != ""
+				assert.Equal(t, want, IsTmuxKillSessionGone([]byte(message), wrapped))
+			})
+		}
+	}
+	assert.True(t, IsTmuxKillSessionGone(nil, nil))
+	assert.False(t, IsTmuxKillSessionGone([]byte("server exited unexpectedly"), errors.New("wrapper failed")))
+}
+
+func TestManagerStopTreatsTmuxServerExitAsGone(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
-	mgr := NewManager(Options{TmuxCommand: []string{tmuxPath}})
+	mgr := NewManager(Options{TmuxCommand: []string{"sh", "-c", "echo 'server exited unexpectedly' >&2; exit 1"}})
 	mgr.sessions["ws-1:codex"] = &session{
 		info: SessionInfo{
 			Key:         "ws-1:codex",
@@ -1484,8 +1500,7 @@ func TestManagerStopIgnoresAbsentTmuxSession(t *testing.T) {
 		done:        done,
 	}
 
-	err := mgr.Stop(context.Background(), "ws-1", "ws-1:codex")
-
+	err := mgr.Stop(t.Context(), "ws-1", "ws-1:codex")
 	require.NoError(t, err)
 }
 
@@ -1831,7 +1846,7 @@ func TestStopWorkspaceWaitsForInflightLaunches(t *testing.T) {
 		require.FailNow(
 			"StopWorkspace returned before inflight launch drained",
 		)
-	case <-time.After(75 * time.Millisecond):
+	case <-time.After(75 * time.Millisecond): //nolint:kennlint // shows the event does not happen; the inflight launch count keeps StopWorkspace blocked until releaseInflight
 	}
 
 	mgr.releaseInflight("ws-1")
@@ -2000,65 +2015,78 @@ func TestSessionWatchPtyOwnerWaitsForFinalOutputDrain(t *testing.T) {
 }
 
 func TestManagerRemovesNaturallyExitedSession(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		target       LaunchTarget
+		shellCommand []string
+	}{
+		{name: "agent", target: helperTarget("helper", "sleep")},
+		{name: "shell", target: plainShellTarget(), shellCommand: []string{"/bin/sh"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx := context.Background()
+				exited := make(chan SessionInfo, 1)
+				owner := newFakeRuntimePtyOwner()
+				mgr := NewManager(Options{
+					ShellCommand:    tc.shellCommand,
+					Targets:         []LaunchTarget{tc.target},
+					OnSessionExit:   func(info SessionInfo) { exited <- info },
+					PtyOwnerRuntime: owner,
+				})
+				t.Cleanup(mgr.Shutdown)
+
+				session, err := mgr.Launch(ctx, "ws-1", t.TempDir(), tc.target.Key)
+				require.NoError(t, err)
+				owner.startedPTY.exitCode = 7
+				owner.startedPTY.Close()
+				synctest.Wait()
+				got := <-exited
+
+				assert := assert.New(t)
+				assert.Equal(session.Key, got.Key)
+				assert.Equal(SessionStatusExited, got.Status)
+				assert.NotNil(got.ExitedAt)
+				assert.NotNil(got.ExitCode)
+				assert.Equal(7, *got.ExitCode)
+				assert.Empty(mgr.ListSessions("ws-1"))
+			})
+		})
+	}
+}
+
+// Exit handling that began before shutdown can be forgetting a finished
+// session's record. Shutdown waits for it, so the process does not exit or
+// close its database first.
+func TestManagerShutdownWaitsForExitHandling(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()
-		exited := make(chan SessionInfo, 1)
+		entered := make(chan struct{})
+		release := make(chan struct{})
 		owner := newFakeRuntimePtyOwner()
 		mgr := NewManager(Options{Targets: []LaunchTarget{
 			helperTarget("helper", "sleep"),
-		}, OnSessionExit: func(info SessionInfo) {
-			exited <- info
+		}, OnSessionExit: func(SessionInfo) {
+			close(entered)
+			<-release
 		}, PtyOwnerRuntime: owner})
-		t.Cleanup(mgr.Shutdown)
 
-		session, err := mgr.Launch(ctx, "ws-1", t.TempDir(), "helper")
+		_, err := mgr.Launch(ctx, "ws-1", t.TempDir(), "helper")
 		require.NoError(t, err)
 		owner.startedPTY.Close()
+		<-entered
 
+		var returned atomic.Bool
+		go func() {
+			mgr.Shutdown()
+			returned.Store(true)
+		}()
 		synctest.Wait()
-		got := <-exited
+		assert.False(t, returned.Load(), "shutdown returned while exit handling ran")
 
-		assert := assert.New(t)
-		assert.Equal(session.Key, got.Key)
-		assert.Equal(SessionStatusExited, got.Status)
-		assert.NotNil(got.ExitedAt)
-		assert.NotNil(got.ExitCode)
-		assert.Equal(0, *got.ExitCode)
-		assert.Empty(mgr.ListSessions("ws-1"))
-	})
-}
-
-func TestManagerRemovesNaturallyExitedShell(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		ctx := context.Background()
-		exited := make(chan SessionInfo, 1)
-		owner := newFakeRuntimePtyOwner()
-		mgr := NewManager(Options{
-			ShellCommand: []string{"/bin/sh"},
-			Targets:      []LaunchTarget{plainShellTarget()},
-			OnSessionExit: func(info SessionInfo) {
-				exited <- info
-			},
-			PtyOwnerRuntime: owner,
-		})
-		t.Cleanup(mgr.Shutdown)
-
-		shell, err := mgr.Launch(
-			ctx, "ws-1", t.TempDir(), string(LaunchTargetPlainShell),
-		)
-		require.NoError(t, err)
-		owner.startedPTY.Close()
-
+		close(release)
 		synctest.Wait()
-		got := <-exited
-
-		assert := assert.New(t)
-		assert.Equal(shell.Key, got.Key)
-		assert.Equal(SessionStatusExited, got.Status)
-		assert.NotNil(got.ExitedAt)
-		assert.NotNil(got.ExitCode)
-		assert.Equal(0, *got.ExitCode)
-		assert.Empty(mgr.ListSessions("ws-1"))
+		assert.True(t, returned.Load())
 	})
 }
 
@@ -2205,7 +2233,7 @@ func TestAttachmentResizeOwnerPrefersActiveLocalUntilInactive(t *testing.T) {
 	}
 
 	remote, err := attachToSession(
-		s, "ws-1", "session-1", nil,
+		s, "ws-1", "session-1", nil, func() {},
 		AttachSessionOptions{
 			ResizePriority: ResizePriorityRemote,
 			ResizeActive:   true,
@@ -2216,7 +2244,7 @@ func TestAttachmentResizeOwnerPrefersActiveLocalUntilInactive(t *testing.T) {
 	require.NoError(remote.Resize(ptysize.Geometry{Cols: 80, Rows: 24}))
 
 	local, err := attachToSession(
-		s, "ws-1", "session-1", nil,
+		s, "ws-1", "session-1", nil, func() {},
 		AttachSessionOptions{ResizePriority: ResizePriorityLocal},
 	)
 	require.NoError(err)
@@ -2258,7 +2286,7 @@ func TestAttachmentResizeOwnerFollowsLatestDeliberateLocalClaim(t *testing.T) {
 	}
 
 	first, err := attachToSession(
-		s, "ws-1", "session-1", nil,
+		s, "ws-1", "session-1", nil, func() {},
 		AttachSessionOptions{
 			ResizePriority: ResizePriorityLocal,
 			ResizeActive:   true,
@@ -2267,7 +2295,7 @@ func TestAttachmentResizeOwnerFollowsLatestDeliberateLocalClaim(t *testing.T) {
 	require.NoError(err)
 	defer first.Close()
 	second, err := attachToSession(
-		s, "ws-1", "session-1", nil,
+		s, "ws-1", "session-1", nil, func() {},
 		AttachSessionOptions{
 			ResizePriority: ResizePriorityLocal,
 		},
@@ -2344,7 +2372,7 @@ func TestAttachmentResizeOwnerFallbackRestoresLatestRemainingClaim(t *testing.T)
 	}
 
 	first, err := attachToSession(
-		s, "ws-1", "session-1", nil,
+		s, "ws-1", "session-1", nil, func() {},
 		AttachSessionOptions{
 			ResizePriority: ResizePriorityLocal,
 			ResizeActive:   true,
@@ -2356,7 +2384,7 @@ func TestAttachmentResizeOwnerFallbackRestoresLatestRemainingClaim(t *testing.T)
 	require.NoError(err)
 
 	second, err := attachToSession(
-		s, "ws-1", "session-1", nil,
+		s, "ws-1", "session-1", nil, func() {},
 		AttachSessionOptions{
 			ResizePriority: ResizePriorityLocal,
 			ResizeActive:   true,
@@ -2368,7 +2396,7 @@ func TestAttachmentResizeOwnerFallbackRestoresLatestRemainingClaim(t *testing.T)
 	require.NoError(err)
 
 	third, err := attachToSession(
-		s, "ws-1", "session-1", nil,
+		s, "ws-1", "session-1", nil, func() {},
 		AttachSessionOptions{
 			ResizePriority: ResizePriorityLocal,
 			ResizeActive:   true,
@@ -2388,6 +2416,58 @@ func TestAttachmentResizeOwnerFallbackRestoresLatestRemainingClaim(t *testing.T)
 	}, pty.resizes())
 }
 
+func TestManagerSubmitInitialMessageWaitsForTmuxAgentInput(t *testing.T) {
+	if !testtmux.Supported() {
+		t.Skip("requires private tmux")
+	}
+	tmuxPath, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux unavailable")
+	}
+	require := require.New(t)
+	dir := t.TempDir()
+	gate := filepath.Join(dir, "ready")
+	received := filepath.Join(dir, "received")
+	// Keep the pane in cooked mode until the agent starts reading. Tmux
+	// already advertises bracketed paste to its attached client at this point.
+	script := "while [ ! -f " + shellquote.Join(gate) + " ]; do sleep 0.02; done; " +
+		"stty raw -echo; printf '\033[?2004h'; " +
+		"dd bs=1 count=24 of=" + shellquote.Join(received) + " 2>/dev/null; sleep 10"
+	mgr := NewManager(Options{
+		TmuxCommand:             privateTmuxOwner.Command(t, tmuxPath),
+		WrapAgentSessionsInTmux: true,
+		Targets: []LaunchTarget{{
+			Key: "agent", Label: "agent", Kind: LaunchTargetAgent, Available: true,
+			Command: []string{"/bin/sh", "-c", script},
+		}, {
+			Key: string(LaunchTargetShell), Kind: LaunchTargetShell, Available: true,
+		}},
+	})
+	t.Cleanup(mgr.Shutdown)
+	info, err := mgr.Launch(t.Context(), "ws-1", dir, "agent")
+	require.NoError(err)
+	mgr.mu.Lock()
+	s := mgr.sessions[info.Key]
+	mgr.mu.Unlock()
+	require.NotNil(s)
+	require.Eventually(func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.inputModes.observed[2004]
+	}, 5*time.Second, 10*time.Millisecond)
+
+	require.ErrorIs(mgr.SubmitInitialMessage(t.Context(), "ws-1", info.Key, "review this", ACPSender{Kind: ACPSenderUser}), ErrBracketedPasteInactive)
+	require.NoError(os.WriteFile(gate, nil, 0o600))
+	require.Eventually(func() bool {
+		err := mgr.SubmitInitialMessage(t.Context(), "ws-1", info.Key, "review this", ACPSender{Kind: ACPSenderUser})
+		return err == nil
+	}, 5*time.Second, 20*time.Millisecond)
+	require.Eventually(func() bool {
+		data, err := os.ReadFile(received)
+		return err == nil && string(data) == "\x1b[200~review this\x1b[201~\r"
+	}, 5*time.Second, 20*time.Millisecond)
+}
+
 func TestManagerSubmitInitialMessageWritesEnterAsSeparateKeystrokeAfterPaste(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -2404,10 +2484,13 @@ func TestManagerSubmitInitialMessageWritesEnterAsSeparateKeystrokeAfterPaste(t *
 	}
 	mgr := NewManager(Options{})
 	mgr.sessions[s.info.Key] = s
+	var noted []string
+	mgr.SetInputObserver(func(workspaceID string) { noted = append(noted, workspaceID) })
 
-	err := mgr.SubmitInitialMessage(t.Context(), "ws-1", "agent-1", "review this")
+	err := mgr.SubmitInitialMessage(t.Context(), "ws-1", "agent-1", "review this", ACPSender{Kind: ACPSenderUser})
 	require.ErrorIs(err, ErrBracketedPasteInactive)
 	assert.Empty(pty.written())
+	assert.Empty(noted, "a message that wasn't written isn't input")
 
 	s.broadcast([]byte("\x1b[?2004h"))
 	submit := func(message, framed string) {
@@ -2415,7 +2498,7 @@ func TestManagerSubmitInitialMessageWritesEnterAsSeparateKeystrokeAfterPaste(t *
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
 
-		require.NoError(mgr.SubmitInitialMessage(ctx, "ws-1", "agent-1", message))
+		require.NoError(mgr.SubmitInitialMessage(ctx, "ws-1", "agent-1", message, ACPSender{Kind: ACPSenderUser}))
 		pty.mu.Lock()
 		writeCalls := slices.Clone(pty.writeCalls)
 		pty.mu.Unlock()
@@ -2432,111 +2515,73 @@ func TestManagerSubmitInitialMessageWritesEnterAsSeparateKeystrokeAfterPaste(t *
 func TestManagerSubmitInitialMessageClassifiesMissingSessionAsNotWritten(t *testing.T) {
 	mgr := NewManager(Options{})
 
-	err := mgr.SubmitInitialMessage(t.Context(), "ws-1", "missing-agent", "review this")
+	err := mgr.SubmitInitialMessage(t.Context(), "ws-1", "missing-agent", "review this", ACPSender{Kind: ACPSenderUser})
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrInitialMessageNotWritten)
 }
 
-func TestManagerSubmitInitialMessageHonorsContextWithoutHoldingSessionLock(t *testing.T) {
-	require := require.New(t)
-	writeStarted := make(chan struct{})
-	writeRelease := make(chan struct{})
-	writeFinished := make(chan struct{})
-	pty := &fakeRuntimePTY{
-		output: make(chan []byte), done: make(chan struct{}),
-		writeStarted: writeStarted, writeRelease: writeRelease, writeFinished: writeFinished,
-	}
-	s := &session{
-		info: SessionInfo{
-			Key: "agent-1", WorkspaceID: "ws-1", Kind: LaunchTargetAgent,
-			Status: SessionStatusRunning,
-		},
-		pty: pty, done: make(chan struct{}),
-		subscribers: make(map[chan []byte]struct{}),
-	}
-	mgr := NewManager(Options{})
-	mgr.sessions[s.info.Key] = s
-	s.broadcast([]byte("\x1b[?2004h"))
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-	defer cancel()
-	result := make(chan error, 1)
-	go func() {
-		result <- mgr.SubmitInitialMessage(ctx, "ws-1", "agent-1", "review this")
-	}()
-
-	<-writeStarted
-	snapshotDone := make(chan struct{})
-	go func() {
-		_ = s.snapshot()
-		close(snapshotDone)
-	}()
-	select {
-	case <-snapshotDone:
-	case <-time.After(time.Second):
-		require.FailNow("session lock remained held during terminal write")
-	}
-	select {
-	case err := <-result:
-		require.ErrorIs(err, context.DeadlineExceeded)
-	case <-time.After(time.Second):
-		require.FailNow("initial message write ignored context deadline")
-	}
-	close(writeRelease)
-	select {
-	case <-writeFinished:
-	case <-time.After(time.Second):
-		require.FailNow("blocked test write did not finish")
-	}
-}
-
 func TestManagerSubmitInitialMessageStillSendsEnterWhenCallerStopsWaiting(t *testing.T) {
-	require := require.New(t)
-	writeRelease := make(chan struct{})
-	writeObserved := make(chan []byte)
-	pty := &fakeRuntimePTY{
-		output: make(chan []byte), done: make(chan struct{}),
-		writeRelease: writeRelease, writeObserved: writeObserved,
-	}
-	s := &session{
-		info: SessionInfo{
-			Key: "agent-1", WorkspaceID: "ws-1", Kind: LaunchTargetAgent,
-			Status: SessionStatusRunning,
-		},
-		pty: pty, done: make(chan struct{}),
-		subscribers: make(map[chan []byte]struct{}),
-	}
-	mgr := NewManager(Options{})
-	mgr.sessions[s.info.Key] = s
-	s.broadcast([]byte("\x1b[?2004h"))
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-	defer cancel()
-	result := make(chan error, 1)
-	go func() {
-		result <- mgr.SubmitInitialMessage(ctx, "ws-1", "agent-1", "review this")
-	}()
-	select {
-	case err := <-result:
-		require.ErrorIs(err, context.DeadlineExceeded)
-	case <-time.After(time.Second):
-		require.FailNow("initial message write ignored context deadline")
-	}
-
-	// The paste completes after the caller gave up. A paste without its
-	// Enter leaves the prompt sitting in the agent's input box, so the
-	// keystroke must still follow.
-	close(writeRelease)
-	observe := func() []byte {
-		select {
-		case data := <-writeObserved:
-			return data
-		case <-time.After(2 * time.Second):
-			require.FailNow("expected a terminal write after the caller stopped waiting")
-			return nil
+	synctest.Test(t, func(t *testing.T) {
+		require := require.New(t)
+		writeStarted := make(chan struct{})
+		writeRelease := make(chan struct{})
+		writeObserved := make(chan []byte)
+		pty := &fakeRuntimePTY{
+			output: make(chan []byte), done: make(chan struct{}),
+			writeStarted: writeStarted, writeRelease: writeRelease, writeObserved: writeObserved,
 		}
-	}
-	require.Equal([]byte("\x1b[200~review this\x1b[201~"), observe())
-	require.Equal([]byte("\r"), observe())
+		s := &session{
+			info: SessionInfo{
+				Key: "agent-1", WorkspaceID: "ws-1", Kind: LaunchTargetAgent,
+				Status: SessionStatusRunning,
+			},
+			pty: pty, done: make(chan struct{}),
+			subscribers: make(map[chan []byte]struct{}),
+		}
+		mgr := NewManager(Options{})
+		mgr.sessions[s.info.Key] = s
+		noted := make(chan string, 4)
+		mgr.SetInputObserver(func(workspaceID string) { noted <- workspaceID })
+		s.broadcast([]byte("\x1b[?2004h"))
+		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancel()
+		result := make(chan error, 1)
+		go func() {
+			result <- mgr.SubmitInitialMessage(ctx, "ws-1", "agent-1", "review this", ACPSender{Kind: ACPSenderUser})
+		}()
+		<-writeStarted
+		require.True(s.mu.TryLock(), "session lock remained held during terminal write")
+		s.mu.Unlock()
+		select {
+		case err := <-result:
+			require.ErrorIs(err, context.DeadlineExceeded)
+		case <-time.After(time.Second):
+			require.FailNow("initial message write ignored context deadline")
+		}
+
+		// The paste completes after the caller gave up. A paste without its
+		// Enter leaves the prompt sitting in the agent's input box, so the
+		// keystroke must still follow.
+		close(writeRelease)
+		observe := func() []byte {
+			select {
+			case data := <-writeObserved:
+				return data
+			case <-time.After(2 * time.Second):
+				require.FailNow("expected a terminal write after the caller stopped waiting")
+				return nil
+			}
+		}
+		require.Equal([]byte("\x1b[200~review this\x1b[201~"), observe())
+		require.Equal([]byte("\r"), observe())
+		select {
+		case workspaceID := <-noted:
+			require.Equal("ws-1", workspaceID)
+		default:
+			require.FailNow("a paste written after the caller stopped waiting is still input")
+		}
+	})
 }
 
 func TestManagerSubmitInitialMessageSerializesAttachmentInputUntilEnter(t *testing.T) {
@@ -2557,12 +2602,12 @@ func TestManagerSubmitInitialMessageSerializesAttachmentInputUntilEnter(t *testi
 	mgr := NewManager(Options{})
 	mgr.sessions[s.info.Key] = s
 	s.broadcast([]byte("\x1b[?2004h"))
-	attachment, err := attachToSession(s, "ws-1", "agent-1", nil, AttachSessionOptions{})
+	attachment, err := attachToSession(s, "ws-1", "agent-1", nil, func() {}, AttachSessionOptions{})
 	require.NoError(err)
 	defer attachment.Close()
 
 	go func() {
-		_ = mgr.SubmitInitialMessage(t.Context(), "ws-1", "agent-1", "review this")
+		_ = mgr.SubmitInitialMessage(t.Context(), "ws-1", "agent-1", "review this", ACPSender{Kind: ACPSenderUser})
 	}()
 	observe := func() []byte {
 		select {
@@ -2595,7 +2640,7 @@ func TestManagerSubmitInitialMessageRejectsMultilineWithoutBracketedPaste(t *tes
 	mgr := NewManager(Options{})
 	mgr.sessions[s.info.Key] = s
 
-	err := mgr.SubmitInitialMessage(t.Context(), "ws-1", "agent-1", "first\nsecond")
+	err := mgr.SubmitInitialMessage(t.Context(), "ws-1", "agent-1", "first\nsecond", ACPSender{Kind: ACPSenderUser})
 	require.ErrorIs(err, ErrBracketedPasteInactive)
 	assert.Empty(t, pty.written())
 }
@@ -2618,10 +2663,6 @@ func newFakeRuntimePtyOwner() *fakeRuntimePtyOwner {
 	return &fakeRuntimePtyOwner{}
 }
 
-func (f *fakeRuntimePtyOwner) HasState(session string) bool {
-	return f.startedSession == session
-}
-
 func writeLongRunningAttachTmux(t *testing.T) string {
 	t.Helper()
 	tmuxPath := filepath.Join(t.TempDir(), "tmux")
@@ -2635,6 +2676,8 @@ exit 0
 `), 0o755))
 	return tmuxPath
 }
+
+func (*fakeRuntimePtyOwner) Gone(context.Context, string) bool { return false }
 
 func (f *fakeRuntimePtyOwner) Start(
 	_ context.Context,
@@ -2666,8 +2709,8 @@ func (f *fakeRuntimePtyOwner) Attach(
 		f.attachErrs = f.attachErrs[1:]
 		return nil, err
 	}
-	if !f.HasState(session) || f.startedPTY == nil {
-		return nil, errors.New("missing pty owner state")
+	if f.startedSession != session || f.startedPTY == nil {
+		return nil, fmt.Errorf("%w: missing pty owner state", ptyowner.ErrOwnerGone)
 	}
 	return f.startedPTY, nil
 }
@@ -2685,6 +2728,7 @@ func (f *fakeRuntimePtyOwner) Stop(_ context.Context, session string) error {
 }
 
 type fakeRuntimePTY struct {
+	exitCode      int
 	mu            sync.Mutex
 	output        chan []byte
 	done          chan struct{}
@@ -2770,7 +2814,7 @@ func (f *fakeRuntimePTY) resizes() []terminalResize {
 	return slices.Clone(f.resizeCalls)
 }
 
-func (f *fakeRuntimePTY) ExitCode() int { return 0 }
+func (f *fakeRuntimePTY) ExitCode() int { return f.exitCode }
 
 func (f *fakeRuntimePTY) Close() {
 	select {
@@ -2864,7 +2908,7 @@ func TestSessionBroadcastClosesSlowSubscriber(t *testing.T) {
 	select {
 	case _, ok := <-ch:
 		assert.False(ok)
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("slow subscriber was not closed")
 	}
 	s.mu.Lock()
@@ -2887,7 +2931,7 @@ func TestSessionSubscribeReplaysBufferedOutput(t *testing.T) {
 	select {
 	case data := <-ch:
 		assert.Equal("startup-banner\r\n$ ", string(data))
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("subscriber did not receive replay")
 	}
 
@@ -2895,7 +2939,7 @@ func TestSessionSubscribeReplaysBufferedOutput(t *testing.T) {
 	select {
 	case data := <-ch:
 		assert.Equal("ls\r\n", string(data))
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("subscriber did not receive new output after replay")
 	}
 }
@@ -2917,7 +2961,7 @@ func TestSessionSubscribeReplayTruncationPreservesUTF8Boundary(t *testing.T) {
 		assert := assert.New(t)
 		assert.Equal(byte('?'), data[0])
 		assert.NotContains(string(data), "\x1b[?2004l")
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail(t, "subscriber did not receive replay")
 	}
 }
@@ -2934,7 +2978,7 @@ func TestSessionSubscribeReplayTruncationPreservesRawC1(t *testing.T) {
 	select {
 	case data := <-ch:
 		assert.Equal(t, byte(0x9b), data[0])
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail(t, "subscriber did not receive replay")
 	}
 }
@@ -2953,7 +2997,7 @@ func TestSessionSubscribeRestoresInputModesAfterReplayTruncation(t *testing.T) {
 		assert := assert.New(t)
 		assert.Len(data, maxSessionOutputReplay+len(modeSequence))
 		assert.Equal(modeSequence, string(data[maxSessionOutputReplay:]))
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail(t, "subscriber did not receive replay")
 	}
 }
@@ -2973,7 +3017,7 @@ func TestSessionSubscribeRestoresDisabledInputModesAfterReplayTruncation(t *test
 		assert := assert.New(t)
 		assert.Len(data, maxSessionOutputReplay+len(resetSequence))
 		assert.Equal(resetSequence, string(data[maxSessionOutputReplay:]))
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail(t, "subscriber did not receive replay")
 	}
 }
@@ -2991,7 +3035,7 @@ func TestSessionSubscribeOverridesStaleReplayInputModes(t *testing.T) {
 	select {
 	case data := <-ch:
 		assert.Equal(t, "screen\x1b[?1000h\x1b[?1000l", string(data))
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail(t, "subscriber did not receive replay")
 	}
 }
@@ -3006,7 +3050,7 @@ func TestSessionSubscribeDoesNotSynthesizeDuplicateRetainedFocusMode(t *testing.
 	select {
 	case data := <-ch:
 		assert.Equal(t, 2, bytes.Count(data, []byte("\x1b[?1004h")))
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail(t, "subscriber did not receive replay")
 	}
 }
@@ -3118,7 +3162,7 @@ func TestSessionSubscribePreservesSplitTerminalData(t *testing.T) {
 			select {
 			case data := <-ch:
 				assert.True(bytes.HasSuffix(data, []byte("\x1b[?1000h"+tt.candidate)))
-			case <-time.After(100 * time.Millisecond):
+			default:
 				assert.Fail("subscriber did not receive replay")
 			}
 
@@ -3126,13 +3170,13 @@ func TestSessionSubscribePreservesSplitTerminalData(t *testing.T) {
 			select {
 			case data := <-ch:
 				assert.Equal(tt.continuation, string(data))
-			case <-time.After(100 * time.Millisecond):
+			default:
 				assert.Fail("subscriber did not receive split sequence continuation")
 			}
 			select {
 			case data := <-ch:
 				assert.Nil(data)
-			case <-time.After(100 * time.Millisecond):
+			default:
 				assert.Fail("subscriber did not receive replay boundary")
 			}
 		})
@@ -3150,13 +3194,13 @@ func TestSessionSubscribeReplayBoundaryReadyWithoutPendingTail(t *testing.T) {
 	select {
 	case data := <-ch:
 		assert.Equal("complete replay", string(data))
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("subscriber did not receive replay")
 	}
 	select {
 	case data := <-ch:
 		assert.Nil(data)
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("subscriber did not receive replay boundary")
 	}
 }
@@ -3201,7 +3245,7 @@ func TestSessionSubscribePlacesTransitionsAfterCompleteOrDiscardedC1Data(t *test
 			select {
 			case data := <-ch:
 				assert.True(t, bytes.HasSuffix(data, []byte(tt.controlString+"\x1b[?1000h")))
-			case <-time.After(100 * time.Millisecond):
+			default:
 				assert.Fail(t, "subscriber did not receive replay")
 			}
 		})
@@ -3219,7 +3263,7 @@ func TestSessionSubscribeRestoresInputModesWhileAlternateScreenActive(t *testing
 	select {
 	case data := <-ch:
 		assert.Equal(t, "\x1b[?1000;1006h", string(data))
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail(t, "subscriber did not receive input mode replay")
 	}
 }
@@ -3241,7 +3285,7 @@ func TestSessionSubscribeIgnoresUTF8ContinuationWhileAlternateScreenActive(t *te
 			"unexpected replay: %q",
 			string(data),
 		)
-	case <-time.After(25 * time.Millisecond):
+	default:
 	}
 }
 
@@ -3257,20 +3301,20 @@ func TestSessionSubscribePreservesSplitUTF8C1WhileAlternateScreenActive(t *testi
 	select {
 	case data := <-ch:
 		assert.Equal("\xc2", string(data))
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("subscriber did not receive split UTF-8 C1 prefix")
 	}
 	s.broadcast([]byte("\x9b?1h"))
 	select {
 	case data := <-ch:
 		assert.Equal("\x9b?1h", string(data))
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("subscriber did not receive split UTF-8 C1 continuation")
 	}
 	select {
 	case data := <-ch:
 		assert.Nil(data)
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("subscriber did not receive replay boundary")
 	}
 }
@@ -3337,7 +3381,7 @@ func TestSessionSubscribePreservesSplitTerminalDataWhileAlternateScreenActive(t 
 			select {
 			case data := <-ch:
 				assert.Equal("\x1b[?1000h"+tt.candidate, string(data))
-			case <-time.After(100 * time.Millisecond):
+			default:
 				assert.Fail("subscriber did not receive terminal replay")
 			}
 
@@ -3345,13 +3389,13 @@ func TestSessionSubscribePreservesSplitTerminalDataWhileAlternateScreenActive(t 
 			select {
 			case data := <-ch:
 				assert.Equal(tt.continuation, string(data))
-			case <-time.After(100 * time.Millisecond):
+			default:
 				assert.Fail("subscriber did not receive split sequence continuation")
 			}
 			select {
 			case data := <-ch:
 				assert.Nil(data)
-			case <-time.After(100 * time.Millisecond):
+			default:
 				assert.Fail("subscriber did not receive replay boundary")
 			}
 		})
@@ -3381,7 +3425,7 @@ func TestSessionSubscribeDropsRawC1TailWhileAlternateScreenActive(t *testing.T) 
 			select {
 			case data := <-ch:
 				assert.Equal(t, "\x1b[?1000h", string(data))
-			case <-time.After(100 * time.Millisecond):
+			default:
 				assert.Fail(t, "subscriber did not receive terminal replay")
 			}
 		})
@@ -3404,13 +3448,13 @@ func TestSessionSubscribeAfterCloseCombinesReplayAndInputModes(t *testing.T) {
 		assert.True(ok)
 		assert.Len(data, maxSessionOutputReplay+len(modeSequence))
 		assert.Equal(modeSequence, string(data[maxSessionOutputReplay:]))
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("expected replay before channel close")
 	}
 	select {
 	case _, ok := <-ch:
 		assert.False(ok)
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("expected channel to close after replay")
 	}
 }
@@ -3425,7 +3469,7 @@ func TestSessionSubscribeWithoutInputModesPreservesReplay(t *testing.T) {
 	select {
 	case data := <-ch:
 		assert.Equal(t, "startup-banner\r\n$ ", string(data))
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail(t, "subscriber did not receive replay")
 	}
 }
@@ -3442,13 +3486,13 @@ func TestSessionInputModeReplayIsSubscriberOnly(t *testing.T) {
 	select {
 	case data := <-ch:
 		assert.Equal(raw, data)
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("subscriber did not receive live output")
 	}
 	select {
 	case data := <-ch:
 		assert.Failf("subscriber received synthesized live output", "output: %q", data)
-	case <-time.After(25 * time.Millisecond):
+	default:
 	}
 	s.mu.Lock()
 	replay := bytes.Clone(s.outputBuffer)
@@ -3474,14 +3518,14 @@ func TestSessionSubscribeSkipsReplayWhileAlternateScreenActive(t *testing.T) {
 			"unexpected replay: %q",
 			string(data),
 		)
-	case <-time.After(25 * time.Millisecond):
+	default:
 	}
 
 	s.broadcast([]byte("\x1b[Hupdated screen"))
 	select {
 	case data := <-ch:
 		assert.Equal("\x1b[Hupdated screen", string(data))
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("subscriber did not receive live output")
 	}
 }
@@ -3501,7 +3545,7 @@ func TestSessionSubscribeReplaysNormalOutputAfterAlternateScreenExit(t *testing.
 	select {
 	case data := <-ch:
 		assert.Equal("\r\n$ ", string(data))
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("subscriber did not receive normal replay after exit")
 	}
 }
@@ -3524,7 +3568,7 @@ func TestSessionAlternateScreenTrackingHandlesSplitEscapeSequences(t *testing.T)
 			"unexpected replay: %q",
 			string(data),
 		)
-	case <-time.After(25 * time.Millisecond):
+	default:
 	}
 
 	s.broadcast([]byte("\x1b[?104"))
@@ -3533,13 +3577,13 @@ func TestSessionAlternateScreenTrackingHandlesSplitEscapeSequences(t *testing.T)
 	select {
 	case data := <-ch:
 		live.Write(data)
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("subscriber did not receive live split exit prefix")
 	}
 	select {
 	case data := <-ch:
 		live.Write(data)
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("subscriber did not receive live split exit suffix")
 	}
 	assert.Equal("\x1b[?1049l\r\n$ ", live.String())
@@ -3549,7 +3593,7 @@ func TestSessionAlternateScreenTrackingHandlesSplitEscapeSequences(t *testing.T)
 	select {
 	case data := <-ch2:
 		assert.Equal("\r\n$ ", string(data))
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("subscriber did not receive replay after split exit")
 	}
 }
@@ -3569,13 +3613,13 @@ func TestSessionSubscribeAfterCloseStillReplays(t *testing.T) {
 	case data, ok := <-ch:
 		assert.True(ok)
 		assert.Equal("hello\r\nbye\r\n", string(data))
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("expected replay before channel close")
 	}
 	select {
 	case _, ok := <-ch:
 		assert.False(ok)
-	case <-time.After(100 * time.Millisecond):
+	default:
 		assert.Fail("expected channel to close after replay")
 	}
 }
@@ -3859,7 +3903,7 @@ func TestHelperProcess(t *testing.T) {
 	mode := helperArgs[0]
 	switch mode {
 	case "sleep":
-		time.Sleep(time.Hour)
+		time.Sleep(time.Hour) //nolint:kennlint // keeps the helper subprocess alive until the manager stops it
 	case "sleep-record":
 		if len(helperArgs) < 2 {
 			os.Exit(2)
@@ -3874,7 +3918,7 @@ func TestHelperProcess(t *testing.T) {
 		}
 		_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
 		_ = f.Close()
-		time.Sleep(time.Hour)
+		time.Sleep(time.Hour) //nolint:kennlint // keeps the helper subprocess alive until the manager stops it
 	case "spawn-child":
 		if len(helperArgs) < 2 {
 			os.Exit(2)
@@ -3897,7 +3941,7 @@ func TestHelperProcess(t *testing.T) {
 			f, "%d\n%d\n", os.Getpid(), child.Process.Pid,
 		)
 		_ = f.Close()
-		time.Sleep(time.Hour)
+		time.Sleep(time.Hour) //nolint:kennlint // keeps the helper subprocess alive until the manager stops it
 	case "exit":
 		os.Exit(3)
 	default:

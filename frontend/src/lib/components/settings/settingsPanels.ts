@@ -18,6 +18,15 @@ export const SETTINGS_PANELS: SettingsPanelMeta[] = [
     keywords: "repos repositories providers github gitlab forgejo gitea import glob",
   },
   {
+    id: "settings-sync",
+    label: "Sync",
+    title: "Sync",
+    group: "Providers",
+    description: "Background updates, airplane mode, and the hourly sync budget",
+    keywords:
+      "sync airplane mode slow internet bandwidth relay offline network budget ceiling quota rate limit requests hourly",
+  },
+  {
     id: "settings-pull-requests",
     label: "Pull requests",
     title: "Pull request safeguards",
@@ -39,24 +48,17 @@ export const SETTINGS_PANELS: SettingsPanelMeta[] = [
     title: "Activity feed defaults",
     group: "Workflow",
     description: "Default activity feed filters",
-    keywords: "activity feed defaults filters time range closed bots",
+    keywords:
+      "activity feed defaults filters time range horizon closed merged bots item event types comments reviews commits force pushes notifications branch rollup",
   },
   {
     id: "settings-workspaces",
     label: "Workspaces",
     title: "Workspaces",
     group: "Workspace",
-    description: "Workspace creation and list indicators",
+    description: "Workspace behavior, list indicators, terminal and ACP appearance",
     keywords:
-      "workspace create pull request issue assign self assignee ownership agent status working approval input done lists activity",
-  },
-  {
-    id: "settings-terminal",
-    label: "Terminal",
-    title: "Workspace terminal",
-    group: "Workspace",
-    description: "Workspace terminal appearance and behavior",
-    keywords: "workspace terminal font cursor scrollback ligatures",
+      "workspace create pull request issue assign self assignee ownership agent status working approval input done lists activity terminal ACP harness chat appearance font size cursor scrollback ligatures retained sessions retention tmux graphics",
   },
   {
     id: "settings-kata-projects",
@@ -72,7 +74,7 @@ export const SETTINGS_PANELS: SettingsPanelMeta[] = [
     title: "Workspace agents",
     group: "Workspace",
     description: "Agent commands available in workspaces",
-    keywords: "workspace agents codex claude gemini opencode aider binary arguments",
+    keywords: "workspace agents codex claude pi gemini opencode aider binary arguments",
   },
   {
     id: "settings-quick-actions",
@@ -96,7 +98,15 @@ export const SETTINGS_PANELS: SettingsPanelMeta[] = [
     title: "Visible modes",
     group: "Navigation",
     description: "Modes shown in the app header",
-    keywords: "visible modes navigation tabs prs issues reviews docs kata actions github workflows release dispatch",
+    keywords: "visible modes navigation tabs prs issues docs kata actions github workflows release dispatch",
+  },
+  {
+    id: "settings-appearance",
+    label: "Appearance",
+    title: "Appearance",
+    group: "Navigation",
+    description: "Color theme and contrast on this device",
+    keywords: "theme light dark system contrast e-reader eink e-ink color",
   },
   {
     id: "settings-mcp",

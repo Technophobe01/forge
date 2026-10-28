@@ -1,5 +1,6 @@
 import { canonicalProvider } from "../api/provider-routes.js";
 import { buildIssueRoute, buildRoutedItemRoute, type RepositoryRouteRef } from "../routes.js";
+import { withBasePath } from "../stores/router.svelte.js";
 
 export type ItemReferenceType = "pr" | "issue";
 
@@ -28,6 +29,7 @@ export type ItemReferenceLink = {
 const defaultHosts: Record<string, string> = {
   github: "github.com",
   gitlab: "gitlab.com",
+  bitbucket: "bitbucket.org",
 };
 
 function providerHost(provider: string, platformHost: string | undefined): string | null {
@@ -48,10 +50,16 @@ export function buildCanonicalProviderItemURL(ref: ResolvableItemReference): str
   if (!host || !repoPath) return undefined;
   const provider = canonicalProvider(ref.provider);
   const number = encodeURIComponent(ref.number.toString());
+  if (provider === "bitbucket" && host.toLowerCase() !== "bitbucket.org") {
+    if (ref.itemType !== "pr") return undefined;
+    return `https://${host}/projects/${encodeURIComponent(ref.owner)}/repos/${encodeURIComponent(ref.name)}/pull-requests/${number}`;
+  }
   let itemPath: string;
   if (ref.itemType === "pr") {
     if (provider === "gitlab") {
       itemPath = `/-/merge_requests/${number}`;
+    } else if (provider === "bitbucket") {
+      itemPath = `/pull-requests/${number}`;
     } else if (provider === "github") {
       itemPath = `/pull/${number}`;
     } else {
@@ -94,7 +102,18 @@ export function parseProviderItemURL(
   let itemType: ItemReferenceType;
   let repoSegments: string[];
   let numberText: string;
-  if (provider === "gitlab") {
+  if (provider === "bitbucket" && host.toLowerCase() !== "bitbucket.org") {
+    if (
+      (segments.length !== 6 && !(segments.length === 7 && segments[6] === "overview")) ||
+      segments[0] !== "projects" ||
+      segments[2] !== "repos" ||
+      segments[4] !== "pull-requests"
+    )
+      return null;
+    itemType = "pr";
+    repoSegments = [segments[1]!, segments[3]!];
+    numberText = segments[5]!;
+  } else if (provider === "gitlab") {
     const marker = segments.lastIndexOf("-");
     if (marker < 1 || segments.length !== marker + 3) return null;
     const kind = segments[marker + 1];
@@ -107,7 +126,8 @@ export function parseProviderItemURL(
     if (segments.length !== 4) return null;
     const kind = segments[2];
     if (kind === "issues") itemType = "issue";
-    else if (kind === (provider === "github" ? "pull" : "pulls")) itemType = "pr";
+    else if (kind === (provider === "github" ? "pull" : provider === "bitbucket" ? "pull-requests" : "pulls"))
+      itemType = "pr";
     else return null;
     repoSegments = segments.slice(0, 2);
     numberText = segments[3]!;
@@ -127,14 +147,31 @@ export function parseProviderItemURL(
   };
 }
 
+export type ProviderContext = { provider: string; platformHost?: string | undefined };
+
+// Tries each known provider host, then the providers' public hosts, so a
+// link to any repository on a host Forge knows about becomes a reference.
+export function parseKnownProviderItemURL(
+  raw: string,
+  contexts: ReadonlyArray<ProviderContext>,
+): ResolvableItemReference | null {
+  for (const context of [...contexts, { provider: "github" }, { provider: "gitlab" }, { provider: "bitbucket" }]) {
+    const ref = parseProviderItemURL(raw, context);
+    if (ref) return ref;
+  }
+  return null;
+}
+
+// The href carries the base path so modifier clicks, new tabs, and copied
+// links reach Forge. Plain clicks route from the data attributes instead.
 export function buildItemReferenceHref(ref: ResolvableItemReference): string {
   if (ref.itemType === "pr") {
-    return buildRoutedItemRoute({ ...ref, itemType: "pr" });
+    return withBasePath(buildRoutedItemRoute({ ...ref, itemType: "pr" }));
   }
   if (ref.itemType === "issue") {
-    return buildRoutedItemRoute({ ...ref, itemType: "issue" });
+    return withBasePath(buildRoutedItemRoute({ ...ref, itemType: "issue" }));
   }
-  return buildIssueRoute(ref);
+  return withBasePath(buildIssueRoute(ref));
 }
 
 export function itemReferenceDataAttributes(ref: ResolvableItemReference): ItemReferenceDataAttributes {

@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -21,12 +23,15 @@ import (
 	"go.kenn.io/forge/internal/federation"
 	"go.kenn.io/forge/internal/federationauth"
 	"go.kenn.io/forge/internal/server/httpapi"
+	"go.kenn.io/forge/internal/server/workspaceapi"
 	"go.kenn.io/forge/internal/terminalpaste"
 	"go.kenn.io/forge/internal/terminalwebsocket"
 	"go.kenn.io/forge/internal/tracing"
 )
 
 type fleetRESTProxyRoute struct {
+	responseType reflect.Type
+	responseCode int
 	operationID  string
 	method       string
 	path         string
@@ -158,6 +163,52 @@ func (s *Handler) registerFleetOperationRoutes(api huma.API) {
 			},
 		},
 		{
+			operationID:  "list-fleet-workspace-targets",
+			method:       http.MethodGet,
+			path:         "/fleet/hosts/{host_key}/workspaces/{id}/targets",
+			summary:      "List workspace targets on fleet host",
+			pathParams:   []string{"host_key", "id"},
+			responseType: reflect.TypeFor[workspaceapi.WorkspaceTargetsResponse](),
+			targetPath: func(r *http.Request) string {
+				return "/api/v1/workspaces/" + escapePath(r.PathValue("id")) + "/targets"
+			},
+		},
+		{
+			operationID:  "update-fleet-workspace-target",
+			method:       http.MethodPut,
+			path:         "/fleet/hosts/{host_key}/workspaces/{id}/targets",
+			summary:      "Track or hide a workspace target on fleet host",
+			pathParams:   []string{"host_key", "id"},
+			body:         true,
+			responseCode: http.StatusNoContent,
+			targetPath: func(r *http.Request) string {
+				return "/api/v1/workspaces/" + escapePath(r.PathValue("id")) + "/targets"
+			},
+		},
+		{
+			operationID:  "get-fleet-workspace-view-state",
+			responseType: reflect.TypeFor[workspaceapi.WorkspaceViewState](),
+			method:       http.MethodGet,
+			path:         "/fleet/hosts/{host_key}/workspaces/{id}/view-state",
+			summary:      "Get workspace view state on fleet host",
+			pathParams:   []string{"host_key", "id"},
+			targetPath: func(r *http.Request) string {
+				return "/api/v1/workspaces/" + escapePath(r.PathValue("id")) + "/view-state"
+			},
+		},
+		{
+			operationID:  "update-fleet-workspace-view-state",
+			responseType: reflect.TypeFor[workspaceapi.WorkspaceViewState](),
+			method:       http.MethodPut,
+			path:         "/fleet/hosts/{host_key}/workspaces/{id}/view-state",
+			summary:      "Update workspace view state on fleet host",
+			pathParams:   []string{"host_key", "id"},
+			body:         true,
+			targetPath: func(r *http.Request) string {
+				return "/api/v1/workspaces/" + escapePath(r.PathValue("id")) + "/view-state"
+			},
+		},
+		{
 			operationID: "retry-fleet-workspace",
 			method:      http.MethodPost,
 			path:        "/fleet/hosts/{host_key}/workspaces/{id}/retry",
@@ -213,6 +264,9 @@ func (s *Handler) registerFleetOperationRoutes(api huma.API) {
 			path:        "/fleet/hosts/{host_key}/workspaces/{id}/runtime",
 			summary:     "Get workspace runtime on fleet host",
 			pathParams:  []string{"host_key", "id"},
+			queryParams: []*huma.Param{
+				{Name: "viewing", In: "query", Description: "Set to true when the workspace view is showing.", Schema: &huma.Schema{Type: "boolean"}},
+			},
 			targetPath: func(r *http.Request) string {
 				return "/api/v1/workspaces/" + escapePath(r.PathValue("id")) + "/runtime"
 			},
@@ -601,6 +655,19 @@ func (s *Handler) registerFleetOperationRoutes(api huma.API) {
 			Responses:    fleetProxyResponses(),
 			MaxBodyBytes: maxBodyBytes,
 		}
+		if route.responseCode != 0 {
+			op.Responses[strconv.Itoa(route.responseCode)] = &huma.Response{
+				Description: http.StatusText(route.responseCode),
+			}
+		}
+		if route.responseType != nil {
+			op.Responses["200"] = &huma.Response{
+				Description: "Response returned by the owning fleet host.",
+				Content: map[string]*huma.MediaType{
+					"application/json": {Schema: api.OpenAPI().Components.Schemas.Schema(route.responseType, true, route.responseType.Name())},
+				},
+			}
+		}
 		if route.binaryBody {
 			op.RequestBody = fleetProxyBinaryRequestBody()
 		} else if route.body {
@@ -609,7 +676,7 @@ func (s *Handler) registerFleetOperationRoutes(api huma.API) {
 		api.OpenAPI().AddOperation(op)
 		api.Adapter().Handle(op, func(ctx huma.Context) {
 			r, w := humago.Unwrap(ctx)
-			if !bufferFleetProxyRequestBody(w, r, maxBodyBytes) {
+			if !BufferProxyRequestBody(w, r, maxBodyBytes) {
 				return
 			}
 			s.serveFleetRESTProxy(w, r, route.targetPath(r))
@@ -743,10 +810,10 @@ func fleetProxyRequestBody() *huma.RequestBody {
 	}
 }
 
-// bufferFleetProxyRequestBody bounds and consumes any browser request body
+// BufferProxyRequestBody bounds and consumes any browser request body
 // before the hub resolves or dials a fleet member. The fleet adapter handles
 // raw requests, so Huma's MaxBodyBytes metadata is not enforced automatically.
-func bufferFleetProxyRequestBody(w http.ResponseWriter, r *http.Request, maxBodyBytes int64) bool {
+func BufferProxyRequestBody(w http.ResponseWriter, r *http.Request, maxBodyBytes int64) bool {
 	if r.ContentLength > maxBodyBytes {
 		writeProblemResponse(w, httpapi.NewProblem(
 			http.StatusRequestEntityTooLarge,
@@ -887,7 +954,7 @@ func (s *Handler) serveRemoteFleetRESTProxy(
 	}
 	defer resp.Body.Close()
 
-	copyProxyResponseHeaders(w.Header(), resp.Header)
+	CopyProxyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		slog.Debug(
@@ -931,10 +998,15 @@ func (s *Handler) serveFleetWebSocketProxy(
 	dialHeader := make(http.Header)
 	copyProxyWebSocketRequestHeaders(dialHeader, r.Header)
 	s.authorizeFederationRequest(dialHeader, target.credential)
-	peerConn, _, err := terminalwebsocket.Dial(
+	// A successful dial hijacks the response body as the connection
+	// transport. Close that body only when the handshake fails.
+	peerConn, peerResp, err := terminalwebsocket.Dial(
 		r.Context(), peerURL, dialHeader, target.clients.websocket,
 	)
 	if err != nil {
+		if peerResp != nil && peerResp.Body != nil {
+			_ = peerResp.Body.Close()
+		}
 		attachSpan.SetAttributes(attribute.Bool("error", true))
 		writeProblemResponse(w, httpapi.NewProblem(
 			http.StatusBadGateway,
@@ -958,8 +1030,12 @@ func (s *Handler) serveFleetWebSocketProxy(
 	}
 	defer clientConn.Close(websocket.StatusNormalClosure, "hub detached")
 
+	if r.URL.Query().Get("protocol") == "acp" {
+		clientConn.SetReadLimit(terminalwebsocket.ACPReadLimit)
+		peerConn.SetReadLimit(terminalwebsocket.ACPReadLimit)
+	}
 	endAttachSpan()
-	bridgeWebSocketProxy(r.Context(), clientConn, peerConn)
+	BridgeWebSocketProxy(r.Context(), clientConn, peerConn)
 }
 
 func startFleetAttachSpan(r *http.Request) (*http.Request, trace.Span, func()) {
@@ -968,7 +1044,7 @@ func startFleetAttachSpan(r *http.Request) (*http.Request, trace.Span, func()) {
 	return r.WithContext(ctx), attachSpan, endAttachSpan
 }
 
-func bridgeWebSocketProxy(ctx context.Context, client, peer *websocket.Conn) {
+func BridgeWebSocketProxy(ctx context.Context, client, peer *websocket.Conn) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -1037,6 +1113,9 @@ func (s *Handler) fleetSelfKey(localHostname string) string {
 func (s *Handler) resolveEnrolledSpoke(
 	member config.FleetMember,
 ) (fleetHostTarget, bool) {
+	if member.OutboundDisabled {
+		return fleetHostTarget{}, false
+	}
 	enrollment, ok := s.enrollments.EnrollmentForSpoke(member.NodeID)
 	if !ok || enrollment.State != federation.EnrollmentActive ||
 		enrollment.ActivationLeaseVersion != federation.ActivationLeaseVersion ||
@@ -1192,7 +1271,7 @@ func isPeerProxyClientHeader(key string) bool {
 		strings.HasPrefix(lower, "x-forwarded-")
 }
 
-func copyProxyResponseHeaders(dst, src http.Header) {
+func CopyProxyResponseHeaders(dst, src http.Header) {
 	connectionHeaders := proxyConnectionTokens(src)
 	for key, values := range src {
 		lower := strings.ToLower(key)

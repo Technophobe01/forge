@@ -5,51 +5,66 @@ import type { WorkspaceEventsNotification } from "../../stores/events.svelte.js"
 import { workspaceEventStream } from "./workspace-event-stream.js";
 
 describe("workspaceEventStream", () => {
-  it("subscribes before selecting the workspace and releases both together", async () => {
-    let subscriber: ((event: WorkspaceEventsNotification) => void) | undefined;
+  it("preserves an explicit workspace status for readiness without inventing a status", async () => {
+    const signals = await Effect.runPromise(
+      workspaceEventStream((next) => {
+        queueMicrotask(() => {
+          next({ type: "workspace_status", payload: { id: "ws-1", status: "ready" } });
+          next({ type: "workspace_status", payload: { id: "ws-1" } });
+        });
+        return () => {};
+      }).pipe(Stream.take(2), Stream.runCollect, Effect.timeout("1 second")),
+    );
+
+    expect(signals).toEqual([
+      { _tag: "Status", workspaceId: "ws-1", status: "ready" },
+      { _tag: "Status", workspaceId: "ws-1", status: undefined },
+    ]);
+  });
+
+  it("signals synced item data changes so linked-item state can reload", async () => {
+    const signals = await Effect.runPromise(
+      workspaceEventStream((next) => {
+        queueMicrotask(() => next({ type: "data_changed" }));
+        return () => {};
+      }).pipe(Stream.take(1), Stream.runCollect, Effect.timeout("1 second")),
+    );
+
+    expect(signals).toEqual([{ _tag: "ItemDataChanged" }]);
+  });
+
+  it("maps workspace events and unsubscribes when the stream ends", async () => {
     const unsubscribe = vi.fn();
-    const releaseSelection = vi.fn();
 
     const signals = await Effect.runPromise(
-      workspaceEventStream(
-        (next) => {
-          subscriber = next;
-          return unsubscribe;
-        },
-        () => {
-          subscriber?.({
+      workspaceEventStream((next) => {
+        queueMicrotask(() =>
+          next({
             type: "workspace_diff_ready",
             payload: { workspace_id: "ws-1", version: "generation:ready" },
-          });
-          return releaseSelection;
-        },
-      ).pipe(Stream.take(1), Stream.runCollect, Effect.timeout("1 second")),
+          }),
+        );
+        return unsubscribe;
+      }).pipe(Stream.take(1), Stream.runCollect, Effect.timeout("1 second")),
     );
 
     expect(signals).toEqual([{ _tag: "DiffReady", workspaceId: "ws-1", version: "generation:ready" }]);
     expect(unsubscribe).toHaveBeenCalledOnce();
-    expect(releaseSelection).toHaveBeenCalledOnce();
   });
 
   it("delivers a burst without terminating the workspace stream", async () => {
-    let subscriber: ((event: WorkspaceEventsNotification) => void) | undefined;
-
     const signals = await Effect.runPromise(
-      workspaceEventStream(
-        (next) => {
-          subscriber = next;
-          return () => {};
-        },
-        () => {
+      workspaceEventStream((next: (event: WorkspaceEventsNotification) => void) => {
+        queueMicrotask(() => {
           for (let index = 0; index < 100; index += 1) {
-            subscriber?.({
+            next({
               type: "workspace_diff_changed",
               payload: { workspace_id: "ws-1", version: `generation:${index}` },
             });
           }
-          return () => {};
-        },
-      ).pipe(Stream.take(100), Stream.runCollect, Effect.timeout("1 second")),
+        });
+        return () => {};
+      }).pipe(Stream.take(100), Stream.runCollect, Effect.timeout("1 second")),
     );
 
     expect(signals).toHaveLength(100);

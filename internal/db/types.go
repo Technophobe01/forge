@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"go.kenn.io/forge/platform"
 )
 
 type Label struct {
@@ -35,7 +37,7 @@ type Repo struct {
 	ID                    int64
 	Platform              string
 	PlatformHost          string
-	PlatformRepoID        string `json:"-"`
+	Key                   platform.RepositoryKey `json:"-"`
 	Owner                 string
 	Name                  string
 	RepoPath              string `json:"-"`
@@ -62,23 +64,67 @@ func (r Repo) FullName() string {
 	return r.Owner + "/" + r.Name
 }
 
+// ActiveRepo is a repository the catalog reports as active. Every active
+// repository has a provider-verified identity, so callers never check it
+// for emptiness. Only this package builds ActiveRepo values; Identity reads
+// a private copy, so editing the embedded Repo cannot change it.
+type ActiveRepo struct {
+	Repo
+	identity platform.RepositoryIdentity
+}
+
+// Identity returns the repository's provider-verified identity.
+func (r *ActiveRepo) Identity() platform.RepositoryIdentity {
+	return r.identity
+}
+
+// Row returns the repository row for code that works with *Repo.
+func (r *ActiveRepo) Row() *Repo {
+	return &r.Repo
+}
+
+func newActiveRepo(repo Repo) (*ActiveRepo, error) {
+	identity := platform.RepositoryIdentity{
+		Provider: repo.Platform, PlatformHost: repo.PlatformHost, Key: repo.Key,
+	}.Canonical()
+	if !identity.Valid() {
+		return nil, fmt.Errorf("active repository %d has no provider identity", repo.ID)
+	}
+	return &ActiveRepo{Repo: repo, identity: identity}, nil
+}
+
+// RepoIdentity is a repository route (owner/name) plus, once the provider has
+// verified it, the provider's stable repository key. Lookups by route resolve
+// user input; the provider key is the key everywhere else.
 type RepoIdentity struct {
-	Platform       string
-	PlatformHost   string
-	PlatformRepoID string
-	Owner          string
-	Name           string
-	RepoPath       string
-	OwnerKey       string
-	NameKey        string
-	RepoPathKey    string
+	Platform     string
+	PlatformHost string
+	Key          platform.RepositoryKey
+	Owner        string
+	Name         string
+	RepoPath     string
+	OwnerKey     string
+	NameKey      string
+	RepoPathKey  string
+}
+
+// ProviderIdentity returns the provider identity part of the route.
+func (r RepoIdentity) ProviderIdentity() platform.RepositoryIdentity {
+	return platform.RepositoryIdentity{
+		Provider: r.Platform, PlatformHost: r.PlatformHost, Key: r.Key,
+	}.Canonical()
+}
+
+// hasStableProviderIdentity reports whether a lookup should use the provider
+// key instead of the owner/name route.
+func (r RepoIdentity) hasStableProviderIdentity() bool {
+	return !r.Key.IsZero()
 }
 
 type RepoProviderMetadata struct {
-	PlatformRepoID string
-	WebURL         string
-	CloneURL       string
-	DefaultBranch  string
+	WebURL        string
+	CloneURL      string
+	DefaultBranch string
 }
 
 type RepoMergeSettings struct {
@@ -587,6 +633,7 @@ type MergeRequest struct {
 	URL                string
 	Title              string
 	Author             string
+	AuthorAssociation  *string `json:"-"`
 	AuthorDisplayName  string
 	State              MergeRequestState `enum:"open,closed,merged"`
 	IsDraft            bool
@@ -619,16 +666,23 @@ type MergeRequest struct {
 	MergeCommitSHA        string
 	CommentCount          int
 	ReviewDecision        string
-	CIStatus              string
-	CIChecksJSON          string
-	CreatedAt             time.Time
-	UpdatedAt             time.Time
-	LastActivityAt        time.Time
-	MergedAt              *time.Time
-	ClosedAt              *time.Time
-	MergeableState        string
-	DetailFetchedAt       *time.Time
-	CIHadPending          bool
+	// ReviewDecisionObservedAt, CIObservedAt, and MergeableStateObservedAt
+	// record when Forge observed the value currently stored in the sibling
+	// field, not when the row was last written. A nil time means the value
+	// is unknown-provenance (never stamped, or explicitly cleared).
+	ReviewDecisionObservedAt *time.Time `json:"review_decision_observed_at,omitzero"`
+	CIStatus                 string
+	CIChecksJSON             string
+	CIObservedAt             *time.Time `json:"ci_observed_at,omitzero"`
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
+	LastActivityAt           time.Time
+	MergedAt                 *time.Time
+	ClosedAt                 *time.Time
+	MergeableState           string
+	MergeableStateObservedAt *time.Time `json:"mergeable_state_observed_at,omitzero"`
+	DetailFetchedAt          *time.Time
+	CIHadPending             bool
 	// WorkflowApprovalCheckedAt is when kenn-forge last reconciled the
 	// workflow-approval state for this merge request. Nil means never
 	// checked; the GET path treats persisted state as authoritative
@@ -647,8 +701,8 @@ type MergeRequest struct {
 	// records a provider-confirmed empty set.
 	AssigneesJSON      string   `json:"-"`
 	ReviewersJSON      string   `json:"-"`
-	Assignees          []string `json:"assignees,omitempty"`
-	RequestedReviewers []string `json:"requested_reviewers,omitempty"`
+	Assignees          []string `json:"assignees,omitzero"`
+	RequestedReviewers []string `json:"requested_reviewers,omitzero"`
 }
 
 type MergeRequestState string
@@ -698,6 +752,7 @@ type MREvent struct {
 	PlatformExternalID string
 	EventType          string
 	Author             string
+	AuthorAssociation  *string `json:"-"`
 	Summary            string
 	Body               string
 	MetadataJSON       string
@@ -824,7 +879,7 @@ type ListWorkflowStatesOpts struct {
 type WorkflowStateListRow struct {
 	Platform       string
 	PlatformHost   string
-	PlatformRepoID string
+	RepoKey        platform.RepositoryKey
 	Owner          string
 	Name           string
 	RepoPath       string
@@ -845,6 +900,10 @@ type WorkflowStateListRow struct {
 }
 
 type ListMergeRequestsOpts struct {
+	// AllowedRepoIDs scopes repositories before pagination. nil is unrestricted; empty matches none.
+	AllowedRepoIDs []int64
+	// Items limits results to the named items before pagination. nil is unrestricted; empty matches none.
+	Items             []RepoItemNumber
 	Label             string
 	RepoID            int64
 	PlatformHost      string
@@ -866,6 +925,11 @@ type ListMergeRequestsOpts struct {
 	ViewerLogins []RepoViewerLogin
 }
 
+type RepoItemNumber struct {
+	RepoID int64
+	Number int
+}
+
 type ItemActivityOverride struct {
 	RepoID     int64
 	ItemNumber int
@@ -879,17 +943,18 @@ type WorkspaceSubjectKey struct {
 }
 
 type WorkspaceSubjectMetadata struct {
-	Key            WorkspaceSubjectKey
-	Platform       string
-	PlatformHost   string
-	PlatformRepoID string
-	RepoOwner      string
-	RepoName       string
-	RepoPath       string
-	Title          string
-	State          string
-	URL            string
-	Author         string
+	Key          WorkspaceSubjectKey
+	Platform     string
+	PlatformHost string
+	RepoKey      platform.RepositoryKey
+	RepoOwner    string
+	RepoName     string
+	RepoPath     string
+	Title        string
+	State        string
+	URL          string
+	Author       string
+	IsDraft      bool
 }
 
 // RepoViewerLogin binds a provider-authenticated login to the stable local
@@ -900,12 +965,12 @@ type RepoViewerLogin struct {
 }
 
 type RepoFilter struct {
-	Platform       string
-	PlatformHost   string
-	PlatformRepoID string
-	RepoOwner      string
-	RepoName       string
-	RepoPath       string
+	Platform     string
+	PlatformHost string
+	RepoKey      platform.RepositoryKey
+	RepoOwner    string
+	RepoName     string
+	RepoPath     string
 }
 
 type Issue struct {
@@ -918,6 +983,7 @@ type Issue struct {
 	URL                string
 	Title              string
 	Author             string
+	AuthorAssociation  *string `json:"-"`
 	State              string
 	Body               string
 	CommentCount       int
@@ -931,7 +997,7 @@ type Issue struct {
 	Starred            bool
 	WorkflowStatus     KanbanStatus `enum:"new,reviewing,waiting,awaiting_merge"`
 	Labels             []Label      `json:"labels,omitempty"`
-	Assignees          []string     `json:"assignees,omitempty"` // Parsed assignees
+	Assignees          []string     `json:"assignees,omitzero"` // Parsed assignees
 }
 
 type IssueEvent struct {
@@ -960,6 +1026,10 @@ type CommentAutocompleteReference struct {
 }
 
 type ListIssuesOpts struct {
+	// AllowedRepoIDs scopes repositories before pagination. nil is unrestricted; empty matches none.
+	AllowedRepoIDs []int64
+	// Items limits results to the named items before pagination. nil is unrestricted; empty matches none.
+	Items             []RepoItemNumber
 	PlatformHost      string
 	RepoOwner         string
 	RepoName          string
@@ -1087,22 +1157,22 @@ type RateLimit struct {
 
 // ActivityItem represents one row in the unified activity feed.
 type ActivityItem struct {
-	ActivityType   string // new_pr, new_issue, comment, review, commit, default_branch_*
-	Source         string // pr, issue, pre, ise, bc, bfp
-	SourceID       int64  // PK from the source table
-	RepoID         int64
-	Platform       string
-	PlatformHost   string
-	PlatformRepoID string
-	RepoOwner      string
-	RepoName       string
-	RepoPath       string
-	ItemType       string // pr, issue, or empty for repo-level activity
-	ItemNumber     int
-	ItemTitle      string
-	ItemURL        string
-	ItemState      string // open, merged, closed
-	Author         string
+	ActivityType string // new_pr, new_issue, comment, review, commit, default_branch_*
+	Source       string // pr, issue, pre, ise, bc, bfp
+	SourceID     int64  // PK from the source table
+	RepoID       int64
+	Platform     string
+	PlatformHost string
+	RepoKey      platform.RepositoryKey
+	RepoOwner    string
+	RepoName     string
+	RepoPath     string
+	ItemType     string // pr, issue, or empty for repo-level activity
+	ItemNumber   int
+	ItemTitle    string
+	ItemURL      string
+	ItemState    string // open, merged, closed
+	Author       string
 	// ItemAuthor is the author of the parent PR/issue, carried on every
 	// PR/issue row (open, comment, review, commit, force_push) so the
 	// threaded feed can show the item's author rather than the latest
@@ -1115,6 +1185,7 @@ type ActivityItem struct {
 	BeforeSHA      string
 	AfterSHA       string
 	AuthorName     string
+	CommitAuthor   string
 	AuthorEmail    string
 	CommitterName  string
 	CommitterEmail string
@@ -1147,8 +1218,12 @@ type Stack struct {
 	RepoID     int64
 	BaseNumber int
 	Name       string
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// Native is true when the provider's native stack feature owns the
+	// membership; merging a member there also merges every unmerged member
+	// below it.
+	Native    bool
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // StackMember links a merge request to a stack with a position.
@@ -1183,8 +1258,35 @@ type StackMemberWithPR struct {
 // StackPlacement is a merge request's contiguous position within its stack
 // after hidden members are filtered, plus the visible stack size.
 type StackPlacement struct {
+	StackID  int64
 	Position int
 	Size     int
+}
+
+// MergeQueueState is a pull request's merge queue state, read from the pull
+// request itself.
+type MergeQueueState struct {
+	Number     int
+	BaseBranch string
+	// Enabled reports whether the base branch has a merge queue, so merging
+	// adds the pull request to it.
+	Enabled bool
+	// MergeMethod is the queue's merge method (merge, squash, or rebase), or
+	// "" when Forge has not read it. A write with "" keeps the stored method
+	// for the same base branch.
+	MergeMethod string
+	// Queued reports that the pull request is in the queue. Position 0 means
+	// the queue has not reported its position yet.
+	Queued               bool
+	Position             int
+	State                string
+	EnqueuedAt           *time.Time
+	EstimatedTimeToMerge *time.Duration
+	// RemovalReason is set when the queue's latest action removed the pull
+	// request without merging it.
+	RemovedAt     *time.Time
+	RemovalReason string
+	ObservedAt    time.Time
 }
 
 // GitHubNativeStack is a cached GitHub stack resource. It remains separate
@@ -1306,17 +1408,40 @@ var (
 	ErrLaunchSpecSourceHidden    = errors.New("workspace launch source is not visible")
 )
 
+// WorkspaceLaunchRepository is the repository a launch specification names.
+// Its JSON encoding is WorkspaceLaunchRepositoryJSON, stored in launch spec
+// rows and exchanged with hubs, so the key keeps its flat wire fields.
 type WorkspaceLaunchRepository struct {
-	Provider       string `json:"provider"`
-	PlatformHost   string `json:"platform_host"`
-	PlatformRepoID string `json:"platform_repo_id"`
-	Owner          string `json:"owner"`
-	Name           string `json:"name"`
-	CloneURL       string `json:"clone_url"`
-	DefaultBranch  string `json:"default_branch"`
+	Provider      string                 `json:"provider"`
+	PlatformHost  string                 `json:"platform_host"`
+	Key           platform.RepositoryKey `json:"-" repokey:"platform_repo_id,bitbucket_repository_uuid"`
+	Owner         string                 `json:"owner"`
+	Name          string                 `json:"name"`
+	CloneURL      string                 `json:"clone_url"`
+	DefaultBranch string                 `json:"default_branch"`
+}
+
+func (r WorkspaceLaunchRepository) MarshalJSON() ([]byte, error) {
+	type plain WorkspaceLaunchRepository
+	return platform.MarshalKeyedJSON(plain(r))
+}
+
+func (r *WorkspaceLaunchRepository) UnmarshalJSON(data []byte) error {
+	type plain WorkspaceLaunchRepository
+	return platform.UnmarshalKeyedJSON(data, (*plain)(r))
+}
+
+// Identity returns the launch repository's provider identity.
+func (r WorkspaceLaunchRepository) Identity() platform.RepositoryIdentity {
+	return platform.RepositoryIdentity{
+		Provider: r.Provider, PlatformHost: r.PlatformHost, Key: r.Key,
+	}.Canonical()
 }
 
 type WorkspaceLaunchPull struct {
+	BaseBranch       string `json:"base_branch,omitempty"`
+	BaseOID          string `json:"base_oid,omitempty"`
+	HeadOID          string `json:"head_oid,omitempty"`
 	HeadBranch       string `json:"head_branch"`
 	HeadRepoKind     string `json:"head_repo_kind" enum:"same_repo,fork,unknown"`
 	HeadRepoCloneURL string `json:"head_repo_clone_url"`
@@ -1351,11 +1476,13 @@ func (spec WorkspaceLaunchSpec) Validate() error {
 	}{
 		{name: "provider", value: spec.Repository.Provider},
 		{name: "platform_host", value: spec.Repository.PlatformHost},
-		{name: "platform_repo_id", value: spec.Repository.PlatformRepoID},
 		{name: "owner", value: spec.Repository.Owner},
 		{name: "name", value: spec.Repository.Name},
 		{name: "clone_url", value: spec.Repository.CloneURL},
 		{name: "default_branch", value: spec.Repository.DefaultBranch},
+	}
+	if !spec.Repository.Identity().Valid() {
+		return errors.New("workspace launch repository identity is required")
 	}
 	for _, field := range repositoryFields {
 		if strings.TrimSpace(field.value) == "" {
@@ -1457,16 +1584,16 @@ func (spec WorkspaceLaunchSpec) RequireVisible(now time.Time) error {
 }
 
 type UnpreparedWorkspace struct {
-	Workspace      Workspace `json:"workspace"`
-	Reason         string    `json:"reason"`
-	PlatformRepoID string    `json:"-"`
+	Workspace Workspace              `json:"workspace"`
+	Reason    string                 `json:"reason"`
+	RepoKey   platform.RepositoryKey `json:"-"`
 }
 
 // WorkspaceSummary extends Workspace with joined source-item metadata.
 type WorkspaceSummary struct {
 	Workspace
-	RepoID         int64
-	RepoPlatformID string
+	RepoID  int64
+	RepoKey platform.RepositoryKey
 	// SourceItemVisible and AssociatedPRVisible are false only at the public
 	// removed-upstream boundary. Inaccessible and not-yet-synced items remain
 	// visible by number, matching the rest of the public read contract.
@@ -1489,6 +1616,7 @@ type WorkspaceSummary struct {
 	// creation-time GitHeadRef snapshot for push-target context.
 	MRHeadBranch       *string
 	ItemLastActivityAt *time.Time
+	ItemAuthor         *string
 }
 
 type WorkspaceSetupEvent struct {
@@ -1510,6 +1638,24 @@ type WorkspaceRuntimeSession struct {
 	Scope         string
 	TmuxSession   string
 	CreatedAt     time.Time
+	// ConversationAgent and ConversationID name the conversation the agent
+	// last reported through its hooks; recovery resumes it.
+	ConversationAgent string
+	ConversationID    string
+	// ConversationEndReason is the reason that conversation's SessionEnd hook
+	// gave, empty while it runs or when its agent gives none.
+	ConversationEndReason string
+}
+
+// RuntimeConversation is the conversation saved on a runtime row, with the
+// worktree of the workspace that owns the row.
+type RuntimeConversation struct {
+	WorktreePath string
+	// CreatedAt is when the row's current runtime started.
+	CreatedAt time.Time
+	Agent     string
+	ID        string
+	EndReason string
 }
 
 // ListActivityOpts holds filters and pagination for the activity feed.
@@ -1537,6 +1683,7 @@ type ListActivityOpts struct {
 	ExcludeNotifications bool
 	HideClosedMerged     bool
 	HideBots             bool
+	HideDrafts           bool
 	HideDefaultBranch    bool
 	ParentRepoID         int64
 	ParentItemType       string
@@ -1583,6 +1730,7 @@ type ListActivitySubjectsOpts struct {
 	ViewerLogins             []RepoViewerLogin
 	HideClosedMerged         bool
 	HideBots                 bool
+	HideDrafts               bool
 	Limit                    int
 	Since                    *time.Time
 }

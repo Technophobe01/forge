@@ -19,6 +19,8 @@ import { showFlash } from "./flash.svelte.js";
 import { ProviderMutations, providerMutationFailureMessage } from "./ordered-mutations.js";
 import { readInvolvesMeFilter, writeInvolvesMeFilter } from "./involves-me-filter.js";
 import { readUnassignedFilter, writeUnassignedFilter } from "./unassigned-filter.js";
+import { repositoryKeyFromWire, repositoryKeyToWire } from "../api/repository-key.js";
+import { parseRepoFilterSelection, providerQualifiedRepoFilterValue } from "../utils/repo-filter-values.js";
 
 export type TimeRange = "24h" | "7d" | "30d" | "90d";
 export type ViewMode = "flat" | "threaded";
@@ -108,10 +110,12 @@ function writeSelectedFilters<T extends string>(
   searchParams: URLSearchParams,
   name: string,
   selected: ReadonlySet<T>,
+  available: readonly T[],
   defaults: readonly T[],
+  preserve: boolean,
 ): void {
-  const ordered = defaults.filter((candidate) => selected.has(candidate));
-  if (ordered.length === defaults.length) {
+  const ordered = available.filter((candidate) => selected.has(candidate));
+  if (!preserve && ordered.length === defaults.length && defaults.every((value) => selected.has(value))) {
     searchParams.delete(name);
   } else {
     searchParams.set(name, ordered.length > 0 ? ordered.join(",") : NO_ACTIVITY_FILTER_TYPE);
@@ -163,9 +167,25 @@ interface OwnedActivityResponse {
   readonly startedAt: number;
 }
 
+interface ActivityReadResponse extends OwnedActivityResponse {
+  readonly scope: string;
+  readonly repo: string | undefined;
+  readonly filterScope: string;
+}
+
+interface CachedActivitySnapshot {
+  readonly repo: string | undefined;
+  readonly filterScope: string;
+  readonly items: ActivityItem[];
+  readonly itemActivity: ActivitySubject[];
+  readonly workspaceActivity: WorkspaceActivitySubject[];
+  readonly capped: boolean;
+  readonly itemActivityCapped: boolean;
+}
+
 type ActivityPollProjection =
-  | { readonly mode: "append"; readonly result: OwnedActivityResponse }
-  | { readonly mode: "replace"; readonly result: OwnedActivityResponse };
+  | { readonly mode: "append"; readonly result: ActivityReadResponse }
+  | { readonly mode: "replace"; readonly result: ActivityReadResponse };
 
 export interface ActivityStoreOptions {
   runtime: AppRuntime;
@@ -209,13 +229,19 @@ export function createActivityStore(opts: ActivityStoreOptions) {
   let filterTypes = $state<string[]>([]);
   let searchQuery = $state<string | undefined>(undefined);
   let authorFilter = $state<string | undefined>(undefined);
-  let authorCandidates = $state.raw<string[]>([]);
+  let authorCandidates = $state.raw<string[] | null>(null);
   let authorsLoading = $state(false);
   let authorsError = $state<string | null>(null);
   let timeRange = $state<TimeRange>("7d");
   let viewMode = $state<ViewMode>("flat");
   let timeRangeDefault: TimeRange = "7d";
   let viewModeDefault: ViewMode = "flat";
+  let itemTypesDefault: readonly ActivityItemType[] = DEFAULT_ACTIVITY_ITEM_TYPES;
+  let eventTypesDefault: readonly string[] = DEFAULT_EVENT_TYPES;
+  let rollUpCommitsDefault = false;
+  let hideDefaultBranchDefault = false;
+  let showNotificationsDefault = true;
+  const selectedFilters = new Set<string>();
   let defaultsHydrated = false;
   let timeRangeSelected = false;
   let viewModeSelected = false;
@@ -232,7 +258,13 @@ export function createActivityStore(opts: ActivityStoreOptions) {
   let bulkRequestToken: symbol | undefined;
   let authorRequestVersion = 0;
   let authorScopeKey: string | null = null;
+  let authorCandidatesScopeKey: string | null = null;
   let pollCount = 0;
+  let pollingStarted = false;
+  let snapshotScope: string | undefined;
+  let snapshotFilterScope: string | undefined;
+  let displayedRepo: string | undefined;
+  const recentSnapshots = new Map<string, CachedActivitySnapshot>();
   const AUTHORITATIVE_REFRESH_EVERY = 4;
   let activityLifecycleTick = 0;
   const notificationStateOwnership = new Map<string, { readonly tick: number; readonly state: string }>();
@@ -240,6 +272,8 @@ export function createActivityStore(opts: ActivityStoreOptions) {
   let hideClosedMerged = $state(false);
   let hideClosedMergedOverride: boolean | undefined;
   let hideBots = $state(false);
+  let hideDrafts = $state(false);
+  let hideDraftsOverride: boolean | undefined;
   let useWorkspaceActivityForRecency = $state(false);
   let hideDefaultBranchActivity = $state(false);
   let enabledItemTypes = $state<Set<ActivityItemType>>(new Set(DEFAULT_ACTIVITY_ITEM_TYPES));
@@ -289,16 +323,17 @@ export function createActivityStore(opts: ActivityStoreOptions) {
   }
   function getActivityAuthors(): string[] {
     const selected = authorFilter;
-    if (!selected) return authorCandidates;
-    const selectedIndex = authorCandidates.findIndex((candidate) => candidate.toLowerCase() === selected.toLowerCase());
-    if (selectedIndex < 0) return [selected, ...authorCandidates];
-    if (authorCandidates[selectedIndex] === selected) return authorCandidates;
-    const candidates = [...authorCandidates];
-    candidates[selectedIndex] = selected;
-    return candidates;
+    const candidates = authorCandidates ?? [];
+    if (!selected) return candidates;
+    const selectedIndex = candidates.findIndex((candidate) => candidate.toLowerCase() === selected.toLowerCase());
+    if (selectedIndex < 0) return [selected, ...candidates];
+    if (candidates[selectedIndex] === selected) return candidates;
+    const withSelected = [...candidates];
+    withSelected[selectedIndex] = selected;
+    return withSelected;
   }
   function isActivityAuthorsLoading(): boolean {
-    return authorsLoading;
+    return authorsLoading && authorCandidates === null;
   }
   function getActivityAuthorsError(): string | null {
     return authorsError;
@@ -323,6 +358,9 @@ export function createActivityStore(opts: ActivityStoreOptions) {
   }
   function getHideBots(): boolean {
     return hideBots;
+  }
+  function getHideDrafts(): boolean {
+    return hideDrafts;
   }
   function getUseWorkspaceActivityForRecency(): boolean {
     return useWorkspaceActivityForRecency;
@@ -378,10 +416,12 @@ export function createActivityStore(opts: ActivityStoreOptions) {
     invalidatePagedActivityRequests();
   }
   function setActivityPageLimit(limit: number | undefined): void {
+    if (activityPageLimit === limit) return;
     activityPageLimit = limit;
     invalidatePagedActivityRequests();
   }
   function setRollUpCommits(value: boolean): void {
+    selectedFilters.add("rollup_commits");
     rollUpCommits = value;
   }
   function collapseAllThreads(): void {
@@ -415,19 +455,28 @@ export function createActivityStore(opts: ActivityStoreOptions) {
     hideBots = v;
     invalidatePagedActivityRequests();
   }
+  function setHideDrafts(v: boolean): void {
+    hideDrafts = v;
+    hideDraftsOverride = v;
+    invalidatePagedActivityRequests();
+  }
   function setHideDefaultBranchActivity(v: boolean): void {
+    selectedFilters.add("hide_branch");
     hideDefaultBranchActivity = v;
     invalidatePagedActivityRequests();
   }
   function setEnabledItemTypes(itemTypes: Set<ActivityItemType>): void {
+    selectedFilters.add("item_types");
     enabledItemTypes = itemTypes;
     invalidatePagedActivityRequests();
   }
   function setEnabledEvents(events: Set<string>): void {
+    selectedFilters.add("event_types");
     enabledEvents = events;
     invalidatePagedActivityRequests();
   }
   function setShowNotifications(v: boolean): void {
+    selectedFilters.add("notif");
     showNotifications = v;
     invalidatePagedActivityRequests();
   }
@@ -446,15 +495,27 @@ export function createActivityStore(opts: ActivityStoreOptions) {
   function hydrateDefaults(activity: ActivitySettings): void {
     timeRangeDefault = activity.time_range;
     viewModeDefault = activity.view_mode;
+    itemTypesDefault = DEFAULT_ACTIVITY_ITEM_TYPES.filter((value) => activity.item_types.includes(value));
+    eventTypesDefault = activity.event_types;
+    rollUpCommitsDefault = activity.roll_up_commits;
+    hideDefaultBranchDefault = activity.hide_default_branch;
+    showNotificationsDefault = !activity.hide_notifications;
+    enabledItemTypes = new Set(itemTypesDefault);
+    enabledEvents = new Set(eventTypesDefault);
+    rollUpCommits = rollUpCommitsDefault;
+    hideDefaultBranchActivity = hideDefaultBranchDefault;
+    showNotifications = showNotificationsDefault;
     defaultsHydrated = true;
     viewMode = activity.view_mode;
     timeRange = activity.time_range;
     hideClosedMerged = activity.hide_closed;
     hideBots = activity.hide_bots;
+    hideDrafts = hideDraftsOverride ?? activity.hide_drafts;
     useWorkspaceActivityForRecency = activity.use_workspace_activity_for_recency;
     collapseThreadsDefault = activity.collapse_threads;
     collapseThreads = activity.collapse_threads;
     expandOverrides = new Set();
+    rebuildFilterTypes();
     if (initialized) {
       syncFromURL();
       // Once a settings reload makes the live state match the new default,
@@ -467,7 +528,9 @@ export function createActivityStore(opts: ActivityStoreOptions) {
   }
 
   function initializeFromMount(): void {
+    const previousScope = pagedActivityScopeKey();
     syncFromURL();
+    if (previousScope !== pagedActivityScopeKey()) invalidatePagedActivityRequests();
     initialized = true;
     syncToURL();
   }
@@ -498,6 +561,7 @@ export function createActivityStore(opts: ActivityStoreOptions) {
     if (unassigned) p.unassigned = true;
     if (hideClosedMerged) p.hide_closed_merged = true;
     if (hideBots) p.hide_bots = true;
+    if (hideDrafts) p.hide_drafts = true;
     if (hideDefaultBranchActivity) p.hide_default_branch = true;
     return p;
   }
@@ -519,6 +583,7 @@ export function createActivityStore(opts: ActivityStoreOptions) {
       params.unassigned ?? false,
       params.hide_closed_merged ?? false,
       params.hide_bots ?? false,
+      params.hide_drafts ?? false,
       params.hide_default_branch ?? false,
       params.limit ?? 0,
     ]);
@@ -529,6 +594,59 @@ export function createActivityStore(opts: ActivityStoreOptions) {
     return JSON.stringify([activityProjectionScope(params), params.projection]);
   }
 
+  function rememberActivitySnapshot(): void {
+    if (snapshotScope === undefined || snapshotFilterScope === undefined) return;
+    recentSnapshots.delete(snapshotScope);
+    recentSnapshots.set(snapshotScope, {
+      repo: displayedRepo,
+      filterScope: snapshotFilterScope,
+      items,
+      itemActivity,
+      workspaceActivity,
+      capped,
+      itemActivityCapped,
+    });
+    if (recentSnapshots.size > 8) recentSnapshots.delete(recentSnapshots.keys().next().value!);
+  }
+
+  function restoreRepositoryActivity(params: ActivityParams): void {
+    rememberActivitySnapshot();
+    if (displayedRepo === params.repo) return;
+    const { repo, ...unscopedParams } = params;
+    const selected = new Set(parseRepoFilterSelection(repo));
+    const filterScope = activityProjectionScope(unscopedParams);
+    const cached =
+      recentSnapshots.get(pagedActivityScopeKey()) ??
+      [...recentSnapshots.values()].reverse().find((entry) => {
+        if (entry.filterScope !== filterScope) return false;
+        const cachedRepos = parseRepoFilterSelection(entry.repo);
+        return (
+          cachedRepos.length === 0 || (selected.size > 0 && [...selected].every((value) => cachedRepos.includes(value)))
+        );
+      });
+    const matchesRepo = (item: ActivityItem | ActivitySubject | WorkspaceActivitySubject): boolean => {
+      if (selected.size === 0) return true;
+      const value = providerQualifiedRepoFilterValue({
+        provider: item.repo?.provider,
+        platformHost: item.repo?.platform_host ?? item.platform_host,
+        repoPath: item.repo?.repo_path,
+      });
+      return value !== null && selected.has(value);
+    };
+    displayedRepo = repo;
+    items = cached?.items.filter(matchesRepo) ?? [];
+    itemActivity = cached?.itemActivity.filter(matchesRepo) ?? [];
+    workspaceActivity = cached?.workspaceActivity.filter(matchesRepo) ?? [];
+    capped = cached?.capped ?? false;
+    itemActivityCapped = cached?.itemActivityCapped ?? false;
+    // Cached rows are a preview. Only the response for this selection may
+    // establish cursor and child-page authority or satisfy ensureActivityLoaded.
+    snapshotScope = undefined;
+    snapshotFilterScope = undefined;
+    activityEventCursor = "";
+    loadedThreadKeys = new Set();
+  }
+
   function ownsForegroundSnapshot(generation: number, scope: string): boolean {
     return generation === pagedActivityGeneration && scope === activityProjectionScope(buildParams());
   }
@@ -536,6 +654,7 @@ export function createActivityStore(opts: ActivityStoreOptions) {
   function invalidatePagedActivityRequests(): void {
     pagedActivityGeneration += 1;
     childProjectionInvalidationGeneration += 1;
+    loading = false;
     threadRequestTokens.clear();
     loadingThreadKeys = new Set();
     failedThreadKeys = new Set();
@@ -549,8 +668,10 @@ export function createActivityStore(opts: ActivityStoreOptions) {
       const scopeKey = `${repo ?? ""}\0${timeRange}`;
       if (!force && scopeKey === authorScopeKey) return Effect.void;
 
-      if (scopeKey !== authorScopeKey) {
-        authorCandidates = [];
+      // Refreshes and retries keep the picker usable until its repo or range changes.
+      if (scopeKey !== authorCandidatesScopeKey) {
+        authorCandidates = null;
+        authorCandidatesScopeKey = scopeKey;
       }
       authorScopeKey = scopeKey;
       const version = ++authorRequestVersion;
@@ -596,13 +717,18 @@ export function createActivityStore(opts: ActivityStoreOptions) {
   }
 
   function activityRead(params: ActivityParams) {
+    const scope = pagedActivityScopeKey();
+    // Background reads may request collapsed summaries while the retained
+    // display includes expanded children. Cache by the logical display scope.
+    const { repo, ...unscopedParams } = buildParams();
+    const filterScope = activityProjectionScope(unscopedParams);
     return Effect.sync(() => ++activityLifecycleTick).pipe(
       Effect.flatMap((startedAt) =>
         executeGeneratedApiRequest("GET /activity", (client, signal) =>
           client.ActivityService.listActivity(params, { signal }),
         ).pipe(
           retryIdempotentRead,
-          Effect.map((response) => ({ response, startedAt })),
+          Effect.map((response) => ({ response, startedAt, scope, repo, filterScope })),
         ),
       ),
     );
@@ -641,12 +767,12 @@ export function createActivityStore(opts: ActivityStoreOptions) {
   function stableParentKey(item: ActivityItem | ActivitySubject): string | undefined {
     const repo = item.repo;
     if (!repo) return undefined;
-    const platformRepoId = repo.platform_repo_id?.trim();
-    if (!platformRepoId || (item.item_type !== "pr" && item.item_type !== "issue")) return undefined;
+    const repositoryKey = repositoryKeyFromWire(repo);
+    if (!repositoryKey || (item.item_type !== "pr" && item.item_type !== "issue")) return undefined;
     return activityItemKey({
       provider: repo.provider,
       platformHost: repo.platform_host,
-      platformRepoId,
+      repositoryKey,
       owner: repo.owner,
       name: repo.name,
       repoPath: repo.repo_path,
@@ -669,7 +795,7 @@ export function createActivityStore(opts: ActivityStoreOptions) {
       return {
         ...retainedEvent,
         ...(item.activity_type === "notification" ? { activity_url: subject.item_url } : {}),
-        item_author: subject.item_author ?? "",
+        item_author: subject.item_author || item.item_author || "",
         item_last_activity_at: subject.activity_at,
         item_state: item.activity_type === "notification" ? item.item_state : subject.item_state,
         item_title: subject.item_title,
@@ -692,7 +818,10 @@ export function createActivityStore(opts: ActivityStoreOptions) {
     itemActivityCapped = response.item_activity_capped ?? false;
   }
 
-  function projectActivitySnapshot(result: OwnedActivityResponse, projection: ActivityParams["projection"]): void {
+  function projectActivitySnapshot(result: ActivityReadResponse, projection: ActivityParams["projection"]): void {
+    snapshotScope = result.scope;
+    snapshotFilterScope = result.filterScope;
+    displayedRepo = result.repo;
     items = projectOwnedNotificationStates(result);
     projectActivitySubjects(result.response);
     capped = result.response.capped;
@@ -720,7 +849,10 @@ export function createActivityStore(opts: ActivityStoreOptions) {
     }
   }
 
-  function projectAuthoritativeActivitySnapshot(result: OwnedActivityResponse): void {
+  function projectAuthoritativeActivitySnapshot(result: ActivityReadResponse): void {
+    snapshotScope = result.scope;
+    snapshotFilterScope = result.filterScope;
+    displayedRepo = result.repo;
     const reconcileCollapsedThreads = shouldUseCollapsedAuthoritativeProjection();
     const autoLoadExpandedThreadEvents = activityPageLimit === undefined;
     const childProjectionStale =
@@ -743,6 +875,7 @@ export function createActivityStore(opts: ActivityStoreOptions) {
       unassigned ||
       hideClosedMerged ||
       hideBots ||
+      hideDrafts ||
       enabledItemTypes.size !== DEFAULT_ACTIVITY_ITEM_TYPES.length;
     const absentThreadKeys = new Set<string>();
     if (reconcileCollapsedThreads && (!result.response.item_activity_capped || parentFilterActive)) {
@@ -840,7 +973,7 @@ export function createActivityStore(opts: ActivityStoreOptions) {
       const workflow = yield* ActivityWorkflow;
       const scope = activityProjectionScope(params);
       const read = activityRead(params);
-      const project = (result: OwnedActivityResponse) =>
+      const project = (result: ActivityReadResponse) =>
         Effect.sync(() => {
           if (acceptsProjection()) projectActivitySnapshot(result, params.projection);
         });
@@ -878,8 +1011,7 @@ export function createActivityStore(opts: ActivityStoreOptions) {
       if (shouldUseCollapsedAuthoritativeProjection()) params.projection = "collapsed";
       const scope = activityProjectionScope(params);
       const read = activityRead(params);
-      const project = (result: OwnedActivityResponse) =>
-        Effect.sync(() => projectAuthoritativeActivitySnapshot(result));
+      const project = (result: ActivityReadResponse) => Effect.sync(() => projectAuthoritativeActivitySnapshot(result));
       return Effect.gen(function* () {
         const workflow = yield* ActivityWorkflow;
         yield* Effect.all([workflow.reconcileRead(scope, read, project), loadActivityAuthorsEffect(true)], {
@@ -893,8 +1025,8 @@ export function createActivityStore(opts: ActivityStoreOptions) {
   function loadThreadEvents(key: string, loadAllPages = true): void {
     if (loadedThreadKeys.has(key) || loadingThreadKeys.has(key)) return;
     const subject = itemActivity.find((candidate) => stableParentKey(candidate) === key);
-    const platformRepoID = subject?.repo.platform_repo_id?.trim();
-    if (!subject || !platformRepoID || (subject.item_type !== "pr" && subject.item_type !== "issue")) return;
+    const repositoryKey = repositoryKeyFromWire(subject?.repo);
+    if (!subject || !repositoryKey || (subject.item_type !== "pr" && subject.item_type !== "issue")) return;
     const itemType: "pr" | "issue" = subject.item_type === "pr" ? "pr" : "issue";
 
     const requestGeneration = pagedActivityGeneration;
@@ -909,7 +1041,7 @@ export function createActivityStore(opts: ActivityStoreOptions) {
     const baseQuery = {
       provider: subject.repo.provider,
       platform_host: subject.repo.platform_host,
-      platform_repo_id: platformRepoID,
+      ...repositoryKeyToWire(repositoryKey),
       item_type: itemType,
       item_number: subject.item_number,
       since: computeSince(),
@@ -920,6 +1052,7 @@ export function createActivityStore(opts: ActivityStoreOptions) {
       ...(unassigned ? { unassigned: true } : {}),
       ...(hideClosedMerged ? { hide_closed_merged: true } : {}),
       ...(hideBots ? { hide_bots: true } : {}),
+      ...(hideDrafts ? { hide_drafts: true } : {}),
       ...(hideDefaultBranchActivity ? { hide_default_branch: true } : {}),
     };
     const isCurrentRequest = () =>
@@ -1069,10 +1202,16 @@ export function createActivityStore(opts: ActivityStoreOptions) {
     });
   }
 
+  function ensureActivityLoaded(): void {
+    if (snapshotScope !== pagedActivityScopeKey()) loadActivity(true);
+    startActivityPolling();
+  }
+
   function loadActivity(forceAuthors = false): void {
     invalidatePagedActivityRequests();
     const generation = pagedActivityGeneration;
     const params = buildParams();
+    restoreRepositoryActivity(params);
     const scope = activityProjectionScope(params);
     loadActivityAuthors(forceAuthors || authorsLoading);
     runtime.runCommand(loadActivityEffect(params, generation, scope), {
@@ -1105,6 +1244,14 @@ export function createActivityStore(opts: ActivityStoreOptions) {
   // propagation backend-side and flips the row to read locally so the
   // unread affordance clears without waiting for the next sync. The
   // activity item id for a notification is "ntf:<db id>".
+  function projectNotificationState(id: string, state: string): void {
+    const update = (item: ActivityItem): ActivityItem => (item.id === id ? { ...item, item_state: state } : item);
+    items = items.map(update);
+    for (const [scope, snapshot] of recentSnapshots) {
+      recentSnapshots.set(scope, { ...snapshot, items: snapshot.items.map(update) });
+    }
+  }
+
   function markNotificationSeen(item: ActivityItem): void {
     const id = notificationDbId(item.id);
     if (id === null) return;
@@ -1114,7 +1261,7 @@ export function createActivityStore(opts: ActivityStoreOptions) {
     const apply = (state: string) =>
       Effect.sync(() => {
         notificationStateOwnership.set(item.id, { tick: mutationTick, state });
-        items = items.map((candidate) => (candidate.id === item.id ? { ...candidate, item_state: state } : candidate));
+        projectNotificationState(item.id, state);
       });
     const program = Effect.gen(function* () {
       const mutations = yield* ProviderMutations;
@@ -1138,7 +1285,7 @@ export function createActivityStore(opts: ActivityStoreOptions) {
       if (acknowledged) {
         const acknowledgementTick = ++activityLifecycleTick;
         notificationStateOwnership.set(item.id, { tick: acknowledgementTick, state: "read" });
-        items = items.map((candidate) => (candidate.id === item.id ? { ...candidate, item_state: "read" } : candidate));
+        projectNotificationState(item.id, "read");
       } else {
         notificationStateOwnership.delete(item.id);
         showFlash("Failed to mark notification as read.", { tone: "danger" });
@@ -1217,10 +1364,18 @@ export function createActivityStore(opts: ActivityStoreOptions) {
   );
 
   function startActivityPolling(): void {
+    if (pollingStarted) return;
+    pollingStarted = true;
     const program = Effect.gen(function* () {
       const workflow = yield* ActivityWorkflow;
       yield* workflow.poll(pollNewItems, "15 seconds");
-    });
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          pollingStarted = false;
+        }),
+      ),
+    );
     runtime.runCommand(program, {
       operation: "poll activity",
       safeContext: {},
@@ -1271,10 +1426,10 @@ export function createActivityStore(opts: ActivityStoreOptions) {
     const legacySelections = sp.has("types") ? readLegacyFilterSelections(sp.get("types") ?? "") : undefined;
     enabledItemTypes = sp.has(ACTIVITY_ITEM_TYPES_PARAM)
       ? readSelectedFilters(sp.get(ACTIVITY_ITEM_TYPES_PARAM), DEFAULT_ACTIVITY_ITEM_TYPES)
-      : (legacySelections?.itemTypes ?? new Set(DEFAULT_ACTIVITY_ITEM_TYPES));
+      : (legacySelections?.itemTypes ?? new Set(itemTypesDefault));
     enabledEvents = sp.has(ACTIVITY_EVENT_TYPES_PARAM)
       ? readSelectedFilters(sp.get(ACTIVITY_EVENT_TYPES_PARAM), DEFAULT_EVENT_TYPES)
-      : (legacySelections?.events ?? new Set(DEFAULT_EVENT_TYPES));
+      : (legacySelections?.events ?? new Set(eventTypesDefault));
     if (sp.has("search")) searchQuery = sp.get("search") ?? undefined;
     authorFilter = sp.get("author")?.trim() || undefined;
     if (sp.has("range")) {
@@ -1285,9 +1440,9 @@ export function createActivityStore(opts: ActivityStoreOptions) {
       const viewParam = sp.get("view");
       if (viewParam === "flat" || viewParam === "threaded") viewMode = viewParam;
     }
-    rollUpCommits = sp.get("rollup_commits") === "1";
-    hideDefaultBranchActivity = sp.get("hide_branch") === "1";
-    showNotifications = sp.get("notif") !== "0";
+    rollUpCommits = sp.has("rollup_commits") ? sp.get("rollup_commits") === "1" : rollUpCommitsDefault;
+    hideDefaultBranchActivity = sp.has("hide_branch") ? sp.get("hide_branch") === "1" : hideDefaultBranchDefault;
+    showNotifications = sp.has("notif") ? sp.get("notif") !== "0" : showNotificationsDefault;
     const hideClosedParam = sp.get("hide_closed");
     hideClosedMergedOverride = hideClosedParam === "1" ? true : hideClosedParam === "0" ? false : undefined;
     if (hideClosedMergedOverride !== undefined) hideClosedMerged = hideClosedMergedOverride;
@@ -1298,9 +1453,25 @@ export function createActivityStore(opts: ActivityStoreOptions) {
   function syncToURL(): void {
     const sp = new URLSearchParams(window.location.search);
     rebuildFilterTypes();
+    const legacySelections = sp.has("types");
     sp.delete("types");
-    writeSelectedFilters(sp, ACTIVITY_ITEM_TYPES_PARAM, enabledItemTypes, DEFAULT_ACTIVITY_ITEM_TYPES);
-    writeSelectedFilters(sp, ACTIVITY_EVENT_TYPES_PARAM, enabledEvents, DEFAULT_EVENT_TYPES);
+    const preserve = (name: string) => !defaultsHydrated && (selectedFilters.has(name) || sp.has(name));
+    writeSelectedFilters(
+      sp,
+      ACTIVITY_ITEM_TYPES_PARAM,
+      enabledItemTypes,
+      DEFAULT_ACTIVITY_ITEM_TYPES,
+      itemTypesDefault,
+      preserve(ACTIVITY_ITEM_TYPES_PARAM) || (!defaultsHydrated && legacySelections),
+    );
+    writeSelectedFilters(
+      sp,
+      ACTIVITY_EVENT_TYPES_PARAM,
+      enabledEvents,
+      DEFAULT_EVENT_TYPES,
+      eventTypesDefault,
+      preserve(ACTIVITY_EVENT_TYPES_PARAM) || (!defaultsHydrated && legacySelections),
+    );
     if (searchQuery) sp.set("search", searchQuery);
     else sp.delete("search");
     if (authorFilter) sp.set("author", authorFilter);
@@ -1313,12 +1484,14 @@ export function createActivityStore(opts: ActivityStoreOptions) {
     if (viewMode !== viewModeDefault || (!defaultsHydrated && (viewModeSelected || sp.has("view"))))
       sp.set("view", viewMode);
     else sp.delete("view");
-    if (rollUpCommits) sp.set("rollup_commits", "1");
-    else sp.delete("rollup_commits");
-    if (hideDefaultBranchActivity) sp.set("hide_branch", "1");
-    else sp.delete("hide_branch");
-    if (!showNotifications) sp.set("notif", "0");
-    else sp.delete("notif");
+    for (const [name, value, defaultValue] of [
+      ["rollup_commits", rollUpCommits, rollUpCommitsDefault],
+      ["hide_branch", hideDefaultBranchActivity, hideDefaultBranchDefault],
+      ["notif", showNotifications, showNotificationsDefault],
+    ] as const) {
+      if (value !== defaultValue || preserve(name)) sp.set(name, value ? "1" : "0");
+      else sp.delete(name);
+    }
     if (collapseThreads !== collapseThreadsDefault) {
       sp.set("collapsed", collapseThreads ? "1" : "0");
     } else {
@@ -1353,6 +1526,7 @@ export function createActivityStore(opts: ActivityStoreOptions) {
     isThreadItemExpanded,
     getHideClosedMerged,
     getHideBots,
+    getHideDrafts,
     getUseWorkspaceActivityForRecency,
     getHideDefaultBranchActivity,
     getEnabledItemTypes,
@@ -1376,6 +1550,7 @@ export function createActivityStore(opts: ActivityStoreOptions) {
     loadThreadPreview,
     setHideClosedMerged,
     setHideBots,
+    setHideDrafts,
     setHideDefaultBranchActivity,
     setEnabledItemTypes,
     setEnabledEvents,
@@ -1385,6 +1560,7 @@ export function createActivityStore(opts: ActivityStoreOptions) {
     hydrateDefaults,
     initializeFromMount,
     loadActivityAuthors,
+    ensureActivityLoaded,
     loadActivity,
     loadActivityEffect,
     reconcileActivityEffect,

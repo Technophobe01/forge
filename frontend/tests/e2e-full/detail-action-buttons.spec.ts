@@ -536,8 +536,10 @@ test.describe("detail action buttons", () => {
         merged: false,
         message: "provider did not merge the pull request",
       });
-      await expect(modal).toBeVisible();
-      await expect(modal).toContainText("provider did not merge the pull request");
+      await expect(modal).toHaveCount(0);
+      await expect(page.locator(".kit-flash-stack").getByRole("status")).toContainText(
+        "provider did not merge the pull request",
+      );
       expect((await apiContext.get(`/api/v1/workspaces/${createdWorkspace.id}`)).status()).toBe(200);
       await expect(page.locator(".detail-pane-workspace-slot .workspace-host-wrapper")).toBeVisible();
     } finally {
@@ -879,8 +881,9 @@ test.describe("detail action buttons", () => {
       await expect
         .poll(() => payloads)
         .toEqual([
-          {},
+          { platform_repo_id: 3579412034 },
           {
+            platform_repo_id: 3579412034,
             git_head_ref: scenario.branch,
             ...scenario.reusePayload,
           },
@@ -1015,8 +1018,9 @@ test.describe("detail action buttons", () => {
     await expect
       .poll(() => payloads)
       .toEqual([
-        {},
+        { platform_repo_id: 3579412034 },
         {
+          platform_repo_id: 3579412034,
           git_head_ref: "kenn-forge/issue-10-2",
         },
       ]);
@@ -1176,7 +1180,7 @@ test.describe("detail action buttons", () => {
     }
   });
 
-  test("rejected merge keeps the edited modal retryable and pull request open", async ({ page }) => {
+  test("rejected merge closes the modal and leaves the pull request open for retry", async ({ page }) => {
     const server = await startIsolatedE2EServer();
     try {
       const failure = await page.request.post(`${server.info.base_url}/__e2e/merge/fail`);
@@ -1188,9 +1192,6 @@ test.describe("detail action buttons", () => {
 
       const modal = page.getByRole("dialog", { name: "Merge Pull Request" });
       await expect(modal).toBeVisible();
-      await modal.getByLabel("Commit title").fill("Preserve this title");
-      await modal.getByLabel("Commit message").fill("Preserve this message");
-
       const mergeResponse = page.waitForResponse((response) => {
         const url = new URL(response.url());
         return response.request().method() === "POST" && url.pathname === "/api/v1/pulls/github/acme/widgets/1/merge";
@@ -1199,9 +1200,10 @@ test.describe("detail action buttons", () => {
       expect((await mergeResponse).status()).toBe(502);
 
       await expect(page.locator(".kit-flash-stack").getByRole("status")).toContainText("provider rejected merge");
+      await expect(modal).toHaveCount(0);
+      await expect(page.locator(".btn--merge").first()).toBeEnabled();
+      await page.locator(".btn--merge").first().click();
       await expect(modal).toBeVisible();
-      await expect(modal.getByLabel("Commit title")).toHaveValue("Preserve this title");
-      await expect(modal.getByLabel("Commit message")).toHaveValue("Preserve this message");
 
       await page.reload();
       await expect(page.locator(".pull-detail")).toBeVisible();

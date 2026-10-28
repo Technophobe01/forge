@@ -6,6 +6,7 @@
   import { getStores } from "../context.js";
   import {
     collapseActivityRuns,
+    activityAuthor,
     isCollapsedActivityRow,
     activityItemKey,
     activityRepoKey,
@@ -38,6 +39,7 @@
   import CheckIcon from "@lucide/svelte/icons/check";
   import ChevronDownIcon from "@lucide/svelte/icons/chevron-down";
   import ChevronRightIcon from "@lucide/svelte/icons/chevron-right";
+  import { repositoryKeyFromWire, type RepositoryKey } from "../api/repository-key.js";
 
   interface Props {
     items: ActivityItem[];
@@ -114,7 +116,7 @@
     kind: "branch";
     row: ActivityRow;
     provider: string;
-    platformRepoId: string;
+    repositoryKey?: RepositoryKey | undefined;
     repoOwner: string;
     repoName: string;
     repoPath: string;
@@ -162,7 +164,7 @@
       const itemKey = activityItemKey({
         provider: item.repo?.provider ?? "",
         platformHost: item.platform_host ?? "",
-        platformRepoId: item.repo?.platform_repo_id,
+        repositoryKey: repositoryKeyFromWire(item.repo),
         owner: item.repo_owner,
         name: item.repo_name,
         itemType: item.item_type,
@@ -218,7 +220,7 @@
       const itemKey = activityItemKey({
         provider: subject.repo.provider,
         platformHost: subject.repo.platform_host,
-        platformRepoId: subject.repo.platform_repo_id,
+        repositoryKey: repositoryKeyFromWire(subject.repo),
         owner: subject.repo.owner,
         name: subject.repo.name,
         repoPath: subject.repo.repo_path,
@@ -271,7 +273,7 @@
       const itemKey = activityItemKey({
         provider: subject.repo.provider,
         platformHost: subject.repo.platform_host,
-        platformRepoId: subject.repo.platform_repo_id,
+        repositoryKey: repositoryKeyFromWire(subject.repo),
         owner: subject.repo.owner,
         name: subject.repo.name,
         repoPath: subject.repo.repo_path,
@@ -422,7 +424,7 @@
       kind: "branch",
       row,
       provider: item.repo.provider,
-      platformRepoId: item.repo.platform_repo_id ?? "",
+      repositoryKey: repositoryKeyFromWire(item.repo),
       repoOwner: item.repo.owner,
       repoName: item.repo.name,
       repoPath: item.repo.repo_path,
@@ -491,7 +493,7 @@
     return activityItemKey({
       provider: g.provider,
       platformHost: g.platformHost,
-      platformRepoId: g.repo.platform_repo_id,
+      repositoryKey: repositoryKeyFromWire(g.repo),
       owner: g.repoOwner,
       name: g.repoName,
       itemType: g.itemType,
@@ -505,7 +507,7 @@
     return `${activityRepoKey({
       provider: entry.provider,
       platformHost: entry.platformHost,
-      platformRepoId: entry.platformRepoId,
+      repositoryKey: entry.repositoryKey,
       owner: entry.repoOwner,
       name: entry.repoName,
     })}:branch-activity:${entry.row.id}`;
@@ -663,22 +665,16 @@
         || selected.platformHost === item.platform_host);
   }
 
-  function eventAuthor(event: ActivityItem): string {
-    return event.author_name || event.author;
-  }
-
-  // The item row attributes the thread to the PR/issue author (carried on
-  // every row as item_author), not the latest actor. Falls back to the
-  // event actor only when item_author is absent (older cached rows).
+  // Attribute the thread to its PR/issue author once that identity is known.
   function itemAuthor(event: ActivityItem): string {
-    return event.item_author || eventAuthor(event);
+    return event.item_author ?? "";
   }
 
   function activityRepoIdentity(item: ActivityItem): RepoLabelIdentity {
     return {
       provider: item.repo?.provider ?? "",
       platformHost: item.repo?.platform_host ?? item.platform_host,
-      platformRepoId: item.repo?.platform_repo_id,
+      repositoryKey: repositoryKeyFromWire(item.repo),
       owner: item.repo?.owner ?? item.repo_owner,
       name: item.repo?.name ?? item.repo_name,
       repoPath: item.repo?.repo_path,
@@ -689,7 +685,7 @@
     return {
       provider: subject.repo.provider,
       platformHost: subject.repo.platform_host,
-      platformRepoId: subject.repo.platform_repo_id,
+      repositoryKey: repositoryKeyFromWire(subject.repo),
       owner: subject.repo.owner,
       name: subject.repo.name,
       repoPath: subject.repo.repo_path,
@@ -700,7 +696,7 @@
     return {
       provider: subject.repo.provider,
       platformHost: subject.repo.platform_host,
-      platformRepoId: subject.repo.platform_repo_id,
+      repositoryKey: repositoryKeyFromWire(subject.repo),
       owner: subject.repo.owner,
       name: subject.repo.name,
       repoPath: subject.repo.repo_path,
@@ -711,7 +707,7 @@
     return {
       provider: entry.kind === "item" ? entry.group.provider : entry.provider,
       platformHost: entryPlatformHost(entry),
-      platformRepoId: entry.kind === "item" ? entry.group.repo.platform_repo_id : entry.platformRepoId,
+      repositoryKey: entry.kind === "item" ? repositoryKeyFromWire(entry.group.repo) : entry.repositoryKey,
       owner: entryRepoOwner(entry),
       name: entryRepoName(entry),
       repoPath: entryRepoPath(entry),
@@ -729,7 +725,7 @@
   function branchRowAuthor(row: ActivityRow): string {
     return isCollapsedActivityRow(row)
       ? row.author
-      : eventAuthor(row);
+      : activityAuthor(row);
   }
 
   function eventSummary(event: ActivityItem): string {
@@ -957,7 +953,7 @@
                 {#if eventSummary(row)}
                   <span class="event-summary">{eventSummary(row)}</span>
                 {/if}
-                <span class="event-author">{eventAuthor(row)}</span>
+                <span class="event-author">{activityAuthor(row)}</span>
                 <span class="event-time">{relativeTime(row.created_at)}</span>
                 {#if isUnreadNotification(row)}
                   <button
@@ -1089,8 +1085,8 @@
     padding: 6px 0 4px;
     font-size: var(--font-size-2xs);
     font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
+    text-transform: var(--label-transform, uppercase);
+    letter-spacing: var(--letter-spacing-label, 0.5px);
     color: var(--text-muted);
     border-bottom: 1px solid var(--border-default);
     position: sticky;

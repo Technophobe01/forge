@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
 
@@ -26,10 +27,10 @@ func (s *Server) listPullContexts(ctx context.Context, in listPullContextsInput)
 		return listPullContextsOutput{}, err
 	}
 	if repo.Provider == "" {
-		return listPullContextsOutput{}, fmt.Errorf("repo is required")
+		return listPullContextsOutput{}, errors.New("repo is required")
 	}
 	if in.Offset < 0 {
-		return listPullContextsOutput{}, fmt.Errorf("offset must not be negative")
+		return listPullContextsOutput{}, errors.New("offset must not be negative")
 	}
 	limit := clampLimit(in.Limit, 25, 100)
 	pulls, err := s.backend.ListPulls(ctx, ItemListQuery{
@@ -49,7 +50,7 @@ func (s *Server) listPullContexts(ctx context.Context, in listPullContextsInput)
 			DetailLoaded: pull.DetailLoaded, DetailFetchedAt: pull.DetailFetchedAt,
 		}
 		if in.IncludeEvents {
-			detail, err = s.backend.GetPull(ctx, itemIdentityFromRef(pull.itemRef()))
+			detail, err = s.backend.GetPull(ctx, pull.itemKey().itemIdentity())
 			if err != nil {
 				return listPullContextsOutput{}, fmt.Errorf("PR %d context: %w", pull.Number, err)
 			}

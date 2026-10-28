@@ -11,29 +11,32 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
+
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
 	"go.kenn.io/forge/internal/apiclient"
 	"go.kenn.io/forge/internal/apiclient/generated"
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/federationauth"
 	"go.kenn.io/forge/internal/gitclone"
+
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/procutil"
-	"go.kenn.io/forge/internal/server/workspaceapi"
+	"go.kenn.io/forge/internal/server/routepolicy"
+	"go.kenn.io/forge/internal/server/spokeapi"
+	"go.kenn.io/forge/internal/testutil"
 	"go.kenn.io/forge/internal/testutil/dbtest"
 	"go.kenn.io/forge/internal/testutil/gitfixture"
+	"go.kenn.io/forge/platform"
 )
 
 type lockedBuffer struct {
@@ -127,62 +130,6 @@ func setTmuxRecorderPaneOutput(t *testing.T, record, output string) {
 	))
 }
 
-func readTmuxRecord(t *testing.T, path string) [][]string {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	require.NoError(t, err)
-	// Split on NUL. Each record is "<argc>\0<arg0>\0<arg1>\0...\0",
-	// so a flushed stream always ends with a trailing \0 and Split
-	// produces a final empty element after it. Strip exactly one
-	// trailing empty so we don't mistake it for part of the next
-	// record. Interior empty elements are real args (the NUL framing
-	// exists to preserve them) and must NOT be skipped.
-	parts := strings.Split(string(data), "\x00")
-	if len(parts) > 0 && parts[len(parts)-1] == "" {
-		parts = parts[:len(parts)-1]
-	}
-	var out [][]string
-	for i := 0; i < len(parts); {
-		n, err := strconv.Atoi(parts[i])
-		if err != nil {
-			// Trailing record is mid-write: argc isn't a valid
-			// integer yet. Stop; the next poll will see the full
-			// record once the recorder script flushes.
-			break
-		}
-		if i+1+n > len(parts) {
-			// argc is parsed but not all args are on disk yet.
-			// Same treatment: defer to the next poll.
-			break
-		}
-		i++
-		argv := parts[i : i+n]
-		for j := range argv {
-			argv[j] = normalizeRecordedTmuxArg(argv[j])
-		}
-		out = append(out, argv)
-		i += n
-	}
-	return out
-}
-
-func normalizeRecordedTmuxArg(arg string) string {
-	if runtime.GOOS != "windows" {
-		return arg
-	}
-	switch arg {
-	case "#session_name":
-		return "#{session_name}"
-	case "#pane_title":
-		return "#{pane_title}"
-	default:
-		return arg
-	}
-}
-
 func argAfter(argv []string, flag string) (string, bool) {
 	for i, arg := range argv {
 		if arg == flag && i+1 < len(argv) {
@@ -247,8 +194,9 @@ func setupWrapperServerWithScriptAndDBAndServer(
 	bareDir := filepath.Join(dir, "clones")
 	require.NoError(t, os.MkdirAll(bareDir, 0o755))
 	clones := gitclone.New(bareDir, nil)
+	t.Cleanup(clones.Wait)
 	bare, err := clones.ClonePathForContext(
-		gitclone.WithRepositoryIdentity(t.Context(), "repo-acme-widget"),
+		gitclone.WithRepositoryIdentity(t.Context(), platform.RepositoryIdentity{Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget"))}),
 		"github", "github.com", "acme", "widget",
 	)
 	require.NoError(t, err)
@@ -281,7 +229,7 @@ func setupWrapperServerWithScriptAndDBAndServer(
 	repos := []ghclient.RepoRef{
 		{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "github.com"},
 	}
-	mock := &mockGH{}
+	mock := &serverfake.MockGH{}
 	syncer := ghclient.NewSyncer(
 		map[string]ghclient.Client{"github.com": mock},
 		database, nil, repos, time.Minute, nil, nil,
@@ -297,13 +245,13 @@ func setupWrapperServerWithScriptAndDBAndServer(
 		Clones:      clones,
 		WorktreeDir: worktreeDir,
 	})
-	seedPR(t, database, "acme", "widget", 1)
+	serverfake.SeedPR(t, database, "acme", "widget", 1)
 
 	// Real listener — WebSocket Dial needs a real TCP endpoint.
 	// The generated API client also points at this URL rather than
 	// the in-process roundtripper used elsewhere, because we cannot
 	// split HTTP and WebSocket transports per-request.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	serveErr := make(chan error, 1)
 	go func() {
@@ -331,7 +279,7 @@ func setupWrapperServerWithScriptAndDBAndServer(
 	// to the normal transport, which still reaches the httptest
 	// server over TCP so WebSocket upgrades continue to work.
 	httpClient := &http.Client{
-		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		Transport: serverfake.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
 			if req.Method != http.MethodGet && req.Header.Get("Content-Type") == "" {
 				req.Header.Set("Content-Type", "application/json")
 			}
@@ -345,7 +293,7 @@ func setupWrapperServerWithScriptAndDBAndServer(
 }
 
 func TestTmuxWrapperNewSession(t *testing.T) {
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 	acquireRootWorkspaceGitSlot(t)
 
 	require := require.New(t)
@@ -364,11 +312,11 @@ func TestTmuxWrapperNewSession(t *testing.T) {
 	require.NotNil(createResp.JSON202)
 
 	// Workspace setup runs asynchronously. Poll the record file
-	// until the new-session invocation shows up, up to ~5s.
+	// until the new-session invocation shows up within the setup budget.
 	var argvs [][]string
 	require.Eventually(
 		func() bool {
-			argvs = readTmuxRecord(t, record)
+			argvs = serverfake.ReadTmuxRecord(t, record)
 			for _, argv := range argvs {
 				if len(argv) >= 2 && argv[1] == "new-session" {
 					return true
@@ -376,7 +324,7 @@ func TestTmuxWrapperNewSession(t *testing.T) {
 			}
 			return false
 		},
-		5*time.Second, 50*time.Millisecond,
+		workspaceSetupWait, 50*time.Millisecond,
 		"new-session argv not recorded",
 	)
 
@@ -403,6 +351,8 @@ func TestTmuxWrapperNewSession(t *testing.T) {
 }
 
 func TestWorkspaceResponseIncludesTmuxWorkingState(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
+	acquireRootWorkspaceGitSlot(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	client, _, record := setupWrapperServer(t)
@@ -424,16 +374,11 @@ func TestWorkspaceResponseIncludesTmuxWorkingState(t *testing.T) {
 
 	waitForWorkspaceReady(t, ctx, client, wsID)
 
-	var got struct {
-		TmuxPaneTitle      *string `json:"tmux_pane_title"`
-		TmuxWorking        bool    `json:"tmux_working"`
-		TmuxActivitySource string  `json:"tmux_activity_source"`
-		TmuxLastOutputAt   *string `json:"tmux_last_output_at"`
-	}
-	require.Eventually(func() bool {
-		got = getRawWorkspaceActivity(t, client, ctx, wsID)
-		return got.TmuxPaneTitle != nil && got.TmuxWorking
-	}, time.Second, 10*time.Millisecond)
+	// Failed activity enrichment waits for the next five-second refresh.
+	// Allow that retry before declaring the fixture baseline unavailable.
+	got := waitForWorkspaceActivity(t, client, ctx, wsID, func(activity workspaceActivityResponse) bool {
+		return activity.TmuxPaneTitle != nil && activity.TmuxWorking
+	})
 	require.NotNil(got.TmuxPaneTitle)
 	assert.Equal("⠴ t3code-b5014b03", *got.TmuxPaneTitle)
 	assert.True(got.TmuxWorking)
@@ -445,17 +390,29 @@ func TestWorkspaceResponseIncludesTmuxWorkingState(t *testing.T) {
 			TmuxWorking   bool    `json:"tmux_working"`
 		} `json:"workspaces"`
 	}
-	require.Eventually(func() bool {
-		listResp, listErr := client.HTTP.ListWorkspacesRaw(ctx, client.Transport)
+	listCtx, cancel := context.WithTimeout(ctx, workspaceActivityWait)
+	defer cancel()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		listResp, listErr := client.HTTP.ListWorkspacesRaw(listCtx, client.Transport)
 		require.NoError(listErr)
-		defer listResp.Body.Close()
-		require.Equal(http.StatusOK, listResp.StatusCode)
 		listed.Workspaces = nil
-		require.NoError(json.NewDecoder(listResp.Body).Decode(&listed))
-		return len(listed.Workspaces) == 1 &&
+		decodeErr := json.NewDecoder(listResp.Body).Decode(&listed)
+		_ = listResp.Body.Close()
+		require.Equal(http.StatusOK, listResp.StatusCode)
+		require.NoError(decodeErr)
+		if len(listed.Workspaces) == 1 &&
 			listed.Workspaces[0].TmuxPaneTitle != nil &&
-			listed.Workspaces[0].TmuxWorking
-	}, time.Second, 10*time.Millisecond)
+			listed.Workspaces[0].TmuxWorking {
+			break
+		}
+		select {
+		case <-listCtx.Done():
+			require.NoError(listCtx.Err(), "listed workspace activity did not converge")
+		case <-ticker.C:
+		}
+	}
 	require.Len(listed.Workspaces, 1)
 	assert.Equal(wsID, listed.Workspaces[0].ID)
 	require.NotNil(listed.Workspaces[0].TmuxPaneTitle)
@@ -464,7 +421,7 @@ func TestWorkspaceResponseIncludesTmuxWorkingState(t *testing.T) {
 }
 
 func TestFilteredActivityIncrementalPollRetainsWorkspaceSubject(t *testing.T) {
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 	acquireRootWorkspaceGitSlot(t)
 
 	require := require.New(t)
@@ -478,7 +435,7 @@ func TestFilteredActivityIncrementalPollRetainsWorkspaceSubject(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)
 
-	repo, err := database.GetRepoByIdentity(ctx, verifiedGitHubRepoIdentity("github.com", "acme", "widget"))
+	repo, err := database.GetRepoByIdentity(ctx, serverfake.VerifiedGitHubRepoIdentity("github.com", "acme", "widget"))
 	require.NoError(err)
 	require.NotNil(repo)
 	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 1)
@@ -503,10 +460,9 @@ func TestFilteredActivityIncrementalPollRetainsWorkspaceSubject(t *testing.T) {
 	workspaceID := createResp.JSON202.ID
 	waitForWorkspaceReady(t, ctx, client, workspaceID)
 
-	require.Eventually(func() bool {
-		activity := getRawWorkspaceActivity(t, client, ctx, workspaceID)
+	waitForWorkspaceActivity(t, client, ctx, workspaceID, func(activity workspaceActivityResponse) bool {
 		return activity.TmuxActivitySource == "none" && activity.TmuxLastOutputAt == nil
-	}, 3*time.Second, 50*time.Millisecond, "tmux baseline was not observed")
+	})
 	setTmuxRecorderPaneOutput(t, record, "changed output")
 
 	search := "search-reviewer"
@@ -572,7 +528,7 @@ func TestFilteredActivityIncrementalPollRetainsWorkspaceSubject(t *testing.T) {
 }
 
 func TestActivityAuthorsIncludeWorkspaceOnlySubject(t *testing.T) {
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 	acquireRootWorkspaceGitSlot(t)
 
 	require := require.New(t)
@@ -586,7 +542,7 @@ func TestActivityAuthorsIncludeWorkspaceOnlySubject(t *testing.T) {
 	ctx := t.Context()
 
 	repo, err := database.GetRepoByIdentity(
-		ctx, verifiedGitHubRepoIdentity("github.com", "acme", "widget"),
+		ctx, serverfake.VerifiedGitHubRepoIdentity("github.com", "acme", "widget"),
 	)
 	require.NoError(err)
 	require.NotNil(repo)
@@ -603,10 +559,9 @@ func TestActivityAuthorsIncludeWorkspaceOnlySubject(t *testing.T) {
 	require.NotNil(createResp.JSON202)
 	waitForWorkspaceReady(t, ctx, client, createResp.JSON202.ID)
 
-	require.Eventually(func() bool {
-		activity := getRawWorkspaceActivity(t, client, ctx, createResp.JSON202.ID)
+	waitForWorkspaceActivity(t, client, ctx, createResp.JSON202.ID, func(activity workspaceActivityResponse) bool {
 		return activity.TmuxActivitySource == "none" && activity.TmuxLastOutputAt == nil
-	}, 3*time.Second, 50*time.Millisecond, "tmux baseline was not observed")
+	})
 	since := time.Now().UTC().Format(time.RFC3339Nano)
 	setTmuxRecorderPaneOutput(t, record, "workspace-only activity")
 
@@ -651,7 +606,7 @@ func TestActivityAuthorsIncludeWorkspaceOnlySubject(t *testing.T) {
 }
 
 func TestFederatedActivityIncludesNodeWorkspaceOnlySubject(t *testing.T) {
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 	acquireRootWorkspaceGitSlot(t)
 
 	require := require.New(t)
@@ -670,10 +625,9 @@ func TestFederatedActivityIncludesNodeWorkspaceOnlySubject(t *testing.T) {
 	require.Equal(http.StatusAccepted, createResp.StatusCode)
 	require.NotNil(createResp.JSON202)
 	waitForWorkspaceReady(t, t.Context(), client, createResp.JSON202.ID)
-	require.Eventually(func() bool {
-		activity := getRawWorkspaceActivity(t, client, t.Context(), createResp.JSON202.ID)
+	waitForWorkspaceActivity(t, client, t.Context(), createResp.JSON202.ID, func(activity workspaceActivityResponse) bool {
 		return activity.TmuxActivitySource == "none" && activity.TmuxLastOutputAt == nil
-	}, 3*time.Second, 50*time.Millisecond)
+	})
 
 	providerClient := providerPlaneClientFunc(func(
 		_ context.Context, scope federationauth.Scope, request *http.Request,
@@ -691,8 +645,8 @@ func TestFederatedActivityIncludesNodeWorkspaceOnlySubject(t *testing.T) {
 			Body:       io.NopCloser(strings.NewReader(body)),
 		}, nil
 	})
-	srv.providerSource = &hubProviderSource{client: providerClient}
-	srv.providerProxy = newProviderProxy(providerClient)
+	srv.providerSource = &spokeapi.HubProviderSource{Client: providerClient}
+	srv.providerProxy = routepolicy.NewProviderProxy(providerClient, t.Context())
 	srv.providerRouteSpoke = true
 
 	since := time.Now().UTC().Format(time.RFC3339Nano)
@@ -711,7 +665,7 @@ func TestFederatedActivityIncludesNodeWorkspaceOnlySubject(t *testing.T) {
 	require.Equal(createResp.JSON202.ID, response.JSON200.WorkspaceActivity[0].Workspace.ID)
 
 	repo, err := database.GetRepoByIdentity(
-		t.Context(), verifiedGitHubRepoIdentity("github.com", "acme", "widget"),
+		t.Context(), serverfake.VerifiedGitHubRepoIdentity("github.com", "acme", "widget"),
 	)
 	require.NoError(err)
 	require.NotNil(repo)
@@ -727,7 +681,7 @@ func TestFederatedActivityIncludesNodeWorkspaceOnlySubject(t *testing.T) {
 }
 
 func TestWorkspaceActivityNumberSearchIncludesEventlessSubject(t *testing.T) {
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 	acquireRootWorkspaceGitSlot(t)
 
 	require := require.New(t)
@@ -741,7 +695,7 @@ func TestWorkspaceActivityNumberSearchIncludesEventlessSubject(t *testing.T) {
 	ctx := t.Context()
 
 	repo, err := database.GetRepoByIdentity(
-		ctx, verifiedGitHubRepoIdentity("github.com", "acme", "widget"),
+		ctx, serverfake.VerifiedGitHubRepoIdentity("github.com", "acme", "widget"),
 	)
 	require.NoError(err)
 	require.NotNil(repo)
@@ -762,10 +716,9 @@ func TestWorkspaceActivityNumberSearchIncludesEventlessSubject(t *testing.T) {
 	workspaceID := createResp.JSON202.ID
 	waitForWorkspaceReady(t, ctx, client, workspaceID)
 
-	require.Eventually(func() bool {
-		activity := getRawWorkspaceActivity(t, client, ctx, workspaceID)
+	waitForWorkspaceActivity(t, client, ctx, workspaceID, func(activity workspaceActivityResponse) bool {
 		return activity.TmuxActivitySource == "none" && activity.TmuxLastOutputAt == nil
-	}, 3*time.Second, 50*time.Millisecond, "tmux baseline was not observed")
+	})
 	since := time.Now().UTC().Format(time.RFC3339Nano)
 	setTmuxRecorderPaneOutput(t, record, "changed output")
 
@@ -793,81 +746,55 @@ func TestWorkspaceActivityNumberSearchIncludesEventlessSubject(t *testing.T) {
 	}
 }
 
+const workspaceActivityWait = 10 * time.Second
+
+type workspaceActivityResponse struct {
+	TmuxPaneTitle      *string `json:"tmux_pane_title"`
+	TmuxWorking        bool    `json:"tmux_working"`
+	TmuxActivitySource string  `json:"tmux_activity_source"`
+	TmuxLastOutputAt   *string `json:"tmux_last_output_at"`
+}
+
+func waitForWorkspaceActivity(
+	t *testing.T, client *apiclient.Client, ctx context.Context, workspaceID string,
+	matches func(workspaceActivityResponse) bool,
+) workspaceActivityResponse {
+	t.Helper()
+	waitCtx, cancel := context.WithTimeout(ctx, workspaceActivityWait)
+	defer cancel()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		activity := getRawWorkspaceActivity(t, client, waitCtx, workspaceID)
+		if matches(activity) {
+			return activity
+		}
+		select {
+		case <-waitCtx.Done():
+			require.NoError(t, waitCtx.Err(), "workspace activity did not converge: %+v", activity)
+		case <-ticker.C:
+		}
+	}
+}
+
 func getRawWorkspaceActivity(
 	t *testing.T,
 	client *apiclient.Client,
 	ctx context.Context,
 	wsID string,
-) struct {
-	TmuxPaneTitle      *string `json:"tmux_pane_title"`
-	TmuxWorking        bool    `json:"tmux_working"`
-	TmuxActivitySource string  `json:"tmux_activity_source"`
-	TmuxLastOutputAt   *string `json:"tmux_last_output_at"`
-} {
+) workspaceActivityResponse {
 	t.Helper()
 	resp, err := client.HTTP.GetWorkspaceRaw(ctx, client.Transport, &generated.GetWorkspaceRequestOptions{PathParams: &generated.GetWorkspacePath{ID: wsID}})
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	var got struct {
-		TmuxPaneTitle      *string `json:"tmux_pane_title"`
-		TmuxWorking        bool    `json:"tmux_working"`
-		TmuxActivitySource string  `json:"tmux_activity_source"`
-		TmuxLastOutputAt   *string `json:"tmux_last_output_at"`
-	}
+	var got workspaceActivityResponse
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
 	return got
 }
 
-func TestIsWorkingTmuxTitleDetectsCodexSpinner(t *testing.T) {
-	assert := assert.New(t)
-
-	cases := []struct {
-		name    string
-		title   string
-		working bool
-	}{
-		{
-			name:    "codex spinner frame",
-			title:   "⠴ t3code-b5014b03",
-			working: true,
-		},
-		{
-			name:    "another codex spinner frame",
-			title:   "⠦ t3code-b5014b03",
-			working: true,
-		},
-		{
-			name:    "settled codex title",
-			title:   "t3code-b5014b03",
-			working: false,
-		},
-		{
-			name:    "english busy title is not protocol",
-			title:   "codex working",
-			working: false,
-		},
-		{
-			name:    "opencode style title is not protocol",
-			title:   "OC | Run sleep 10",
-			working: false,
-		},
-		{
-			name:    "pi style title is not protocol",
-			title:   "π - tmp.foo",
-			working: false,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(tc.working, workspaceapi.IsWorkingTmuxTitle(tc.title))
-		})
-	}
-}
-
-func TestWorkspaceCreateFailureLogsAndPersistsAuditEvent(t *testing.T) {
+func TestWorkspaceCreateFailureLogsAndPersistsAuditEvent(t *testing.T) { //nolint:paralleltest // swaps slog.Default to capture logs
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -949,7 +876,7 @@ func TestWorkspaceCreateFailureLogsAndPersistsAuditEvent(t *testing.T) {
 }
 
 func TestWorkspaceShutdownCancellationPersistsFailureViaAPI(t *testing.T) {
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 	acquireRootWorkspaceGitSlot(t)
 
 	assert := assert.New(t)
@@ -992,7 +919,7 @@ func TestWorkspaceShutdownCancellationPersistsFailureViaAPI(t *testing.T) {
 
 	require.Eventually(
 		func() bool {
-			argvs := readTmuxRecord(t, record)
+			argvs := serverfake.ReadTmuxRecord(t, record)
 			for _, argv := range argvs {
 				if len(argv) >= 2 && argv[1] == "new-session" {
 					return true
@@ -1000,7 +927,7 @@ func TestWorkspaceShutdownCancellationPersistsFailureViaAPI(t *testing.T) {
 			}
 			return false
 		},
-		5*time.Second,
+		workspaceSetupWait,
 		50*time.Millisecond,
 	)
 
@@ -1011,15 +938,15 @@ func TestWorkspaceShutdownCancellationPersistsFailureViaAPI(t *testing.T) {
 	require.NoError(srv.Shutdown(shutdownCtx))
 
 	restartSyncer := ghclient.NewSyncer(
-		map[string]ghclient.Client{"github.com": &mockGH{}},
-		database, nil, defaultTestRepos, time.Minute, nil, nil,
+		map[string]ghclient.Client{"github.com": &serverfake.MockGH{}},
+		database, nil, serverfake.DefaultTestRepos, time.Minute, nil, nil,
 	)
 	t.Cleanup(restartSyncer.Stop)
 	restarted := New(
 		database, restartSyncer, nil, "/",
 		nil, ServerOptions{WorktreeDir: filepath.Join(dir, "restart-worktrees")},
 	)
-	t.Cleanup(func() { gracefulShutdown(t, restarted) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, restarted) })
 	restartedClient := setupTestClient(t, restarted)
 
 	getResp, err := restartedClient.HTTP.GetWorkspaceWithResponse(ctx, &generated.GetWorkspaceRequestOptions{PathParams: &generated.GetWorkspacePath{ID: wsID}})
@@ -1061,6 +988,8 @@ func TestWorkspaceShutdownCancellationPersistsFailureViaAPI(t *testing.T) {
 }
 
 func TestWorkspaceSetupFailureRollbackCleansWorktreeViaAPI(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
+	acquireRootWorkspaceGitSlot(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -1085,7 +1014,7 @@ func TestWorkspaceSetupFailureRollbackCleansWorktreeViaAPI(t *testing.T) {
 	)
 	ctx := t.Context()
 	clonePath, err := srv.clones.ClonePathForContext(
-		gitclone.WithRepositoryIdentity(ctx, "repo-acme-widget"),
+		gitclone.WithRepositoryIdentity(ctx, platform.RepositoryIdentity{Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget"))}),
 		"github", "github.com", "acme", "widget",
 	)
 	require.NoError(err)
@@ -1103,24 +1032,7 @@ func TestWorkspaceSetupFailureRollbackCleansWorktreeViaAPI(t *testing.T) {
 	require.NotNil(createResp.JSON202)
 	wsID := createResp.JSON202.ID
 
-	var failed *generated.WorkspaceResponse
-	require.Eventually(
-		func() bool {
-			getResp, getErr := client.HTTP.GetWorkspaceWithResponse(ctx, &generated.GetWorkspaceRequestOptions{PathParams: &generated.GetWorkspacePath{ID: wsID}})
-			require.NoError(getErr)
-			if getResp.StatusCode != http.StatusOK || getResp.JSON200 == nil {
-				return false
-			}
-			if getResp.JSON200.Status != "error" {
-				return false
-			}
-			failed = getResp.JSON200
-			return true
-		},
-		5*time.Second,
-		50*time.Millisecond,
-	)
-
+	failed := waitForWorkspaceStatus(t, ctx, client, wsID, "error")
 	require.NotNil(failed)
 	assert.Equal(featureSHA, gitfixture.SHA(t, clonePath, "refs/heads/feature"))
 	assert.Eventually(
@@ -1140,7 +1052,7 @@ func TestWorkspaceSetupFailureRollbackCleansWorktreeViaAPI(t *testing.T) {
 }
 
 func TestWorkspaceRetryWhileCreatingQueuesAndRunsAfterFailureViaAPI(t *testing.T) {
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 	acquireRootWorkspaceGitSlot(t)
 
 	assert := assert.New(t)
@@ -1179,7 +1091,7 @@ func TestWorkspaceRetryWhileCreatingQueuesAndRunsAfterFailureViaAPI(t *testing.T
 	client, _, database := setupWrapperServerWithScriptAndDB(
 		t, script,
 	)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(ctx, &generated.CreateWorkspaceRequestOptions{Body: &generated.CreateWorkspaceInputBody{
 		Provider:     "github",
@@ -1195,7 +1107,7 @@ func TestWorkspaceRetryWhileCreatingQueuesAndRunsAfterFailureViaAPI(t *testing.T
 
 	require.Eventually(
 		func() bool {
-			argvs := readTmuxRecord(t, record)
+			argvs := serverfake.ReadTmuxRecord(t, record)
 			for _, argv := range argvs {
 				if len(argv) >= 2 && argv[1] == "new-session" {
 					return true
@@ -1203,7 +1115,7 @@ func TestWorkspaceRetryWhileCreatingQueuesAndRunsAfterFailureViaAPI(t *testing.T
 			}
 			return false
 		},
-		5*time.Second,
+		workspaceSetupWait,
 		50*time.Millisecond,
 	)
 
@@ -1223,10 +1135,14 @@ func TestWorkspaceRetryWhileCreatingQueuesAndRunsAfterFailureViaAPI(t *testing.T
 	require.NoError(os.WriteFile(release, []byte("go\n"), 0o644))
 
 	var ready *generated.WorkspaceResponse
+	var pollErr error
 	require.Eventually(
 		func() bool {
 			getResp, getErr := client.HTTP.GetWorkspaceWithResponse(ctx, &generated.GetWorkspaceRequestOptions{PathParams: &generated.GetWorkspacePath{ID: wsID}})
-			require.NoError(getErr)
+			if getErr != nil {
+				pollErr = getErr
+				return true
+			}
 			if getResp.StatusCode != http.StatusOK || getResp.JSON200 == nil {
 				return false
 			}
@@ -1239,10 +1155,11 @@ func TestWorkspaceRetryWhileCreatingQueuesAndRunsAfterFailureViaAPI(t *testing.T
 		15*time.Second,
 		50*time.Millisecond,
 	)
+	require.NoError(pollErr)
 	require.NotNil(ready)
 	assert.Nil(ready.ErrorMessage)
 
-	argvs := readTmuxRecord(t, record)
+	argvs := serverfake.ReadTmuxRecord(t, record)
 	var newSessionCount int
 	for _, argv := range argvs {
 		if len(argv) >= 2 && argv[1] == "new-session" {
@@ -1263,7 +1180,7 @@ func TestWorkspaceRetryWhileCreatingQueuesAndRunsAfterFailureViaAPI(t *testing.T
 }
 
 func TestWorkspaceShutdownCancellationDoesNotPersistAfterDeadlineBudgetExhausted(t *testing.T) {
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 	acquireRootWorkspaceGitSlot(t)
 
 	assert := assert.New(t)
@@ -1305,7 +1222,7 @@ func TestWorkspaceShutdownCancellationDoesNotPersistAfterDeadlineBudgetExhausted
 
 	require.Eventually(
 		func() bool {
-			argvs := readTmuxRecord(t, record)
+			argvs := serverfake.ReadTmuxRecord(t, record)
 			for _, argv := range argvs {
 				if len(argv) >= 2 && argv[1] == "new-session" {
 					return true
@@ -1313,7 +1230,7 @@ func TestWorkspaceShutdownCancellationDoesNotPersistAfterDeadlineBudgetExhausted
 			}
 			return false
 		},
-		5*time.Second,
+		workspaceSetupWait,
 		50*time.Millisecond,
 	)
 
@@ -1352,11 +1269,15 @@ func TestWorkspaceShutdownCancellationDoesNotPersistAfterDeadlineBudgetExhausted
 		require.FailNow("blocking request never started")
 	}
 
-	time.AfterFunc(250*time.Millisecond, func() {
-		close(blockRelease)
-	})
+	// Release the request once the HTTP drain starts, so Shutdown reaches the workspace stop.
+	srv.bgMu.Lock()
+	httpSrv := srv.httpSrv
+	srv.bgMu.Unlock()
+	require.NotNil(httpSrv)
+	var releaseOnce sync.Once
+	httpSrv.RegisterOnShutdown(func() { releaseOnce.Do(func() { close(blockRelease) }) })
 
-	shutdownCtx, cancel := context.WithTimeout(
+	shutdownCtx, cancel := context.WithTimeout( //nolint:kennlint // the deadline is the expected result; the held setup transaction keeps Shutdown waiting until it fires
 		t.Context(), 400*time.Millisecond,
 	)
 	defer cancel()
@@ -1389,7 +1310,7 @@ func TestWorkspaceShutdownCancellationDoesNotPersistAfterDeadlineBudgetExhausted
 }
 
 func TestTmuxWrapperAttachSession(t *testing.T) {
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 	acquireRootWorkspaceGitSlot(t)
 
 	require := require.New(t)
@@ -1410,16 +1331,7 @@ func TestTmuxWrapperAttachSession(t *testing.T) {
 	wsID := createResp.JSON202.ID
 
 	// Poll for status == "ready".
-	require.Eventually(
-		func() bool {
-			getResp, getErr := client.HTTP.GetWorkspaceWithResponse(ctx, &generated.GetWorkspaceRequestOptions{PathParams: &generated.GetWorkspacePath{ID: wsID}})
-			if getErr != nil || getResp.JSON200 == nil {
-				return false
-			}
-			return getResp.JSON200.Status == "ready"
-		},
-		5*time.Second, 50*time.Millisecond,
-	)
+	waitForWorkspaceReady(t, ctx, client, wsID)
 
 	// Connect to the WebSocket terminal endpoint using the
 	// httptest baseURL (the generated client cannot upgrade to
@@ -1458,7 +1370,7 @@ func TestTmuxWrapperAttachSession(t *testing.T) {
 	// The recorded argv should contain an attach-session invocation
 	// with our "wrap" prefix.
 	var attach []string
-	for _, argv := range readTmuxRecord(t, record) {
+	for _, argv := range serverfake.ReadTmuxRecord(t, record) {
 		if len(argv) >= 3 &&
 			argv[1] == "-u" &&
 			argv[2] == "attach-session" {
@@ -1477,6 +1389,8 @@ func TestTmuxWrapperAttachSession(t *testing.T) {
 }
 
 func TestTerminalRouteE2EPropagatesWorkspaceID(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
+	acquireRootWorkspaceGitSlot(t)
 	assert := assert.New(t)
 	_, baseURL, _ := setupWrapperServer(t)
 
@@ -1494,6 +1408,8 @@ func TestTerminalRouteE2EPropagatesWorkspaceID(t *testing.T) {
 }
 
 func TestWorkspaceSetupResourceExhaustionGetsHelpfulErrorViaAPI(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
+	acquireRootWorkspaceGitSlot(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -1517,7 +1433,7 @@ func TestWorkspaceSetupResourceExhaustionGetsHelpfulErrorViaAPI(t *testing.T) {
 	require.NoError(os.WriteFile(script, []byte(body), 0o755))
 
 	client, _, _ := setupWrapperServerWithScriptAndDB(t, script)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(ctx, &generated.CreateWorkspaceRequestOptions{Body: &generated.CreateWorkspaceInputBody{
 		Provider:     "github",
@@ -1531,33 +1447,18 @@ func TestWorkspaceSetupResourceExhaustionGetsHelpfulErrorViaAPI(t *testing.T) {
 	require.NotNil(createResp.JSON202)
 	wsID := createResp.JSON202.ID
 
-	var failed *generated.WorkspaceResponse
-	require.Eventually(
-		func() bool {
-			getResp, getErr := client.HTTP.GetWorkspaceWithResponse(ctx, &generated.GetWorkspaceRequestOptions{PathParams: &generated.GetWorkspacePath{ID: wsID}})
-			require.NoError(getErr)
-			if getResp.StatusCode != http.StatusOK || getResp.JSON200 == nil {
-				return false
-			}
-			if getResp.JSON200.Status != "error" {
-				return false
-			}
-			failed = getResp.JSON200
-			return true
-		},
-		5*time.Second, 50*time.Millisecond,
-	)
+	failed := waitForWorkspaceStatus(t, ctx, client, wsID, "error")
 	require.NotNil(failed)
 	require.NotNil(failed.ErrorMessage)
 	assert.Contains(*failed.ErrorMessage, "host process limit reached")
 }
 
-func TestWorkspaceListReturnsWhileSubprocessCapacityIsHeld(t *testing.T) {
+func TestWorkspaceListReturnsWhileSubprocessCapacityIsHeld(t *testing.T) { //nolint:paralleltest // swaps the procutil default limiter
 	assert := assert.New(t)
 	require := require.New(t)
 
 	restoreLimiter := procutil.SetDefaultLimiterForTest(
-		procutil.NewLimiterWithAcquireTimeout(1, 500*time.Millisecond),
+		procutil.NewLimiterWithAcquireTimeout(1, time.Minute),
 	)
 	t.Cleanup(restoreLimiter)
 
@@ -1606,14 +1507,14 @@ func TestWorkspaceListReturnsWhileSubprocessCapacityIsHeld(t *testing.T) {
 		require.NoError(json.NewDecoder(got.resp.Body).Decode(&listed))
 		require.Len(listed.Workspaces, 1)
 		assert.Equal(createResp.JSON202.ID, listed.Workspaces[0].ID)
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		require.Fail("workspace list waited for subprocess capacity")
 	}
 
 	releaseHeld()
 }
 
-func TestWorkspaceSetupLimiterTimeoutSurfacesResourceExhaustionViaAPI(t *testing.T) {
+func TestWorkspaceSetupLimiterTimeoutSurfacesResourceExhaustionViaAPI(t *testing.T) { //nolint:paralleltest // swaps the procutil default limiter
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -1623,7 +1524,7 @@ func TestWorkspaceSetupLimiterTimeoutSurfacesResourceExhaustionViaAPI(t *testing
 	t.Cleanup(restoreLimiter)
 
 	client, _, _ := setupWrapperServer(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	releaseHeld, err := procutil.TryAcquire(
 		context.Background(), "test-held subprocess capacity",
@@ -1642,47 +1543,11 @@ func TestWorkspaceSetupLimiterTimeoutSurfacesResourceExhaustionViaAPI(t *testing
 	require.Equal(http.StatusAccepted, createResp.StatusCode)
 	require.NotNil(createResp.JSON202)
 
-	var failed *generated.WorkspaceResponse
-	require.Eventually(
-		func() bool {
-			getResp, getErr := client.HTTP.GetWorkspaceWithResponse(ctx, &generated.GetWorkspaceRequestOptions{PathParams: &generated.GetWorkspacePath{ID: createResp.JSON202.ID}})
-			require.NoError(getErr)
-			if getResp.StatusCode != http.StatusOK || getResp.JSON200 == nil {
-				return false
-			}
-			if getResp.JSON200.Status != "error" {
-				return false
-			}
-			failed = getResp.JSON200
-			return true
-		},
-		5*time.Second, 25*time.Millisecond,
-	)
+	failed := waitForWorkspaceStatus(t, ctx, client, createResp.JSON202.ID, "error")
 	require.NotNil(failed)
 	require.NotNil(failed.ErrorMessage)
 	assert.Contains(*failed.ErrorMessage, "host process limit reached")
 	assert.Contains(*failed.ErrorMessage, "subprocess capacity")
-}
-
-// TestReadTmuxRecordPreservesEmptyArgs pins down the parser's
-// empty-arg handling. The NUL-delimited record format was chosen to
-// round-trip argv with empty-string elements unambiguously; the
-// parser must keep interior and trailing empties rather than
-// collapsing them.
-func TestReadTmuxRecordPreservesEmptyArgs(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	path := filepath.Join(t.TempDir(), "record")
-
-	// First record: 3 args with an interior empty ("a", "", "b").
-	// Second record: 2 args with a trailing empty ("x", "").
-	body := "3\x00a\x00\x00b\x00" + "2\x00x\x00\x00"
-	require.NoError(os.WriteFile(path, []byte(body), 0o644))
-
-	argvs := readTmuxRecord(t, path)
-	require.Len(argvs, 2)
-	assert.Equal([]string{"a", "", "b"}, argvs[0])
-	assert.Equal([]string{"x", ""}, argvs[1])
 }
 
 // TestTmuxWrapperKillSession proves the configured tmux.command
@@ -1690,7 +1555,7 @@ func TestReadTmuxRecordPreservesEmptyArgs(t *testing.T) {
 // This complements TestTmuxWrapperNewSession and TestTmuxWrapperAttachSession —
 // together they cover all three tmux verbs that cross the HTTP boundary.
 func TestTmuxWrapperKillSession(t *testing.T) {
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 	acquireRootWorkspaceGitSlot(t)
 
 	require := require.New(t)
@@ -1712,16 +1577,7 @@ func TestTmuxWrapperKillSession(t *testing.T) {
 
 	// Poll for status == "ready" before deleting so the tmux
 	// session is known to exist from the manager's perspective.
-	require.Eventually(
-		func() bool {
-			getResp, getErr := client.HTTP.GetWorkspaceWithResponse(ctx, &generated.GetWorkspaceRequestOptions{PathParams: &generated.GetWorkspacePath{ID: wsID}})
-			if getErr != nil || getResp.JSON200 == nil {
-				return false
-			}
-			return getResp.JSON200.Status == "ready"
-		},
-		5*time.Second, 50*time.Millisecond,
-	)
+	waitForWorkspaceReady(t, ctx, client, wsID)
 
 	force := true
 	delResp, err := client.HTTP.DeleteWorkspaceWithResponse(ctx, &generated.DeleteWorkspaceRequestOptions{PathParams: &generated.DeleteWorkspacePath{ID: wsID}, Query: &generated.DeleteWorkspaceQuery{Force: &force}})
@@ -1731,7 +1587,7 @@ func TestTmuxWrapperKillSession(t *testing.T) {
 	// The recorded argv should contain a kill-session invocation
 	// with our "wrap" prefix.
 	var kill []string
-	for _, argv := range readTmuxRecord(t, record) {
+	for _, argv := range serverfake.ReadTmuxRecord(t, record) {
 		if len(argv) >= 2 && argv[1] == "kill-session" {
 			kill = argv
 			break
@@ -1746,6 +1602,8 @@ func TestTmuxWrapperKillSession(t *testing.T) {
 }
 
 func TestDeleteWorkspacePreservesRowWhenTmuxKillFails(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
+	acquireRootWorkspaceGitSlot(t)
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -1780,16 +1638,7 @@ func TestDeleteWorkspacePreservesRowWhenTmuxKillFails(t *testing.T) {
 	require.NotNil(createResp.JSON202)
 	wsID := createResp.JSON202.ID
 
-	require.Eventually(
-		func() bool {
-			getResp, getErr := client.HTTP.GetWorkspaceWithResponse(ctx, &generated.GetWorkspaceRequestOptions{PathParams: &generated.GetWorkspacePath{ID: wsID}})
-			if getErr != nil || getResp.JSON200 == nil {
-				return false
-			}
-			return getResp.JSON200.Status == "ready"
-		},
-		5*time.Second, 50*time.Millisecond,
-	)
+	waitForWorkspaceReady(t, ctx, client, wsID)
 
 	force := true
 	delResp, err := client.HTTP.DeleteWorkspaceWithResponse(ctx, &generated.DeleteWorkspaceRequestOptions{PathParams: &generated.DeleteWorkspacePath{ID: wsID}, Query: &generated.DeleteWorkspaceQuery{Force: &force}})
@@ -1814,71 +1663,8 @@ func TestDeleteWorkspacePreservesRowWhenTmuxKillFails(t *testing.T) {
 	assert.Equal(wsID, getResp.JSON200.ID)
 }
 
-func TestDeleteWorkspaceTreatsTmuxServerExitAsGoneE2E(t *testing.T) {
-	runParallelServerTest(t)
-	acquireRootWorkspaceGitSlot(t)
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	dir := t.TempDir()
-	script := filepath.Join(dir, "fake-tmux")
-	body := "#!/bin/sh\n" +
-		`for a in "$@"; do` + "\n" +
-		`  if [ "$a" = "has-session" ]; then` + "\n" +
-		`    echo "can't find session: sim" >&2` + "\n" +
-		`    exit 1` + "\n" +
-		`  fi` + "\n" +
-		`  if [ "$a" = "kill-session" ]; then` + "\n" +
-		`    echo "server exited unexpectedly" >&2` + "\n" +
-		`    exit 1` + "\n" +
-		`  fi` + "\n" +
-		"done\n" +
-		"exit 0\n"
-	require.NoError(os.WriteFile(script, []byte(body), 0o755))
-
-	client, _, database := setupWrapperServerWithScriptAndDB(t, script)
-
-	createResp, err := client.HTTP.CreateWorkspaceWithResponse(t.Context(), &generated.CreateWorkspaceRequestOptions{Body: &generated.CreateWorkspaceInputBody{
-		Provider:     "github",
-		PlatformHost: "github.com",
-		Owner:        "acme",
-		Name:         "widget",
-		MrNumber:     1,
-	}})
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, createResp.StatusCode)
-	require.NotNil(createResp.JSON202)
-	wsID := createResp.JSON202.ID
-
-	require.Eventually(
-		func() bool {
-			getResp, getErr := client.HTTP.GetWorkspaceWithResponse(t.Context(), &generated.GetWorkspaceRequestOptions{PathParams: &generated.GetWorkspacePath{ID: wsID}})
-			if getErr != nil || getResp.JSON200 == nil {
-				return false
-			}
-			return getResp.JSON200.Status == "ready"
-		},
-		15*time.Second, 50*time.Millisecond,
-	)
-
-	force := true
-	delResp, err := client.HTTP.DeleteWorkspaceWithResponse(t.Context(), &generated.DeleteWorkspaceRequestOptions{PathParams: &generated.DeleteWorkspacePath{ID: wsID}, Query: &generated.DeleteWorkspaceQuery{Force: &force}})
-	require.NoError(err)
-	require.Equal(http.StatusNoContent, delResp.StatusCode)
-
-	getResp, err := client.HTTP.GetWorkspaceWithResponse(t.Context(), &generated.GetWorkspaceRequestOptions{PathParams: &generated.GetWorkspacePath{ID: wsID}})
-	require.Error(err)
-	require.NotNil(getResp)
-	require.Equal(http.StatusNotFound, getResp.StatusCode)
-
-	stored, err := database.GetWorkspace(t.Context(), wsID)
-	require.NoError(err)
-	assert.Nil(stored)
-}
-
 func TestDeleteErroredWorkspaceAllowsUnavailableTmux(t *testing.T) {
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 	acquireRootWorkspaceGitSlot(t)
 
 	require := require.New(t)
@@ -1952,7 +1738,7 @@ func TestDeleteErroredWorkspaceAllowsUnavailableTmux(t *testing.T) {
 // the terminal handler sees the error and closes the WebSocket with
 // StatusInternalError.
 func TestTmuxWrapperAttachSurfacesWrapperFailure(t *testing.T) {
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 	acquireRootWorkspaceGitSlot(t)
 
 	record := filepath.Join(t.TempDir(), "record")
@@ -1996,16 +1782,7 @@ func attachWebsocketAndExpectInternalError(t *testing.T, scriptBody string) {
 	require.NotNil(createResp.JSON202)
 	wsID := createResp.JSON202.ID
 
-	require.Eventually(
-		func() bool {
-			getResp, getErr := client.HTTP.GetWorkspaceWithResponse(ctx, &generated.GetWorkspaceRequestOptions{PathParams: &generated.GetWorkspacePath{ID: wsID}})
-			if getErr != nil || getResp.JSON200 == nil {
-				return false
-			}
-			return getResp.JSON200.Status == "ready"
-		},
-		5*time.Second, 50*time.Millisecond,
-	)
+	waitForWorkspaceReady(t, ctx, client, wsID)
 
 	wsURL := strings.Replace(baseURL, "http://", "ws://", 1) +
 		"/ws/v1/workspaces/" + wsID + "/terminal"
@@ -2044,7 +1821,7 @@ func attachWebsocketAndExpectInternalError(t *testing.T, scriptBody string) {
 // reviewer flagged — shell wrappers often exit 1 for their own
 // generic errors.
 func TestTmuxWrapperAttachSurfacesExit1Failure(t *testing.T) {
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 	acquireRootWorkspaceGitSlot(t)
 
 	record := filepath.Join(t.TempDir(), "record")
@@ -2068,7 +1845,7 @@ func TestTmuxWrapperAttachSurfacesExit1Failure(t *testing.T) {
 // "session absent." Pairs with the unit-level
 // TestManagerEnsureTmuxIgnoresAbsencePhraseOnStdout.
 func TestTmuxWrapperAttachIgnoresAbsencePhraseOnStdout(t *testing.T) {
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 	acquireRootWorkspaceGitSlot(t)
 
 	record := filepath.Join(t.TempDir(), "record")

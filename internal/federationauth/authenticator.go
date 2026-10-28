@@ -26,6 +26,10 @@ var authorizedRoutes = []authorizedRoute{
 	{method: http.MethodGet, path: "/api/v1/workspaces", scope: ScopeWorkspaceRead},
 	{method: http.MethodPost, path: "/api/v1/workspaces", scope: ScopeWorkspaceWrite},
 	{method: http.MethodGet, path: "/api/v1/workspaces/{id}", scope: ScopeWorkspaceRead},
+	{method: http.MethodGet, path: "/api/v1/workspaces/{id}/targets", scope: ScopeWorkspaceRead},
+	{method: http.MethodPut, path: "/api/v1/workspaces/{id}/targets", scope: ScopeWorkspaceWrite},
+	{method: http.MethodGet, path: "/api/v1/workspaces/{id}/view-state", scope: ScopeWorkspaceRead},
+	{method: http.MethodPut, path: "/api/v1/workspaces/{id}/view-state", scope: ScopeWorkspaceWrite},
 	{method: http.MethodDelete, path: "/api/v1/workspaces/{id}", scope: ScopeWorkspaceWrite},
 	{method: http.MethodPost, path: "/api/v1/workspaces/{id}/retry", scope: ScopeWorkspaceWrite},
 	{method: http.MethodPost, path: "/api/v1/workspaces/{id}/refresh", scope: ScopeWorkspaceWrite},
@@ -74,6 +78,7 @@ var authorizedRoutes = []authorizedRoute{
 	{method: http.MethodGet, path: "/ws/v1/workspaces/{id}/runtime/sessions/{session_key}/terminal", scope: ScopeTerminalAttach},
 	{method: http.MethodGet, path: "/api/v1/federation/identity", scope: ScopeEnrollmentActivate},
 	{method: http.MethodGet, path: "/api/v1/federation/events", scope: ScopeEventsRead},
+	{method: http.MethodPost, path: "/api/v1/federation/browser-login-tickets", scope: ScopeBrowserLogin},
 	{
 		method: http.MethodPost,
 		path:   "/api/v1/federation/enrollments/{enrollment_id}/activate",

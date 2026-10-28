@@ -9,14 +9,15 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, join, relative, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { normalizePath } from "vite";
 import { parse } from "yaml";
 import { renderModule, schemaConstraints } from "../../scripts/generate-schema-constraints.mjs";
 
-const vpPath = resolve(dirname(fileURLToPath(import.meta.url)), "../../node_modules/vite-plus/bin/vp");
+const frontendRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const vpPath = resolve(frontendRoot, "../node_modules/vite-plus/bin/vp");
 
 function operationName(operation) {
   if (!operation.operationId) throw new Error("Every API operation must have an operationId");
@@ -42,7 +43,7 @@ function run(command, args, frontendDir) {
   if (result.status !== 0) throw new Error(`${command} ${args.join(" ")} exited ${result.status}`);
 }
 
-async function generateClient(frontendDir) {
+export async function generateClient(frontendDir = frontendRoot) {
   const specPath = resolve(frontendDir, "openapi/openapi.yaml");
   const generatedDir = resolve(frontendDir, "src/lib/api/generated");
   if (!existsSync(specPath)) throw new Error(`OpenAPI document does not exist: ${specPath}`);
@@ -80,10 +81,36 @@ async function generateClient(frontendDir) {
     const document = parse(readFileSync(specPath, "utf8"));
     writeFileSync(join(stagingDir, "schema-constraints.ts"), renderModule(schemaConstraints(document)));
     run(process.execPath, [vpPath, "fmt", stagingDir, "--write"], frontendDir);
-    rmSync(generatedDir, { recursive: true, force: true });
-    renameSync(stagingDir, generatedDir);
+    installGeneratedDir(stagingDir, generatedDir);
   } finally {
     rmSync(stagingDir, { recursive: true, force: true });
+  }
+}
+
+function listFiles(dir) {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir, { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => relative(dir, join(entry.parentPath, entry.name)));
+}
+
+// The dev stack runs the frontend dev server and the backend's frontend build
+// at the same time, and both generate this client. Replace files one at a time
+// with atomic renames and never remove the directory, so a concurrent build
+// always reads complete files. Unchanged files stay untouched and do not
+// trigger dev-server reloads.
+function installGeneratedDir(stagingDir, generatedDir) {
+  const staged = listFiles(stagingDir);
+  for (const file of staged) {
+    const source = join(stagingDir, file);
+    const target = join(generatedDir, file);
+    if (existsSync(target) && readFileSync(target).equals(readFileSync(source))) continue;
+    mkdirSync(dirname(target), { recursive: true });
+    renameSync(source, target);
+  }
+  const current = new Set(staged);
+  for (const file of listFiles(generatedDir)) {
+    if (!current.has(file)) rmSync(join(generatedDir, file), { force: true });
   }
 }
 
@@ -106,4 +133,10 @@ export function frontendApiClient() {
       if (id === specPath) await generateClient(frontendDir);
     },
   };
+}
+
+// `make api-generate` runs the same generator directly; a full `vp build` only
+// to trigger buildStart made the pre-commit hook pay for a production bundle.
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  await generateClient();
 }

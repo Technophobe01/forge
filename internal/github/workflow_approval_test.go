@@ -3,12 +3,14 @@ package github
 import (
 	"testing"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"github.com/stretchr/testify/assert"
 	platformgithub "go.kenn.io/forge/platform/github"
 )
 
 func TestFilterWorkflowRunsAwaitingApproval(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name    string
 		runs    []*gh.WorkflowRun
@@ -136,6 +138,8 @@ func TestFilterWorkflowRunsAwaitingApproval(t *testing.T) {
 }
 
 func TestParseHeadRepoFullName(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name string
 		in   string
@@ -156,6 +160,8 @@ func TestParseHeadRepoFullName(t *testing.T) {
 }
 
 func TestWorkflowApprovalStateFromRuns(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	runs := []*gh.WorkflowRun{
 		{ID: new(int64(11))},

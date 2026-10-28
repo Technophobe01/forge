@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
+	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 	"go.kenn.io/forge/platform"
 )
 
@@ -127,5 +127,7 @@ func (c *Client) validateAssignableLabelNames(names []string) error {
 	return nil
 }
 
-var _ platform.LabelReader = (*Client)(nil)
-var _ platform.LabelMutator = (*Client)(nil)
+var (
+	_ platform.LabelReader  = (*Client)(nil)
+	_ platform.LabelMutator = (*Client)(nil)
+)

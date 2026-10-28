@@ -1,21 +1,22 @@
 package workspacetest
 
 import (
-	"context"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gofrs/flock"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/forge/internal/apiclient/generated"
 	"go.kenn.io/forge/internal/config"
-	"go.kenn.io/forge/internal/workspace"
-	gitcmd "go.kenn.io/kit/git/cmd"
+	"go.kenn.io/forge/internal/testutil/gitsafe"
 )
 
 func TestWorkspaceForceDeleteWaitsForInFlightSetupE2E(t *testing.T) {
@@ -26,9 +27,8 @@ func TestWorkspaceForceDeleteWaitsForInFlightSetupE2E(t *testing.T) {
 	fixture := setupWorkspaceServerFixture(t, nil)
 	ctx := t.Context()
 
-	lockManager := workspace.NewFileLockManager()
-	held, err := lockManager.Acquire(ctx, fixture.bare)
-	require.NoError(err)
+	held := flock.New(filepath.Join(fixture.bare, ".kenn-forge-worktree.lock"))
+	require.NoError(held.Lock())
 	unlocked := false
 	defer func() {
 		if !unlocked {
@@ -67,7 +67,7 @@ func TestWorkspaceForceDeleteWaitsForInFlightSetupE2E(t *testing.T) {
 	case result := <-deleteDone:
 		require.NoError(result.err)
 		require.FailNow("force-delete returned while workspace setup was paused")
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(500 * time.Millisecond): //nolint:kennlint // shows the event does not happen; the held setup lock blocks the force-delete until unlock
 	}
 
 	require.NoError(held.Unlock())
@@ -456,7 +456,7 @@ func TestWorkspaceConcurrentSameRepoOperationsE2E(t *testing.T) {
 	assert := assert.New(t)
 
 	fixture := setupWorkspaceServerFixture(t, nil)
-	ctx := context.Background()
+	ctx := t.Context()
 	client := fixture.client
 
 	// Fixture already seeded PR #1; add PR #2 in the same repo so both
@@ -602,7 +602,7 @@ func (e *unexpectedStatusError) Error() string {
 // each managed worktree adds one more.
 func listBareWorktrees(t *testing.T, bare string) int {
 	t.Helper()
-	out, stderr, err := gitcmd.New().Run(t.Context(), bare, nil, "worktree", "list", "--porcelain")
+	out, stderr, err := gitsafe.Runner().Run(t.Context(), bare, nil, "worktree", "list", "--porcelain")
 	require.NoError(t, err, "git worktree list: %s%s", out, stderr)
 	count := 0
 	for line := range strings.SplitSeq(string(out), "\n") {

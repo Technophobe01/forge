@@ -7,6 +7,9 @@ optional modes.
 Use Settings for routine changes. Edit TOML for provider hosts and advanced
 options. Restart Forge after changing startup settings.
 
+Configure private PR cards and action buttons with TOML-only
+[`external_context` sources](external-pr-context.md).
+
 ## Repositories
 
 ### Faster GitHub updates
@@ -25,9 +28,10 @@ Use the HTTPS origin without `/activity` or a webhook path. In a fleet, add
 this setting to the hub. An empty URL disables the relay. Normal syncing
 continues. See [Faster GitHub updates](activity-relay.md) for setup, access,
 and a walkthrough to check that it works. The relay supports GitHub.com.
-With `workflow_run` webhooks enabled, the relay sends at most one checks hint
-per repository/PR per minute. Forge refreshes its checks on receipt, within
-the usual API limits. No extra setting is needed.
+With `workflow_run` and `check_run` webhooks enabled, the relay batches Actions
+updates once per minute. Forge refreshes PR checks when each batch arrives.
+While **Actions** is open, it also refreshes the selected workflow's run list.
+The usual API limits still apply; no extra setting is needed.
 
 ### Repository selection
 
@@ -135,9 +139,81 @@ Public-host defaults are:
 - GitLab `gitlab.com`: no implicit variable, then the GitLab CLI.
 - Forgejo `codeberg.org`: `KENN_FORGE_FORGEJO_TOKEN`, then the Forgejo CLI.
 - Gitea `gitea.com`: `KENN_FORGE_GITEA_TOKEN`, then the Forgejo CLI.
+- Bitbucket Cloud `bitbucket.org`: `KENN_FORGE_BITBUCKET_TOKEN`, then host-scoped `BKT_*` settings.
 
 Grant read access for monitoring. Add write access only for comments, reviews,
 state changes, edits, or merges.
+
+### Bitbucket Cloud
+
+Add your repository using its workspace name and repository slug:
+
+```toml
+[[repos]]
+platform = "bitbucket"
+owner = "example-workspace"
+name = "widgets"
+token_env = "KENN_FORGE_BITBUCKET_TOKEN"
+```
+
+Set `KENN_FORGE_BITBUCKET_TOKEN` to `account-email:api-token` for an Atlassian
+API token, or to the token alone for an OAuth or repository access token.
+You can use `token_file` instead of `token_env`. Grant read access to
+repositories and pull requests for monitoring. Add write access for actions
+such as commenting, reviewing, and merging. To select reviewers by name, also
+grant `read:workspace:bitbucket`. Forge lists workspace members and submits their
+account IDs. Existing reviewers outside the workspace can still be removed.
+
+Merging in Forge requires an account API token whose repository write permission
+can be checked. OAuth and repository access tokens can read data, but Forge
+does not enable merges with those credentials. Branch restrictions and token
+scopes still apply.
+
+If you use the community `bkt` CLI, Forge can read its environment settings.
+Set `BKT_HOST=https://bitbucket.org` and `BKT_TOKEN`. For bearer tokens, set
+`BKT_AUTH_METHOD=bearer`. For basic authentication, set `BKT_USERNAME`.
+Forge uses its own configured credentials first. It does not read saved `bkt`
+logins or Atlassian `acli` credentials.
+
+With Cloud, you can:
+
+- Discover repositories and follow pull requests, tags, and commit statuses.
+- Read, create, and comment on issues when the repository has issues enabled.
+- Comment, reply, view and resolve inline threads, and change reviewers.
+- Approve pull requests, request changes, and merge using merge, squash, or rebase.
+
+Forge does not yet support Cloud workflow controls, notifications, labels,
+publishing review drafts, editing pull requests or changing their state outside
+a merge, or collecting historical archives.
+
+### Bitbucket Data Center
+
+Set `platform_host` to your server's hostname, `owner` to the project key,
+and `name` to the repository slug. Forge uses Cloud for `bitbucket.org` and
+Data Center for other hosts.
+
+```toml
+[[repos]]
+platform = "bitbucket"
+platform_host = "bitbucket.example.com"
+owner = "PROJECT"
+name = "widgets"
+token_env = "BITBUCKET_DC_CREDENTIAL"
+```
+
+Set `BITBUCKET_DC_CREDENTIAL` to `username:personal-access-token`. Forge uses
+this credential for both the API and Git.
+
+With Data Center, you can discover repositories, follow pull requests, tags,
+and commit statuses, and approve, edit, reopen, or merge pull requests.
+Merging requires a user personal access token with repository write permission.
+Forge offers merge, squash, and rebase when enabled in the repository settings;
+branch restrictions still apply.
+
+Forge does not yet support Data Center comments or inline threads, issues,
+workflows, notifications, reviewer changes, or publishing review drafts. Your server must serve Bitbucket
+at the hostname root, such as `https://bitbucket.example.com/`. A path such as
+`https://example.com/bitbucket/` is not supported.
 
 ### GitHub credentials by owner
 
@@ -229,10 +305,31 @@ Selected repository access is a startup routing snapshot. New grants use the
 PAT route until refresh. Revoked App access can return 404, and Forge does
 not retry that response with a PAT because 404 can also mean missing or private.
 
+## Airplane mode
+
+Turn on **Settings → Sync → Airplane mode** to pause automatic background
+sync after any running update finishes. Relay updates, opening an item, and
+manual **Sync** remain available, including a manually requested full sync.
+The status bar shows **airplane mode** while enabled; click it to return to
+the setting.
+
+Airplane mode is off by default and stays enabled across restarts until you
+turn it off. It applies only to the Forge instance you configure. On a fleet
+spoke, it pauses local background refresh; the hub keeps its own setting.
+
+The equivalent top-level option, before any `[section]` header, is:
+
+```toml
+airplane_mode = true
+```
+
+Changes apply without restarting Forge.
+
 ## Sync budget
 
 `sync_budget_per_hour` limits the API requests Forge spends on live background
-sync each hour. It defaults to 500. For a large or active repository, raise it in
+sync each hour. It defaults to 500. For a large or active repository, raise
+**Hourly sync budget** under **Settings > Sync**, or set it in
 `~/.kenn/forge/config.toml`:
 
 ```toml
@@ -240,13 +337,11 @@ sync_budget_per_hour = 3000
 ```
 
 Put this at the top level, before any `[section]` or `[[repos]]` header. If
-the key already exists, change its value. Restart Forge to apply it:
+the key already exists, change its value. Either way the new limit applies
+without a restart and keeps the requests already spent this hour.
 
-```sh
-kenn-forge daemon restart
-```
-
-The value must be at least 50. Omitting it or setting it to `0` uses the
+The value must be between 50 and 15,000, the largest hourly quota GitHub
+grants a single account. Omitting it or setting it to `0` uses the
 500-request default; zero does not disable the ceiling.
 
 The same configured limit applies to each budget. GitHub repositories share a
@@ -273,6 +368,8 @@ to move sync reads to an installation quota.
 
 ## Activity defaults
 
+Set these in **Settings → Activity**, or edit the `[activity]` section:
+
 ```toml
 [activity]
 view_mode = "threaded"
@@ -280,11 +377,19 @@ time_range = "7d"
 hide_closed = false
 hide_bots = false
 collapse_threads = true
+item_types = ["pr", "issue"]
+event_types = ["comment", "review", "commit", "force_push"]
+hide_notifications = false
+hide_default_branch = false
+roll_up_commits = false
 default_branch_retention_days = 90
 default_branch_max_commits = 5000
 ```
 
-These values set the initial Activity view and local default-branch retention.
+Filter defaults apply when opening Activity; explicit filters in the URL take
+precedence. An empty `item_types` or `event_types` list selects none. The
+`commit` event filter controls default-branch commits; PR commits remain part of
+their PR timeline. The retention limits control locally stored default-branch history.
 
 ## App modes
 
@@ -296,7 +401,6 @@ docs = false
 actions = false
 pulls = true
 issues = true
-reviews = true
 workspaces = true
 ```
 
@@ -308,8 +412,8 @@ other mode to `false` to hide it.
 
 ## Roborev
 
-The Reviews page reads from a separately running Roborev daemon. The default
-endpoint is `http://127.0.0.1:7373`:
+The Reviews panel in local workspaces reads from a separately running Roborev
+daemon when displayed. The default endpoint is `http://127.0.0.1:7373`:
 
 ```toml
 [roborev]
@@ -323,8 +427,7 @@ also change it under **Settings → Workspaces** without restarting. When it is
 enabled, the endpoint must use loopback HTTP (`127.0.0.1`, `localhost`, or
 `[::1]`) because Forge passes it to the Roborev CLI during workspace setup.
 
-Set `reviews = false` under `[modes]` if you do not want the Reviews page. See
-[Integrations](integrations.md#review-roborev-jobs) for the current Reviews
+See [Integrations](integrations.md#review-roborev-jobs) for the Reviews panel
 workflow.
 
 ## Workspace agents
@@ -364,7 +467,7 @@ question all assumptions
 
 `agent` is a workspace agent key. Labels must be unique (case-insensitive).
 Prompts may contain printable text and line breaks, and are limited to 64 KiB,
-the same rules as an agent's first message. A
+the same rules as a terminal agent's first message. A
 quick action whose agent is missing or unavailable stays visible but disabled
 until the agent is fixed.
 
@@ -401,6 +504,39 @@ names may not reuse standard terminal variables such as `EDITOR` or
 Sessions started by versions that used the default tmux server keep
 running there after an upgrade, but Forge no longer sees them.
 Reattach or clean them up with plain `tmux ls` and `tmux kill-session`.
+
+### Stopping idle workspaces
+
+Without tmux (on Windows, for example), each workspace's agents and shells keep
+running until you delete it, holding their consoles. Set an idle timeout to
+stop them in workspaces nobody has looked at for that many hours:
+
+```toml
+[workspaces]
+idle_runtime_stop_hours = 12
+```
+
+A workspace counts as in use while its page shows in a visible browser tab, and
+whenever someone types into one of its terminals or chats, from any client.
+An agent stops once it has finished its turn or is waiting on an approval or an
+answer, as long as it can resume its conversation and has no pending background
+work or scheduled wakeups. A pending approval or question is lost; ask again after
+it resumes. A working agent, a terminal agent
+that was never prompted, and chat agents started before you upgraded Forge keep
+running, as do command sessions and terminals in project worktrees. Shell tabs
+stop too, along with anything running in them. The workspace terminal stops
+unless a terminal is connected to it, and starts a fresh shell when opened.
+Forge knows a terminal agent finished its turn, or resumed a conversation, from
+the agent's activity hooks, so an agent without them keeps running.
+
+Opening the workspace page resumes each stopped agent's conversation and starts
+fresh shells. A runtime used only from a client other than the browser waits
+for the page to show before it resumes. Forge's tools list a stopped runtime as
+`parked`. Idle time carries across Forge restarts, and a restart relaunches
+nothing that stopped. Turning the setting on starts every workspace's clock at
+that moment. Turning it off hands stopped agents and chats back to normal
+recovery, and stopped shell tabs show as errored, as after a reboot. The
+default, `0`, never stops them.
 
 ## Docs folders
 
@@ -460,8 +596,10 @@ base_path = "/"
 ```
 
 - `sync_interval` controls provider refreshes.
+- After a restart, accounts with rate tracking resume their schedule from their oldest healthy live repository's successful sync plus `sync_interval`, while overdue accounts and failed or never-synced repositories refresh at startup.
 - `host` and `port` set the listener.
-- `base_path` adds a URL prefix behind a reverse proxy.
+- `base_path` adds a URL prefix behind a reverse proxy. It cannot start with
+  `api`, `healthz`, or `livez`, which Forge serves at the root.
 - `data_dir` moves app data while leaving config under `KENN_FORGE_HOME`.
 
 For a trusted reverse proxy or a larger SSE replay window:
@@ -496,20 +634,29 @@ proxy and use HTTPS origins for federation.
 
 ### MCP companion
 
-Enable the daemon's optional loopback MCP listener with:
+The companion is on by default on Forge's own port when `host` is a loopback IP,
+`mcp.enabled` and `mcp.port` are omitted, and Forge isn't an execution worker.
+Loopback IP hosts include `127.0.0.1`; other hosts, such as `0.0.0.0` or a
+tailnet IP, require `enabled = true`. To turn it off:
 
 ```toml
 [mcp]
-enabled = true
-# port = 8092 # defaults to the main backend port plus one
-diff_cache_mb = 128
+enabled = false
 ```
+
+Set `enabled = true` for a separate listener at the backend port plus one, or
+also set `port` to choose its port. Existing explicit settings keep their endpoint.
+A saved `port` with `enabled` omitted keeps MCP off. Re-enabling in Settings uses
+the default endpoint for the saved host and port. Older versions dropped explicit
+false values on save; set `enabled = false` again to preserve an old opt-out.
 
 The sessionless Streamable HTTP endpoint is
 `http://127.0.0.1:<resolved-port>/mcp`. Authentication follows
 `[api].require_auth`. Full diff files use a request-based least-recently-used
 cache; `diff_cache_mb` defaults to 128 MiB. MCP listener or cache changes
-require a daemon restart.
+require a daemon restart. The companion stays on `127.0.0.1` when `host` is
+not loopback; clients on other machines use `/mcp` on the main port with the
+daemon bearer token instead (see [Kenn Forge MCP](kenn-forge-mcp.md)).
 
 ## Pull request stacks
 
@@ -525,13 +672,143 @@ stacks. Mid-stack merges stay blocked by default.
 
 ## Telemetry
 
-Forge sends limited anonymous telemetry by default: daemon activity, app
-view names, version, commit, OS and architecture, and an anonymous install ID.
+Forge sends limited anonymous telemetry by default: daemon activity, an app
+open about once a day per browser, which screens were opened (each counted once
+per installation per UTC day), `pr_viewed`, `workspace_opened`, `sync_failed`,
+`search_empty`, `error_shown`, version, commit, OS and architecture, and an
+anonymous install ID. The browser reports app opens to the daemon, never to
+the analytics service.
+Once per installation, the daemon reports `setup_finished` with no properties
+the first time Forge has a ready workspace or a pull request or issue it can
+show. Installations that already had work when they upgraded are not reported.
+At startup and daily while running, the daemon reports the number of tracked
+repositories as `repo_count`: `0-5`, `6-20`, `21-100`, or `over-100`.
+Earlier events retain exact numeric values; newer events use string ranges.
+A full sync pass sends at most one `sync_failed` event per source, when a
+repository newly fails that source. A repository that keeps failing stays quiet
+until a full pass reads that repository and source successfully.
+The event sends only `sync_source` (`merge_requests`, `issues`, or `checks`)
+and `reason` (`auth`, `rate_limited`, `not_found`, or `other`).
+These properties identify no repository. A restart can count one outage twice.
+Closing a tab or leaving it hidden for 30 minutes reports `session_ended` with
+`surface: web` and a `duration_bucket` of `under_1m`, `1_to_5m`, `5_to_30m`,
+`30m_to_2h`, or `over_2h`.
+Tabs opened before an upgrade may report `over_30m`, meaning more than 30 minutes
+without finer detail. Forge accepts that bucket and rejects missing or unknown durations.
+Each duration sums visible time across tab switches and excludes hidden time.
+A hidden tab that the browser or phone closes without notice reports nothing.
+Screen names are activity, actions, repos, repo-browser, pulls, issues, docs,
+workspaces, terminal, workspace-item, settings, project-intake, design-system,
+and onboarding. Screen counts persist across tabs and daemon restarts.
+An upgrade preserves prior screen counts in the private `telemetry-daily.json`
+file beside the database. Keep that file to retain daily counts across restarts.
+Forge also sends `pr_viewed` with the provider when a PR's detail is on screen,
+and `workspace_opened` with its type when you open its own page or launch a
+session or quick action in it. Automatic display beside a PR or issue, or
+creating a workspace without launching anything, sends nothing.
+Each event counts once per installation per UTC day for each provider or
+workspace type. Supported providers are GitHub, GitLab, Forgejo, Gitea, and
+Bitbucket. Workspace types are pull request, issue, Kata task, and ad hoc.
+These events send only `surface: web` and the provider or workspace type.
 It does not send repository names, item content, tokens, usernames, hostnames,
 or paths.
 
-Disable telemetry with:
+Only release builds send telemetry, and it stays off in CI. Disable it with
+`TELEMETRY_ENABLED=0` or `DO_NOT_TRACK=1` in the daemon's environment, then
+restart the daemon:
 
 ```sh
-TELEMETRY_ENABLED=0 kenn-forge daemon start
+TELEMETRY_ENABLED=0 kenn-forge daemon restart
 ```
+
+Once the daemon reports telemetry as disabled, the web UI stops sending events.
+If you turn telemetry back on, the web UI resumes on the next UTC day, even if
+you reload the page sooner.
+
+`search_empty` counts each distinct submitted query that returns no results from
+the server, resetting when the text changes. Typing previews send nothing.
+`error_shown` counts failed PR views and workspace opens or launches once per
+attempt when the error comes on screen, with `kind` set to `pr_viewed` or
+`workspace_opened`. Queries and error text stay on your machine.
+
+## Container startup
+
+Build a local image from the repository root:
+
+```sh
+docker build -t kenn-forge:local .
+```
+
+The image runs `kenn-forge serve` directly as uid/gid 1000, with git, tmux,
+OpenSSH client, curl, and CA certificates. Release image publication is managed
+by the external release pipeline.
+
+Persist `/home/forge` so configuration, repositories, and the automatically
+minted bearer token survive container replacement. Bind-mounted directories
+must be writable by uid 1000. A Docker named volume inherits the image ownership.
+
+For browser access from outside the Docker host, put an HTTPS reverse proxy in
+front of Forge and keep the direct HTTP port private. This example publishes
+the port only on host loopback and assumes the proxy runs on the Docker host:
+
+```sh
+docker run -d --name forge \
+  -p 127.0.0.1:8091:8091 \
+  -v forge-home:/home/forge \
+  -e KENN_FORGE_ALLOWED_HOSTS=127.0.0.1:8091,forge.example \
+  -e KENN_FORGE_TRUST_REVERSE_PROXY=true \
+  kenn-forge:local
+```
+
+Configure the proxy to terminate HTTPS for `forge.example`, forward to
+`127.0.0.1:8091`, and send the original public authority in
+`X-Forwarded-Host` or `Forwarded`. For example, this Caddy site requires a
+hostname with a trusted certificate:
+
+```caddyfile
+forge.example {
+    reverse_proxy 127.0.0.1:8091 {
+        header_up X-Forwarded-Host {http.request.host}
+    }
+}
+```
+
+The allowlist includes both the backend and public authorities because Forge
+checks the raw `Host` and forwarded public host. If the proxy runs in another
+container, connect it to Forge over a private Docker network and do not publish
+Forge's port to host interfaces.
+
+Read the login token with `docker exec forge cat /home/forge/.kenn/forge/auth_token`,
+then open `https://forge.example/?auth_token=<token>` through the proxy. Do not
+open the token-bearing URL over the direct HTTP listener. Keep the token out of
+proxy access logs. The persisted token file stays private (mode 0600).
+The image defaults to an authenticated `0.0.0.0:8091` listener. Wildcard listeners
+require API authentication; existing specific-address configurations retain
+their behavior. Declare each external/backend Host authority you use.
+
+Startup settings accept these environment variables:
+
+| Variable | Setting |
+| --- | --- |
+| `KENN_FORGE_HOST` | Listen IP |
+| `KENN_FORGE_PORT` | Listen port, 1–65535 |
+| `KENN_FORGE_ALLOWED_HOSTS` | Comma-separated exact Host authorities; empty clears the list |
+| `KENN_FORGE_REQUIRE_AUTH` | Require bearer authentication |
+| `KENN_FORGE_TRUST_REVERSE_PROXY` | Validate forwarded Host as well as backend Host |
+| `KENN_FORGE_ROBOREV_ENDPOINT` | Absolute HTTP(S) URL of a separate Roborev service |
+| `KENN_FORGE_DATA_DIR` | Data directory |
+| `KENN_FORGE_HOME` | Configuration/discovery home |
+
+`serve --host` and `--port` override environment values. Precedence is flags,
+environment, TOML, then defaults. Invalid winning values stop startup; malformed
+TOML still fails. Runtime overrides survive file reloads and remain outside the
+saved TOML, so changing settings does not seed deployment values into the file.
+Startup logs report effective settings and their sources.
+
+The image probes `/healthz` at IPv4 loopback using `KENN_FORGE_PORT` and a matching
+forwarded Host, including in trusted-proxy mode. If you choose a specific host or an IPv6-only bind, or override the port through
+a flag or TOML, supply a matching Docker healthcheck.
+`/livez` reports process liveness; `/healthz` reports application readiness.
+
+Run Roborev as a separate service and set its endpoint above. Install agent CLIs
+into the persistent `/home/forge/.local/bin`, or build a derived image with them.

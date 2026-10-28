@@ -11,6 +11,9 @@
 </script>
 
 <script lang="ts">
+  import { getAppRuntime } from "../../app/runtime-context.js";
+  import { reportPRViewed } from "../../app/telemetry.js";
+  import { documentVisible } from "../../browser/document-visible.svelte.js";
   import PullDetail from "./PullDetail.svelte";
   import DiffFilesLayout from "../diff/DiffFilesLayout.svelte";
   import { reviewThreadsFromEvents } from "../diff/review-thread-context.js";
@@ -39,6 +42,9 @@
     onViewWorkspaces?: (() => void) | undefined;
     /** Phone-like routes render PR actions as one kit action grid. */
     phonePresentation?: boolean;
+    /** Phone diff layout only, for phone screens that keep the desktop
+     * conversation layout. `phonePresentation` implies it. */
+    phoneFilesLayout?: boolean;
   }
 
   const {
@@ -56,7 +62,13 @@
     onOpenWorkspace,
     onViewWorkspaces,
     phonePresentation = false,
+    phoneFilesLayout = false,
   }: Props = $props();
+
+  const appRuntime = getAppRuntime();
+  $effect(() => {
+    if (visible && documentVisible() && (detail || tabKey === "files")) reportPRViewed(appRuntime, pr.provider);
+  });
 
   // Provider capabilities are unknown until the detail lands. Assuming the
   // permissive set would render mutation controls a provider cannot honor, but
@@ -71,6 +83,7 @@
     read_releases: true,
     read_labels: true,
     read_markdown_images: false,
+    read_markdown_media: false,
     read_authenticated_user: false,
     read_ci: true,
     read_workflows: false,
@@ -84,6 +97,7 @@
     reviewer_mutation: false,
     state_mutation: true,
     merge_mutation: true,
+    merge_queue_mutation: false,
     review_mutation: true,
     workflow_approval: true,
     ready_for_review: true,
@@ -109,11 +123,13 @@
 
 {#if tabKey === "conversation"}
   <PullDetail
+    {visible}
     owner={pr.owner}
     name={pr.name}
     number={pr.number}
     provider={pr.provider}
     platformHost={pr.platformHost}
+    repositoryKey={pr.repositoryKey}
     repoPath={pr.repoPath}
     {autoSync}
     {workflowApprovalSync}
@@ -131,6 +147,7 @@
        leak across pull requests. -->
   {#key scrollKey}
     <DiffFilesLayout
+      reportErrors={true}
       owner={pr.owner}
       name={pr.name}
       number={pr.number}
@@ -144,6 +161,7 @@
       initialScrollTop={filesScrollPositions[scrollKey] ?? 0}
       onScrollTopChange={rememberFilesScroll}
       {keyboardActive}
+      phonePresentation={phonePresentation || phoneFilesLayout}
     />
   {/key}
 {/if}

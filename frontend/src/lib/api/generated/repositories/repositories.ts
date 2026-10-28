@@ -13,6 +13,12 @@ import type {
   GetMarkdownImageOnHostPathParameters,
   GetMarkdownImageParams,
   GetMarkdownImagePathParameters,
+  GetMarkdownMediaHeaders,
+  GetMarkdownMediaOnHostHeaders,
+  GetMarkdownMediaOnHostParams,
+  GetMarkdownMediaOnHostPathParameters,
+  GetMarkdownMediaParams,
+  GetMarkdownMediaPathParameters,
   GetRepoBrowserAssetOnHostParams,
   GetRepoBrowserAssetOnHostPathParameters,
   GetRepoBrowserAssetParams,
@@ -55,6 +61,7 @@ import type {
   RepoBrowserLastChangedResponse,
   RepoBrowserRefsResponse,
   RepoBrowserTreeResponse,
+  RepoCatalogResponse,
   RepoLabelsResponse,
   RepoPreviewRequest,
   RepoPreviewResponse,
@@ -487,6 +494,55 @@ export const getMarkdownImageOnHost = async (
   });
 };
 
+export const getGetMarkdownMediaOnHostUrl = (
+  { platformHost, provider, owner, name }: GetMarkdownMediaOnHostPathParameters,
+  params?: GetMarkdownMediaOnHostParams,
+) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? "null" : String(value));
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0
+    ? `/host/${encodeURIComponent(String(platformHost))}/repo/${encodeURIComponent(String(provider))}/${encodeURIComponent(String(owner))}/${encodeURIComponent(String(name))}/markdown-media?${stringifiedParams}`
+    : `/host/${encodeURIComponent(String(platformHost))}/repo/${encodeURIComponent(String(provider))}/${encodeURIComponent(String(owner))}/${encodeURIComponent(String(name))}/markdown-media`;
+};
+
+/**
+ * @summary Get markdown media
+ */
+export const getMarkdownMediaOnHost = async (
+  { platformHost, provider, owner, name }: GetMarkdownMediaOnHostPathParameters,
+  params?: GetMarkdownMediaOnHostParams,
+  headers?: GetMarkdownMediaOnHostHeaders,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<Blob> => {
+  const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+  return orvalFetch<Blob>(getGetMarkdownMediaOnHostUrl({ platformHost, provider, owner, name }, params), {
+    ...options,
+    method: "GET",
+    headers: { ...headers, ...getHeaders(options?.headers) },
+  });
+};
+
 export const getResolveRepoItemOnHostUrl = (
   { platformHost, provider, owner, name, number }: ResolveRepoItemOnHostPathParameters,
   params?: ResolveRepoItemOnHostParams,
@@ -900,6 +956,55 @@ export const getMarkdownImage = async (
   });
 };
 
+export const getGetMarkdownMediaUrl = (
+  { provider, owner, name }: GetMarkdownMediaPathParameters,
+  params?: GetMarkdownMediaParams,
+) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? "null" : String(value));
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0
+    ? `/repo/${encodeURIComponent(String(provider))}/${encodeURIComponent(String(owner))}/${encodeURIComponent(String(name))}/markdown-media?${stringifiedParams}`
+    : `/repo/${encodeURIComponent(String(provider))}/${encodeURIComponent(String(owner))}/${encodeURIComponent(String(name))}/markdown-media`;
+};
+
+/**
+ * @summary Get markdown media
+ */
+export const getMarkdownMedia = async (
+  { provider, owner, name }: GetMarkdownMediaPathParameters,
+  params?: GetMarkdownMediaParams,
+  headers?: GetMarkdownMediaHeaders,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<Blob> => {
+  const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+  return orvalFetch<Blob>(getGetMarkdownMediaUrl({ provider, owner, name }, params), {
+    ...options,
+    method: "GET",
+    headers: { ...headers, ...getHeaders(options?.headers) },
+  });
+};
+
 export const getResolveRepoItemUrl = (
   { provider, owner, name, number }: ResolveRepoItemPathParameters,
   params?: ResolveRepoItemParams,
@@ -940,8 +1045,8 @@ export const getListReposUrl = () => {
 /**
  * @summary List repositories
  */
-export const listRepos = async (options?: Parameters<typeof orvalFetch>[1]): Promise<RepoResponse[]> => {
-  return orvalFetch<RepoResponse[]>(getListReposUrl(), {
+export const listRepos = async (options?: Parameters<typeof orvalFetch>[1]): Promise<RepoCatalogResponse[]> => {
+  return orvalFetch<RepoCatalogResponse[]>(getListReposUrl(), {
     ...options,
     method: "GET",
   });
@@ -961,8 +1066,16 @@ export const bulkAddRepos = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<SettingsResponse>(getBulkAddReposUrl(), {
     ...options,
@@ -986,8 +1099,16 @@ export const previewRepos = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<RepoPreviewResponse>(getPreviewReposUrl(), {
     ...options,

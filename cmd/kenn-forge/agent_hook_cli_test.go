@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -130,22 +131,6 @@ func TestAgentHookRunNormalizesGeminiLifecyclePayload(t *testing.T) {
 	assert.JSONEq(`{}`, stdout.String())
 }
 
-func TestAgentHookProfilesDefaultToEveryKitProfile(t *testing.T) {
-	profiles, err := selectedAgentHookProfiles("")
-
-	require.NoError(t, err)
-	assert.Equal(t, []agenthook.Agent{
-		agenthook.AgentClaude,
-		agenthook.AgentCodex,
-		agenthook.AgentCopilot,
-		agenthook.AgentCursor,
-		agenthook.AgentDroid,
-		agenthook.AgentGemini,
-		agenthook.AgentHermes,
-		agenthook.AgentQwen,
-	}, profiles)
-}
-
 func TestAgentHookProfilesSelectOneIntegration(t *testing.T) {
 	profiles, err := selectedAgentHookProfiles("GeMiNi")
 
@@ -184,12 +169,12 @@ func TestAgentHookInstallDefaultsToEveryKitProfile(t *testing.T) {
 	}, &output))
 
 	for _, profile := range agenthook.Profiles() {
-		path, err := agenthook.ConfigPath(profile.Agent)
+		plan, err := agenthook.PlanUninstall(profile.Agent, "", agentHookMarker)
 		require.NoError(err)
-		data, err := os.ReadFile(path)
+		assert.True(plan.Changed, "%s hooks should carry the kenn-forge marker", profile.Agent)
+		plan, err = agenthook.PlanUninstall(profile.Agent, "", "--agent "+string(profile.Agent))
 		require.NoError(err)
-		assert.Contains(string(data), "--source kenn-forge-agent-activity")
-		assert.Contains(string(data), "--agent "+string(profile.Agent))
+		assert.True(plan.Changed, "%s hooks should route to their own agent", profile.Agent)
 		assert.Contains(output.String(), "Installed kenn-forge "+profile.DisplayName+" hooks")
 	}
 }
@@ -241,4 +226,73 @@ func TestAgentHookRunFailsOpenForMalformedPayload(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Empty(t, stdout.String())
+}
+
+func TestAgentHookSessionEndReportsDaemonFailure(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var status int
+	var body string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		w.WriteHeader(status)
+		_, err := io.WriteString(w, body)
+		assert.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+	configPath := archiveCLITestConfig(t, server.URL, "", "test-token")
+	receive := func(event string) error {
+		input := `{"session_id":"chat","hook_event_name":"` + event +
+			`","source":"startup","reason":"prompt_input_exit"}`
+		return receiveAgentHook(
+			t.Context(), "claude", configPath, agentHookSource, strings.NewReader(input), io.Discard,
+		)
+	}
+	for _, tc := range []struct {
+		name    string
+		status  int
+		body    string
+		wantErr []string
+	}{
+		{
+			name:   "server failure",
+			status: http.StatusInternalServerError,
+			body:   `{"detail":"record agent hook activity: remove D:\\activity\\report.json: access denied"}`,
+			wantErr: []string{
+				"500 Internal Server Error",
+				`remove D:\activity\report.json: access denied`,
+			},
+		},
+		{
+			name:   "unavailable",
+			status: http.StatusServiceUnavailable,
+			body:   `{"detail":"daemon restarting"}`,
+		},
+		{
+			name:    "unparseable body",
+			status:  http.StatusInternalServerError,
+			body:    "invalid",
+			wantErr: []string{"500 Internal Server Error"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			mu.Lock()
+			status, body = tc.status, tc.body
+			mu.Unlock()
+			err := receive("SessionEnd")
+			if tc.wantErr == nil {
+				require.NoError(err)
+			} else {
+				require.ErrorIs(err, errAgentHookResponse)
+				for _, want := range tc.wantErr {
+					require.ErrorContains(err, want)
+				}
+			}
+			require.NoError(receive("SessionStart"), "only SessionEnd reports daemon failures")
+		})
+	}
+	server.Close()
+	require.NoError(t, receive("SessionEnd"), "an unreachable daemon must not fail the hook")
 }

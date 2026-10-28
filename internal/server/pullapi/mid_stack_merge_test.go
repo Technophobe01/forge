@@ -14,24 +14,24 @@ import (
 	"go.kenn.io/forge/internal/db"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
 	"go.kenn.io/forge/platform"
 )
 
 func newMidStackMergeFixture(
-	t *testing.T,
+	t *testing.T, native bool,
 ) (*deferredMergeRouteServer, *deferredMergeTestProvider, *apiclient.Client) {
 	t.Helper()
 	ctx := t.Context()
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	ref := platform.RepoRef{
-		Platform:           platform.KindGitLab,
-		Host:               "gitlab.example.com",
-		Owner:              "group",
-		Name:               "project",
-		RepoPath:           "group/project",
-		PlatformID:         4242,
-		PlatformExternalID: "4242",
-		DefaultBranch:      "main",
+		Platform:      platform.KindGitLab,
+		Host:          "gitlab.example.com",
+		Owner:         "group",
+		Name:          "project",
+		RepoPath:      "group/project",
+		Key:           platform.RepositoryIDKey(4242),
+		DefaultBranch: "main",
 	}
 	provider := &deferredMergeTestProvider{
 		ref: ref,
@@ -52,7 +52,7 @@ func newMidStackMergeFixture(
 	registry, err := platform.NewRegistry(provider)
 	require.NoError(t, err)
 	database := dbtest.Open(t)
-	repoID, err := database.UpsertRepo(ctx, platformdb.DBRepoIdentity(ref))
+	repoID, err := reposeed.Seed(ctx, database, platformdb.DBRepoIdentity(ref))
 	require.NoError(t, err)
 	bottomID, err := database.UpsertMergeRequest(ctx, &db.MergeRequest{
 		RepoID: repoID, PlatformID: 7001, Number: 1, State: db.MergeRequestStateOpen,
@@ -68,7 +68,7 @@ func newMidStackMergeFixture(
 		CreatedAt: now, UpdatedAt: now, LastActivityAt: now,
 	})
 	require.NoError(t, err)
-	stackID, err := database.UpsertStack(ctx, repoID, 1, "feature")
+	stackID, err := database.UpsertStack(ctx, repoID, 1, "feature", native)
 	require.NoError(t, err)
 	require.NoError(t, database.ReplaceStackMembers(ctx, stackID, []db.StackMember{
 		{StackID: stackID, MergeRequestID: bottomID, Position: 1},
@@ -97,7 +97,7 @@ func newMidStackMergeFixture(
 func TestMergePRRejectsMidStackMergeByDefault(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	server, provider, client := newMidStackMergeFixture(t)
+	server, provider, client := newMidStackMergeFixture(t, false)
 
 	resp, err := client.HTTP.MergePullOnHostWithResponse(t.Context(), &generated.MergePullOnHostRequestOptions{PathParams: &generated.MergePullOnHostPath{PlatformHost: "gitlab.example.com", Provider: "gitlab", Owner: "group", Name: "project", Number: int64(2)}, Body: &generated.MergePRInputBody{
 		Method:          "squash",
@@ -119,7 +119,7 @@ func TestMergePRRejectsMidStackMergeByDefault(t *testing.T) {
 func TestMergePRAllowsMidStackMergeFromCommittedConfigSnapshot(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	server, provider, client := newMidStackMergeFixture(t)
+	server, provider, client := newMidStackMergeFixture(t, false)
 	server.handler.ApplyConfig(ConfigSnapshot{AllowMidStackMerges: true})
 
 	resp, err := client.HTTP.MergePullOnHostWithResponse(t.Context(), &generated.MergePullOnHostRequestOptions{PathParams: &generated.MergePullOnHostPath{PlatformHost: "gitlab.example.com", Provider: "gitlab", Owner: "group", Name: "project", Number: int64(2)}, Body: &generated.MergePRInputBody{
@@ -134,5 +134,22 @@ func TestMergePRAllowsMidStackMergeFromCommittedConfigSnapshot(t *testing.T) {
 		assert.Equal("middle-head", call.ExpectedHeadSHA)
 	default:
 		require.Fail("expected merge call")
+	}
+}
+
+func TestPullStackReportsNativeMembership(t *testing.T) {
+	for _, native := range []bool{false, true} {
+		_, _, client := newMidStackMergeFixture(t, native)
+
+		stack, err := client.HTTP.GetPullStackOnHostWithResponse(t.Context(), &generated.GetPullStackOnHostRequestOptions{PathParams: &generated.GetPullStackOnHostPath{PlatformHost: "gitlab.example.com", Provider: "gitlab", Owner: "group", Name: "project", Number: int64(2)}})
+		require.NoError(t, err)
+		require.NotNil(t, stack.JSON200)
+		assert.Equal(t, native, stack.JSON200.Native)
+
+		detail, err := client.HTTP.GetPullOnHostWithResponse(t.Context(), &generated.GetPullOnHostRequestOptions{PathParams: &generated.GetPullOnHostPath{PlatformHost: "gitlab.example.com", Provider: "gitlab", Owner: "group", Name: "project", Number: int64(2)}})
+		require.NoError(t, err)
+		require.NotNil(t, detail.JSON200)
+		require.NotNil(t, detail.JSON200.Stack)
+		assert.Equal(t, native, detail.JSON200.Stack.Native)
 	}
 }

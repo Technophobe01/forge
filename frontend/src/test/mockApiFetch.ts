@@ -27,6 +27,7 @@ const defaultProviderCapabilities = {
   workflow_dispatch: true,
   read_labels: true,
   read_markdown_images: true,
+  read_markdown_media: true,
   read_authenticated_user: true,
   comment_mutation: true,
   state_mutation: true,
@@ -210,9 +211,22 @@ const issues = [
   },
 ];
 
+export function mockPullFixture(number: number): (typeof pulls)[number] {
+  const pull = pulls.find((candidate) => candidate.Number === number);
+  if (!pull) throw new Error(`no mock pull #${number}`);
+  return JSON.parse(JSON.stringify(pull));
+}
+
+export function mockIssueFixture(number: number): (typeof issues)[number] {
+  const issue = issues.find((candidate) => candidate.Number === number);
+  if (!issue) throw new Error(`no mock issue #${number}`);
+  return JSON.parse(JSON.stringify(issue));
+}
+
 const repos = [
   {
     ID: 1,
+    PlatformRepoID: 1001,
     Owner: "acme",
     Name: "widgets",
     Platform: "github",
@@ -267,6 +281,7 @@ const syncStatus = {
 };
 
 export const mockSettings = {
+  airplane_mode: false,
   repos: [
     {
       provider: "github",
@@ -283,6 +298,11 @@ export const mockSettings = {
   repo_presets: [],
   activity: {
     collapse_threads: false,
+    item_types: ["pr", "issue"],
+    event_types: ["comment", "review", "commit", "force_push"],
+    hide_notifications: false,
+    hide_default_branch: false,
+    roll_up_commits: false,
     default_branch_max_commits: 5000,
     use_workspace_activity_for_recency: false,
     default_branch_retention_days: 90,
@@ -290,12 +310,14 @@ export const mockSettings = {
     time_range: "7d",
     hide_closed: false,
     hide_bots: false,
+    hide_drafts: false,
   },
   detail: {
     initial_timeline_entry_limit: 50,
     collapse_single_line_breaks: false,
     render_commit_messages_as_markdown: false,
   },
+  sync: { budget_per_hour: 500 },
   issues: {
     hide_bots: false,
   },
@@ -315,7 +337,6 @@ export const mockSettings = {
     issues: true,
     pulls: true,
     repos: true,
-    reviews: true,
     workspaces: true,
   },
   kata_projects: [],
@@ -356,6 +377,8 @@ export const mockSettings = {
   roborev: {
     init_managed_clones: false,
   },
+  provider_settings_loaded: true,
+  acp: { font_family: "", font_size: 13 },
 } satisfies SettingsResponse;
 
 export function makeRateLimits() {
@@ -467,7 +490,7 @@ function matchesRouteIdentity(
 function pullDetailResponse(pr: (typeof pulls)[number]) {
   return {
     merge_request: pr,
-    repo: pr.repo,
+    repo: { ...pr.repo, platform_repo_id: 1001 },
     repo_owner: pr.repo_owner,
     repo_name: pr.repo_name,
     platform_host: pr.platform_host,
@@ -745,6 +768,10 @@ export function createMockApiHandler(overrides: MockRouteOverride[] = []): MockA
 
     if (method === "GET" && pathname === "/api/v1/settings") {
       return jsonResponse(mockSettings);
+    }
+
+    if (method === "GET" && pathname === "/api/v1/worklists") {
+      return jsonResponse({ worklists: [] });
     }
 
     if (method === "GET" && pathname === "/api/v1/rate-limits") {

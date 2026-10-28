@@ -42,7 +42,13 @@ function settings(collapse: boolean, useWorkspaceActivityForRecency = false): Ac
     time_range: "7d",
     hide_closed: false,
     hide_bots: false,
+    hide_drafts: false,
     collapse_threads: collapse,
+    item_types: ["pr", "issue"],
+    event_types: ["comment", "review", "commit", "force_push"],
+    hide_notifications: false,
+    hide_default_branch: false,
+    roll_up_commits: false,
     default_branch_retention_days: 90,
     default_branch_max_commits: 5000,
     use_workspace_activity_for_recency: useWorkspaceActivityForRecency,
@@ -52,6 +58,103 @@ function settings(collapse: boolean, useWorkspaceActivityForRecency = false): Ac
 function makeStore() {
   return createActivityStore({ client: fakeClient });
 }
+
+describe("configured Activity filters", () => {
+  const defaults = () => ({
+    ...settings(false),
+    item_types: ["issue"],
+    event_types: ["comment"],
+    hide_notifications: true,
+    hide_default_branch: true,
+    roll_up_commits: true,
+    hide_drafts: true,
+  });
+
+  it.each([false, true])("uses configured filters on opening Activity (late settings: %s)", (late) => {
+    const store = makeStore();
+    if (!late) store.hydrateDefaults(defaults());
+    store.initializeFromMount();
+    if (late) store.hydrateDefaults(defaults());
+    expect([...store.getEnabledItemTypes()]).toEqual(["issue"]);
+    expect([...store.getEnabledEvents()]).toEqual(["comment"]);
+    expect(store.getActivityFilterTypes()).toEqual(["new_issue", "comment"]);
+    expect(store.getShowNotifications()).toBe(false);
+    expect(store.getHideDefaultBranchActivity()).toBe(true);
+    expect(store.getRollUpCommits()).toBe(true);
+    expect(store.getHideDrafts()).toBe(true);
+    store.syncToURL();
+    expect(window.location.search).toBe("");
+  });
+
+  it.each([false, true])("keeps explicit all/on/off URL overrides (late settings: %s)", (late) => {
+    window.history.replaceState(
+      null,
+      "",
+      "/?item_types=pr,issue&event_types=comment,review,commit,force_push&notif=1&hide_branch=0&rollup_commits=0",
+    );
+    const store = makeStore();
+    if (!late) store.hydrateDefaults(defaults());
+    store.initializeFromMount();
+    if (late) store.hydrateDefaults(defaults());
+    store.syncToURL();
+    store.hydrateDefaults(defaults());
+    expect([...store.getEnabledItemTypes()]).toEqual(["pr", "issue"]);
+    expect([...store.getEnabledEvents()]).toEqual(["comment", "review", "commit", "force_push"]);
+    expect(store.getShowNotifications()).toBe(true);
+    expect(store.getHideDefaultBranchActivity()).toBe(false);
+    expect(store.getRollUpCommits()).toBe(false);
+  });
+
+  it("preserves choices made before settings arrive", () => {
+    const store = makeStore();
+    store.initializeFromMount();
+    store.setEnabledItemTypes(new Set(["pr", "issue"]));
+    store.setEnabledEvents(new Set(["comment", "review", "commit", "force_push"]));
+    store.setShowNotifications(true);
+    store.setHideDefaultBranchActivity(false);
+    store.setRollUpCommits(false);
+    store.setHideDrafts(false);
+    store.syncToURL();
+    store.hydrateDefaults(defaults());
+    expect([...store.getEnabledItemTypes()]).toEqual(["pr", "issue"]);
+    expect([...store.getEnabledEvents()]).toEqual(["comment", "review", "commit", "force_push"]);
+    expect(store.getShowNotifications()).toBe(true);
+    expect(store.getHideDefaultBranchActivity()).toBe(false);
+    expect(store.getRollUpCommits()).toBe(false);
+    expect(store.getHideDrafts()).toBe(false);
+  });
+
+  it("preserves the session draft choice when settings reload", () => {
+    const store = makeStore();
+    store.hydrateDefaults(defaults());
+    store.initializeFromMount();
+    store.setHideDrafts(false);
+    store.hydrateDefaults(defaults());
+    expect(store.getHideDrafts()).toBe(false);
+  });
+
+  it("keeps a legacy all-items bookmark while settings are loading", () => {
+    window.history.replaceState(null, "", "/?types=new_pr,new_issue,comment,review,commit,force_push");
+    const store = makeStore();
+    store.initializeFromMount();
+    store.hydrateDefaults(defaults());
+    expect([...store.getEnabledItemTypes()]).toEqual(["pr", "issue"]);
+    expect([...store.getEnabledEvents()]).toEqual(["comment", "review", "commit", "force_push"]);
+  });
+
+  it("honors empty selections and restores defaults when overrides are removed", () => {
+    const store = makeStore();
+    store.hydrateDefaults({ ...defaults(), item_types: [], event_types: [] });
+    store.initializeFromMount();
+    expect(store.getActivityFilterTypes()).toEqual(["none"]);
+    store.setEnabledItemTypes(new Set(["pr"]));
+    store.setEnabledEvents(new Set(["review"]));
+    store.syncToURL();
+    window.history.replaceState(null, "", "/");
+    store.syncFromURL();
+    expect(store.getActivityFilterTypes()).toEqual(["none"]);
+  });
+});
 
 function workspaceActivity(itemNumber: number): WorkspaceActivitySubject {
   return {
@@ -93,9 +196,68 @@ beforeEach(() => {
 afterEach(async () => {
   for (const item of getFlashes()) dismissFlash(item.id);
   if (runtime !== undefined) await Effect.runPromise(runtime.disposeEffect);
+  vi.useRealTimers();
 });
 
 describe("activity store workspace activity", () => {
+  it.each(["layout", "URL filters"])("resumes polling when cached %s supersede a pending load", async (change) => {
+    vi.useFakeTimers();
+    const mobile = Promise.withResolvers<{ data: { items: []; capped: false }; error: null }>();
+    let title = "Desktop activity";
+    const get = vi.fn(async (path: string, options: { params?: { query?: Record<string, unknown> } }) => {
+      if (path === "/activity/authors") return { data: { authors: [] }, error: null };
+      if (options.params?.query?.limit === 30 || options.params?.query?.search === "beta") return mobile.promise;
+      return {
+        data: { items: [], item_activity: [{ ...itemActivity(7), item_title: title }], capped: false },
+        error: null,
+      };
+    });
+    const store = createActivityStore({ client: { GET: get } as unknown as GeneratedClient });
+    window.history.replaceState(null, "", "/?search=alpha");
+    store.initializeFromMount();
+    store.ensureActivityLoaded();
+    await vi.waitFor(() => expect(store.getItemActivity()[0]?.item_title).toBe("Desktop activity"));
+    if (change === "layout") store.setActivityPageLimit(30);
+    else store.setActivitySearch("beta");
+    store.ensureActivityLoaded();
+    await vi.waitFor(() => expect(store.isActivityLoading()).toBe(true));
+
+    store.setActivityPageLimit(undefined);
+    store.initializeFromMount();
+    store.ensureActivityLoaded();
+    mobile.resolve({ data: { items: [], capped: false }, error: null });
+    await vi.waitFor(() => expect(store.isActivityLoading()).toBe(false));
+    title = "Updated desktop activity";
+    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.waitFor(() => expect(store.getItemActivity()[0]?.item_title).toBe("Updated desktop activity"));
+  });
+
+  it("reuses an empty snapshot on return but loads a changed query", async () => {
+    const get = vi.fn(async (path: string, options: { params?: { query?: Record<string, unknown> } }) => {
+      if (path === "/activity/authors") return { data: { authors: [] }, error: null };
+      return {
+        data: {
+          items: [],
+          item_activity: options.params?.query?.search === "PR 7" ? [itemActivity(7)] : [],
+          capped: false,
+        },
+        error: null,
+      };
+    });
+    const store = createActivityStore({ client: { GET: get } as unknown as GeneratedClient });
+    store.ensureActivityLoaded();
+    await vi.waitFor(() => expect(store.isActivityLoading()).toBe(false));
+    const reads = get.mock.calls.filter(([path]) => path === "/activity").length;
+
+    store.ensureActivityLoaded();
+    expect(store.isActivityLoading()).toBe(false);
+    expect(get.mock.calls.filter(([path]) => path === "/activity")).toHaveLength(reads);
+
+    store.setActivitySearch("PR 7");
+    store.ensureActivityLoaded();
+    await vi.waitFor(() => expect(store.getItemActivity().map((item) => item.item_title)).toEqual(["PR 7"]));
+  });
+
   it.each(["range", "view", "neither"])(
     "keeps an explicit %s choice made before defaults arrive without pinning untouched controls",
     (selected) => {
@@ -184,6 +346,33 @@ describe("activity store workspace activity", () => {
       "/activity",
       expect.objectContaining({
         params: { query: expect.objectContaining({ unassigned: true }) },
+      }),
+    );
+  });
+
+  it("sends the Hide drafts filter", async () => {
+    const get = vi.fn(async () => ({ data: { items: [], capped: false }, error: null }));
+    const store = createActivityStore({ client: { GET: get } as unknown as GeneratedClient });
+
+    store.setHideDrafts(true);
+    store.loadActivity();
+    await vi.waitFor(() => expect(store.isActivityLoading()).toBe(false));
+
+    expect(get).toHaveBeenLastCalledWith(
+      "/activity",
+      expect.objectContaining({
+        params: { query: expect.objectContaining({ hide_drafts: true }) },
+      }),
+    );
+
+    store.setHideDrafts(false);
+    store.loadActivity();
+    await vi.waitFor(() => expect(store.isActivityLoading()).toBe(false));
+
+    expect(get).toHaveBeenLastCalledWith(
+      "/activity",
+      expect.objectContaining({
+        params: { query: expect.not.objectContaining({ hide_drafts: true }) },
       }),
     );
   });
@@ -321,7 +510,7 @@ describe("activity store collapse state", () => {
       repo: {
         provider: "github",
         platform_host: "github.com",
-        platform_repo_id: "repo-7",
+        platform_repo_id: 1007,
         repo_path: "acme/widgets",
         owner: "acme",
         name: "widgets",
@@ -355,7 +544,7 @@ describe("activity store collapse state", () => {
     await vi.waitFor(() => expect(store.getItemActivity()).toEqual([subject]));
     expect(threadQueries).toHaveLength(0);
 
-    store.loadThreadPreview("github|github.com|id|repo-7:pr:7");
+    store.loadThreadPreview("github|github.com|id|1007:pr:7");
     await vi.waitFor(() => expect(threadQueries).toHaveLength(1));
 
     expect(threadQueries[0]).toEqual(expect.objectContaining({ limit: 10, at_or_before: "hidden:9" }));
@@ -427,7 +616,7 @@ describe("activity store collapse state", () => {
       repo: {
         provider: "github",
         platform_host: "github.com",
-        platform_repo_id: "repo-7",
+        platform_repo_id: 1007,
         repo_path: "acme/widgets",
         owner: "acme",
         name: "widgets",
@@ -450,25 +639,42 @@ describe("activity store collapse state", () => {
       }
       const query = options.params?.query ?? {};
       threadQueries.push(query);
+      const firstPage = query.before === undefined;
       return {
         data: {
-          items: [],
+          items: firstPage ? threadPage("a", Number(query.limit)) : threadPage("b", 3),
           item_activity: [],
           workspace_activity: [],
-          capped: query.before === undefined,
+          capped: false,
           event_cursor: "hidden:9",
-          ...(query.before === undefined ? { next_cursor: "thread-page-2" } : {}),
+          ...(firstPage ? { next_cursor: "thread-page-2" } : {}),
         },
         error: null,
       };
     });
+    const threadPage = (prefix: string, count: number): ActivityItem[] =>
+      Array.from(
+        { length: count },
+        (_, index) =>
+          ({
+            id: `pre:${prefix}${index}`,
+            cursor: `${prefix}${index}`,
+            activity_type: "comment",
+            repo: subject.repo,
+            item_type: "pr",
+            item_number: 7,
+            item_title: subject.item_title,
+            created_at: "2026-04-27T12:00:00Z",
+          }) as unknown as ActivityItem,
+      );
     const store = createActivityStore({ client: { GET: get } as unknown as GeneratedClient });
     store.hydrateDefaults(settings(true));
     store.setUnassigned(true);
+    store.setHideDrafts(true);
     store.loadActivity();
     await vi.waitFor(() => expect(store.isActivityLoading()).toBe(false));
 
-    const key = "github|github.com|id|repo-7:pr:7";
+    const key = "github|github.com|id|1007:pr:7";
     store.toggleThreadItem(key);
     await vi.waitFor(() => expect(threadQueries).toHaveLength(2));
     store.toggleThreadItem(key);
@@ -478,21 +684,72 @@ describe("activity store collapse state", () => {
       expect.objectContaining({
         provider: "github",
         platform_host: "github.com",
-        platform_repo_id: "repo-7",
+        platform_repo_id: 1007,
         item_type: "pr",
         item_number: 7,
         unassigned: true,
+        hide_drafts: true,
         at_or_before: "hidden:9",
       }),
       expect.objectContaining({ before: "thread-page-2", at_or_before: "hidden:9", unassigned: true }),
     ]);
+    await vi.waitFor(() =>
+      expect(store.getActivityItems().filter((item) => item.id.startsWith("pre:"))).toHaveLength(103),
+    );
+  });
+
+  it("loads a Bitbucket Cloud thread by repository UUID", async () => {
+    const uuid = "0f5d2a4e-3b1c-4d7e-9a8b-1c2d3e4f5a6b";
+    const subject = {
+      ...itemActivity(7),
+      repo: {
+        provider: "bitbucket",
+        platform_host: "bitbucket.org",
+        platform_repo_id: 0,
+        bitbucket_repository_uuid: uuid,
+        repo_path: "team/cloud-app",
+        owner: "team",
+        name: "cloud-app",
+        host: "bitbucket.org",
+      },
+    } satisfies ActivitySubject;
+    const threadQueries: Array<Record<string, unknown>> = [];
+    const get = vi.fn(async (path: string, options: { params?: { query?: Record<string, unknown> } }) => {
+      if (path === "/activity/thread-events") threadQueries.push(options.params?.query ?? {});
+      return {
+        data: {
+          items: [],
+          item_activity: path === "/activity/thread-events" ? [] : [subject],
+          workspace_activity: [],
+          capped: false,
+          event_cursor: "hidden:9",
+        },
+        error: null,
+      };
+    });
+    const store = createActivityStore({ client: { GET: get } as unknown as GeneratedClient });
+    store.hydrateDefaults(settings(true));
+    store.loadActivity();
+    await vi.waitFor(() => expect(store.isActivityLoading()).toBe(false));
+
+    store.toggleThreadItem(`bitbucket|bitbucket.org|uuid|${uuid}:pr:7`);
+    await vi.waitFor(() => expect(threadQueries).toHaveLength(1));
+
+    expect(threadQueries[0]).toMatchObject({
+      provider: "bitbucket",
+      platform_host: "bitbucket.org",
+      bitbucket_repository_uuid: uuid,
+      item_type: "pr",
+      item_number: 7,
+    });
+    expect(threadQueries[0]).not.toHaveProperty("platform_repo_id");
   });
 
   it("reloads expanded threads after a foreground collapsed-scope reload", async () => {
     const repo = {
       provider: "github",
       platform_host: "github.com",
-      platform_repo_id: "repo-7",
+      platform_repo_id: 1007,
       repo_path: "acme/widgets",
       owner: "acme",
       name: "widgets",
@@ -543,7 +800,7 @@ describe("activity store collapse state", () => {
     store.loadActivity();
     await vi.waitFor(() => expect(store.getItemActivity()).toEqual([subject]));
 
-    const key = "github|github.com|id|repo-7:pr:7";
+    const key = "github|github.com|id|1007:pr:7";
     store.toggleThreadItem(key);
     await vi.waitFor(() => expect(store.getActivityItems().map((item) => item.id)).toEqual([firstEvent.id]));
 
@@ -559,7 +816,7 @@ describe("activity store collapse state", () => {
     const repo = {
       provider: "github",
       platform_host: "github.com",
-      platform_repo_id: "repo-7",
+      platform_repo_id: 1007,
       repo_path: "acme/widgets",
       owner: "acme",
       name: "widgets",
@@ -621,7 +878,7 @@ describe("activity store collapse state", () => {
     store.loadActivity();
     await vi.waitFor(() => expect(store.getItemActivity()).toEqual([subject]));
 
-    const key = "github|github.com|id|repo-7:pr:7";
+    const key = "github|github.com|id|1007:pr:7";
     store.toggleThreadItem(key);
     await vi.waitFor(() => expect(store.getActivityItems().map((item) => item.id)).toEqual([staleComment.id]));
 
@@ -657,7 +914,7 @@ describe("activity store collapse state", () => {
       repo: {
         provider: "github",
         platform_host: "github.com",
-        platform_repo_id: "repo-7",
+        platform_repo_id: 1007,
         repo_path: "acme/widgets",
         owner: "acme",
         name: "widgets",
@@ -690,7 +947,7 @@ describe("activity store collapse state", () => {
     store.loadActivity();
     await vi.waitFor(() => expect(store.isActivityLoading()).toBe(false));
 
-    store.toggleThreadItem("github|github.com|id|repo-7:pr:7");
+    store.toggleThreadItem("github|github.com|id|1007:pr:7");
     await vi.waitFor(() => expect(threadQuery).toBeDefined());
 
     expect(threadQuery).toEqual(
@@ -705,7 +962,7 @@ describe("activity store collapse state", () => {
     const repo = {
       provider: "github",
       platform_host: "github.com",
-      platform_repo_id: "repo-7",
+      platform_repo_id: 1007,
       repo_path: "acme/widgets",
       owner: "acme",
       name: "widgets",
@@ -770,7 +1027,7 @@ describe("activity store collapse state", () => {
     const repo = {
       provider: "github",
       platform_host: "github.com",
-      platform_repo_id: "repo-7",
+      platform_repo_id: 1007,
       repo_path: "acme/widgets",
       owner: "acme",
       name: "widgets",
@@ -825,7 +1082,7 @@ describe("activity store collapse state", () => {
     store.loadActivity();
     await vi.waitFor(() => expect(store.getItemActivity()).toEqual([originalSubject]));
 
-    store.toggleThreadItem("github|github.com|id|repo-7:pr:7");
+    store.toggleThreadItem("github|github.com|id|1007:pr:7");
     await vi.waitFor(() => expect(threadQueries).toHaveLength(1));
 
     if (runtime === undefined) throw new Error("test runtime was not created");
@@ -848,7 +1105,7 @@ describe("activity store collapse state", () => {
     const repo = {
       provider: "github",
       platform_host: "github.com",
-      platform_repo_id: "repo-7",
+      platform_repo_id: 1007,
       repo_path: "acme/widgets",
       owner: "acme",
       name: "widgets",
@@ -902,7 +1159,7 @@ describe("activity store collapse state", () => {
     store.loadActivity();
     await vi.waitFor(() => expect(store.getItemActivity()).toEqual([originalSubject]));
 
-    store.toggleThreadItem("github|github.com|id|repo-7:pr:7");
+    store.toggleThreadItem("github|github.com|id|1007:pr:7");
     await vi.waitFor(() => expect(threadReads).toBe(1));
 
     if (runtime === undefined) throw new Error("test runtime was not created");
@@ -932,7 +1189,7 @@ describe("activity store collapse state", () => {
     const repo = {
       provider: "github",
       platform_host: "github.com",
-      platform_repo_id: "repo-7",
+      platform_repo_id: 1007,
       repo_path: "acme/widgets",
       owner: "acme",
       name: "widgets",
@@ -990,7 +1247,7 @@ describe("activity store collapse state", () => {
     store.loadActivity();
     await vi.waitFor(() => expect(store.getItemActivity()).toEqual([originalSubject]));
 
-    store.toggleThreadItem("github|github.com|id|repo-7:pr:7");
+    store.toggleThreadItem("github|github.com|id|1007:pr:7");
     await vi.waitFor(() => expect(threadReads).toBe(1));
 
     if (runtime === undefined) throw new Error("test runtime was not created");
@@ -1010,7 +1267,7 @@ describe("activity store collapse state", () => {
     const repo = {
       provider: "github",
       platform_host: "github.com",
-      platform_repo_id: "repo-7",
+      platform_repo_id: 1007,
       repo_path: "acme/widgets",
       owner: "acme",
       name: "widgets",
@@ -1068,7 +1325,7 @@ describe("activity store collapse state", () => {
     store.loadActivity();
     await vi.waitFor(() => expect(store.getItemActivity()).toEqual([originalSubject]));
 
-    store.toggleThreadItem("github|github.com|id|repo-7:pr:7");
+    store.toggleThreadItem("github|github.com|id|1007:pr:7");
     await vi.waitFor(() => expect(store.getActivityItems().map((item) => item.id)).toEqual([originalEvent.id]));
 
     if (runtime === undefined) throw new Error("test runtime was not created");
@@ -1079,7 +1336,7 @@ describe("activity store collapse state", () => {
     }).exit;
     await vi.waitFor(() => expect(store.getItemActivity()).toEqual([]));
 
-    store.toggleThreadItem("github|github.com|id|repo-7:pr:7");
+    store.toggleThreadItem("github|github.com|id|1007:pr:7");
 
     await runtime.runCommand(store.reconcileActivityEffect(), {
       operation: "reconcile reappeared activity parent in test",
@@ -1088,7 +1345,7 @@ describe("activity store collapse state", () => {
     }).exit;
 
     expect(threadReads).toBe(1);
-    store.toggleThreadItem("github|github.com|id|repo-7:pr:7");
+    store.toggleThreadItem("github|github.com|id|1007:pr:7");
 
     await vi.waitFor(() => expect(threadReads).toBe(2));
     await vi.waitFor(() => expect(store.getActivityItems().map((item) => item.id)).toEqual([reappearedEvent.id]));
@@ -1098,7 +1355,7 @@ describe("activity store collapse state", () => {
     const repo = {
       provider: "github",
       platform_host: "github.com",
-      platform_repo_id: "repo-7",
+      platform_repo_id: 1007,
       repo_path: "acme/widgets",
       owner: "acme",
       name: "widgets",
@@ -1151,7 +1408,7 @@ describe("activity store collapse state", () => {
     const repo = {
       provider: "github",
       platform_host: "github.com",
-      platform_repo_id: "repo-7",
+      platform_repo_id: 1007,
       repo_path: "acme/widgets",
       owner: "acme",
       name: "widgets",
@@ -1215,7 +1472,7 @@ describe("activity store collapse state", () => {
     store.loadActivity();
     await vi.waitFor(() => expect(store.getItemActivity()).toEqual([originalSubject]));
 
-    store.toggleThreadItem("github|github.com|id|repo-7:pr:7");
+    store.toggleThreadItem("github|github.com|id|1007:pr:7");
     await vi.waitFor(() => expect(threadReads).toBe(1));
 
     if (runtime === undefined) throw new Error("test runtime was not created");
@@ -1239,7 +1496,7 @@ describe("activity store collapse state", () => {
       repo: {
         provider: "github",
         platform_host: "github.com",
-        platform_repo_id: "repo-7",
+        platform_repo_id: 1007,
         repo_path: "acme/widgets",
         owner: "acme",
         name: "widgets",
@@ -1307,7 +1564,7 @@ describe("activity store collapse state", () => {
     store.loadActivity();
     await vi.waitFor(() => expect(store.getItemActivity()).toEqual([subject]));
 
-    store.toggleThreadItem("github|github.com|id|repo-7:pr:7");
+    store.toggleThreadItem("github|github.com|id|1007:pr:7");
     await vi.waitFor(() => expect(store.getThreadLoadError()).toBe("thread history unavailable"));
     expect(store.getActivityItems()).toEqual([]);
 
@@ -1326,7 +1583,7 @@ describe("activity store collapse state", () => {
       repo: {
         provider: "github",
         platform_host: "github.com",
-        platform_repo_id: "repo-7",
+        platform_repo_id: 1007,
         repo_path: "acme/widgets",
         owner: "acme",
         name: "widgets",
@@ -1363,7 +1620,7 @@ describe("activity store collapse state", () => {
     store.loadActivity();
     await vi.waitFor(() => expect(store.getItemActivity()).toEqual([subject]));
 
-    store.toggleThreadItem("github|github.com|id|repo-7:pr:7");
+    store.toggleThreadItem("github|github.com|id|1007:pr:7");
     await vi.waitFor(() =>
       expect(get.mock.calls.filter(([path]) => path === "/activity/thread-events")).toHaveLength(1),
     );
@@ -1438,7 +1695,7 @@ describe("activity store collapse state", () => {
     const repo = {
       provider: "github",
       platform_host: "github.com",
-      platform_repo_id: "repo-7",
+      platform_repo_id: 1007,
       repo_path: "acme/widgets",
       owner: "acme",
       name: "widgets",
@@ -1522,7 +1779,7 @@ describe("activity store collapse state", () => {
     const repo = {
       provider: "github",
       platform_host: "github.com",
-      platform_repo_id: "repo-7",
+      platform_repo_id: 1007,
       repo_path: "acme/widgets",
       owner: "acme",
       name: "widgets",
@@ -2108,6 +2365,7 @@ describe("activity store URL hydration", () => {
     ({ legacyTypes, expectedItems, expectedEvents, expectedItemParam, expectedEventParam }) => {
       window.history.replaceState(null, "", `/?types=${legacyTypes}`);
       const first = makeStore();
+      first.hydrateDefaults(settings(false));
       first.initializeFromMount();
 
       expect([...first.getEnabledItemTypes()]).toEqual(expectedItems);
@@ -2127,6 +2385,7 @@ describe("activity store URL hydration", () => {
   it("normalizes explicit default item and event selections out of the URL", () => {
     window.history.replaceState(null, "", "/?item_types=pr,issue&event_types=comment,review,commit,force_push");
     const s = makeStore();
+    s.hydrateDefaults(settings(false));
     s.initializeFromMount();
     expect(s.getActivityFilterTypes()).toEqual([]);
     const normalized = new URLSearchParams(window.location.search);
@@ -2171,6 +2430,7 @@ describe("activity store URL hydration", () => {
   it("round trips default item scope with every event toggle disabled after URL normalization", () => {
     window.history.replaceState(null, "", "/?item_types=pr,issue&event_types=none");
     const first = makeStore();
+    first.hydrateDefaults(settings(false));
     first.initializeFromMount();
 
     expect([...first.getEnabledItemTypes()]).toEqual(DEFAULT_ACTIVITY_ITEM_TYPES);
@@ -2228,6 +2488,86 @@ describe("activity store URL hydration", () => {
 });
 
 describe("activity store author candidates", () => {
+  it.each([{ authors: ["Alice"] }, { authors: [] }])(
+    "keeps loaded candidates available during same-scope refreshes: $authors",
+    async ({ authors }) => {
+      const pending = Promise.withResolvers<{ data: { authors: string[] }; error: null }>();
+      let refresh = false;
+      const get = vi.fn(async (path: string) => {
+        if (path === "/activity/authors") {
+          return refresh ? pending.promise : { data: { authors }, error: null };
+        }
+        return { data: { items: [], capped: false }, error: null };
+      });
+      const s = createActivityStore({ client: { GET: get } as unknown as GeneratedClient });
+
+      s.loadActivityAuthors();
+      await vi.waitFor(() => expect(s.isActivityAuthorsLoading()).toBe(false));
+      refresh = true;
+      const reconciliation = runtime!.runCommand(s.reconcileActivityEffect(), {
+        operation: "refresh activity authors in test",
+        safeContext: {},
+        onFailure: () => {},
+      });
+      await vi.waitFor(() => expect(get.mock.calls.filter(([path]) => path === "/activity/authors")).toHaveLength(2));
+
+      expect(s.isActivityAuthorsLoading()).toBe(false);
+      expect(s.getActivityAuthors()).toEqual(authors);
+      pending.resolve({ data: { authors: ["Bob"] }, error: null });
+      await reconciliation.exit;
+      expect(s.getActivityAuthors()).toEqual(["Bob"]);
+    },
+  );
+
+  it("retains candidates while retrying a failed same-scope refresh", async () => {
+    const pending = Promise.withResolvers<{ data: { authors: string[] }; error: null }>();
+    const get = vi
+      .fn()
+      .mockResolvedValueOnce({ data: { authors: ["Alice"] }, error: null })
+      .mockResolvedValueOnce({
+        error: { detail: "authors unavailable" },
+        response: new Response(null, { status: 500 }),
+      })
+      .mockImplementationOnce(() => pending.promise);
+    const s = createActivityStore({ client: { GET: get } as unknown as GeneratedClient });
+    s.loadActivityAuthors();
+    await vi.waitFor(() => expect(s.getActivityAuthors()).toEqual(["Alice"]));
+
+    s.loadActivityAuthors(true);
+    await vi.waitFor(() => expect(s.getActivityAuthorsError()).toBe("authors unavailable"));
+    s.loadActivityAuthors();
+    await vi.waitFor(() => expect(get).toHaveBeenCalledTimes(3));
+    expect(s.getActivityAuthors()).toEqual(["Alice"]);
+    expect(s.isActivityAuthorsLoading()).toBe(false);
+
+    pending.resolve({ data: { authors: ["Alice", "Bob"] }, error: null });
+    await vi.waitFor(() => expect(s.getActivityAuthors()).toEqual(["Alice", "Bob"]));
+    expect(s.getActivityAuthorsError()).toBeNull();
+  });
+
+  it.each(["repo", "range"])("loads fresh candidates when the %s changes", async (scope) => {
+    let repo = "github|github.com/acme/widgets";
+    const pending = Promise.withResolvers<{ data: { authors: string[] }; error: null }>();
+    const get = vi
+      .fn()
+      .mockResolvedValueOnce({ data: { authors: ["Alice"] }, error: null })
+      .mockImplementationOnce(() => pending.promise);
+    const s = createActivityStore({ client: { GET: get } as unknown as GeneratedClient, getGlobalRepo: () => repo });
+    s.loadActivityAuthors();
+    await vi.waitFor(() => expect(s.getActivityAuthors()).toEqual(["Alice"]));
+
+    if (scope === "repo") repo = "github|github.com/acme/tools";
+    else s.setTimeRange("30d");
+    s.loadActivityAuthors();
+    await vi.waitFor(() => expect(get).toHaveBeenCalledTimes(2));
+    expect(s.isActivityAuthorsLoading()).toBe(true);
+    expect(s.getActivityAuthors()).toEqual([]);
+
+    pending.resolve({ data: { authors: ["Bob"] }, error: null });
+    await vi.waitFor(() => expect(s.getActivityAuthors()).toEqual(["Bob"]));
+    expect(s.isActivityAuthorsLoading()).toBe(false);
+  });
+
   it("keeps a URL-selected author available when it is absent from the current candidates", () => {
     window.history.replaceState(null, "", "/?author=FormerUser");
     const s = makeStore();
@@ -2623,6 +2963,7 @@ describe("activity store default-branch visibility", () => {
     expect(new URLSearchParams(window.location.search).get("hide_branch")).toBe("1");
 
     const next = makeStore();
+    next.hydrateDefaults(settings(false));
     next.initializeFromMount();
     expect(next.getHideDefaultBranchActivity()).toBe(true);
 
@@ -2653,6 +2994,7 @@ describe("activity store default-branch visibility", () => {
       "/?types=new_pr,new_issue,comment,review,commit,force_push,notification&hide_branch=1",
     );
     const first = makeStore();
+    first.hydrateDefaults(settings(false));
     first.initializeFromMount();
 
     expect(first.getHideDefaultBranchActivity()).toBe(true);
@@ -2700,6 +3042,7 @@ describe("activity store commit roll-up", () => {
     expect(new URLSearchParams(window.location.search).get("rollup_commits")).toBe("1");
 
     const next = makeStore();
+    next.hydrateDefaults(settings(false));
     next.initializeFromMount();
     expect(next.getRollUpCommits()).toBe(true);
 
@@ -2906,7 +3249,10 @@ describe("activity polling recovery", () => {
     vi.useRealTimers();
   });
 
-  it("reconciles retained item events from stable authoritative parent identities", async () => {
+  it.each([
+    ["updated", "current-parent-author", "current-parent-author"],
+    ["missing", undefined, "old-parent-author"],
+  ])("reconciles retained item events with parent author %s", async (_label, parentAuthor, expectedAuthor) => {
     const now = new Date().toISOString();
     const retained = {
       id: "pre:7",
@@ -2928,7 +3274,7 @@ describe("activity polling recovery", () => {
       repo: {
         provider: "github",
         platform_host: "github.com",
-        platform_repo_id: "repo-original",
+        platform_repo_id: 1013,
         owner: "acme",
         name: "widgets",
         repo_path: "acme/widgets",
@@ -2945,7 +3291,7 @@ describe("activity polling recovery", () => {
     } as ActivityItem;
     const renamed = {
       activity_at: now,
-      item_author: "current-parent-author",
+      item_author: parentAuthor,
       item_number: 7,
       item_state: "merged",
       item_title: "Current title",
@@ -2957,7 +3303,7 @@ describe("activity polling recovery", () => {
       repo: {
         provider: "github",
         platform_host: "github.com",
-        platform_repo_id: "repo-original",
+        platform_repo_id: 1013,
         owner: "acme",
         name: "widgets-renamed",
         repo_path: "acme/widgets-renamed",
@@ -2971,7 +3317,7 @@ describe("activity polling recovery", () => {
       repo_name: "widgets",
       repo: {
         ...renamed.repo,
-        platform_repo_id: "repo-replacement",
+        platform_repo_id: 1012,
         name: "widgets",
         repo_path: "acme/widgets",
       },
@@ -3016,7 +3362,7 @@ describe("activity polling recovery", () => {
       expect.objectContaining({
         activity_url: retained.activity_url,
         author: "event-author",
-        item_author: "current-parent-author",
+        item_author: expectedAuthor,
         item_state: "merged",
         item_title: "Current title",
         item_url: "https://github.com/acme/widgets-renamed/pull/7",
@@ -3264,7 +3610,7 @@ describe("activity polling recovery", () => {
       repo: {
         provider: "github",
         platform_host: "github.com",
-        platform_repo_id: "repo-1",
+        platform_repo_id: 1011,
         owner: "acme",
         name: "widgets",
         repo_path: "acme/widgets",
@@ -3285,7 +3631,7 @@ describe("activity polling recovery", () => {
                   repo: {
                     provider: "github",
                     platform_host: "github.com",
-                    platform_repo_id: "repo-1",
+                    platform_repo_id: 1011,
                     owner: "acme",
                     name: "widgets",
                     repo_path: "acme/widgets",
@@ -3374,7 +3720,7 @@ describe("activity polling recovery", () => {
     const repo = {
       provider: "github",
       platform_host: "github.com",
-      platform_repo_id: "repo-1",
+      platform_repo_id: 1011,
       owner: "acme",
       name: "widgets",
       repo_path: "acme/widgets",

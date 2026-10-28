@@ -18,6 +18,7 @@ import {
 } from "../api/provider-routes.js";
 import type { AppExecution, AppRuntime } from "../app/runtime.js";
 import type { WorkflowDispatchProgressEvent } from "./provider-events-workflow.js";
+import { repositoryKeyFromWire, repositoryKeyString, type RepositoryKey } from "../api/repository-key.js";
 
 export type WorkflowCatalog = WorkflowCatalogResponse;
 export type WorkflowDefinition = WorkflowDefinitionResponse;
@@ -26,7 +27,7 @@ export type WorkflowRun = WorkflowRunResponse;
 export type WorkflowRunJob = WorkflowRunJobResponse;
 export type WorkflowActionsError = ApiProblemError | TransientTransportError;
 
-export type WorkflowRepositoryRef = ProviderRouteRef & { readonly platformRepoId: string };
+export type WorkflowRepositoryRef = ProviderRouteRef & { readonly repositoryKey: RepositoryKey };
 
 export interface WorkflowDispatchInput {
   readonly ref: WorkflowRepositoryRef;
@@ -85,6 +86,7 @@ export interface WorkflowActionsStore {
   readonly loadCatalog: (ref: WorkflowRepositoryRef) => void;
   readonly refreshCatalog: (ref: WorkflowRepositoryRef, workflowId: string) => void;
   readonly selectWorkflow: (ref: WorkflowRepositoryRef, workflowId: string | null) => void;
+  readonly refreshRuns: (ref: WorkflowRepositoryRef) => void;
   readonly loadMoreRuns: (ref: WorkflowRepositoryRef) => void;
   readonly loadJobs: (ref: WorkflowRepositoryRef, runId: string) => void;
   readonly dispatch: (input: WorkflowDispatchInput) => void;
@@ -110,10 +112,11 @@ const runsPageSize = 50;
 const notLoading: WorkflowActionsLoading = { catalog: false, runs: false, jobs: [] };
 
 export function workflowRepositoryKey(
-  ref: Pick<WorkflowRepositoryRef, "provider" | "platformHost" | "platformRepoId">,
+  ref: Pick<WorkflowRepositoryRef, "provider" | "platformHost"> & { readonly repositoryKey: RepositoryKey | undefined },
 ): string {
   const provider = canonicalProvider(ref.provider);
-  return [provider, resolvedPlatformHost(provider, ref.platformHost).toLowerCase(), ref.platformRepoId]
+  const key = ref.repositoryKey ? repositoryKeyString(ref.repositoryKey) : "";
+  return [provider, resolvedPlatformHost(provider, ref.platformHost).toLowerCase(), key]
     .map(encodeURIComponent)
     .join("|");
 }
@@ -124,11 +127,11 @@ function verifyRepository<A extends { readonly repo: RepoRefResponse }>(
 ): Effect.Effect<A, ApiProblemError> {
   const repository = response.repo;
   if (
-    repository.platform_repo_id &&
+    repositoryKeyFromWire(repository) &&
     workflowRepositoryKey({
       provider: repository.provider,
       platformHost: repository.platform_host,
-      platformRepoId: repository.platform_repo_id,
+      repositoryKey: repositoryKeyFromWire(repository),
     }) === workflowRepositoryKey(ref)
   )
     return Effect.succeed(response);
@@ -322,6 +325,7 @@ export function createWorkflowActionsStore(options: WorkflowActionsStoreOptions)
   }
 
   function readRuns(ref: WorkflowRepositoryRef, workflowId: string, cursor: string | undefined): void {
+    const dispatchAtStart = snapshotFor(ref).dispatches[workflowId];
     const generation =
       cursor === undefined ? nextGeneration(ref, "runs") : (generations.get(workflowRepositoryKey(ref))?.runs ?? 0);
     run(
@@ -361,11 +365,13 @@ export function createWorkflowActionsStore(options: WorkflowActionsStoreOptions)
             const items = page.items ?? [];
             const cycle = snapshot.dispatches[workflowId];
             const retainedRun = cycle?.kind === "succeeded" || cycle?.kind === "timed_out" ? cycle.run : undefined;
+            const retainRun =
+              retainedRun && (cycle !== dispatchAtStart || !items.some((run) => run.id === retainedRun.id));
             return {
               ...snapshot,
               runs:
                 cursor === undefined
-                  ? retainedRun
+                  ? retainRun
                     ? mergeNamedRun(items, retainedRun).runs
                     : items
                   : [...snapshot.runs, ...items.filter((item) => !snapshot.runs.some((run) => run.id === item.id))],
@@ -402,9 +408,26 @@ export function createWorkflowActionsStore(options: WorkflowActionsStoreOptions)
     if (!enabled) return;
     const snapshot = snapshotFor(ref);
     const cursor = snapshot.runsPage.nextCursor;
-    if (!snapshot.selectedWorkflow || !cursor || snapshot.runsPage.exhausted || snapshot.runsPage.loadingMore) return;
+    if (
+      !snapshot.selectedWorkflow ||
+      snapshot.loading.runs ||
+      !cursor ||
+      snapshot.runsPage.exhausted ||
+      snapshot.runsPage.loadingMore
+    )
+      return;
     update(ref, (current) => ({ ...current, runsPage: { ...current.runsPage, loadingMore: true } }));
     readRuns(ref, snapshot.selectedWorkflow.id, cursor);
+  }
+
+  function refreshRuns(ref: WorkflowRepositoryRef): void {
+    if (!enabled) return;
+    const snapshot = snapshotFor(ref);
+    if (!snapshot.selectedWorkflow) return;
+    // A relay hint supersedes a read that may already contain stale status.
+    // readRuns interrupts that request and fences out its response.
+    update(ref, (current) => ({ ...current, loading: { ...current.loading, runs: true } }));
+    readRuns(ref, snapshot.selectedWorkflow.id, undefined);
   }
 
   function loadJobs(ref: WorkflowRepositoryRef, runId: string): void {
@@ -518,7 +541,7 @@ export function createWorkflowActionsStore(options: WorkflowActionsStoreOptions)
     const key = workflowRepositoryKey({
       provider: event.provider,
       platformHost: event.platform_host,
-      platformRepoId: event.platform_repo_id,
+      repositoryKey: repositoryKeyFromWire(event),
     });
     const snapshot = snapshots[key];
     if (!snapshot) return;
@@ -559,6 +582,7 @@ export function createWorkflowActionsStore(options: WorkflowActionsStoreOptions)
     loadCatalog,
     refreshCatalog,
     selectWorkflow,
+    refreshRuns,
     loadMoreRuns,
     loadJobs,
     dispatch,

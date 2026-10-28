@@ -4,11 +4,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/db"
+	"go.kenn.io/forge/platform"
 )
 
 func TestCreateAdHocGeneratesBranchWhenUnnamed(t *testing.T) {
@@ -17,7 +17,7 @@ func TestCreateAdHocGeneratesBranchWhenUnnamed(t *testing.T) {
 
 	d := openTestDB(t)
 	seedRepo(t, d, "github.com", "acme", "widget")
-	mgr := NewManager(d, t.TempDir())
+	mgr := newWorkspaceTestManager(t, d, t.TempDir())
 
 	ws, err := mgr.CreateAdHoc(
 		t.Context(), "github", "github.com", "acme", "widget",
@@ -41,7 +41,7 @@ func TestCreateAdHocUsesRequestedBranch(t *testing.T) {
 
 	d := openTestDB(t)
 	seedRepo(t, d, "github.com", "acme", "widget")
-	mgr := NewManager(d, t.TempDir())
+	mgr := newWorkspaceTestManager(t, d, t.TempDir())
 
 	ws, err := mgr.CreateAdHoc(
 		t.Context(), "github", "github.com", "acme", "widget",
@@ -55,10 +55,26 @@ func TestCreateAdHocUsesRequestedBranch(t *testing.T) {
 	assert.Contains(filepath.Base(ws.WorktreePath), "work-spike-rate-limits-")
 }
 
+func TestCreateAdHocRejectsChangedRepositoryIdentity(t *testing.T) {
+	require := require.New(t)
+	database := openTestDB(t)
+	seedRepo(t, database, "github.com", "acme", "widget")
+	manager := newWorkspaceTestManager(t, database, t.TempDir())
+	ws, err := manager.CreateAdHoc(t.Context(), "github", "github.com", "acme", "widget",
+		CreateAdHocOptions{RepoKey: platform.RepositoryIDKey(2002), BranchName: "spike/stale-picker"})
+	require.ErrorIs(err, db.ErrRepositoryIdentityChanged)
+	require.Nil(ws)
+
+	ws, err = manager.CreateAdHoc(t.Context(), "github", "github.com", "acme", "widget",
+		CreateAdHocOptions{RepoKey: platform.RepositoryIDKey(testRepoID("acme", "widget")), BranchName: "spike/stale-picker"})
+	require.NoError(err)
+	require.Equal("spike/stale-picker", ws.GitHeadRef)
+}
+
 func TestCreateAdHocRejectsInvalidBranch(t *testing.T) {
 	d := openTestDB(t)
 	seedRepo(t, d, "github.com", "acme", "widget")
-	mgr := NewManager(d, t.TempDir())
+	mgr := newWorkspaceTestManager(t, d, t.TempDir())
 
 	_, err := mgr.CreateAdHoc(
 		t.Context(), "github", "github.com", "acme", "widget",
@@ -70,7 +86,7 @@ func TestCreateAdHocRejectsInvalidBranch(t *testing.T) {
 
 func TestCreateAdHocRejectsUntrackedRepo(t *testing.T) {
 	d := openTestDB(t)
-	mgr := NewManager(d, t.TempDir())
+	mgr := newWorkspaceTestManager(t, d, t.TempDir())
 
 	_, err := mgr.CreateAdHoc(
 		t.Context(), "github", "github.com", "acme", "widget",
@@ -85,7 +101,7 @@ func TestCreateAdHocSameBranchTwiceIsDuplicate(t *testing.T) {
 
 	d := openTestDB(t)
 	seedRepo(t, d, "github.com", "acme", "widget")
-	mgr := NewManager(d, t.TempDir())
+	mgr := newWorkspaceTestManager(t, d, t.TempDir())
 
 	_, err := mgr.CreateAdHoc(
 		t.Context(), "github", "github.com", "acme", "widget",
@@ -109,7 +125,7 @@ func TestCreateAdHocDistinctBranchesGetDistinctWorktrees(t *testing.T) {
 
 	d := openTestDB(t)
 	seedRepo(t, d, "github.com", "acme", "widget")
-	mgr := NewManager(d, t.TempDir())
+	mgr := newWorkspaceTestManager(t, d, t.TempDir())
 
 	first, err := mgr.CreateAdHoc(
 		t.Context(), "github", "github.com", "acme", "widget",
@@ -136,7 +152,7 @@ func TestCreateAdHocExistingLocalBranchIsUniquified(t *testing.T) {
 
 	d := openTestDB(t)
 	seedRepo(t, d, "github.com", "acme", "widget")
-	mgr := NewManager(d, t.TempDir())
+	mgr := newWorkspaceTestManager(t, d, t.TempDir())
 	mgr.SetWorktreeBasePathResolver(staticBaseResolver(localRepo))
 
 	ws, err := mgr.CreateAdHoc(
@@ -192,7 +208,8 @@ func TestNextAvailableAdHocBranchNameAvoidsRefNamespaceConflicts(t *testing.T) {
 				runWorkspaceTestGit(t, localRepo, "branch", branch)
 			}
 
-			got, nextAttempt, err := nextAvailableAdHocBranchName(
+			mgr := newTestManager(t, openTestDB(t), t.TempDir())
+			got, nextAttempt, err := mgr.nextAvailableAdHocBranchName(
 				t.Context(), localRepo, tt.requested, workspaceID, 0,
 			)
 
@@ -215,9 +232,9 @@ func TestPersistAdHocWorkspaceRetriesReservedHashedBranch(t *testing.T) {
 	seedRepo(t, d, "github.com", "acme", "widget")
 	localRepo := setupLocalWorktreeBaseForWorkspaceGitTest(t, "feature/other")
 	runWorkspaceTestGit(t, localRepo, "branch", "docs/guide-refresh")
-	mgr := NewManager(d, t.TempDir())
+	mgr := newWorkspaceTestManager(t, d, t.TempDir())
 
-	firstBranch, nextAttempt, err := nextAvailableAdHocBranchName(
+	firstBranch, nextAttempt, err := mgr.nextAvailableAdHocBranchName(
 		t.Context(), localRepo, requested, workspaceID, 0,
 	)
 	require.NoError(err)
@@ -279,7 +296,7 @@ func TestCreateAdHocReuseExistingLocalBranch(t *testing.T) {
 
 	d := openTestDB(t)
 	seedRepo(t, d, "github.com", "acme", "widget")
-	mgr := NewManager(d, t.TempDir())
+	mgr := newWorkspaceTestManager(t, d, t.TempDir())
 	mgr.SetWorktreeBasePathResolver(staticBaseResolver(localRepo))
 
 	ws, err := mgr.CreateAdHoc(
@@ -306,7 +323,7 @@ func TestSetupAdHocWorkspaceBranchesFromOriginHead(t *testing.T) {
 	seedRepo(t, d, platformHost, "acme", "widget")
 
 	tmuxScript, _ := writeRecorderScript(t)
-	mgr := NewManager(d, t.TempDir())
+	mgr := newWorkspaceTestManager(t, d, t.TempDir())
 	mgr.SetTmuxCommand([]string{tmuxScript})
 	mgr.SetWorktreeBasePathResolver(staticBaseResolver(localRepo))
 
@@ -336,42 +353,33 @@ func TestSetupAdHocWorkspaceBranchesFromOriginHead(t *testing.T) {
 	assert.Equal(originHead, worktreeHead)
 }
 
-func TestConfigureFallbackBranchUpstreamIgnoresAdHocWorkspace(t *testing.T) {
+func TestSetupAdHocWorkspaceLeavesMatchingRemoteUntracked(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	const (
-		headBranch     = "spike/thing"
-		fallbackBranch = "kenn-forge/work-abcd"
-	)
-	localRepo := setupLocalWorktreeBaseForWorkspaceGitTest(t, "feature/other")
+	const branch = "spike/thing"
+	d := openTestDB(t)
+	localRepo, _, platformHost := setupHTTPWorktreeBaseForWorkspaceGitTest(t, branch)
+	seedRepo(t, d, platformHost, "acme", "widget")
 	headSHA := strings.TrimSpace(string(runWorkspaceTestGit(
-		t, localRepo, "rev-parse", "HEAD",
+		t, localRepo, "rev-parse", "refs/remotes/origin/"+branch,
 	)))
-	runWorkspaceTestGit(
-		t, localRepo, "update-ref", "refs/remotes/origin/"+headBranch, headSHA,
-	)
-	runWorkspaceTestGit(t, localRepo, "branch", fallbackBranch, headSHA)
-	worktreePath := filepath.Join(t.TempDir(), "worktree")
-	runWorkspaceTestGit(
-		t, localRepo, "worktree", "add", worktreePath, fallbackBranch,
-	)
-
-	err := configureFallbackBranchUpstream(
-		t.Context(), workspaceGitDir{path: localRepo, remote: originRemoteName},
-		&Workspace{
-			ItemType:     db.WorkspaceItemTypeAdHoc,
-			GitHeadRef:   headBranch,
-			WorktreePath: worktreePath,
-		},
-		fallbackBranch,
+	tmuxScript, _ := writeRecorderScript(t)
+	mgr := newWorkspaceTestManager(t, d, t.TempDir())
+	mgr.SetTmuxCommand([]string{tmuxScript})
+	mgr.SetWorktreeBasePathResolver(staticBaseResolver(localRepo))
+	ws, err := mgr.CreateAdHoc(
+		t.Context(), "github", platformHost, "acme", "widget",
+		CreateAdHocOptions{BranchName: branch},
 	)
 	require.NoError(err)
+	require.Equal(branch, ws.GitHeadRef)
+	require.Equal(branch, ws.WorkspaceBranch)
+	require.NoError(mgr.Setup(t.Context(), ws))
 
-	_, err = gitConfigValue(
-		t.Context(), worktreePath, "branch."+fallbackBranch+".remote",
-	)
-	assert.Error(err)
+	assert.Equal(branch, strings.TrimSpace(string(runWorkspaceTestGit(t, ws.WorktreePath, "branch", "--show-current"))))
+	assert.Equal(headSHA, strings.TrimSpace(string(runWorkspaceTestGit(t, ws.WorktreePath, "rev-parse", "HEAD"))))
+	assert.Empty(strings.TrimSpace(string(runWorkspaceTestGit(t, ws.WorktreePath, "for-each-ref", "--format=%(upstream)", "refs/heads/"+branch))))
 }
 
 func TestSetupAdHocWorkspaceUsesHashedBranchForPrefixConflict(t *testing.T) {
@@ -386,7 +394,7 @@ func TestSetupAdHocWorkspaceUsesHashedBranchForPrefixConflict(t *testing.T) {
 	seedRepo(t, d, platformHost, "acme", "widget")
 
 	tmuxScript, _ := writeRecorderScript(t)
-	mgr := NewManager(d, t.TempDir())
+	mgr := newWorkspaceTestManager(t, d, t.TempDir())
 	mgr.SetTmuxCommand([]string{tmuxScript})
 	mgr.SetWorktreeBasePathResolver(staticBaseResolver(localRepo))
 
@@ -422,7 +430,7 @@ func TestSetupAdHocWorkspaceLateBranchConflictFailsWithoutChangingIdentity(t *te
 	seedRepo(t, d, platformHost, "acme", "widget")
 
 	tmuxScript, _ := writeRecorderScript(t)
-	mgr := NewManager(d, t.TempDir())
+	mgr := newWorkspaceTestManager(t, d, t.TempDir())
 	mgr.SetTmuxCommand([]string{tmuxScript})
 	mgr.SetWorktreeBasePathResolver(staticBaseResolver(localRepo))
 
@@ -454,7 +462,8 @@ func TestAgentContextForAdHocWorkspace(t *testing.T) {
 		RepoName:        "widget",
 		ItemType:        db.WorkspaceItemTypeAdHoc,
 		GitHeadRef:      "spike/thing",
-		WorkspaceBranch: "spike/thing"}
+		WorkspaceBranch: "spike/thing",
+	}
 
 	rendered := RenderAgentContext(BuildAgentContext(summary))
 
@@ -479,7 +488,8 @@ func TestAgentContextForAdHocWorkspaceWithDetectedPR(t *testing.T) {
 		GitHeadRef:          "spike/thing",
 		WorkspaceBranch:     "spike/thing",
 		AssociatedPRNumber:  &prNumber,
-		AssociatedPRVisible: true}
+		AssociatedPRVisible: true,
+	}
 
 	rendered := RenderAgentContext(BuildAgentContext(summary))
 
@@ -500,7 +510,8 @@ func TestAgentContextForAdHocWorkspaceBeforeSetup(t *testing.T) {
 		RepoName:        "widget",
 		ItemType:        db.WorkspaceItemTypeAdHoc,
 		GitHeadRef:      "spike/thing",
-		WorkspaceBranch: workspaceBranchUnknown}
+		WorkspaceBranch: workspaceBranchUnknown,
+	}
 
 	rendered := RenderAgentContext(BuildAgentContext(summary))
 
@@ -523,7 +534,7 @@ func TestSetupFailsClosedWhenRouteReplacedMidSetup(t *testing.T) {
 	seedRepo(t, d, platformHost, "acme", "widget")
 
 	tmuxScript, _ := writeRecorderScript(t)
-	mgr := NewManager(d, t.TempDir())
+	mgr := newWorkspaceTestManager(t, d, t.TempDir())
 	mgr.SetTmuxCommand([]string{tmuxScript})
 	mgr.SetWorktreeBasePathResolver(staticBaseResolver(localRepo))
 
@@ -534,69 +545,24 @@ func TestSetupFailsClosedWhenRouteReplacedMidSetup(t *testing.T) {
 	require.NoError(err)
 
 	mgr.beforeSetupRouteRevalidation = func() {
-		_, _, replaceErr := d.ReconcileRepositoryObservation(
+		_, replaceErr := d.ObserveRepository(
 			t.Context(), db.RepoIdentity{
-				Platform:       "github",
-				PlatformHost:   platformHost,
-				PlatformRepoID: "repo-acme-widget-replacement",
-				Owner:          "acme",
-				Name:           "widget",
-			}, time.Now().UTC(),
+				Platform:     "github",
+				PlatformHost: platformHost,
+				Key:          platform.RepositoryIDKey(1012),
+				Owner:        "acme",
+				Name:         "widget",
+			},
 		)
 		require.NoError(replaceErr)
 	}
 
 	err = mgr.Setup(t.Context(), ws)
-	require.ErrorIs(err, db.ErrRepositoryRouteFenceChanged)
+	require.ErrorIs(err, db.ErrRepositoryIdentityChanged)
 	stored, getErr := d.GetWorkspace(t.Context(), ws.ID)
 	require.NoError(getErr)
 	require.NotNil(stored)
 	assert.Equal("error", stored.Status)
-}
-
-func TestSetupFailsClosedWhenRepositoryRenamedAndRouteReplacedMidSetup(t *testing.T) {
-	require := require.New(t)
-
-	d := openTestDB(t)
-	localRepo, _, platformHost := setupHTTPWorktreeBaseForWorkspaceGitTest(
-		t, "feature/other",
-	)
-	seedRepo(t, d, platformHost, "acme", "widget")
-
-	tmuxScript, _ := writeRecorderScript(t)
-	mgr := NewManager(d, t.TempDir())
-	mgr.SetTmuxCommand([]string{tmuxScript})
-	mgr.SetWorktreeBasePathResolver(staticBaseResolver(localRepo))
-
-	ws, err := mgr.CreateAdHoc(
-		t.Context(), "github", platformHost, "acme", "widget",
-		CreateAdHocOptions{BranchName: "spike/renamed-and-replaced"},
-	)
-	require.NoError(err)
-
-	mgr.beforeSetupRouteRevalidation = func() {
-		_, _, renameErr := d.ReconcileRepositoryObservation(
-			t.Context(), db.RepoIdentity{
-				Platform: "github", PlatformHost: platformHost,
-				PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "renamed",
-			}, time.Now().UTC(),
-		)
-		require.NoError(renameErr)
-		_, _, replaceErr := d.ReconcileRepositoryObservation(
-			t.Context(), db.RepoIdentity{
-				Platform: "github", PlatformHost: platformHost,
-				PlatformRepoID: "repo-acme-widget-replacement", Owner: "acme", Name: "widget",
-			}, time.Now().UTC().Add(time.Second),
-		)
-		require.NoError(replaceErr)
-	}
-
-	err = mgr.Setup(t.Context(), ws)
-	require.ErrorIs(err, db.ErrRepositoryRouteFenceChanged)
-	stored, getErr := d.GetWorkspace(t.Context(), ws.ID)
-	require.NoError(getErr)
-	require.NotNil(stored)
-	require.Equal("error", stored.Status)
 }
 
 func TestSetupUsesCurrentRepositoryAfterRouteReuse(t *testing.T) {
@@ -606,27 +572,26 @@ func TestSetupUsesCurrentRepositoryAfterRouteReuse(t *testing.T) {
 	localRepo, _, platformHost := setupHTTPWorktreeBaseForWorkspaceGitTest(
 		t, "feature/other",
 	)
-	observedAt := time.Date(2026, 8, 29, 0, 0, 0, 0, time.UTC)
-	_, _, err := d.ReconcileRepositoryObservation(t.Context(), db.RepoIdentity{
-		Platform:       "github",
-		PlatformHost:   platformHost,
-		PlatformRepoID: "repo-original",
-		Owner:          "acme",
-		Name:           "widget",
-	}, observedAt)
+	_, err := d.ObserveRepository(t.Context(), db.RepoIdentity{
+		Platform:     "github",
+		PlatformHost: platformHost,
+		Key:          platform.RepositoryIDKey(1020),
+		Owner:        "acme",
+		Name:         "widget",
+	})
 	require.NoError(err)
-	current, _, err := d.ReconcileRepositoryObservation(t.Context(), db.RepoIdentity{
-		Platform:       "github",
-		PlatformHost:   platformHost,
-		PlatformRepoID: "repo-current",
-		Owner:          "acme",
-		Name:           "widget",
-	}, observedAt.Add(time.Hour))
+	current, err := d.ObserveRepository(t.Context(), db.RepoIdentity{
+		Platform:     "github",
+		PlatformHost: platformHost,
+		Key:          platform.RepositoryIDKey(1013),
+		Owner:        "acme",
+		Name:         "widget",
+	})
 	require.NoError(err)
 	require.NotNil(current)
 
 	tmuxScript, _ := writeRecorderScript(t)
-	mgr := NewManager(d, t.TempDir())
+	mgr := newWorkspaceTestManager(t, d, t.TempDir())
 	mgr.SetTmuxCommand([]string{tmuxScript})
 	mgr.SetWorktreeBasePathResolver(staticBaseResolver(localRepo))
 

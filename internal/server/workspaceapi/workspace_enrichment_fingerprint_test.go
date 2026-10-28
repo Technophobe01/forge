@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/testutil/dbtest"
-	"go.kenn.io/forge/internal/workspace"
+	"go.kenn.io/forge/internal/testutil/workspacetest"
 )
 
 func initFingerprintRepo(t *testing.T, dir string) {
@@ -50,7 +50,7 @@ func installGitSpawnCounter(t *testing.T) func() int {
 	}
 }
 
-func TestBackgroundEnrichmentSkipsGitWhileFingerprintUnchanged(t *testing.T) {
+func TestBackgroundEnrichmentSkipsGitWhileFingerprintUnchanged(t *testing.T) { //nolint:paralleltest // t.Setenv writes PATH through installGitSpawnCounter
 	require := require.New(t)
 	assert := assert.New(t)
 	gitSpawns := installGitSpawnCounter(t)
@@ -58,7 +58,7 @@ func TestBackgroundEnrichmentSkipsGitWhileFingerprintUnchanged(t *testing.T) {
 	initFingerprintRepo(t, worktree)
 
 	database := dbtest.Open(t)
-	manager := workspace.NewManager(database, t.TempDir())
+	manager := workspacetest.NewManager(t, database, t.TempDir())
 	var clockMu sync.Mutex
 	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 	clock := func() time.Time {
@@ -72,17 +72,18 @@ func TestBackgroundEnrichmentSkipsGitWhileFingerprintUnchanged(t *testing.T) {
 		now = now.Add(d)
 	}
 	handler := New(Deps{DB: database, Workspaces: manager, Now: clock})
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	handler.Start(ctx, true)
 	t.Cleanup(func() {
 		cancel()
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Second)
 		defer shutdownCancel()
 		require.NoError(handler.Shutdown(shutdownCtx))
 	})
 
 	summary := &db.WorkspaceSummary{
-		ID: "ws-fingerprint", Status: "ready", WorktreePath: worktree}
+		ID: "ws-fingerprint", Status: "ready", WorktreePath: worktree,
+	}
 	waitForRefresh := func(after time.Time) workspaceResponse {
 		t.Helper()
 		var resp workspaceResponse
@@ -142,6 +143,7 @@ func TestBackgroundEnrichmentSkipsGitWhileFingerprintUnchanged(t *testing.T) {
 }
 
 func TestListReadSchedulesTmuxOnlyWorkWhenDivergenceIsStillFresh(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	srv := newEnrichmentTestHandler(t, "")
@@ -175,7 +177,7 @@ func TestListReadSchedulesTmuxOnlyWorkWhenDivergenceIsStillFresh(t *testing.T) {
 	assert.Equal(workspaceEnrichmentTmux, job.kind, "only tmux is due, so only tmux work may be queued")
 }
 
-func TestChangeAwareRefreshLeavesFreshDivergenceUntouched(t *testing.T) {
+func TestChangeAwareRefreshLeavesFreshDivergenceUntouched(t *testing.T) { //nolint:paralleltest // t.Setenv writes PATH through installGitSpawnCounter
 	assert := assert.New(t)
 	require := require.New(t)
 	gitSpawns := installGitSpawnCounter(t)
@@ -217,6 +219,7 @@ func TestChangeAwareRefreshLeavesFreshDivergenceUntouched(t *testing.T) {
 }
 
 func TestElapsedForcedIntervalMakesDivergenceDueDespiteRecentRevalidation(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
 	entry := workspaceEnrichmentCacheEntry{

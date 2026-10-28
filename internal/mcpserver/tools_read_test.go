@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+	"uuid"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/forge/platform"
 )
 
 func TestRepoFilterInputRepositoryIdentity(t *testing.T) {
@@ -20,7 +24,7 @@ func TestRepoFilterInputRepositoryIdentity(t *testing.T) {
 		{
 			name: "github default host",
 			filter: repoFilterInput{
-				Provider: "GH", PlatformRepoID: "repo-acme-widget",
+				Provider: "GH", PlatformRepoID: 1001,
 				Owner: "acme", Name: "widget",
 			},
 			want: testRepository(),
@@ -30,18 +34,19 @@ func TestRepoFilterInputRepositoryIdentity(t *testing.T) {
 			name: "nested path",
 			filter: repoFilterInput{
 				Provider: "gitlab", PlatformHost: "git.example.test",
-				PlatformRepoID: "gid://gitlab/Project/42",
+				PlatformRepoID: 42,
 				RepoPath:       "group/subgroup/project",
 			},
 			want: RepositoryIdentity{
 				Provider: "gitlab", PlatformHost: "git.example.test",
-				PlatformRepoID: "gid://gitlab/Project/42",
-				RepoPath:       "group/subgroup/project", Owner: "group/subgroup", Name: "project",
+				Key:      platform.RepositoryIDKey(42),
+				RepoPath: "group/subgroup/project", Owner: "group/subgroup", Name: "project",
 			},
 		},
-		{name: "missing provider", filter: repoFilterInput{PlatformRepoID: "repo-1", Owner: "acme", Name: "widget"}, wantErr: "provider"},
+		{name: "missing provider", filter: repoFilterInput{PlatformRepoID: 1001, Owner: "acme", Name: "widget"}, wantErr: "provider"},
 		{name: "missing stable id", filter: repoFilterInput{Provider: "github", Owner: "acme", Name: "widget"}, wantErr: "platform_repo_id"},
-		{name: "missing name", filter: repoFilterInput{Provider: "github", PlatformRepoID: "repo-1", Owner: "acme"}, wantErr: "name"},
+		{name: "negative stable id", filter: repoFilterInput{Provider: "github", PlatformRepoID: -1, Owner: "acme", Name: "widget"}, wantErr: "platform_repo_id"},
+		{name: "missing name", filter: repoFilterInput{Provider: "github", PlatformRepoID: 1001, Owner: "acme"}, wantErr: "name"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -62,7 +67,7 @@ func TestListReposUsesBackendSummaries(t *testing.T) {
 	backend := &fakeBackend{listRepositoriesFn: func(context.Context) ([]RepositorySummary, error) {
 		return []RepositorySummary{
 			{Repository: testRepository(), OpenPRCount: 3, OpenIssueCount: 2, LastSyncCompletedAt: "2026-07-01T10:00:00Z"},
-			{Repository: RepositoryIdentity{Provider: "gitlab", PlatformRepoID: "gitlab-project", PlatformHost: "git.example.test", RepoPath: "group/project", Owner: "group", Name: "project"}},
+			{Repository: RepositoryIdentity{Provider: "gitlab", Key: platform.RepositoryIDKey(2001), PlatformHost: "git.example.test", RepoPath: "group/project", Owner: "group", Name: "project"}},
 		}, nil
 	}}
 	s := newMCPTestServer(t, backend)
@@ -71,7 +76,7 @@ func TestListReposUsesBackendSummaries(t *testing.T) {
 
 	require.NoError(err)
 	require.Len(out.Repos, 1)
-	assert.Equal("repo-acme-widget", out.Repos[0].PlatformRepoID)
+	assert.Equal(int64(1001), out.Repos[0].PlatformRepoID)
 	assert.Equal("acme/widget", out.Repos[0].RepoPath)
 	assert.Equal(3, out.Repos[0].OpenPRCount)
 	assert.Equal(2, out.Repos[0].OpenIssueCount)
@@ -104,7 +109,7 @@ func TestSearchItemsForwardsTypedQueriesAndOrdersResults(t *testing.T) {
 	s := newMCPTestServer(t, backend)
 
 	out, err := s.searchItems(t.Context(), searchItemsInput{
-		Query: "retry", Repo: repoFilterInput{Provider: "github", PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget"},
+		Query: "retry", Repo: repoFilterInput{Provider: "github", PlatformRepoID: 1001, Owner: "acme", Name: "widget"},
 	})
 
 	require.NoError(err)
@@ -174,7 +179,7 @@ func TestListActivityForwardsTypedFiltersAndAppliesOutputLimit(t *testing.T) {
 
 	out, err := s.listActivity(t.Context(), listActivityInput{
 		Since: "2026-07-01T00:00:00Z",
-		Repo:  repoFilterInput{Provider: "github", PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget"},
+		Repo:  repoFilterInput{Provider: "github", PlatformRepoID: 1001, Owner: "acme", Name: "widget"},
 		Types: []string{"comment", "commit"}, Search: "retry", Limit: 1, After: "cursor-1",
 	})
 
@@ -186,4 +191,63 @@ func TestListActivityForwardsTypedFiltersAndAppliesOutputLimit(t *testing.T) {
 	require.Len(out.Items, 1)
 	assert.True(out.Capped)
 	assert.Equal("please retry", out.Items[0].BodyPreview)
+}
+
+func TestListReposEncodesBitbucketCloudUUIDBesideIntegerIDs(t *testing.T) {
+	require := require.New(t)
+	backend := &fakeBackend{listRepositoriesFn: func(context.Context) ([]RepositorySummary, error) {
+		return []RepositorySummary{
+			{Repository: testRepository(), OpenPRCount: 3},
+			{Repository: RepositoryIdentity{
+				Provider: "bitbucket", PlatformHost: "bitbucket.org",
+				Key:      platform.RepositoryUUIDKey(uuid.MustParse("5f0c6a1e-2b7d-4c3a-9e8f-0a1b2c3d4e5f")),
+				RepoPath: "acme/cloud", Owner: "acme", Name: "cloud",
+			}},
+		}, nil
+	}}
+	client := connectMCPTestSession(t, newMCPTestServer(t, backend))
+
+	result, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "kenn_forge_list_repos"})
+
+	require.NoError(err)
+	require.False(result.IsError, "%v", result.Content)
+	encoded, err := json.Marshal(result.StructuredContent)
+	require.NoError(err)
+	var out struct {
+		Repos []json.RawMessage `json:"repos"`
+	}
+	require.NoError(json.Unmarshal(encoded, &out))
+	require.Len(out.Repos, 2)
+	assert.JSONEq(t, `{
+		"provider": "github", "platform_host": "github.com", "platform_repo_id": 1001,
+		"owner": "acme", "name": "widget", "repo_path": "acme/widget",
+		"open_pr_count": 3, "open_issue_count": 0
+	}`, string(out.Repos[0]))
+	assert.JSONEq(t, `{
+		"provider": "bitbucket", "platform_host": "bitbucket.org", "platform_repo_id": 0,
+		"bitbucket_repository_uuid": "5f0c6a1e-2b7d-4c3a-9e8f-0a1b2c3d4e5f",
+		"owner": "acme", "name": "cloud", "repo_path": "acme/cloud",
+		"open_pr_count": 0, "open_issue_count": 0
+	}`, string(out.Repos[1]))
+}
+
+func TestItemIdentityJSONKeepsIntegerEncodingAndAddsBitbucketUUID(t *testing.T) {
+	require := require.New(t)
+	integer := testItemIdentity("pr", 42)
+	cloud := integer
+	cloud.RepoKey = platform.RepositoryUUIDKey(uuid.MustParse("5f0c6a1e-2b7d-4c3a-9e8f-0a1b2c3d4e5f"))
+
+	integerJSON, err := json.Marshal(integer)
+	require.NoError(err)
+	cloudJSON, err := json.Marshal(cloud)
+	require.NoError(err)
+
+	assert.JSONEq(t, `{"type":"pr","provider":"github","platform_host":"github.com",`+
+		`"platform_repo_id":1001,"owner":"acme","name":"widget","number":42}`, string(integerJSON))
+	assert.JSONEq(t, `{"type":"pr","provider":"github","platform_host":"github.com",`+
+		`"platform_repo_id":0,"bitbucket_repository_uuid":"5f0c6a1e-2b7d-4c3a-9e8f-0a1b2c3d4e5f",`+
+		`"owner":"acme","name":"widget","number":42}`, string(cloudJSON))
+	var decoded ItemIdentity
+	require.NoError(json.Unmarshal(cloudJSON, &decoded))
+	assert.Equal(t, cloud, decoded)
 }

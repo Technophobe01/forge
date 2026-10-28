@@ -152,6 +152,35 @@ describe("sync store", () => {
     await vi.waitFor(() => expect(statusReads).toBe(2));
   });
 
+  it("publishes refreshed rate limits even when a sync status event lands mid-read", async () => {
+    const raised = {
+      provider_pools: {},
+      local_ceilings: {
+        "github.com": {
+          provider: "github",
+          platform_host: "github.com",
+          rate_principal: "",
+          principal_label: "",
+          limit: 3000,
+          background_limit: 2700,
+          spent: 500,
+          remaining: 2500,
+          reset_at: "2026-08-05T13:00:00Z",
+        },
+      },
+    };
+    const pendingRates = Promise.withResolvers<typeof raised>();
+    const getRates = vi.fn(() => pendingRates.promise);
+    const store = createSyncStore(makeGeneratedClient({ SyncService: { getRateLimits: getRates } }));
+
+    store.refreshRateLimits();
+    await vi.waitFor(() => expect(getRates).toHaveBeenCalledOnce());
+    store.setSyncStatus({ running: true, last_run_at: "2026-08-05T12:00:00Z", last_error: "" });
+    pendingRates.resolve(raised);
+
+    await vi.waitFor(() => expect(store.getRateLimits().local_ceilings["github.com"]?.limit).toBe(3000));
+  });
+
   it("wakes idle polling when a sync starts without an event stream", async () => {
     vi.useFakeTimers();
     const pendingSync = Promise.withResolvers<void>();
@@ -177,6 +206,34 @@ describe("sync store", () => {
     await vi.advanceTimersByTimeAsync(2_000);
 
     expect(getStatus).toHaveBeenCalled();
+    polling.interrupt();
+  });
+
+  it("uses slow polling with live updates and resumes fast polling when they disconnect", async () => {
+    vi.useFakeTimers();
+    const running = { running: true, last_run_at: "", last_error: "" };
+    const getStatus = vi.fn(async () => running);
+    const getRates = vi.fn(async () => ({ provider_pools: {}, local_ceilings: {} }));
+    const store = createSyncStore(
+      makeGeneratedClient({ SyncService: { getSyncStatus: getStatus, getRateLimits: getRates } }),
+    );
+    store.setLiveUpdatesConnected(true);
+    store.setSyncStatus(running);
+    if (runtime === undefined) throw new Error("test runtime was not initialized");
+    const polling = runtime.runCommand(store.pollingEffect, {
+      operation: "test sync polling with live updates",
+      safeContext: {},
+      onFailure: () => {},
+    });
+
+    await vi.waitFor(() => expect(getStatus).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(getStatus).toHaveBeenCalledOnce();
+    expect(getRates).toHaveBeenCalledOnce();
+
+    store.setLiveUpdatesConnected(false);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(getStatus.mock.calls.length).toBeGreaterThanOrEqual(2);
     polling.interrupt();
   });
 

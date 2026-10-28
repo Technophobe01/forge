@@ -10,18 +10,20 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
+
 	dbpkg "go.kenn.io/forge/internal/db"
 )
 
 func TestInspectProjectWorktreeCountsStoredTmuxSessionsWithRuntime(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
 	require := require.New(t)
 	assert := assert.New(t)
 
-	srv, projectID, worktreeID, _ :=
-		setupProjectWorktreeCommandSessionTestWithRecord(t)
+	srv, projectID, worktreeID, _ := setupProjectWorktreeCommandSessionTestWithRecord(t)
 	require.NotNil(srv.runtime, "fixture must configure a runtime manager")
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
@@ -36,8 +38,13 @@ func TestInspectProjectWorktreeCountsStoredTmuxSessionsWithRuntime(t *testing.T)
 		},
 	))
 
-	resp := httpDo(t, ts, http.MethodGet,
+	resp := serverfake.HttpDo(t, ts, http.MethodGet,
 		"/api/v1/projects/"+projectID+"/worktrees/"+worktreeID+"/inspect", nil)
+	t.Cleanup(func() {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	})
 	require.Equal(http.StatusOK, resp.StatusCode)
 	var got struct {
 		AliveSessionCount int `json:"alive_session_count"`

@@ -2,7 +2,6 @@ package workspaceapi
 
 import (
 	"context"
-	"strings"
 	"time"
 
 	"go.kenn.io/forge/internal/agentactivity"
@@ -10,11 +9,13 @@ import (
 	"go.kenn.io/forge/internal/providerplane"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/workspace/localruntime"
+	"go.kenn.io/forge/platform"
 )
 
 type CreatePullWorkspaceRequest struct {
 	Provider           string
 	PlatformHost       string
+	RepoKey            platform.RepositoryKey
 	Owner              string
 	Name               string
 	Number             int
@@ -24,6 +25,7 @@ type CreatePullWorkspaceRequest struct {
 type CreateIssueWorkspaceRequest struct {
 	Provider               string
 	PlatformHost           string
+	RepoKey                platform.RepositoryKey
 	Owner                  string
 	Name                   string
 	Number                 int
@@ -36,16 +38,30 @@ type CreateIssueWorkspaceRequest struct {
 type CreateAdHocWorkspaceRequest struct {
 	Provider            string
 	PlatformHost        string
+	RepoKey             platform.RepositoryKey
 	Owner               string
 	Name                string
 	Branch              *string
 	ReuseExistingBranch bool
 }
 
+// ProviderWorkspaceItemRequest names a workspace's source item for hub-owned
+// automation. Its JSON form flattens the key; see platform.MarshalKeyedJSON.
 type ProviderWorkspaceItemRequest struct {
 	Repository providerplane.RepositoryRoute `json:"repository"`
+	RepoKey    platform.RepositoryKey        `json:"-" repokey:"platform_repo_id,bitbucket_repository_uuid"`
 	ItemType   string                        `json:"item_type"`
 	ItemNumber int                           `json:"item_number"`
+}
+
+func (r ProviderWorkspaceItemRequest) MarshalJSON() ([]byte, error) {
+	type plain ProviderWorkspaceItemRequest
+	return platform.MarshalKeyedJSON(plain(r))
+}
+
+func (r *ProviderWorkspaceItemRequest) UnmarshalJSON(data []byte) error {
+	type plain ProviderWorkspaceItemRequest
+	return platform.UnmarshalKeyedJSON(data, (*plain)(r))
 }
 
 type ProviderWorkspaceAutomation interface {
@@ -93,6 +109,9 @@ type InitialMessageRequest struct {
 	RuntimeSessionKey string
 	TargetKey         string
 	Message           string
+	// FromAgent marks a message an agent sends through a Forge tool rather
+	// than a person.
+	FromAgent bool
 }
 
 type InitialMessageResult struct {
@@ -112,6 +131,7 @@ type AgentMessageResult struct {
 func (s *Handler) resolveWorkspaceLaunchSpec(
 	ctx context.Context,
 	route providerplane.RepositoryRoute,
+	repoKey platform.RepositoryKey,
 	itemType string,
 	itemNumber int,
 	gitHeadRef string,
@@ -124,7 +144,9 @@ func (s *Handler) resolveWorkspaceLaunchSpec(
 		ctx,
 		providerplane.WorkspaceLaunchRequest{
 			Repository: route, ItemType: itemType, ItemNumber: itemNumber,
-			GitHeadRef: gitHeadRef, IssueBranchSlug: issueBranchSlug,
+			RepoKey:     repoKey,
+			ForCreation: true,
+			GitHeadRef:  gitHeadRef, IssueBranchSlug: issueBranchSlug,
 		},
 	)
 }
@@ -142,16 +164,18 @@ func (s *Handler) RefreshProviderWorkspaceFacts(
 	if err != nil {
 		return httpapi.BadRequest(httpapi.CodeValidationError, err.Error(), nil)
 	}
-	var repo *db.Repo
-	if platformRepoID := strings.TrimSpace(request.PlatformRepoID); platformRepoID != "" {
-		entry, lookupErr := s.db.GetRepositoryByProviderID(
-			ctx, route.Provider, route.PlatformHost, platformRepoID,
-		)
+	var repo *db.ActiveRepo
+	if !request.RepoKey.IsZero() {
+		entry, lookupErr := s.db.GetRepositoryByProviderID(ctx, platform.RepositoryIdentity{
+			Provider: route.Provider, PlatformHost: route.PlatformHost, Key: request.RepoKey,
+		})
 		if lookupErr != nil {
 			return providerRouteLookupError(lookupErr)
 		}
-		if entry != nil && entry.Lifecycle == db.RepositoryLifecycleActive {
-			repo = &entry.Repository
+		if entry != nil {
+			if repo, err = entry.ActiveRepo(); err != nil {
+				return httpapi.Internal("resolve repository failed")
+			}
 		}
 	} else {
 		repo, err = s.lookupRepoByProviderRoute(
@@ -164,8 +188,8 @@ func (s *Handler) RefreshProviderWorkspaceFacts(
 	if repo == nil {
 		return httpapi.NotFound(httpapi.CodeRepoNotFound, "repo not found", nil)
 	}
-	kind := repoProviderKind(*repo)
-	host := repoProviderHost(*repo)
+	kind := repoProviderKind(repo.Repo)
+	host := repoProviderHost(repo.Repo)
 	if request.ItemType == db.WorkspaceItemTypeIssue {
 		return s.refreshWorkspaceIssue(
 			ctx, repo.ID, kind, host, repo.Owner, repo.Name, request.ItemNumber,

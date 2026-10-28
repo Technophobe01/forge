@@ -1,16 +1,21 @@
 <script lang="ts">
+  import SettingsIcon from "@lucide/svelte/icons/settings";
   import ArrowLeftIcon from "@lucide/svelte/icons/arrow-left";
   import { Effect } from "effect";
   import { onMount } from "svelte";
-  import { SearchInput, SettingsLayout, SettingsSection, type SettingsCategory } from "@kenn-io/kit-ui";
+  import { SearchInput, SettingsLayout, SettingsSection, Toggle, type SettingsCategory } from "@kenn-io/kit-ui";
   import { getStores } from "../../context.js";
   import type { Settings } from "../../api/types.js";
   import { getAppRuntime } from "../../app/runtime-context.js";
   import { StartupWorkflow, startupErrorMessage } from "../../app/startup-workflow.js";
-  import { navigate } from "../../stores/router.svelte.js";
+  import { SettingsWorkflow, settingsErrorMessage } from "../../stores/settings-workflow.js";
+  import { getRoute, navigate } from "../../stores/router.svelte.js";
   import RepoSettings from "./RepoSettings.svelte";
   import ActivitySettings from "./ActivitySettings.svelte";
   import TerminalSettings from "./TerminalSettings.svelte";
+  import AppearanceSettings from "./AppearanceSettings.svelte";
+  import ACPSettings from "./ACPSettings.svelte";
+  import { beginACPSettingsHydration, hydrateACPSettings } from "../../stores/acp-settings-persistence.js";
   import ModeVisibilitySettings from "./ModeVisibilitySettings.svelte";
   import AgentSettings from "./AgentSettings.svelte";
   import QuickActionSettings from "./QuickActionSettings.svelte";
@@ -19,6 +24,7 @@
   import KataProjectMappingsSettings from "./KataProjectMappingsSettings.svelte";
   import PullRequestSettings from "./PullRequestSettings.svelte";
   import DetailSettings from "./DetailSettings.svelte";
+  import SyncBudgetSettings from "./SyncBudgetSettings.svelte";
   import WorkspaceSettings from "./WorkspaceSettings.svelte";
   import {
     beginTerminalSettingsHydration,
@@ -39,13 +45,23 @@
   // source of category order, sidebar labels, and per-panel section header
   // copy. The old scroll-spy page let the nav and section orders drift
   // apart; here they cannot.
+  const nativeHost = window.ReactNativeWebView;
   let searchQuery = $state("");
   const runtime = getAppRuntime();
   const { settings: settingsStore } = getStores();
   let settings = $state.raw<Settings | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
-  let active = $state(SETTINGS_PANELS[0]!.id);
+  let providerReady = $state(true);
+  let providerError = $state<string | null>(null);
+  let airplaneMode = $state(false);
+  let savingAirplaneMode = $state(false);
+  let airplaneModeError = $state<string | null>(null);
+  let active = $derived.by(() => {
+    getRoute();
+    const section = new URLSearchParams(window.location.search).get("section");
+    return SETTINGS_PANELS.find((panel) => panel.id === section)?.id ?? SETTINGS_PANELS[0]!.id;
+  });
 
   // The host owns search semantics: kit renders whatever category list it is
   // given, and its display falls back to the first visible category while the
@@ -54,6 +70,12 @@
   const providerOwner: SettingsOwner = $derived(
     settings?.fleet.role === "spoke" ? "hub" : "local",
   );
+  const providerPanels = new Set([
+    "settings-repositories",
+    "settings-activity",
+    "settings-pull-requests",
+    "settings-detail",
+  ]);
   const categories: SettingsCategory[] = $derived.by(() => {
     const query = searchQuery.trim().toLowerCase();
     const visible =
@@ -69,37 +91,82 @@
     const terminalHydration = beginTerminalSettingsHydration(settingsStore);
     const workspaceHydration = beginWorkspaceSettingsHydration(settingsStore);
     const roborevHydration = beginRoborevSettingsHydration(settingsStore);
+    const acpHydration = beginACPSettingsHydration(settingsStore);
     loading = true;
     error = null;
     const execution = runtime.runCommand(
       Effect.gen(function* () {
+        const settingsWorkflow = yield* SettingsWorkflow;
+        const local = yield* settingsWorkflow.readLocal.pipe(
+          Effect.match({ onFailure: () => null, onSuccess: (loaded) => loaded }),
+        );
+        if (local) {
+          const loaded = local;
+          yield* Effect.sync(() => {
+            settings = loaded;
+            airplaneMode = loaded.airplane_mode;
+            settingsStore.setAirplaneMode(loaded.airplane_mode);
+            settingsStore.setModeVisibility(loaded.modes);
+            hydrateTerminalSettings(terminalHydration, loaded.terminal);
+            hydrateACPSettings(acpHydration, loaded.acp);
+            settingsStore.setLaunchTargets(loaded.launch_targets ?? []);
+            settingsStore.setQuickActions(loaded.quick_actions ?? []);
+            hydrateWorkspaceSettings(workspaceHydration, loaded.workspaces);
+            hydrateRoborevSettings(roborevHydration, loaded.roborev);
+            providerReady = loaded.provider_settings_loaded;
+            loading = false;
+          });
+        }
         const workflow = yield* StartupWorkflow;
         yield* workflow.invalidate;
-        return yield* workflow.start;
-      }).pipe(
-        Effect.matchEffect({
-          onFailure: (failure) =>
-            Effect.sync(() => {
-              error = startupErrorMessage(failure);
-              loading = false;
-            }),
-          onSuccess: (loaded) =>
-            Effect.sync(() => {
-              settings = loaded;
-              settingsStore.setConfiguredRepos(loaded.repos);
-              settingsStore.setRepoPresets(loaded.repo_presets);
-              settingsStore.setModeVisibility(loaded.modes);
-              hydrateTerminalSettings(terminalHydration, loaded.terminal);
-              settingsStore.setPullRequestSettings(loaded.pull_requests);
-              settingsStore.setDetailSettings(loaded.detail);
-              settingsStore.setLaunchTargets(loaded.launch_targets ?? []);
-              settingsStore.setQuickActions(loaded.quick_actions ?? []);
-              hydrateWorkspaceSettings(workspaceHydration, loaded.workspaces);
-              hydrateRoborevSettings(roborevHydration, loaded.roborev);
-              loading = false;
-            }),
-        }),
-      ),
+        const result = yield* workflow.start.pipe(Effect.match({
+          onFailure: (failure) => ({ loaded: null, message: startupErrorMessage(failure) }),
+          onSuccess: (loaded) => ({ loaded, message: null }),
+        }));
+        yield* Effect.sync(() => {
+          if (!result.loaded) {
+            if (settings) providerError = result.message;
+            else error = result.message;
+            loading = false;
+            return;
+          }
+          const loaded = result.loaded;
+          settings = settings?.fleet.role === "spoke"
+            ? {
+                ...settings,
+                repos: loaded.repos,
+                repo_presets: loaded.repo_presets,
+                activity: loaded.activity,
+                detail: loaded.detail,
+                pull_requests: loaded.pull_requests,
+                issues: loaded.issues,
+                notifications: loaded.notifications,
+                sync: loaded.sync,
+                provider_settings_loaded: loaded.provider_settings_loaded,
+              }
+            : loaded;
+          if (loaded.fleet.role !== "spoke") {
+            airplaneMode = loaded.airplane_mode;
+            settingsStore.setAirplaneMode(loaded.airplane_mode);
+            settingsStore.setModeVisibility(loaded.modes);
+            hydrateTerminalSettings(terminalHydration, loaded.terminal);
+            hydrateACPSettings(acpHydration, loaded.acp);
+            settingsStore.setLaunchTargets(loaded.launch_targets ?? []);
+            settingsStore.setQuickActions(loaded.quick_actions ?? []);
+            hydrateWorkspaceSettings(workspaceHydration, loaded.workspaces);
+            hydrateRoborevSettings(roborevHydration, loaded.roborev);
+          }
+          settingsStore.setConfiguredRepos(loaded.repos);
+          settingsStore.setRepoPresets(loaded.repo_presets);
+          settingsStore.setPullRequestSettings(loaded.pull_requests);
+          settingsStore.setDetailSettings(loaded.detail);
+          providerReady = loaded.provider_settings_loaded;
+          providerError = loaded.provider_settings_loaded
+            ? null
+            : "Hub-owned settings are unavailable until this spoke is connected to its hub.";
+          loading = false;
+        });
+      }),
       {
         operation: "load settings page",
         safeContext: {},
@@ -108,6 +175,34 @@
     );
     return execution.interrupt;
   });
+
+  function toggleAirplaneMode(enabled: boolean): void {
+    if (!settings || savingAirplaneMode) return;
+    savingAirplaneMode = true;
+    airplaneModeError = null;
+    runtime.runCommand(
+      Effect.gen(function* () {
+        const workflow = yield* SettingsWorkflow;
+        return yield* workflow.persist(() => ({ airplane_mode: enabled }));
+      }).pipe(
+        Effect.tap((saved) => Effect.sync(() => {
+          // A spoke save can succeed without hub-owned fields; keep the loaded ones.
+          settings = settings ? { ...settings, airplane_mode: saved.airplane_mode } : saved;
+          airplaneMode = saved.airplane_mode;
+          settingsStore.setAirplaneMode(saved.airplane_mode);
+        })),
+        Effect.ensuring(Effect.sync(() => { savingAirplaneMode = false; })),
+      ),
+      {
+        operation: "save airplane mode",
+        safeContext: {},
+        onFailure: (failure) => {
+          airplaneMode = settings?.airplane_mode ?? false;
+          airplaneModeError = settingsErrorMessage(failure);
+        },
+      },
+    );
+  }
 
   function backToApp(): void {
     // Always route to an in-app destination rather than window.history.back():
@@ -134,6 +229,12 @@
           <ArrowLeftIcon size="15" strokeWidth="2" aria-hidden="true" />
           <span>Back to app</span>
         </button>
+        {#if nativeHost}
+          <button class="back-button" type="button" onclick={() => nativeHost.postMessage(JSON.stringify({ type: "connection-settings" }))}>
+            <SettingsIcon size="15" strokeWidth="2" aria-hidden="true" />
+            <span>Connection settings</span>
+          </button>
+        {/if}
         <SearchInput
           bind:value={searchQuery}
           placeholder="Search settings..."
@@ -153,7 +254,25 @@
           {@const panelVisible = categories.some((panel) => panel.id === meta.id)}
           <div class="settings-panel" hidden={!panelVisible || meta.id !== activeId}>
             <SettingsSection title={meta.title} description={meta.description}>
-              {#if meta.id === "settings-repositories"}
+              {#if providerOwner === "hub" && !providerReady && providerPanels.has(meta.id)}
+                <p class="state-msg">{providerError ?? "Loading settings from the hub..."}</p>
+              {:else if meta.id === "settings-sync"}
+            <Toggle label="Airplane mode" bind:checked={airplaneMode} disabled={savingAirplaneMode} onchange={toggleAirplaneMode} />
+            <p class="sync-description">Pause automatic background sync on this Forge instance. Relay updates, opening an item, and manual Sync remain available. This setting is remembered after restart.</p>
+            <p class="sync-description">An update already running will finish. On a spoke, this pauses local background refresh; the hub keeps its own sync setting.</p>
+            {#if airplaneModeError}<p class="state-error" role="alert">{airplaneModeError}</p>{/if}
+            {#if providerOwner === "hub" && !providerReady}
+              <p class="state-msg">{providerError ?? "Loading sync settings from the hub..."}</p>
+            {:else}
+              <SyncBudgetSettings
+                sync={loaded.sync}
+                owner={providerOwner}
+                onUpdate={(sync) => {
+                  settings = { ...settings!, sync };
+                }}
+              />
+            {/if}
+          {:else if meta.id === "settings-repositories"}
             <RepoSettings
               repos={loaded.repos}
               owner={providerOwner}
@@ -179,6 +298,8 @@
                 settingsStore.setPullRequestSettings(pull_requests);
               }}
             />
+          {:else if meta.id === "settings-appearance"}
+            <AppearanceSettings />
           {:else if meta.id === "settings-detail"}
             <DetailSettings
               detail={loaded.detail}
@@ -189,23 +310,32 @@
               }}
             />
           {:else if meta.id === "settings-workspaces"}
-            <WorkspaceSettings
-              onUpdate={(workspaces) => {
-                settings = { ...settings!, workspaces };
-                settingsStore.setWorkspaceSettings(workspaces);
-              }}
-              onRoborevUpdate={(roborev) => {
-                settings = { ...settings!, roborev };
-                settingsStore.setRoborevSettings(roborev);
-              }}
-            />
-          {:else if meta.id === "settings-terminal"}
-            <TerminalSettings
-              terminal={loaded.terminal}
-              onUpdate={(terminal) => {
-                settings = { ...settings!, terminal };
-              }}
-            />
+            <section class="workspace-settings-group" aria-labelledby="workspace-behavior-title">
+              <h3 id="workspace-behavior-title">Workspace behavior</h3>
+              <WorkspaceSettings
+                onUpdate={(workspaces) => {
+                  settings = { ...settings!, workspaces };
+                  settingsStore.setWorkspaceSettings(workspaces);
+                }}
+                onRoborevUpdate={(roborev) => {
+                  settings = { ...settings!, roborev };
+                  settingsStore.setRoborevSettings(roborev);
+                }}
+              />
+            </section>
+            <section class="workspace-settings-group" aria-labelledby="workspace-terminal-title">
+              <h3 id="workspace-terminal-title">Terminal</h3>
+              <TerminalSettings
+                terminal={loaded.terminal}
+                onUpdate={(terminal) => {
+                  settings = { ...settings!, terminal };
+                }}
+              />
+            </section>
+            <section class="workspace-settings-group" aria-labelledby="workspace-acp-title">
+              <h3 id="workspace-acp-title">ACP</h3>
+              <ACPSettings />
+            </section>
           {:else if meta.id === "settings-kata-projects"}
             <KataProjectMappingsSettings
               mappings={loaded.kata_projects}
@@ -268,6 +398,21 @@
 </div>
 
 <style>
+  .workspace-settings-group + .workspace-settings-group {
+    margin-top: var(--space-6);
+    padding-top: var(--space-6);
+    border-top: 1px solid var(--border-muted);
+  }
+
+  .workspace-settings-group > h3 {
+    margin: 0 0 var(--space-4);
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    font-weight: var(--font-weight-semibold);
+  }
+
+  .sync-description { color: var(--text-secondary); font-size: var(--font-size-sm); max-width: 65ch; }
+
   .settings-page {
     display: flex;
     flex: 1 1 auto;

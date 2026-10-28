@@ -68,6 +68,8 @@ async function mockPulls(page: Page) {
         }),
         pull(11, "Draft parser cleanup", {
           IsDraft: true,
+          CIStatus: "pending",
+          CIChecksJSON: JSON.stringify([{ name: "test", status: "in_progress", conclusion: "" }]),
           KanbanStatus: "waiting",
         }),
         pull(12, "Ready failed workflow", {
@@ -94,7 +96,7 @@ async function openPrFilters(page: Page): Promise<void> {
   await expect(page.locator(".kit-filter-dropdown__panel")).toBeVisible();
 }
 
-test("PR filters stack attributes and allow multiple kanban statuses", async ({ page }) => {
+test("PR filters match any selected attribute and allow multiple kanban statuses", async ({ page }) => {
   await mockPulls(page);
   await page.goto("/pulls");
 
@@ -107,12 +109,17 @@ test("PR filters stack attributes and allow multiple kanban statuses", async ({ 
     await filterPanel.locator(".kit-filter-dropdown__section-title, .kit-filter-dropdown__item").allTextContents()
   )
     .map((text) => text.trim())
-    .filter((text) => ["Status", "Has workspace", "Visibility"].includes(text));
-  expect(workspaceGrouping).toEqual(["Status", "Has workspace", "Visibility"]);
+    .filter((text) => ["Status", "Has workspace", "View"].includes(text));
+  expect(workspaceGrouping).toEqual(["Status", "Has workspace", "View"]);
 
   await filterPanel.getByRole("button", { name: "Has workspace" }).click();
   await expect(rows).toHaveText([/Approved review queue/, /Ready failed workflow/]);
   await filterPanel.getByRole("button", { name: "Has workspace" }).click();
+
+  await filterPanel.getByRole("button", { name: "Draft", exact: true }).click();
+  await filterPanel.getByRole("button", { name: "Failed CI" }).click();
+  await expect(rows).toHaveText([/Draft parser cleanup/, /Ready failed workflow/]);
+  await filterPanel.getByRole("button", { name: /^(Clear filters|Reset view)$/ }).click();
 
   await filterPanel.getByRole("button", { name: "Ready for review" }).click();
   await filterPanel.getByRole("button", { name: "Reviewing" }).click();
@@ -121,10 +128,15 @@ test("PR filters stack attributes and allow multiple kanban statuses", async ({ 
   await expect(rows).toHaveText([/Approved review queue/, /Ready failed workflow/]);
 
   await filterPanel.getByRole("button", { name: "Failed CI" }).click();
-  await expect(rows).toHaveText([/Ready failed workflow/]);
+  await expect(rows).toHaveText([/Approved review queue/, /Ready failed workflow/]);
 
   await filterPanel.getByRole("button", { name: /^(Clear filters|Reset view)$/ }).click();
   await filterPanel.getByRole("button", { name: "Merge conflicts" }).click();
 
   await expect(rows).toHaveText([/Ready conflict resolver/]);
+
+  await filterPanel.getByRole("button", { name: /^(Clear filters|Reset view)$/ }).click();
+  await filterPanel.getByRole("button", { name: "Passing CI" }).click();
+
+  await expect(rows).toHaveText([/Approved review queue/, /Ready conflict resolver/]);
 });

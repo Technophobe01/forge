@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/forge/platform"
 )
 
 func archiveTestTime() time.Time {
@@ -62,6 +63,8 @@ func archiveProgressStatusForTest(
 }
 
 func TestArchiveDiscoveryLifecyclePreservesExistingState(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -107,15 +110,17 @@ func TestArchiveDiscoveryLifecyclePreservesExistingState(t *testing.T) {
 }
 
 func TestQueueArchivePromptByIdentityTargetsCurrentRouteOccupant(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	database := openTestDB(t)
 	ctx := t.Context()
 	now := archiveTestTime()
-	oldEntry, _, err := database.ReconcileRepositoryObservation(ctx, RepoIdentity{
+	oldEntry, err := database.ObserveRepository(ctx, RepoIdentity{
 		Platform: "github", PlatformHost: "github.com",
-		PlatformRepoID: "R_old", Owner: "acme", Name: "widget",
-	}, now)
+		Key: platform.RepositoryIDKey(1001), Owner: "acme", Name: "widget",
+	})
 	require.NoError(err)
 	require.NoError(database.EnsureDiscoveryArchives(
 		ctx, []int64{oldEntry.Repository.ID}, now,
@@ -124,10 +129,10 @@ func TestQueueArchivePromptByIdentityTargetsCurrentRouteOccupant(t *testing.T) {
 		ctx, []int64{oldEntry.Repository.ID}, now,
 	))
 
-	newEntry, _, err := database.ReconcileRepositoryObservation(ctx, RepoIdentity{
+	newEntry, err := database.ObserveRepository(ctx, RepoIdentity{
 		Platform: "github", PlatformHost: "github.com",
-		PlatformRepoID: "R_new", Owner: "acme", Name: "widget",
-	}, now.Add(time.Minute))
+		Key: platform.RepositoryIDKey(1002), Owner: "acme", Name: "widget",
+	})
 	require.NoError(err)
 	require.NoError(database.ReconcileDiscoveryArchives(
 		ctx, []int64{newEntry.Repository.ID}, now.Add(time.Minute),
@@ -164,6 +169,8 @@ func TestQueueArchivePromptByIdentityTargetsCurrentRouteOccupant(t *testing.T) {
 }
 
 func TestStartFullArchiveCompletesEmptyFinishedInventory(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -193,6 +200,8 @@ func archiveInventoryItemForTest(number int, updatedAt time.Time) ArchiveInvento
 }
 
 func TestArchiveInventoryPageCommitUsesScanCursorCompareAndSwap(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -262,6 +271,8 @@ func TestArchiveInventoryPageCommitUsesScanCursorCompareAndSwap(t *testing.T) {
 }
 
 func TestArchiveInventoryCompletedScanRejectsStaleDeliveries(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -329,6 +340,8 @@ func TestArchiveInventoryCompletedScanRejectsStaleDeliveries(t *testing.T) {
 }
 
 func TestArchiveInventoryPageBoundBlocksScan(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -358,6 +371,8 @@ func TestArchiveInventoryPageBoundBlocksScan(t *testing.T) {
 }
 
 func TestArchiveEnsureDiscoveryRejectsMissingReposAtomically(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	d := openTestDB(t)
 	repoID := insertTestRepo(t, d, "acme", "widget")
@@ -373,6 +388,8 @@ func TestArchiveEnsureDiscoveryRejectsMissingReposAtomically(t *testing.T) {
 }
 
 func TestArchiveStartFullPromotesDiscoveryAndPreservesResumedProgress(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -466,6 +483,8 @@ func TestArchiveStartFullPromotesDiscoveryAndPreservesResumedProgress(t *testing
 }
 
 func TestArchiveStartAndPauseAreAtomicAndIdempotent(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -504,6 +523,8 @@ func TestArchiveStartAndPauseAreAtomicAndIdempotent(t *testing.T) {
 }
 
 func TestArchiveClaimItemUsesEligibleDueWorkAndStableOrder(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -589,6 +610,8 @@ func TestArchiveClaimItemUsesEligibleDueWorkAndStableOrder(t *testing.T) {
 }
 
 func TestArchiveClaimItemExcludesFeatureScope(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -622,6 +645,8 @@ func TestArchiveClaimItemExcludesFeatureScope(t *testing.T) {
 }
 
 func TestArchivePromptRediscoveryMakesTerminalItemClaimable(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	database := openTestDB(t)
@@ -677,6 +702,8 @@ func TestArchivePromptRediscoveryMakesTerminalItemClaimable(t *testing.T) {
 }
 
 func TestArchivePromptReopensEqualOrNewerObservations(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	database := openTestDB(t)
@@ -741,6 +768,8 @@ func TestArchivePromptReopensEqualOrNewerObservations(t *testing.T) {
 }
 
 func TestCommitArchiveItemSyncRejectsMismatchedMergeEvidence(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	database := openTestDB(t)
@@ -789,6 +818,8 @@ func TestCommitArchiveItemSyncRejectsMismatchedMergeEvidence(t *testing.T) {
 }
 
 func TestRequeueArchiveLifecycleDetailsOnlyReopensIncompleteGitHubRows(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	database := openTestDB(t)
@@ -880,6 +911,8 @@ func TestRequeueArchiveLifecycleDetailsOnlyReopensIncompleteGitHubRows(t *testin
 }
 
 func TestRequeueArchiveLifecycleDetailsChecksUnavailableDataOnlyOnce(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	database := openTestDB(t)
@@ -935,7 +968,7 @@ func TestRequeueArchiveLifecycleDetailsIncludesSupportedProviderRows(t *testing.
 			database := openTestDB(t)
 			ctx := t.Context()
 			now := archiveTestTime()
-			repoID, err := database.UpsertRepo(ctx, RepoIdentity{
+			repoID, err := seedTestRepo(ctx, database, RepoIdentity{
 				Platform: provider, PlatformHost: provider + ".example.com",
 				Owner: "acme", Name: "metrics",
 			})
@@ -969,11 +1002,13 @@ func TestRequeueArchiveLifecycleDetailsIncludesSupportedProviderRows(t *testing.
 }
 
 func TestRequeueArchiveLifecycleDetailsIncludesGitLabKnownMergeRequests(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	database := openTestDB(t)
 	ctx := t.Context()
 	now := archiveTestTime()
-	repoID, err := database.UpsertRepo(ctx, RepoIdentity{
+	repoID, err := seedTestRepo(ctx, database, RepoIdentity{
 		Platform: "gitlab", PlatformHost: "gitlab.example.com",
 		Owner: "acme", Name: "metrics",
 	})
@@ -1009,11 +1044,13 @@ func TestRequeueArchiveLifecycleDetailsIncludesGitLabKnownMergeRequests(t *testi
 }
 
 func TestReconcileArchiveCoverageRequeuesKnownItemsWhenInventoryReturns(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	database := openTestDB(t)
 	ctx := t.Context()
 	now := archiveTestTime()
-	repoID, err := database.UpsertRepo(ctx, RepoIdentity{
+	repoID, err := seedTestRepo(ctx, database, RepoIdentity{
 		Platform: "gitea", PlatformHost: "gitea.example.com",
 		Owner: "acme", Name: "metrics",
 	})
@@ -1061,6 +1098,8 @@ func TestReconcileArchiveCoverageRequeuesKnownItemsWhenInventoryReturns(t *testi
 }
 
 func TestReconcileArchiveInventoryAvailablePreservesPromptBoundary(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	database := openTestDB(t)
@@ -1141,6 +1180,8 @@ func prepareLifecycleArchiveCoverage(
 }
 
 func TestArchiveClaimItemExcludesDiscoveryAndEmptyEligibility(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -1159,6 +1200,8 @@ func TestArchiveClaimItemExcludesDiscoveryAndEmptyEligibility(t *testing.T) {
 }
 
 func TestArchiveDeriveProgressStatusAndOrderedPhases(t *testing.T) {
+	t.Parallel()
+
 	now := archiveTestTime()
 	completedAt := now.Add(-time.Hour)
 	watermark := now.Add(-30 * time.Minute)
@@ -1335,6 +1378,8 @@ func TestArchiveDeriveProgressStatusAndOrderedPhases(t *testing.T) {
 }
 
 func TestArchiveGetProgressDerivesCountsFromDurableRows(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -1393,6 +1438,8 @@ func TestArchiveGetProgressDerivesCountsFromDurableRows(t *testing.T) {
 }
 
 func TestArchiveGetProgressUsesOneReadSnapshot(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -1435,6 +1482,8 @@ func TestArchiveGetProgressUsesOneReadSnapshot(t *testing.T) {
 }
 
 func TestArchiveDBBoundariesNormalizeTimestampsToUTC(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -1502,6 +1551,8 @@ func TestArchiveDBBoundariesNormalizeTimestampsToUTC(t *testing.T) {
 }
 
 func TestClaimArchiveItemCarriesAttemptCount(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -1531,9 +1582,28 @@ func TestClaimArchiveItemCarriesAttemptCount(t *testing.T) {
 	require.NoError(err)
 	require.NotNil(claim)
 	assert.Equal(2, claim.AttemptCount)
+
+	// A retry that runs out of capacity has not established recovery.
+	retryAt := now.Add(time.Minute)
+	require.NoError(d.FailArchiveItemSync(ctx, ArchiveItemSyncCommit{
+		RepoID: repoID, ItemType: ArchiveItemTypeIssue, ItemNumber: 1,
+		ScanGeneration: progress.ScanGeneration, ErrorDetail: "budget wait", Now: now,
+	}, ArchiveErrorCodeBudgetExhausted, &retryAt, true))
+	deferred, err := d.GetDatasetProgress(ctx, repoID, ArchiveItemTypeIssue, 1, ArchiveDatasetLookup)
+	require.NoError(err)
+	assert.Equal(ArchiveDatasetProgressFailed, deferred.Status)
+	assert.Equal(2, deferred.AttemptCount)
+	require.NotNil(deferred.LastErrorCode)
+	assert.Equal(string(ArchiveErrorCodeTransient), *deferred.LastErrorCode)
+	require.NotNil(deferred.LastErrorDetail)
+	assert.Equal("boom", *deferred.LastErrorDetail)
+	require.NotNil(deferred.NextRetryAt)
+	assert.Equal(retryAt, *deferred.NextRetryAt)
 }
 
 func TestScanScopedRepositoryFailureIsClaimFenced(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -1587,4 +1657,51 @@ func TestScanScopedRepositoryFailureIsClaimFenced(t *testing.T) {
 	assert.True(applied)
 	require.NotNil(repoErrorCode())
 	assert.Equal(string(ArchiveErrorCodeAuthentication), *repoErrorCode())
+}
+
+func TestLiveMergeRequestPresenceRejectsUnprovenRediscovery(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		providerID int64
+		age        time.Duration
+		wantError  bool
+	}{
+		{name: "different identity", providerID: 8, wantError: true},
+		{name: "missing identity", wantError: true},
+		{name: "older snapshot", providerID: 7, age: -time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			database := openTestDB(t)
+			ctx := t.Context()
+			now := archiveTestTime()
+			repoID := insertTestRepo(t, database, "owner", "repo")
+			original := &MergeRequest{
+				RepoID: repoID, Number: 1, PlatformID: 7, PlatformExternalID: "PR_7",
+				Title: "Retained snapshot", State: MergeRequestStateOpen,
+				CreatedAt: now, UpdatedAt: now, LastActivityAt: now,
+			}
+			_, err := database.UpsertMergeRequest(ctx, original)
+			require.NoError(err)
+			require.NoError(database.RecordRemovedMergeRequest(ctx, repoID, 1, "Not Found", now))
+			observed := *original
+			observed.PlatformID = tc.providerID
+			observed.UpdatedAt = now.Add(tc.age)
+			err = database.RecordLiveMergeRequestPresence(ctx, &observed)
+			if tc.wantError {
+				require.ErrorContains(err, "different provider identity")
+			} else {
+				require.NoError(err)
+			}
+			removed, err := database.IsArchiveItemRemovedUpstream(ctx, repoID, ArchiveItemTypeMergeRequest, 1)
+			require.NoError(err)
+			assert.True(removed)
+			progress, err := database.GetDatasetProgress(ctx, repoID, ArchiveItemTypeMergeRequest, 1, ArchiveDatasetLookup)
+			require.NoError(err)
+			assert.Equal(ArchiveDatasetProgressTerminal, progress.Status)
+			require.NotNil(progress.LastErrorCode)
+			assert.Equal("not_found", *progress.LastErrorCode)
+		})
+	}
 }

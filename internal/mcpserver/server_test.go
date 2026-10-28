@@ -27,16 +27,26 @@ func TestRegisteredToolsResourcesAndPromptsAreCurated(t *testing.T) {
 	}
 	slices.Sort(toolNames)
 	assert.Equal([]string{
+		"kenn_forge_add_workspace_target",
+		"kenn_forge_clear_worklist_marks",
+		"kenn_forge_dismiss_worklist",
 		"kenn_forge_find_review_candidates",
 		"kenn_forge_get_item_context",
 		"kenn_forge_get_item_diff",
 		"kenn_forge_get_stack_context",
+		"kenn_forge_get_worklist",
+		"kenn_forge_import_worklist",
 		"kenn_forge_list_activity",
 		"kenn_forge_list_agent_targets",
 		"kenn_forge_list_items_by_workflow_state",
 		"kenn_forge_list_pull_contexts",
 		"kenn_forge_list_repos",
+		"kenn_forge_list_worklists",
 		"kenn_forge_list_workspace_agent_sessions",
+		"kenn_forge_list_workspace_targets",
+		"kenn_forge_put_worklist",
+		"kenn_forge_remove_workspace_target",
+		"kenn_forge_render_app",
 		"kenn_forge_search_items",
 		"kenn_forge_send_agent_message",
 		"kenn_forge_set_item_workflow_state",
@@ -45,8 +55,8 @@ func TestRegisteredToolsResourcesAndPromptsAreCurated(t *testing.T) {
 
 	resources, err := cs.ListResources(t.Context(), nil)
 	require.NoError(err)
-	require.Len(resources.Resources, 1)
-	assert.Equal("kenn-forge://mcp/guidance", resources.Resources[0].URI)
+	require.Len(resources.Resources, 2)
+	assert.Contains([]string{resources.Resources[0].URI, resources.Resources[1].URI}, "kenn-forge://mcp/guidance")
 	read, err := cs.ReadResource(t.Context(), &mcp.ReadResourceParams{URI: "kenn-forge://mcp/guidance"})
 	require.NoError(err)
 	require.Len(read.Contents, 1)
@@ -144,7 +154,7 @@ func TestSpawnToolFailurePreservesPartialHandoffEvidenceThroughClientSession(t *
 	assert := assert.New(t)
 	require := require.New(t)
 	backend := successfulSpawnBackend("ws-1", "runtime-1", "coding-1")
-	backend.launchWorkspaceRuntimeFn = func(context.Context, string, string) (RuntimeSession, error) {
+	backend.launchWorkspaceRuntimeFn = func(context.Context, string, string, string) (RuntimeSession, error) {
 		return RuntimeSession{}, &Error{
 			Kind: "unavailable", Code: "runtimeLaunchFailed",
 			Message: "agent runtime failed to launch", Retryable: true,
@@ -160,7 +170,7 @@ func TestSpawnToolFailurePreservesPartialHandoffEvidenceThroughClientSession(t *
 					"type": "item",
 					"item": map[string]any{
 						"type": "pr", "provider": "github", "platform_host": "github.com",
-						"platform_repo_id": "repo-acme-widget",
+						"platform_repo_id": 1001,
 						"owner":            "acme", "name": "widget", "number": 42,
 					},
 				},
@@ -210,11 +220,11 @@ func TestHTTPHandlerServesOnlyStatelessMCPPath(t *testing.T) {
 	handler := s.HTTPHandler()
 
 	missing := httptest.NewRecorder()
-	handler.ServeHTTP(missing, httptest.NewRequest(http.MethodPost, "http://localhost/other", nil))
+	handler.ServeHTTP(missing, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://localhost/other", nil))
 	assert.Equal(t, http.StatusNotFound, missing.Code)
 
 	mcpResponse := httptest.NewRecorder()
-	handler.ServeHTTP(mcpResponse, httptest.NewRequest(http.MethodGet, "http://localhost/mcp", nil))
+	handler.ServeHTTP(mcpResponse, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost/mcp", nil))
 	assert.NotEqual(t, http.StatusNotFound, mcpResponse.Code)
 }
 

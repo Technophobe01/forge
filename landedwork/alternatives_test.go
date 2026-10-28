@@ -60,13 +60,17 @@ func TestAutomaticSingleParent(t *testing.T) {
 				assert.Empty(r.Landings)
 				assert.False(r.Coverage.Complete)
 				assert.Equal(f.base, r.Coverage.CertifiedHead)
-				assert.Equal([]landedwork.Gap{{CandidateID: "7", ObjectID: f.head, Reason: reason,
-					Span: landedwork.Span{Before: f.base, Through: f.head}}}, r.Coverage.Gaps)
+				assert.Equal([]landedwork.Gap{{
+					CandidateID: "7", ObjectID: f.head, Reason: reason,
+					Span: landedwork.Span{Before: f.base, Through: f.head},
+				}}, r.Coverage.Gaps)
 				return
 			}
 			require.Len(t, r.Landings, 1)
-			assert.Equal(landedwork.Landing{CandidateID: "7", Proofs: proofs, Before: f.base,
-				Terminal: f.head, Source: f.source, Spine: spine, Introduced: spine}, r.Landings[0])
+			assert.Equal(landedwork.Landing{
+				CandidateID: "7", Proofs: proofs, Before: f.base,
+				Terminal: f.head, Source: f.source, Spine: spine, Introduced: spine,
+			}, r.Landings[0])
 			assert.True(r.Coverage.Complete)
 			assert.Equal(f.head, r.Coverage.CertifiedHead)
 			assert.Empty(r.Coverage.Gaps)
@@ -119,7 +123,7 @@ func TestAutomaticEarlierHistory(t *testing.T) {
 				limits.Nodes = 6
 				reason, object = "input_budget_exhausted", terminal
 			case "shallow":
-				require.NoError(os.WriteFile(filepath.Join(f.repo.GitDir, "shallow"), []byte(earlier+"\n"), 0600))
+				require.NoError(os.WriteFile(filepath.Join(f.repo.GitDir, "shallow"), []byte(earlier+"\n"), 0o600))
 				reason = "shallow_boundary"
 			}
 			r, err := landedwork.Analyze(ctx, p, e, limits)
@@ -169,18 +173,63 @@ func TestAutomaticAggregateCancellation(t *testing.T) {
 		require.NoError(t, err)
 		assert := assert.New(t)
 		assert.Empty(r.DirectPushes)
-		if empty {
-			assert.Empty(r.Landings)
-			assert.False(r.Coverage.Complete)
-			assert.Equal(f.base, r.Coverage.CertifiedHead)
-			require.Len(t, r.Coverage.Gaps, 1)
-			assert.Equal("edits_unavailable", r.Coverage.Gaps[0].Reason)
-		} else {
-			require.Len(t, r.Landings, 1)
-			assert.Equal([]string{"squash"}, r.Landings[0].Proofs)
-			assert.Equal([]string{f.head}, r.Landings[0].Spine)
-			assert.True(r.Coverage.Complete)
-			assert.Equal(f.head, r.Coverage.CertifiedHead)
-		}
+		// Even the empty terminal is not the end of a longer rebase: its
+		// parent is the base the source was written on, not a replay of a
+		// source commit.
+		require.Len(t, r.Landings, 1)
+		assert.Equal([]string{"squash"}, r.Landings[0].Proofs)
+		assert.Equal([]string{f.head}, r.Landings[0].Spine)
+		assert.True(r.Coverage.Complete)
+		assert.Equal(f.head, r.Coverage.CertifiedHead)
+	}
+}
+
+func TestAutomaticRangeThroughEarlierCommit(t *testing.T) {
+	for _, variant := range []string{"declared in interval", "before interval"} {
+		t.Run(variant, func(t *testing.T) {
+			f := buildFixture(t, true)
+			r := f.repo
+			// Repeated lines leave no unique insertion context, so the
+			// rewritten-range pairs compared across different bases stay
+			// inconclusive.
+			r.Checkout("-b", "target", f.base)
+			base := r.CommitFile("rules", "rule\nrule\nrule\nrule\nrule\nrule\n", "rules")
+			r.Checkout("-b", "other", base)
+			other := r.CommitFile("rules", "rule\nother\nrule\nrule\nrule\nrule\nrule\n", "other rule")
+			r.Checkout("target")
+			r.Run("merge", "--squash", "other")
+			r.Run("commit", "-m", "squash other")
+			previous := r.Head()
+			r.Checkout("-b", "stacked", previous)
+			first := r.CommitFile("rules", "rule\nother\nrule\nrule\nfirst\nrule\nrule\nrule\n", "first rule")
+			second := r.CommitFile("rules", "rule\nother\nrule\nrule\nfirst\nrule\nrule\nsecond\nrule\n", "second rule")
+			r.Checkout("target")
+			r.Run("merge", "--squash", "stacked")
+			r.Run("commit", "-m", "squash stacked")
+			f.base, f.head = base, r.Head()
+			if variant == "before interval" {
+				// An earlier interval already covered the other change.
+				f.base = previous
+			}
+			ctx, p := f.prepare(t)
+			e := fixtureEvidence(f, p, "")
+			e.Capabilities = landedwork.Capabilities{SingleParentCorrespondence: true}
+			// The source was written on top of the earlier commit, so that
+			// commit cannot be one this change created when it landed.
+			e.Candidates = []landedwork.Candidate{squashCandidate(f, "7", f.head, first, second)}
+			if variant == "declared in interval" {
+				e.Candidates = append(e.Candidates, squashCandidate(f, "8", previous, other))
+			}
+			res, err := landedwork.Analyze(ctx, p, e, fixtureLimits())
+			require.NoError(t, err)
+			assert := assert.New(t)
+			assert.Empty(res.Coverage.Gaps)
+			require.NotEmpty(t, res.Landings)
+			assert.Equal(landedwork.Landing{
+				CandidateID: "7", Proofs: []string{"squash"}, Before: previous, Terminal: f.head,
+				Spine: []string{f.head}, Source: []string{first, second}, Introduced: []string{f.head},
+			}, res.Landings[len(res.Landings)-1])
+			assert.True(res.Coverage.Complete)
+		})
 	}
 }

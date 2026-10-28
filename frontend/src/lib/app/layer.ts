@@ -1,6 +1,9 @@
 import { Clipboard } from "@effect/platform-browser";
 import { Layer } from "effect";
 import { GeneratedApiLive } from "../api/generated-api.js";
+import { FleetSnapshotReadsLive } from "../api/fleet-snapshot.js";
+import { RepositoryReadsLive } from "../api/repository-reads.js";
+import { WorkspaceTargetMutationsLive } from "../api/workspace-targets.js";
 import type { GeneratedApi } from "../api/generated-api.js";
 import { EventSourceFactoryLive } from "../browser/event-source.js";
 import { BrowserObserversLive } from "../browser/observers.js";
@@ -31,6 +34,7 @@ import { ProjectMutationWorkflowLive } from "../components/terminal/project-muta
 import { WorkspaceRuntimeWorkflowLive } from "../components/terminal/workspace-runtime-workflow.js";
 import { RepoSummaryWorkflowLive } from "../components/repositories/repo-summary-workflow.js";
 import { ToolingStatusWorkflowLive } from "../stores/tooling-status-workflow.js";
+import { ExternalContextWorkflowLive } from "../stores/external-context-workflow.svelte.js";
 
 export function makeAppLiveLayer(generatedApiLayer: Layer.Layer<GeneratedApi>) {
   const browserBoundaryLive = Layer.mergeAll(
@@ -50,6 +54,8 @@ export function makeAppLiveLayer(generatedApiLayer: Layer.Layer<GeneratedApi>) {
 
   const startupLive = Layer.provideMerge(StartupWorkflowLive, browserBoundaryLive);
   const providerWorkflowsLive = Layer.mergeAll(
+    FleetSnapshotReadsLive,
+    Layer.provideMerge(WorkspaceTargetMutationsLive, RepositoryReadsLive),
     PullsWorkflowLive,
     IssuesWorkflowLive,
     ActivityWorkflowLive,
@@ -68,6 +74,7 @@ export function makeAppLiveLayer(generatedApiLayer: Layer.Layer<GeneratedApi>) {
     WorkspaceRuntimeWorkflowLive,
     RepoSummaryWorkflowLive,
     ToolingStatusWorkflowLive,
+    ExternalContextWorkflowLive,
   );
   const applicationWorkflowsLive = Layer.mergeAll(SettingsWorkflowLive, providerWorkflowsLive);
 

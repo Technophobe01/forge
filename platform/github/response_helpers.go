@@ -6,14 +6,14 @@ import (
 	"regexp"
 	"strings"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 )
 
 // IsNotModified returns true if the error represents a 304 Not Modified
 // response from the GitHub API.
 func IsNotModified(err error) bool {
-	var ghErr *gh.ErrorResponse
-	if !errors.As(err, &ghErr) || ghErr == nil || ghErr.Response == nil {
+	ghErr, ok := errors.AsType[*gh.ErrorResponse](err)
+	if !ok || ghErr == nil || ghErr.Response == nil {
 		return false
 	}
 	return ghErr.Response.StatusCode == http.StatusNotModified

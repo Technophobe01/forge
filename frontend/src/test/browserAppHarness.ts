@@ -20,6 +20,7 @@ import { Effect } from "effect";
 import "../app.css";
 import { createMockApiFetch, type MockApiHandle, type MockRouteOverride } from "./mockApiFetch.js";
 import { makeAppRuntime, type OwnedAppRuntime } from "../lib/app/runtime.js";
+import { startRuntimeTelemetry } from "../lib/app/telemetry.js";
 
 let previousRuntimeDisposal = Promise.resolve();
 
@@ -107,6 +108,9 @@ export async function mountBrowserApp(path: string, options: MountBrowserAppOpti
   const runtime = makeAppRuntime();
   const originalFetch = globalThis.fetch;
   globalThis.fetch = api.fetch;
+  const telemetry = startRuntimeTelemetry(runtime, {
+    storageKey: `test.telemetry.${crypto.randomUUID()}`,
+  });
 
   const originalEventSource = globalThis.EventSource;
   globalThis.EventSource = NoopEventSource as unknown as typeof EventSource;
@@ -135,6 +139,7 @@ export async function mountBrowserApp(path: string, options: MountBrowserAppOpti
     runtime,
     target,
     unmount: () => {
+      telemetry.stop();
       unmount();
       target.remove();
       globalThis.fetch = originalFetch;

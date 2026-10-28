@@ -10,10 +10,12 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"go.kenn.io/forge/internal/config"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 )
 
-func TestDocFolderDaemonBindingWarnsWhenCatalogTargetMissingOnStartup(t *testing.T) {
+func TestDocFolderDaemonBindingWarnsWhenCatalogTargetMissingOnStartup(t *testing.T) { //nolint:paralleltest // t.Setenv writes KATA_HOME; swaps slog.Default to capture logs
 	assert := assert.New(t)
 
 	home := t.TempDir()
@@ -36,8 +38,8 @@ local = true
 			{ID: "notes", Name: "Notes", Path: root, Daemon: "gone"},
 		},
 	}
-	srv := New(openTestDB(t), nil, nil, "/", cfg, ServerOptions{})
-	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	srv := New(serverfake.OpenTestDB(t), nil, nil, "/", cfg, ServerOptions{})
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, srv) })
 
 	logs := logBuf.String()
 	assert.Contains(logs, "doc folder references missing Kata daemon")
@@ -45,7 +47,7 @@ local = true
 	assert.Contains(logs, "daemon=gone")
 }
 
-func TestConfigReloadWarnsWhenDocFolderDaemonBindingTargetIsMissing(t *testing.T) {
+func TestConfigReloadWarnsWhenDocFolderDaemonBindingTargetIsMissing(t *testing.T) { //nolint:paralleltest // t.Setenv writes KATA_HOME; swaps slog.Default to capture logs
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -61,8 +63,8 @@ local = true
 	updatedRoot := t.TempDir()
 	initialConfig := validReloadConfigWithDocFolderDaemon("notes", "Notes", initialRoot, "home")
 	updatedConfig := validReloadConfigWithDocFolderDaemon("handbook", "Handbook", updatedRoot, "gone")
-	srv, _, cfgPath := setupTestServerWithConfigContent(t, initialConfig, &mockGH{})
-	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(t, initialConfig, &serverfake.MockGH{})
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, srv) })
 
 	logBuf := &lockedBuffer{}
 	origLogger := slog.Default()
@@ -71,7 +73,7 @@ local = true
 
 	writeConfigToml(t, cfgPath, updatedConfig)
 
-	ev := srv.applyConfigChange(t.Context())
+	ev := srv.configreload.ApplyConfigChange(t.Context())
 	require.True(ev.Valid)
 	assert.False(ev.RestartRequired)
 
@@ -82,7 +84,7 @@ local = true
 	assert.Contains(logs, "daemon=gone")
 }
 
-func TestConfigWatcherWarnsWhenDocFolderDaemonBindingTargetIsMissing(t *testing.T) {
+func TestConfigWatcherWarnsWhenDocFolderDaemonBindingTargetIsMissing(t *testing.T) { //nolint:paralleltest // t.Setenv writes KATA_HOME; swaps slog.Default to capture logs
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -98,8 +100,8 @@ local = true
 	updatedRoot := t.TempDir()
 	initialConfig := validReloadConfigWithDocFolderDaemon("notes", "Notes", initialRoot, "home")
 	updatedConfig := validReloadConfigWithDocFolderDaemon("handbook", "Handbook", updatedRoot, "gone")
-	srv, _, cfgPath := setupTestServerWithConfigContent(t, initialConfig, &mockGH{})
-	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	srv, _, cfgPath, _ := setupTestServerWithConfigContent(t, initialConfig, &serverfake.MockGH{})
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, srv) })
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
 	defer stream.Close()

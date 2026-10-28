@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"go.kenn.io/forge/internal/tokenauth"
 	"go.kenn.io/forge/platform"
 	platformgithub "go.kenn.io/forge/platform/github"
@@ -40,8 +40,12 @@ type Route struct {
 	DiscoveryClient     Client
 	WriteSnapshotClient Client
 	Fetcher             *GraphQLFetcher
-	ReadIdentity        IdentityKey
-	WriteIdentity       IdentityKey
+	// WriteFetcher reads GraphQL as the write (merge) credential when it
+	// differs from the read credential. Merge queue reads use it: they
+	// belong with merging, and a sync App can be denied the queue.
+	WriteFetcher  *GraphQLFetcher
+	ReadIdentity  IdentityKey
+	WriteIdentity IdentityKey
 	// ArchiveKey and ArchiveClient are optional. When present, requests
 	// carrying the archive budget marker use the dedicated App route and its
 	// independent quota instead of the ordinary sync route.
@@ -92,8 +96,8 @@ type HostRouter struct {
 // route whose credential it should use, recording which repository (by
 // stable provider ID) created the mapping.
 type repoCredentialAlias struct {
-	configured     RouteKey
-	providerRepoID string
+	configured RouteKey
+	repoKey    platform.RepositoryKey
 }
 
 func NewHostRouter(host string, routes ...*Route) (*HostRouter, error) {
@@ -250,7 +254,7 @@ func (r *HostRouter) RouteForRepo(owner, name string) (*Route, error) {
 	}
 	route, err := r.RouteForOwner(owner)
 	if err != nil {
-		if missing, ok := err.(*MissingRouteError); ok {
+		if missing, ok := errors.AsType[*MissingRouteError](err); ok {
 			missing.Name = name
 		}
 	}
@@ -342,13 +346,23 @@ func withoutArchiveRoute(route *Route) *Route {
 	if route == nil {
 		return nil
 	}
-	copy := *route
-	copy.ArchiveKey = RouteKey{}
-	copy.ArchiveClient = nil
-	copy.ArchiveFetcher = nil
-	copy.ArchiveCredentialKey = ""
-	copy.ArchiveReadIdentity = IdentityKey{}
-	return &copy
+	cloned := *route
+	cloned.ArchiveKey = RouteKey{}
+	cloned.ArchiveClient = nil
+	cloned.ArchiveFetcher = nil
+	cloned.ArchiveCredentialKey = ""
+	cloned.ArchiveReadIdentity = IdentityKey{}
+	return &cloned
+}
+
+// WriteFetcherForRepo returns the GraphQL fetcher for the repository's write
+// credential, or nil when the route reads and writes with one credential.
+func (r *HostRouter) WriteFetcherForRepo(owner, name string) (*GraphQLFetcher, error) {
+	route, err := r.RouteForRepo(owner, name)
+	if err != nil {
+		return nil, err
+	}
+	return route.WriteFetcher, nil
 }
 
 func (r *HostRouter) WriteIdentityForRepo(owner, name string) (IdentityKey, error) {
@@ -398,8 +412,10 @@ type RoutedClient struct {
 var (
 	_ Client                              = (*RoutedClient)(nil)
 	_ platformgithub.ViewerAPI            = (*RoutedClient)(nil)
+	_ platformgithub.MergeQueueAPI        = (*RoutedClient)(nil)
 	_ platformgithub.ViewerCacheKeyAPI    = (*RoutedClient)(nil)
 	_ notificationThreadGetter            = (*RoutedClient)(nil)
+	_ routedNotificationPageLister        = (*RoutedClient)(nil)
 	_ notificationReadRateReserveBypasser = (*RoutedClient)(nil)
 	_ rateLimitSnapshotter                = (*RoutedClient)(nil)
 	_ platformgithub.LabelAPI             = (*RoutedClient)(nil)
@@ -407,7 +423,9 @@ var (
 	_ platformgithub.ReviewerAPI          = (*RoutedClient)(nil)
 	_ platformgithub.InventoryAPI         = (*RoutedClient)(nil)
 	_ platformgithub.LandingAPI           = (*RoutedClient)(nil)
+	_ platformgithub.LandingInventoryAPI  = (*RoutedClient)(nil)
 	_ markdownImageClient                 = (*RoutedClient)(nil)
+	_ markdownMediaClient                 = (*RoutedClient)(nil)
 	_ repoUserClient                      = (*RoutedClient)(nil)
 	_ platformgithub.NativeStackClient    = (*RoutedClient)(nil)
 )
@@ -478,6 +496,18 @@ func (c *RoutedClient) ListLandingAssociations(ctx context.Context, repo platfor
 	return client.ListLandingAssociations(ctx, repo, commit, cursor)
 }
 
+func (c *RoutedClient) ListMergedLandingChanges(ctx context.Context, repo platform.RepoRef, cursor string) (platform.Page[platform.LandingChangeRef], error) {
+	client, err := c.routeForRepoContext(ctx, repo.Owner, repo.Name)
+	if err != nil {
+		return platform.Page[platform.LandingChangeRef]{}, err
+	}
+	inventory, ok := client.(platformgithub.LandingInventoryAPI)
+	if !ok {
+		return platform.Page[platform.LandingChangeRef]{}, platform.UnsupportedCapability(platform.KindGitHub, c.routes.host, "landing_inventory")
+	}
+	return inventory.ListMergedLandingChanges(ctx, repo, cursor)
+}
+
 func (c *RoutedClient) GetLandingChange(ctx context.Context, repo platform.RepoRef, change platform.LandingChangeRef) (platform.LandingChange, error) {
 	client, err := c.landingClientForRepo(ctx, repo)
 	if err != nil {
@@ -492,6 +522,14 @@ func (c *RoutedClient) ListLandingSource(ctx context.Context, repo platform.Repo
 		return platform.Page[string]{}, err
 	}
 	return client.ListLandingSource(ctx, repo, change, cursor)
+}
+
+func (c *RoutedClient) ListLandingSourceRange(ctx context.Context, repo platform.RepoRef, change platform.LandingChangeRef, base, head, cursor string) (platform.Page[string], error) {
+	client, err := c.landingClientForRepo(ctx, repo)
+	if err != nil {
+		return platform.Page[string]{}, err
+	}
+	return client.ListLandingSourceRange(ctx, repo, change, base, head, cursor)
 }
 
 func (c *RoutedClient) ListInventoryIssuesPage(
@@ -547,6 +585,26 @@ func (c *RoutedClient) GetMarkdownImage(
 		)
 	}
 	return reader.GetMarkdownImage(ctx, owner, repo, sourceURL)
+}
+
+// OpenMarkdownMedia streams a private video attachment with the repository's
+// credential. Without it the embedded Client interface hides the method and
+// routed hosts lose markdown video playback.
+func (c *RoutedClient) OpenMarkdownMedia(
+	ctx context.Context,
+	owner, repo, sourceURL, byteRange string,
+) (platform.MarkdownMedia, error) {
+	client, err := c.routeForRepoContext(ctx, owner, repo)
+	if err != nil {
+		return platform.MarkdownMedia{}, err
+	}
+	reader, ok := client.(markdownMediaClient)
+	if !ok {
+		return platform.MarkdownMedia{}, platform.UnsupportedCapability(
+			platform.KindGitHub, c.routes.host, "read_markdown_media",
+		)
+	}
+	return reader.OpenMarkdownMedia(ctx, owner, repo, sourceURL, byteRange)
 }
 
 // ListOpenPullRequestsWithNativeStackHints and ListNativeStacksPage carry the
@@ -628,8 +686,7 @@ func (c *RoutedClient) listRepositoriesByOwnerAcrossRoutes(
 	}
 	routed, routeErr := c.routeForOwnerContext(ctx, owner)
 	if routeErr != nil {
-		var missing *MissingRouteError
-		if errors.As(routeErr, &missing) && discovery != nil {
+		if _, ok := errors.AsType[*MissingRouteError](routeErr); ok && discovery != nil {
 			return discovery.ListRepositoriesByOwner(ctx, owner)
 		}
 		return nil, routeErr
@@ -822,6 +879,20 @@ func (c *RoutedClient) ListNotifications(ctx context.Context, opts NotificationL
 	return client.ListNotifications(ctx, opts)
 }
 
+// ListNotificationPageForRepo lists the user's notifications across every
+// repository through owner/name's credential route. Owner-scoped routes have
+// no host fallback, so a host-wide listing must still pick a repository route.
+func (c *RoutedClient) ListNotificationPageForRepo(
+	ctx context.Context, owner, repo string,
+	opts NotificationListOptions, ifModifiedSince string,
+) (platformgithub.NotificationPage, error) {
+	client, err := c.routeForRepoContext(ctx, owner, repo)
+	if err != nil {
+		return platformgithub.NotificationPage{}, err
+	}
+	return platformgithub.ListNotificationPage(ctx, client, opts, ifModifiedSince)
+}
+
 func (c *RoutedClient) MarkNotificationThreadReadForRepo(
 	ctx context.Context, owner, name, threadID string,
 ) error {
@@ -847,6 +918,7 @@ func (c *RoutedClient) ListOpenPullRequests(ctx context.Context, owner, repo str
 	}
 	return client.ListOpenPullRequests(ctx, owner, repo)
 }
+
 func (c *RoutedClient) GetPullRequest(ctx context.Context, owner, repo string, number int) (*gh.PullRequest, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -854,9 +926,11 @@ func (c *RoutedClient) GetPullRequest(ctx context.Context, owner, repo string, n
 	}
 	return client.GetPullRequest(ctx, owner, repo, number)
 }
+
 func (c *RoutedClient) ListRepositoriesByOwner(ctx context.Context, owner string) ([]*gh.Repository, error) {
 	return c.listRepositoriesByOwnerAcrossRoutes(ctx, owner)
 }
+
 func (c *RoutedClient) ListReleases(ctx context.Context, owner, repo string, perPage int) ([]*gh.RepositoryRelease, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -864,6 +938,7 @@ func (c *RoutedClient) ListReleases(ctx context.Context, owner, repo string, per
 	}
 	return client.ListReleases(ctx, owner, repo, perPage)
 }
+
 func (c *RoutedClient) ListTags(ctx context.Context, owner, repo string, perPage int) ([]*gh.RepositoryTag, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -871,6 +946,7 @@ func (c *RoutedClient) ListTags(ctx context.Context, owner, repo string, perPage
 	}
 	return client.ListTags(ctx, owner, repo, perPage)
 }
+
 func (c *RoutedClient) ListOpenIssues(ctx context.Context, owner, repo string) ([]*gh.Issue, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -878,6 +954,7 @@ func (c *RoutedClient) ListOpenIssues(ctx context.Context, owner, repo string) (
 	}
 	return client.ListOpenIssues(ctx, owner, repo)
 }
+
 func (c *RoutedClient) GetIssue(ctx context.Context, owner, repo string, number int) (*gh.Issue, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -885,6 +962,7 @@ func (c *RoutedClient) GetIssue(ctx context.Context, owner, repo string, number 
 	}
 	return client.GetIssue(ctx, owner, repo, number)
 }
+
 func (c *RoutedClient) CreateIssue(ctx context.Context, owner, repo, title, body string) (*gh.Issue, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -892,6 +970,7 @@ func (c *RoutedClient) CreateIssue(ctx context.Context, owner, repo, title, body
 	}
 	return client.CreateIssue(ctx, owner, repo, title, body)
 }
+
 func (c *RoutedClient) ListIssueComments(ctx context.Context, owner, repo string, number int) ([]*gh.IssueComment, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -899,6 +978,7 @@ func (c *RoutedClient) ListIssueComments(ctx context.Context, owner, repo string
 	}
 	return client.ListIssueComments(ctx, owner, repo, number)
 }
+
 func (c *RoutedClient) ListIssueCommentsIfChanged(ctx context.Context, owner, repo string, number int) ([]*gh.IssueComment, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -906,6 +986,7 @@ func (c *RoutedClient) ListIssueCommentsIfChanged(ctx context.Context, owner, re
 	}
 	return client.ListIssueCommentsIfChanged(ctx, owner, repo, number)
 }
+
 func (c *RoutedClient) ListReviews(ctx context.Context, owner, repo string, number int) ([]*gh.PullRequestReview, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -913,6 +994,7 @@ func (c *RoutedClient) ListReviews(ctx context.Context, owner, repo string, numb
 	}
 	return client.ListReviews(ctx, owner, repo, number)
 }
+
 func (c *RoutedClient) ListPullRequestReviewThreads(ctx context.Context, owner, repo string, number int) ([]platformgithub.PullRequestReviewThread, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -920,6 +1002,7 @@ func (c *RoutedClient) ListPullRequestReviewThreads(ctx context.Context, owner, 
 	}
 	return client.ListPullRequestReviewThreads(ctx, owner, repo, number)
 }
+
 func (c *RoutedClient) ListCommits(ctx context.Context, owner, repo string, number int) ([]*gh.RepositoryCommit, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -927,6 +1010,7 @@ func (c *RoutedClient) ListCommits(ctx context.Context, owner, repo string, numb
 	}
 	return client.ListCommits(ctx, owner, repo, number)
 }
+
 func (c *RoutedClient) ListPullRequestTimelineEvents(ctx context.Context, owner, repo string, number int) ([]platformgithub.PullRequestTimelineEvent, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -934,6 +1018,7 @@ func (c *RoutedClient) ListPullRequestTimelineEvents(ctx context.Context, owner,
 	}
 	return client.ListPullRequestTimelineEvents(ctx, owner, repo, number)
 }
+
 func (c *RoutedClient) ListForcePushEvents(ctx context.Context, owner, repo string, number int) ([]platformgithub.ForcePushEvent, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -941,6 +1026,7 @@ func (c *RoutedClient) ListForcePushEvents(ctx context.Context, owner, repo stri
 	}
 	return client.ListForcePushEvents(ctx, owner, repo, number)
 }
+
 func (c *RoutedClient) GetCombinedStatus(ctx context.Context, owner, repo, ref string) (*gh.CombinedStatus, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -948,6 +1034,7 @@ func (c *RoutedClient) GetCombinedStatus(ctx context.Context, owner, repo, ref s
 	}
 	return client.GetCombinedStatus(ctx, owner, repo, ref)
 }
+
 func (c *RoutedClient) ListCheckRunsForRef(ctx context.Context, owner, repo, ref string) ([]*gh.CheckRun, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -955,6 +1042,7 @@ func (c *RoutedClient) ListCheckRunsForRef(ctx context.Context, owner, repo, ref
 	}
 	return client.ListCheckRunsForRef(ctx, owner, repo, ref)
 }
+
 func (c *RoutedClient) ListWorkflowRunsForHeadSHA(ctx context.Context, owner, repo, sha string) ([]*gh.WorkflowRun, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -962,6 +1050,7 @@ func (c *RoutedClient) ListWorkflowRunsForHeadSHA(ctx context.Context, owner, re
 	}
 	return client.ListWorkflowRunsForHeadSHA(ctx, owner, repo, sha)
 }
+
 func (c *RoutedClient) ApproveWorkflowRun(ctx context.Context, owner, repo string, runID int64) error {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -969,6 +1058,7 @@ func (c *RoutedClient) ApproveWorkflowRun(ctx context.Context, owner, repo strin
 	}
 	return client.ApproveWorkflowRun(ctx, owner, repo, runID)
 }
+
 func (c *RoutedClient) CreateIssueComment(ctx context.Context, owner, repo string, number int, body string) (*gh.IssueComment, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -976,6 +1066,7 @@ func (c *RoutedClient) CreateIssueComment(ctx context.Context, owner, repo strin
 	}
 	return client.CreateIssueComment(ctx, owner, repo, number, body)
 }
+
 func (c *RoutedClient) EditIssueComment(ctx context.Context, owner, repo string, commentID int64, body string) (*gh.IssueComment, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -983,6 +1074,7 @@ func (c *RoutedClient) EditIssueComment(ctx context.Context, owner, repo string,
 	}
 	return client.EditIssueComment(ctx, owner, repo, commentID, body)
 }
+
 func (c *RoutedClient) DeleteIssueComment(ctx context.Context, owner, repo string, commentID int64) error {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -990,6 +1082,7 @@ func (c *RoutedClient) DeleteIssueComment(ctx context.Context, owner, repo strin
 	}
 	return client.DeleteIssueComment(ctx, owner, repo, commentID)
 }
+
 func (c *RoutedClient) CreatePullRequestReviewCommentReply(ctx context.Context, owner, repo string, number int, body string, commentID int64) (*gh.PullRequestComment, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -997,6 +1090,7 @@ func (c *RoutedClient) CreatePullRequestReviewCommentReply(ctx context.Context, 
 	}
 	return client.CreatePullRequestReviewCommentReply(ctx, owner, repo, number, body, commentID)
 }
+
 func (c *RoutedClient) GetRepository(ctx context.Context, owner, repo string) (*gh.Repository, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -1004,6 +1098,15 @@ func (c *RoutedClient) GetRepository(ctx context.Context, owner, repo string) (*
 	}
 	return client.GetRepository(ctx, owner, repo)
 }
+
+func (c *RoutedClient) GetRepositoryByID(ctx context.Context, owner string, id int64) (*gh.Repository, error) {
+	client, err := c.routeForOwnerContext(ctx, owner)
+	if err != nil {
+		return nil, err
+	}
+	return client.GetRepositoryByID(ctx, owner, id)
+}
+
 func (c *RoutedClient) CreateReview(ctx context.Context, owner, repo string, number int, event, body string) (*gh.PullRequestReview, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -1011,6 +1114,7 @@ func (c *RoutedClient) CreateReview(ctx context.Context, owner, repo string, num
 	}
 	return client.CreateReview(ctx, owner, repo, number, event, body)
 }
+
 func (c *RoutedClient) CreateReviewWithComments(ctx context.Context, owner, repo string, number int, event, body, commitID string, comments []*gh.DraftReviewComment) (*gh.PullRequestReview, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -1018,6 +1122,7 @@ func (c *RoutedClient) CreateReviewWithComments(ctx context.Context, owner, repo
 	}
 	return client.CreateReviewWithComments(ctx, owner, repo, number, event, body, commitID, comments)
 }
+
 func (c *RoutedClient) ApplyReviewSuggestions(ctx context.Context, owner, repo string, number int, input platform.ApplyReviewSuggestionsInput) (*platform.AppliedReviewSuggestions, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -1025,6 +1130,7 @@ func (c *RoutedClient) ApplyReviewSuggestions(ctx context.Context, owner, repo s
 	}
 	return client.ApplyReviewSuggestions(ctx, owner, repo, number, input)
 }
+
 func (c *RoutedClient) DismissReview(ctx context.Context, owner, repo string, number int, reviewID int64, message string) (*gh.PullRequestReview, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -1032,6 +1138,7 @@ func (c *RoutedClient) DismissReview(ctx context.Context, owner, repo string, nu
 	}
 	return client.DismissReview(ctx, owner, repo, number, reviewID, message)
 }
+
 func (c *RoutedClient) MarkPullRequestReadyForReview(ctx context.Context, owner, repo string, number int) (*gh.PullRequest, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -1039,6 +1146,7 @@ func (c *RoutedClient) MarkPullRequestReadyForReview(ctx context.Context, owner,
 	}
 	return client.MarkPullRequestReadyForReview(ctx, owner, repo, number)
 }
+
 func (c *RoutedClient) ConvertPullRequestToDraft(ctx context.Context, owner, repo string, number int) (*gh.PullRequest, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -1046,6 +1154,7 @@ func (c *RoutedClient) ConvertPullRequestToDraft(ctx context.Context, owner, rep
 	}
 	return client.ConvertPullRequestToDraft(ctx, owner, repo, number)
 }
+
 func (c *RoutedClient) MergePullRequest(ctx context.Context, owner, repo string, number int, title, message, method, expectedSHA string) (*gh.PullRequestMergeResult, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -1053,6 +1162,22 @@ func (c *RoutedClient) MergePullRequest(ctx context.Context, owner, repo string,
 	}
 	return client.MergePullRequest(ctx, owner, repo, number, title, message, method, expectedSHA)
 }
+
+func (c *RoutedClient) EnqueuePullRequest(ctx context.Context, owner, repo string, number int, expectedSHA string) (platform.MergeResult, error) {
+	client, err := c.routeForRepoContext(ctx, owner, repo)
+	if err != nil {
+		return platform.MergeResult{}, err
+	}
+	enqueuer, ok := client.(platformgithub.MergeQueueAPI)
+	if !ok {
+		return platform.MergeResult{}, fmt.Errorf(
+			"enqueuing %s/%s#%d: routed GitHub client does not support merge queues",
+			owner, repo, number,
+		)
+	}
+	return enqueuer.EnqueuePullRequest(ctx, owner, repo, number, expectedSHA)
+}
+
 func (c *RoutedClient) EditPullRequest(ctx context.Context, owner, repo string, number int, opts platformgithub.EditPullRequestOpts) (*gh.PullRequest, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -1060,6 +1185,7 @@ func (c *RoutedClient) EditPullRequest(ctx context.Context, owner, repo string, 
 	}
 	return client.EditPullRequest(ctx, owner, repo, number, opts)
 }
+
 func (c *RoutedClient) EditIssue(ctx context.Context, owner, repo string, number int, state string) (*gh.Issue, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -1067,6 +1193,7 @@ func (c *RoutedClient) EditIssue(ctx context.Context, owner, repo string, number
 	}
 	return client.EditIssue(ctx, owner, repo, number, state)
 }
+
 func (c *RoutedClient) EditIssueContent(ctx context.Context, owner, repo string, number int, title, body *string) (*gh.Issue, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -1074,6 +1201,7 @@ func (c *RoutedClient) EditIssueContent(ctx context.Context, owner, repo string,
 	}
 	return client.EditIssueContent(ctx, owner, repo, number, title, body)
 }
+
 func (c *RoutedClient) ListPullRequestsPage(ctx context.Context, owner, repo, state string, page int) ([]*gh.PullRequest, bool, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -1081,6 +1209,7 @@ func (c *RoutedClient) ListPullRequestsPage(ctx context.Context, owner, repo, st
 	}
 	return client.ListPullRequestsPage(ctx, owner, repo, state, page)
 }
+
 func (c *RoutedClient) ListIssuesPage(ctx context.Context, owner, repo, state string, page int) ([]*gh.Issue, bool, error) {
 	client, err := c.routeForRepoContext(ctx, owner, repo)
 	if err != nil {
@@ -1088,6 +1217,7 @@ func (c *RoutedClient) ListIssuesPage(ctx context.Context, owner, repo, state st
 	}
 	return client.ListIssuesPage(ctx, owner, repo, state, page)
 }
+
 func (c *RoutedClient) InvalidateListETagsForRepo(owner, repo string, endpoints ...string) {
 	client, err := c.routeForRepo(owner, repo)
 	if err == nil {
@@ -1197,11 +1327,11 @@ func (c *RoutedClient) ListIssueTimelineEvents(ctx context.Context, owner, repo 
 // provider-resolved owner/name onto the configured repository identity it
 // replaced. Provider APIs keep receiving the resolved names; only credential
 // selection follows the configured route. Alias chains flatten, so repeated
-// renames still resolve to the original configured identity. providerRepoID
+// renames still resolve to the original configured identity. repoKey
 // records which repository the alias belongs to, so a replacement repository
 // reusing the route can displace it.
 func (r *HostRouter) RegisterRepoCredentialAlias(
-	owner, name string, configured RouteKey, providerRepoID string,
+	owner, name string, configured RouteKey, repoKey platform.RepositoryKey,
 ) {
 	if r == nil {
 		return
@@ -1219,8 +1349,8 @@ func (r *HostRouter) RegisterRepoCredentialAlias(
 		r.repoAliases = make(map[string]repoCredentialAlias)
 	}
 	r.repoAliases[key] = repoCredentialAlias{
-		configured:     configured,
-		providerRepoID: providerRepoID,
+		configured: configured,
+		repoKey:    repoKey,
 	}
 }
 
@@ -1229,16 +1359,16 @@ func (r *HostRouter) RegisterRepoCredentialAlias(
 // replacement repository cannot inherit the displaced repository's
 // credential. An unknown occupant identity leaves the alias untouched.
 func (r *HostRouter) ClearDisplacedRepoCredentialAlias(
-	owner, name, providerRepoID string,
+	owner, name string, repoKey platform.RepositoryKey,
 ) {
-	if r == nil || providerRepoID == "" {
+	if r == nil || repoKey.IsZero() {
 		return
 	}
 	key := repoRouteMapKey(owner, name)
 	r.aliasMu.Lock()
 	defer r.aliasMu.Unlock()
 	alias, ok := r.repoAliases[key]
-	if !ok || alias.providerRepoID == providerRepoID {
+	if !ok || alias.repoKey == repoKey {
 		return
 	}
 	delete(r.repoAliases, key)

@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
+	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 	"go.kenn.io/forge/platform"
 )
 
@@ -251,6 +251,7 @@ func (c *Client) Capabilities() platform.Capabilities {
 		ReadCI:                 true,
 		ReadLabels:             true,
 		ReadMarkdownImages:     true,
+		ReadMarkdownMedia:      true,
 		ReadAuthenticatedUser:  true,
 		CommentMutation:        true,
 		StateMutation:          true,
@@ -450,8 +451,7 @@ func (c *Client) ListOpenMergeRequests(
 		}
 		for _, mr := range mrs {
 			normalized := NormalizeMergeRequest(normalizedRef, mr, nil)
-			normalized.HeadRepoCloneURL, normalized.HeadRepoCloneURLUnknown, err =
-				c.optionalHeadRepoCloneURL(enrichCtx, normalizedRef, mr.ProjectID, mr.SourceProjectID)
+			normalized.HeadRepoCloneURL, normalized.HeadRepoCloneURLUnknown, err = c.optionalHeadRepoCloneURL(enrichCtx, normalizedRef, mr.ProjectID, mr.SourceProjectID)
 			if err != nil {
 				if errors.Is(err, platform.ErrSyncBudgetExhausted) {
 					normalized.HeadRepoCloneURL = ""
@@ -486,8 +486,7 @@ func (c *Client) GetMergeRequest(
 		)
 	}
 	normalized := NormalizeDetailedMergeRequest(normalizedRef, mr)
-	normalized.HeadRepoCloneURL, normalized.HeadRepoCloneURLUnknown, err =
-		c.optionalHeadRepoCloneURL(ctx, normalizedRef, mr.ProjectID, mr.SourceProjectID)
+	normalized.HeadRepoCloneURL, normalized.HeadRepoCloneURLUnknown, err = c.optionalHeadRepoCloneURL(ctx, normalizedRef, mr.ProjectID, mr.SourceProjectID)
 	return normalized, err
 }
 
@@ -896,29 +895,27 @@ func (c *Client) withForegroundTimeout(ctx context.Context) (context.Context, co
 }
 
 func (c *Client) projectScopedArg(ctx context.Context, ref platform.RepoRef) (any, platform.RepoRef, error) {
-	if ref.PlatformID != 0 {
-		return ref.PlatformID, c.normalizeRef(ref, ref.PlatformID), nil
+	if id, ok := ref.Key.ID(); ok {
+		return id, c.normalizeRef(ref, id), nil
 	}
 	repo, err := c.GetRepository(ctx, ref)
 	if err != nil {
 		return nil, platform.RepoRef{}, err
 	}
-	return repo.Ref.PlatformID, repo.Ref, nil
+	id, _ := repo.Ref.Key.ID()
+	return id, repo.Ref, nil
 }
 
 func (c *Client) normalizeRef(ref platform.RepoRef, id int64) platform.RepoRef {
 	ref.Platform = platform.KindGitLab
 	ref.Host = c.host
-	ref.PlatformID = id
-	if ref.PlatformExternalID == "" && id != 0 {
-		ref.PlatformExternalID = strconv.FormatInt(id, 10)
-	}
+	ref.Key = platform.RepositoryIDKey(id)
 	return ref
 }
 
 func projectLookupArg(ref platform.RepoRef) (any, error) {
-	if ref.PlatformID != 0 {
-		return ref.PlatformID, nil
+	if id, ok := ref.Key.ID(); ok {
+		return id, nil
 	}
 	return rawProjectPath(ref)
 }
@@ -1028,8 +1025,8 @@ func mapSourceProjectLookupError(err error) error {
 // Note: go-gitlab does not return a typed *gitlab.ErrorResponse for 404s; it
 // returns the sentinel gitlab.ErrNotFound. Use isGitLabNotFound for those.
 func isGitLabStatus(err error, status int) bool {
-	var gitlabErr *gitlab.ErrorResponse
-	return errors.As(err, &gitlabErr) && gitlabErr.HasStatusCode(status)
+	gitlabErr, ok := errors.AsType[*gitlab.ErrorResponse](err)
+	return ok && gitlabErr.HasStatusCode(status)
 }
 
 // isGitLabNotFound reports whether err is a GitLab 404. go-gitlab's
@@ -1084,24 +1081,26 @@ func pipelineInfo(mr *gitlab.MergeRequest) *gitlab.PipelineInfo {
 	return nil
 }
 
-var _ platform.Provider = (*Client)(nil)
-var _ platform.RepositoryReader = (*Client)(nil)
-var _ platform.MergeRequestReader = (*Client)(nil)
-var _ platform.IssueReader = (*Client)(nil)
-var _ platform.ReleaseReader = (*Client)(nil)
-var _ platform.TagReader = (*Client)(nil)
-var _ platform.CIReader = (*Client)(nil)
-var _ platform.ThreadReplier = (*Client)(nil)
-var _ platform.ThreadResolver = (*Client)(nil)
-var _ platform.AssigneeMutator = (*Client)(nil)
-var _ platform.ReviewerMutator = (*Client)(nil)
-var _ platform.CommentMutator = (*Client)(nil)
-var _ platform.StateMutator = (*Client)(nil)
-var _ platform.MergeMutator = (*Client)(nil)
-var _ platform.IssueMutator = (*Client)(nil)
-var _ platform.ReviewMutator = (*Client)(nil)
-var _ platform.MergeRequestContentMutator = (*Client)(nil)
-var _ platform.IssueContentMutator = (*Client)(nil)
-var _ platform.DiffReviewDraftMutator = (*Client)(nil)
-var _ platform.DiffReviewThreadResolver = (*Client)(nil)
-var _ platform.MergeRequestReviewThreadReader = (*Client)(nil)
+var (
+	_ platform.Provider                       = (*Client)(nil)
+	_ platform.RepositoryReader               = (*Client)(nil)
+	_ platform.MergeRequestReader             = (*Client)(nil)
+	_ platform.IssueReader                    = (*Client)(nil)
+	_ platform.ReleaseReader                  = (*Client)(nil)
+	_ platform.TagReader                      = (*Client)(nil)
+	_ platform.CIReader                       = (*Client)(nil)
+	_ platform.ThreadReplier                  = (*Client)(nil)
+	_ platform.ThreadResolver                 = (*Client)(nil)
+	_ platform.AssigneeMutator                = (*Client)(nil)
+	_ platform.ReviewerMutator                = (*Client)(nil)
+	_ platform.CommentMutator                 = (*Client)(nil)
+	_ platform.StateMutator                   = (*Client)(nil)
+	_ platform.MergeMutator                   = (*Client)(nil)
+	_ platform.IssueMutator                   = (*Client)(nil)
+	_ platform.ReviewMutator                  = (*Client)(nil)
+	_ platform.MergeRequestContentMutator     = (*Client)(nil)
+	_ platform.IssueContentMutator            = (*Client)(nil)
+	_ platform.DiffReviewDraftMutator         = (*Client)(nil)
+	_ platform.DiffReviewThreadResolver       = (*Client)(nil)
+	_ platform.MergeRequestReviewThreadReader = (*Client)(nil)
+)

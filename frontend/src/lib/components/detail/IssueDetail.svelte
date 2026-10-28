@@ -1,4 +1,6 @@
 <script lang="ts">
+  import ErrorShown from "../shared/ErrorShown.svelte";
+  import { reportWorkspaceOpenError } from "../../app/telemetry.js";
   import { Effect } from "effect";
   import { onDestroy, tick, untrack } from "svelte";
   import type { ApiProblemError, TransientTransportError } from "../../api/effect-errors.js";
@@ -29,6 +31,7 @@
   import DetailRefreshButton from "./DetailRefreshButton.svelte";
   import IssueCommentBox from "./IssueCommentBox.svelte";
   import WorkspaceCreateSplitButton from "../workspace/WorkspaceCreateSplitButton.svelte";
+  import { createDefaultWorkspaceTarget } from "../../stores/workspace-target.svelte.js";
     import { AdaptiveActionGrid, Button, Chip, Modal } from "@kenn-io/kit-ui";
   import { Spinner } from "@kenn-io/kit-ui";
   import LabelRow from "../shared/LabelRow.svelte";
@@ -60,6 +63,13 @@
     recordWorkspaceCreated,
     resolveControllerlessWorkspaceRef,
   } from "../../stores/workspace-create-pending.svelte.js";
+  import {
+    repositoryKeyAllows,
+    repositoryKeyFromWire,
+    repositoryKeyToWire,
+    sameRepositoryKey,
+    type RepositoryKey,
+  } from "../../api/repository-key.js";
 
   const CLEAR_LABELS_PENDING = "__clear-label-selection__";
 
@@ -83,7 +93,7 @@
       manualRefreshPending
       || issues.isIssueDetailLoading()
       || issues.isIssueDetailSyncing()
-      || staleIssue
+      || detailMismatch
     ) return;
     const requestIdentity = $state.snapshot(itemIdentity);
     const requestGeneration = ++manualRefreshGeneration;
@@ -92,7 +102,7 @@
       owner,
       name,
       number,
-      { provider, platformHost, repoPath },
+      { provider, platformHost, repositoryKey, repoPath },
       {
         onFailure: (message) => {
           if (isCurrentManualRefresh(requestGeneration, requestIdentity)) {
@@ -121,10 +131,12 @@
     workflow_dispatch: false,
     read_labels: false,
     read_markdown_images: false,
+    read_markdown_media: false,
     read_authenticated_user: false,
     comment_mutation: true,
     state_mutation: true,
     merge_mutation: true,
+    merge_queue_mutation: false,
     review_mutation: true,
     workflow_approval: true,
     ready_for_review: true,
@@ -150,11 +162,13 @@
   }
 
   interface Props {
+    visible?: boolean;
     owner: string;
     name: string;
     number: number;
     provider: string;
     platformHost?: string | undefined;
+    repositoryKey?: RepositoryKey | undefined;
     repoPath: string;
     hideStaleWhileLoading?: boolean;
     autoSync?: IssueDetailSyncMode;
@@ -164,11 +178,13 @@
   }
 
   const {
+    visible = true,
     owner,
     name,
     number,
     provider,
     platformHost,
+    repositoryKey,
     repoPath,
     hideStaleWhileLoading = false,
     autoSync = "background",
@@ -180,6 +196,7 @@
   const routeRef = $derived({
     provider,
     platformHost,
+    repositoryKey,
     owner,
     name,
     repoPath,
@@ -211,7 +228,7 @@
   // actions (state change, workspace create, etc.) read the props,
   // which point at the new route — so they must be gated until the
   // displayed issue catches up.
-  const staleIssue = $derived.by(() => {
+  const detailMismatch = $derived.by(() => {
     const d = issues.getIssueDetail();
     if (d == null) return false;
     if (
@@ -227,9 +244,13 @@
     // detail that is in fact current.
     return canonicalProvider(d.repo?.provider ?? "") !== canonicalProvider(provider)
       || d.repo?.repo_path !== repoPath
+      || !repositoryKeyAllows(repositoryKey, repositoryKeyFromWire(d.repo))
       || resolvedPlatformHost(provider, d.repo?.platform_host)
         !== resolvedPlatformHost(provider, platformHost);
   });
+
+  // A restored snapshot stays readable, but cannot authorize actions until revalidated.
+  const staleIssue = $derived(detailMismatch || issues.isIssueDetailFromCache());
 
   // Same comparison shape as PRListView's detailMatchesSelected, but
   // against the inline workspace identity rather than a route ref: the
@@ -247,7 +268,8 @@
       canonicalProvider(detail.repo?.provider ?? "") === canonicalProvider(identity.provider) &&
       resolvedPlatformHost(identity.provider, detail.repo?.platform_host) ===
         resolvedPlatformHost(identity.provider, identity.platformHost) &&
-      detail.repo?.repo_path === identity.repoPath
+      detail.repo?.repo_path === identity.repoPath &&
+      repositoryKeyAllows(repositoryKey, repositoryKeyFromWire(detail.repo))
     );
   }
 
@@ -278,6 +300,7 @@
   }
 
   let lastDetailLoadIdentity: WorkspaceItemIdentity | null = null;
+  let lastDetailLoadRepositoryKey: RepositoryKey | undefined;
   let lastDetailLoadAutoSync: IssueDetailSyncMode | undefined;
 
   $effect(() => {
@@ -286,15 +309,18 @@
     const requestNumber = number;
     const requestProvider = provider;
     const requestPlatformHost = platformHost;
+    const requestRepositoryKey = repositoryKey;
     const requestRepoPath = repoPath;
     const requestAutoSync = autoSync;
     const requestIdentity = $state.snapshot(itemIdentity);
     const shouldLoad =
       lastDetailLoadIdentity === null
       || !identityEquals(lastDetailLoadIdentity, requestIdentity)
+      || !sameRepositoryKey(lastDetailLoadRepositoryKey, requestRepositoryKey)
       || lastDetailLoadAutoSync !== requestAutoSync;
     if (shouldLoad) {
       lastDetailLoadIdentity = requestIdentity;
+      lastDetailLoadRepositoryKey = requestRepositoryKey;
       lastDetailLoadAutoSync = requestAutoSync;
     }
     untrack(() => {
@@ -307,6 +333,7 @@
             sync: requestAutoSync,
             provider: requestProvider,
             platformHost: requestPlatformHost,
+            repositoryKey: requestRepositoryKey,
             repoPath: requestRepoPath,
           },
         );
@@ -318,6 +345,7 @@
         {
           provider: requestProvider,
           platformHost: requestPlatformHost,
+          repositoryKey: requestRepositoryKey,
           repoPath: requestRepoPath,
         },
       );
@@ -619,6 +647,10 @@
   // still in flight, and a round-trip back to this issue must keep the
   // button disabled or a second click sends a duplicate create.
   const workspaceCreateBlocked = $derived(workspaceCreating || isWorkspaceCreatePending(itemIdentity));
+  const workspaceTarget = createDefaultWorkspaceTarget(runtime,
+    () => settings.getWorkspaceSettings().default_execution_target ?? "",
+    () => itemIdentity,
+  );
   // Bumped per create request and on identity change (route-reset
   // effect): a workspace-create response whose generation no longer
   // matches arrived for an item this component stopped showing and must
@@ -769,6 +801,7 @@
     issues.loadIssueDetail(owner, name, number, {
       provider,
       platformHost,
+      repositoryKey,
       repoPath,
     });
   }
@@ -776,7 +809,7 @@
   function createWorkspace(
     options: CreateWorkspaceOptions = {},
   ): void {
-    if (staleIssue) return;
+    if (staleIssue || workspaceTarget.reason) return;
     const detail = issues.getIssueDetail();
     if (!detail) return;
     const requestIdentity = $state.snapshot(itemIdentity);
@@ -820,6 +853,7 @@
       repoPath: requestIdentity.repoPath,
     };
     const requestBody = {
+      ...repositoryKeyToWire(repositoryKeyFromWire(detail.repo)),
       ...(options.gitHeadRef ? { git_head_ref: options.gitHeadRef.trim() } : {}),
       ...(options.reuseExistingBranch ? { reuse_existing_branch: true } : {}),
       ...(options.reuseExistingDirectory ? { reuse_existing_directory: true } : {}),
@@ -830,11 +864,45 @@
     if (branchConflict) {
       branchConflict.error = null;
     }
+    const devboxTarget = workspaceTarget.hostKey;
     const program = executeGeneratedApiRequest("POST issue workspace", (client, signal) =>
-      providerUsesHostRoute(selectedRef) ? client.IssuesService.createIssueWorkspaceOnHost({ ...providerHostRouteParams(selectedRef), number: requestIdentity.number }, requestBody, { signal }) : client.IssuesService.createIssueWorkspace({ ...providerRouteParams(selectedRef), number: requestIdentity.number }, requestBody, { signal }),
+      devboxTarget
+        ? client.DevboxesService.createDevboxWorkspace(
+            { connectionId: devboxTarget.slice(7) },
+            {
+              provider: requestIdentity.provider,
+              platform_host: requestIdentity.platformHost ?? "github.com",
+              ...repositoryKeyToWire(repositoryKeyFromWire(detail.repo)),
+              owner: requestIdentity.owner,
+              name: requestIdentity.name,
+              issue_number: requestIdentity.number,
+              branch: options.gitHeadRef ?? "",
+              reuse_existing_branch: options.reuseExistingBranch ?? false,
+            },
+            { signal },
+          )
+        : providerUsesHostRoute(selectedRef)
+          ? client.IssuesService.createIssueWorkspaceOnHost(
+              { ...providerHostRouteParams(selectedRef), number: requestIdentity.number },
+              requestBody,
+              { signal },
+            )
+          : client.IssuesService.createIssueWorkspace(
+              { ...providerRouteParams(selectedRef), number: requestIdentity.number },
+              requestBody,
+              { signal },
+            ),
     ).pipe(
       Effect.flatMap((data) =>
         Effect.sync(() => {
+          if (data?.id && devboxTarget) {
+            promoteWorkspaceCreateLaunch(requestIdentity, data.id, devboxTarget);
+            if (quickAction) runWorkspaceQuickAction(runtime, data.id, "issue", quickAction, devboxTarget);
+            if (!responseIsStale()) {
+              navigate(`/terminal/fleet/${encodeURIComponent(devboxTarget)}/${encodeURIComponent(data.id)}`);
+            }
+            return;
+          }
           if (data?.id) {
             // Publish the confirmed creation before any liveness guard: the
             // workspace exists server-side even after navigation or unmount.
@@ -845,7 +913,7 @@
             promoteWorkspaceCreateLaunch(requestIdentity, createdRef.id, undefined);
             recordWorkspaceCreated(requestIdentity, createdRef);
             inlineWorkspace?.recordCreated(requestIdentity, createdRef);
-            if (quickAction) runWorkspaceQuickAction(runtime, createdRef.id, quickAction);
+            if (quickAction) runWorkspaceQuickAction(runtime, createdRef.id, "issue", quickAction);
           }
           if (responseIsStale()) return;
           pendingWorkspaceLaunchTarget = null;
@@ -893,11 +961,11 @@
         }
         const message = problem?.detail ?? problem?.title ??
           (failure._tag === "ApiProblemError" ? "failed to create workspace" : "Could not reach Kenn Forge");
-        if (options.fromConflictDialog && branchConflict) {
-          branchConflict.error = message;
-          return;
+        if (options.fromConflictDialog && branchConflict) branchConflict.error = message;
+        else {
+          showFlash(message, { tone: "danger" });
+          if (launchTargetKey || quickAction) reportWorkspaceOpenError(runtime);
         }
-        showFlash(message, { tone: "danger" });
       },
     });
   }
@@ -1182,13 +1250,13 @@
 
 <svelte:document onmousedown={onDocumentMousedown} />
 
-{#if issues.isIssueDetailLoading() && (issues.getIssueDetail() === null || (staleIssue && hideStaleWhileLoading))}
+{#if issues.isIssueDetailLoading() && (issues.getIssueDetail() === null || (detailMismatch && hideStaleWhileLoading))}
   <div class="state-center"><p class="state-msg">Loading...</p></div>
-{:else if issues.getIssueDetailError() !== null && (issues.getIssueDetail() === null || (staleIssue && hideStaleWhileLoading))}
+{:else if issues.getIssueDetailError() !== null && (issues.getIssueDetail() === null || (detailMismatch && hideStaleWhileLoading))}
   <div class="state-center"><p class="state-msg state-msg--error">Error: {issues.getIssueDetailError()}</p></div>
 {:else}
   {@const detail = issues.getIssueDetail()}
-  {@const staleLoadError = staleIssue && issues.getIssueDetailError() !== null}
+  {@const detailLoadError = issues.getIssueDetailError() !== null}
   {#if detail !== null}
     {@const issue = detail.issue}
     {@const labels = issue.labels ?? []}
@@ -1196,9 +1264,10 @@
     <ScrollBox label="Issue conversation">
     <div class="issue-detail">
       <div class="issue-detail-content">
-      {#if staleLoadError}
+      {#if detailLoadError}
         <div class="detail-load-error" data-testid="detail-load-error">
-          Couldn't load this issue: {issues.getIssueDetailError()}
+          {detailMismatch ? "Couldn't load this issue:" : "Couldn't refresh this issue. Showing previously loaded content:"}
+          {issues.getIssueDetailError()}
         </div>
       {/if}
       {#if issues.isIssueStaleRefreshing() && !manualRefreshPending}
@@ -1376,10 +1445,10 @@
             busyLabel="Creating..."
             launchTargets={settings.getLaunchTargets()}
             busy={workspaceCreateBlocked}
-            disabled={staleIssue}
+            disabled={staleIssue || workspaceTarget.reason !== ""}
             disabledReason={staleIssue
               ? "Refresh details before creating a workspace."
-              : createWorkspaceTitle}
+              : workspaceTarget.reason || workspaceTarget.hint || createWorkspaceTitle}
             descriptionId={createWorkspaceDescriptionId}
             onCreate={(targetKey) => void createWorkspace(
               targetKey === undefined ? {} : { launchTargetKey: targetKey },
@@ -1452,7 +1521,7 @@
         <span id={createWorkspaceDescriptionId} class="kit-sr-only">
           {staleIssue
             ? "Refresh details before creating a workspace."
-            : createWorkspaceTitle}
+            : workspaceTarget.reason || workspaceTarget.hint || createWorkspaceTitle}
         </span>
       {/if}
       <AdaptiveActionGrid
@@ -1495,7 +1564,7 @@
                   repo={{ provider, platformHost, owner, name, repoPath }}
                   options={{
                     interactiveTasks: capabilities.state_mutation && !contentGate.unavailable,
-                    collapseSingleLineBreaks: settings.getDetailSettings().collapse_single_line_breaks,
+                    collapseSingleLineBreaks: true,
                   }}
                 />
               </div>
@@ -1512,8 +1581,10 @@
           {number}
           provider={detail.repo.provider}
           platformHost={detail.platform_host}
+          repositoryKey={repositoryKeyFromWire(detail.repo)}
           repoPath={detail.repo.repo_path}
           disabled={staleIssue || !capabilities.comment_mutation || addCommentGate.unavailable}
+          editorDisabled={detailMismatch || !capabilities.comment_mutation || addCommentGate.unavailable}
           disabledReason={addCommentGate.unavailable ? addCommentGate.reason : undefined}
         />
       </div>
@@ -1524,7 +1595,7 @@
           <h3 class="section-title">Activity</h3>
           <div class="section-title-actions">
             <DetailRefreshButton
-              disabled={issues.isIssueDetailLoading() || issues.isIssueDetailSyncing() || staleIssue}
+              disabled={issues.isIssueDetailLoading() || issues.isIssueDetailSyncing() || detailMismatch}
               refreshing={manualRefreshPending}
               onRefresh={refreshDetail}
             />
@@ -1536,9 +1607,11 @@
         </div>
         {#if issues.getIssueDetailLoaded()}
           <EventTimeline
+            {visible}
             events={detail.events ?? []}
             {provider}
             {platformHost}
+            {repositoryKey}
             repoOwner={owner}
             repoName={name}
             {repoPath}
@@ -1569,6 +1642,9 @@
 
     {#if branchConflict}
       {@const conflict = branchConflict}
+      {#if conflict.error && !workspaceCreating && (pendingWorkspaceLaunchTarget || pendingWorkspaceQuickAction)}
+        <ErrorShown kind="workspace_opened" scope={`issue-create:${owner}/${name}#${number}`} />
+      {/if}
       <Modal
         title={conflict.existingDirectory
           ? "Existing Workspace Directory"
@@ -1870,20 +1946,28 @@
   }
 
   .section-title {
-    font-size: var(--font-size-sm);
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--text-muted);
+    font-size: var(--font-size-md);
+    font-weight: var(--font-weight-semibold);
+    text-transform: var(--label-transform, uppercase);
+    letter-spacing: var(--letter-spacing-label, 0.05em);
+    color: var(--text-primary);
   }
 
   .inset-box__content {
-    padding: 10px 12px;
+    padding: var(--space-2) 0;
     font-size: var(--font-size-root);
     color: var(--text-primary);
     word-break: break-word;
     line-height: 1.6;
   }
+  .inset-box__content > :global(:first-child) {
+    margin-top: 0;
+  }
+
+  .inset-box__content > :global(:last-child) {
+    margin-bottom: 0;
+  }
+
 
   .issue-detail :global(.issue-actions-grid) {
     padding: var(--space-4) 0;

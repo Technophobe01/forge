@@ -3,6 +3,8 @@ package testutil
 import (
 	"bytes"
 	"context"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,12 +12,13 @@ import (
 
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/gitclone"
-	gitcmd "go.kenn.io/kit/git/cmd"
+	"go.kenn.io/forge/internal/testutil/gitsafe"
+	"go.kenn.io/forge/platform"
 )
 
 // DiffRepoResult holds the SHAs from the test repo for use in assertions.
 type DiffRepoResult struct {
-	PlatformRepoID string
+	Key            platform.RepositoryKey
 	BaseSHA        string // merge-base / base branch tip
 	HeadSHA        string // PR head commit
 	AltHeadSHA     string // newer PR head commit used by E2E refresh tests
@@ -44,10 +47,10 @@ func SetupDiffRepo(
 	workDir := filepath.Join(tmpDir, "workrepo")
 	cloneBase := filepath.Join(tmpDir, "clones")
 	repoIdentity := db.GitHubRepoIdentity("github.com", "acme", "widgets")
-	repoIdentity.PlatformRepoID = "repo-acme-widgets"
+	repoIdentity.Key = platform.RepositoryIDKey(FixtureRepoID("acme", "widgets"))
 	mgr := gitclone.New(cloneBase, nil)
 	barePath, err := mgr.ClonePathForContext(
-		gitclone.WithRepositoryIdentity(ctx, repoIdentity.PlatformRepoID),
+		gitclone.WithRepositoryIdentity(ctx, repoIdentity.ProviderIdentity()),
 		"github", "github.com", "acme", "widgets",
 	)
 	if err != nil {
@@ -119,6 +122,13 @@ func SetupDiffRepo(
 
 	if err := git(ctx, workDir,
 		"checkout", "-b", "feature/caching"); err != nil {
+		return nil, err
+	}
+
+	// Give PR #1's surviving seeded commits real ancestors of the head so
+	// sync's clone ancestry check agrees with the seeded timeline.
+	survivingCommitSHAs, err := appendSeededPR1Commits(ctx, workDir, "refs/heads/feature/caching")
+	if err != nil {
 		return nil, err
 	}
 
@@ -229,7 +239,7 @@ func SetupDiffRepo(
 	}
 
 	// Seed database with the real SHAs for acme/widgets PR #1.
-	repoID, err := d.UpsertRepo(ctx, repoIdentity)
+	repoID, err := upsertFixtureRepo(ctx, d, repoIdentity)
 	if err != nil {
 		return nil, fmt.Errorf("upsert repo: %w", err)
 	}
@@ -242,7 +252,10 @@ func SetupDiffRepo(
 		ctx, repoID, 1, headSHA, baseSHA); err != nil {
 		return nil, fmt.Errorf("update platform SHAs: %w", err)
 	}
-	if err := d.UpdateRepoProviderMetadata(
+	if err := alignWidgetsPR1CommitEvents(ctx, d, repoID, survivingCommitSHAs); err != nil {
+		return nil, err
+	}
+	if err := d.UpdateRepoProviderObservation(
 		ctx,
 		repoID,
 		db.RepoProviderMetadata{
@@ -250,12 +263,13 @@ func SetupDiffRepo(
 			CloneURL:      barePath,
 			DefaultBranch: "main",
 		},
+		nil, nil,
 	); err != nil {
 		return nil, fmt.Errorf("update repo provider metadata: %w", err)
 	}
 
 	return &DiffRepoResult{
-		PlatformRepoID: repoIdentity.PlatformRepoID,
+		Key:            repoIdentity.Key,
 		BaseSHA:        baseSHA,
 		HeadSHA:        headSHA,
 		AltHeadSHA:     altHeadSHA,
@@ -265,6 +279,106 @@ func SetupDiffRepo(
 		AddedFiles:     []string{"internal/cache.go"},
 		DeletedFiles:   []string{"config.yaml"},
 	}, nil
+}
+
+// appendSeededPR1Commits appends one empty commit per surviving seeded PR #1
+// commit to branch and maps each seeded SHA to its real commit. One fast-import
+// process writes them all; unlike git commit it runs no hooks and never signs,
+// so fixture startup stays fast when the caller's Git config signs commits.
+func appendSeededPR1Commits(
+	ctx context.Context,
+	dir, branch string,
+) (map[string]string, error) {
+	var stream strings.Builder
+	for i, seededSHA := range widgetsPR1SurvivingCommits {
+		message := "seeded PR #1 commit " + seededSHA[:7]
+		fmt.Fprintf(&stream, "commit %s\nmark :%d\n", branch, i+1)
+		stream.WriteString(
+			"committer Test <kenn-forge-fixture@example.invalid> 1774699200 +0000\n")
+		fmt.Fprintf(&stream, "data %d\n%s\n", len(message), message)
+		if i == 0 {
+			fmt.Fprintf(&stream, "from %s^0\n", branch)
+		}
+		stream.WriteString("\n")
+	}
+	for i := range widgetsPR1SurvivingCommits {
+		fmt.Fprintf(&stream, "get-mark :%d\n", i+1)
+	}
+	stdout, stderr, err := gitsafe.Runner().Run(
+		ctx, dir, strings.NewReader(stream.String()), "fast-import", "--quiet")
+	if err != nil {
+		return nil, fmt.Errorf("git fast-import seeded PR #1 commits: %w: %s", err, stderr)
+	}
+	realSHAs := strings.Fields(string(stdout))
+	if len(realSHAs) != len(widgetsPR1SurvivingCommits) {
+		return nil, fmt.Errorf(
+			"git fast-import returned %d commits, want %d",
+			len(realSHAs), len(widgetsPR1SurvivingCommits))
+	}
+	mapped := make(map[string]string, len(realSHAs))
+	for i, seededSHA := range widgetsPR1SurvivingCommits {
+		mapped[seededSHA] = realSHAs[i]
+	}
+	return mapped, nil
+}
+
+// alignWidgetsPR1CommitEvents points seeded PR #1 commit events and
+// force-push targets at the real commits in realSHAs. Callers that do not seed
+// PR #1, or seed it without the fixture timeline, have nothing to change.
+func alignWidgetsPR1CommitEvents(
+	ctx context.Context,
+	d *db.DB,
+	repoID int64,
+	realSHAs map[string]string,
+) error {
+	mr, err := d.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 1)
+	if err != nil {
+		return fmt.Errorf("get PR #1: %w", err)
+	}
+	if mr == nil {
+		return nil
+	}
+	events, err := d.ListMREvents(ctx, mr.ID)
+	if err != nil {
+		return fmt.Errorf("list PR #1 events: %w", err)
+	}
+	var changed []db.MREvent
+	for _, event := range events {
+		switch event.EventType {
+		case "commit":
+			realSHA, ok := realSHAs[event.Summary]
+			if !ok {
+				continue
+			}
+			event.Summary = realSHA
+		case "force_push":
+			var metadata map[string]any
+			if err := json.Unmarshal([]byte(event.MetadataJSON), &metadata); err != nil {
+				return fmt.Errorf("decode force push %s metadata: %w", event.DedupeKey, err)
+			}
+			afterSHA, _ := metadata["after_sha"].(string)
+			realSHA, ok := realSHAs[afterSHA]
+			if !ok || metadata == nil {
+				continue
+			}
+			metadata["after_sha"] = realSHA
+			encoded, err := json.Marshal(metadata)
+			if err != nil {
+				return fmt.Errorf("encode force push %s metadata: %w", event.DedupeKey, err)
+			}
+			event.MetadataJSON = string(encoded)
+		default:
+			continue
+		}
+		changed = append(changed, event)
+	}
+	if len(changed) == 0 {
+		return nil
+	}
+	if err := d.UpsertMREvents(ctx, changed); err != nil {
+		return fmt.Errorf("align PR #1 commit events: %w", err)
+	}
+	return nil
 }
 
 func diffContextFileContent(index int, changed bool) string {
@@ -296,9 +410,9 @@ func diffContextFileContent(index int, changed bool) string {
 
 func git(ctx context.Context, dir string, args ...string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("git: no args")
+		return errors.New("git: no args")
 	}
-	cmd := gitcmd.New().Command(ctx, dir, args...)
+	cmd := gitsafe.Runner().Command(ctx, dir, args...)
 	// Strip inherited GIT_* variables before spawning git. When the
 	// test binary is invoked from a git hook (e.g. prek's pre-commit
 	// hook running `go test`), the outer git exports GIT_DIR,
@@ -319,7 +433,7 @@ func git(ctx context.Context, dir string, args ...string) error {
 }
 
 func revParse(ctx context.Context, dir, ref string) (string, error) {
-	out, err := gitcmd.New().Output(ctx, dir, "rev-parse", ref)
+	out, err := gitsafe.Runner().Output(ctx, dir, "rev-parse", ref)
 	if err != nil {
 		return "", err
 	}

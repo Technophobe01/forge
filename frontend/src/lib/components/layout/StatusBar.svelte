@@ -12,14 +12,19 @@
   import BudgetPopover from "./BudgetPopover.svelte";
   import RelayIndicator from "./RelayIndicator.svelte";
   import { formatCompact } from "./budget-utils";
-  import { getPage } from "../../stores/router.svelte.ts";
+  import { getPage, isWorkspacePage, navigate } from "../../stores/router.svelte.ts";
+  import { repositoryKeyFromWire } from "../../api/repository-key.js";
 
-  const { activity, pulls, issues, sync, events } = getStores();
+  const { activity, pulls, issues, workspaceItemSearch, sync, events, settings } = getStores();
   const runtime = getAppRuntime();
   const liveUpdateState = $derived(events.getConnectionState());
 
   let appVersion = $state("");
   let tick = $state(0);
+
+  $effect(() => {
+    if (isWorkspacePage(getPage())) untrack(() => workspaceItemSearch.ensureLoaded());
+  });
 
   $effect(() => {
     const loadVersion = executeGeneratedApiRequest("GET /version", (client, signal) =>
@@ -65,14 +70,19 @@
     return `synced ${Math.floor(mins / 60)}h ago`;
   }
 
-  const openPulls = $derived(pulls.getPulls().filter((pr) => pr.State === "open"));
-  const openIssues = $derived(issues.getIssues().filter((issue) => issue.State === "open"));
+  const openPulls = $derived(
+    (isWorkspacePage(getPage()) ? workspaceItemSearch.getPulls() : pulls.getPulls()).filter((pr) => pr.State === "open"),
+  );
+  const openIssues = $derived(
+    (isWorkspacePage(getPage()) ? workspaceItemSearch.getIssues() : issues.getIssues()).filter((issue) => issue.State === "open"),
+  );
 
   interface RepoBackedItem {
     repo?: {
       provider?: string | undefined;
       platform_host?: string | undefined;
-      platform_repo_id?: string | undefined;
+      platform_repo_id?: number | undefined;
+      bitbucket_repository_uuid?: string | undefined;
       repo_path?: string | undefined;
       owner?: string | undefined;
       name?: string | undefined;
@@ -106,7 +116,7 @@
     return repoIdentityKey({
       provider,
       platformHost,
-      platformRepoId: item.repo?.platform_repo_id,
+      repositoryKey: repositoryKeyFromWire(item.repo),
       owner: item.repo?.owner ?? item.repo_owner ?? "",
       name: item.repo?.name ?? item.repo_name ?? "",
       repoPath,
@@ -281,6 +291,16 @@
     <span class="status-item">{counts.repos} repos</span>
   {/snippet}
   {#snippet right()}
+    {#if settings.getAirplaneMode()}
+      <button
+        type="button"
+        class="status-item status-item--airplane status-button"
+        aria-label="Airplane mode: open Sync settings"
+        title="Automatic background sync is paused; an update already running will finish. Open Sync settings"
+        onclick={() => navigate("/settings?section=settings-sync")}
+      >airplane mode</button>
+      <span class="status-sep">&middot;</span>
+    {/if}
     {@const relay = sync.getSyncState()?.relay}
     {#if relay}
       <RelayIndicator status={relay} />
@@ -322,7 +342,7 @@
       {#if liveUpdateState === "disconnected"}
         <button
           type="button"
-          class="status-item status-item--error status-item--live-updates live-updates-button"
+          class="status-item status-item--error status-item--live-updates status-button"
           aria-label="Reconnect live updates"
           title={events.getLastError() ?? "Reconnect live updates"}
           onclick={events.reconnect}
@@ -339,6 +359,14 @@
       <span class="status-sep">&middot;</span>
     {/if}
     {#if sync.getProviderAvailable()}
+      {@const overdue = sync.getSyncState()?.detail_refresh_overdue ?? 0}
+      {#if overdue > 0}
+        <span
+          class="status-item status-item--overdue"
+          title="Open PRs/issues not checked in 24 hours or never checked. Background refresh stays within the API budget."
+        >{overdue} overdue checks</span>
+        <span class="status-sep">&middot;</span>
+      {/if}
       <span class="status-item" class:status-item--active={sync.getSyncState()?.running}>
         {#if sync.getSyncState()?.running}
           <StatusDot status="working" label="Syncing" size={5} animated />
@@ -360,6 +388,12 @@
   .status-item--error {
     color: var(--accent-red);
   }
+  .status-item--airplane {
+    color: var(--accent-amber);
+  }
+  .status-item--overdue {
+    color: var(--accent-amber);
+  }
   .status-item--active {
     color: var(--accent-green);
     display: flex;
@@ -376,7 +410,7 @@
     align-items: center;
     gap: 4px;
   }
-  .live-updates-button {
+  .status-button {
     padding: 0;
     border: 0;
     background: transparent;

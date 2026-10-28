@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -15,9 +16,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/db"
+	"go.kenn.io/forge/internal/ptyowner"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/testutil/dbtest"
-	"go.kenn.io/forge/internal/workspace"
+	"go.kenn.io/forge/internal/testutil/workspacetest"
 	"go.kenn.io/forge/internal/workspace/localruntime"
 )
 
@@ -48,7 +50,7 @@ func newAgentHandoffFixture(t *testing.T, status string) agentHandoffFixture {
 	})
 	t.Cleanup(runtime.Shutdown)
 	handler := New(Deps{
-		DB: database, Workspaces: workspace.NewManager(database, filepath.Join(dir, "worktrees")),
+		DB: database, Workspaces: workspacetest.NewManager(t, database, filepath.Join(dir, "worktrees")),
 		Runtime: runtime,
 	})
 	handler.agentHandoffPollInterval = 10 * time.Millisecond
@@ -68,7 +70,7 @@ func (f agentHandoffFixture) request(t *testing.T, body map[string]string) *http
 	t.Helper()
 	encoded, err := json.Marshal(body)
 	require.NoError(t, err)
-	request := httptest.NewRequest(
+	request := httptest.NewRequestWithContext(t.Context(),
 		http.MethodPost, "/api/v1/workspaces/ws-runtime-token/runtime/agent-handoffs", bytes.NewReader(encoded),
 	)
 	request.Header.Set("Content-Type", "application/json")
@@ -87,16 +89,11 @@ func (f agentHandoffFixture) post(t *testing.T, body map[string]string) *httptes
 	return f.serve(f.request(t, body))
 }
 
-func TestAgentHandoffWaitsForReadyThenLaunchesAndDeliversPrompt(t *testing.T) {
+func TestAgentHandoffLaunchesAndDeliversPrompt(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
-	fixture := newAgentHandoffFixture(t, "creating")
-
-	// The workspace becomes ready while the handoff is already waiting.
-	readyTimer := time.AfterFunc(60*time.Millisecond, func() {
-		_ = fixture.database.UpdateWorkspaceStatus(context.Background(), "ws-runtime-token", "ready", nil)
-	})
-	t.Cleanup(func() { readyTimer.Stop() })
+	fixture := newAgentHandoffFixture(t, "ready")
 
 	response := fixture.post(t, map[string]string{
 		"target_key": "CoDeX", "message": "rebase this pull request\r\nonto main",
@@ -134,7 +131,55 @@ func TestAgentHandoffWaitsForReadyThenLaunchesAndDeliversPrompt(t *testing.T) {
 	assert.Equal(body.Session.Key, sessions[0].Key)
 }
 
+func TestClaudeHandoffProvidesPromptAtLaunchWithoutTypingIntoStartupDialogs(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	fixture := newAgentHandoffFixture(t, "ready")
+	fixture.handler.runtime.UpdateTargets([]localruntime.LaunchTarget{{
+		Key: "reviewer", Kind: localruntime.LaunchTargetAgent, Available: true,
+		Command: []string{"claude", "--model", "model-a"},
+	}})
+	fixture.owner.setEmitBracketedPaste(false)
+	const message = "--review this PR\nDon't run $(commands)."
+	result, err := fixture.handler.LaunchWorkspaceAgentHandoffService(t.Context(), WorkspaceAgentHandoffRequest{
+		WorkspaceID: "ws-runtime-token", TargetKey: "reviewer", Message: message,
+	})
+	require.NoError(err)
+	assert.Equal([]string{"claude", "--model", "model-a", "--", message}, fixture.owner.command)
+	assert.Empty(fixture.owner.pty.written())
+	assert.Equal(initialMessageDelivered, result.InitialMessage.State)
+	repeated, err := fixture.handler.SubmitInitialMessageService(t.Context(), InitialMessageRequest{
+		WorkspaceID: "ws-runtime-token", RuntimeSessionKey: result.Session.Key,
+		TargetKey: "reviewer", Message: message,
+	})
+	require.NoError(err)
+	assert.Equal(result.InitialMessage, repeated)
+	assert.Empty(fixture.owner.pty.written())
+}
+
+func TestAgentHandoffReportsOversizedCommandAsBadRequest(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	fixture := newAgentHandoffFixture(t, "ready")
+	// The Windows launch boundary returns this typed error before starting a process.
+	fixture.owner.startErr = fmt.Errorf("start pty owner: %w", ptyowner.ErrCommandLineTooLong)
+	response := fixture.post(t, map[string]string{
+		"target_key": "codex", "message": "review this PR",
+	})
+	require.Equal(http.StatusBadRequest, response.Code, response.Body.String())
+	var problem struct {
+		Code   string `json:"code"`
+		Detail string `json:"detail"`
+	}
+	require.NoError(json.NewDecoder(response.Body).Decode(&problem))
+	require.Equal("badRequest", problem.Code)
+	require.Contains(problem.Detail, "shorten the prompt or launch arguments")
+	require.Empty(fixture.handler.runtime.ListSessions("ws-runtime-token"))
+}
+
 func TestAgentHandoffRetriesUntilAgentInputModeIsReady(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	fixture := newAgentHandoffFixture(t, "ready")
@@ -155,7 +200,11 @@ func TestAgentHandoffRetriesUntilAgentInputModeIsReady(t *testing.T) {
 		fixture.owner.mu.Unlock()
 		return pty != nil && len(fixture.handler.runtime.ListSessions("ws-runtime-token")) == 1
 	}, time.Second, 5*time.Millisecond)
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case response := <-done:
+		require.FailNow("handoff completed before input mode became ready", response.Body.String())
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // shows the event does not happen; handoff must wait for bracketed-paste readiness
+	}
 	assert.Empty(pty.written())
 	pty.output <- []byte("\x1b[?2004h")
 
@@ -170,6 +219,7 @@ func TestAgentHandoffRetriesUntilAgentInputModeIsReady(t *testing.T) {
 }
 
 func TestAgentHandoffRejectsInvalidInputBeforeWaiting(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	fixture := newAgentHandoffFixture(t, "creating")
 
@@ -178,12 +228,18 @@ func TestAgentHandoffRejectsInvalidInputBeforeWaiting(t *testing.T) {
 		body map[string]string
 		want string
 	}{
-		{name: "non-agent target", body: map[string]string{"target_key": "shell", "message": "hi"},
-			want: "not an available agent launch target"},
-		{name: "unknown target", body: map[string]string{"target_key": "nope", "message": "hi"},
-			want: "not an available agent launch target"},
-		{name: "blank message", body: map[string]string{"target_key": "codex", "message": "  \n"},
-			want: "must not be blank"},
+		{
+			name: "non-agent target", body: map[string]string{"target_key": "shell", "message": "hi"},
+			want: "not an available agent launch target",
+		},
+		{
+			name: "unknown target", body: map[string]string{"target_key": "nope", "message": "hi"},
+			want: "not an available agent launch target",
+		},
+		{
+			name: "blank message", body: map[string]string{"target_key": "codex", "message": "  \n"},
+			want: "must not be blank",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -198,6 +254,7 @@ func TestAgentHandoffRejectsInvalidInputBeforeWaiting(t *testing.T) {
 }
 
 func TestAgentHandoffReportsWorkspaceSetupFailure(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	fixture := newAgentHandoffFixture(t, "creating")
 	failure := "clone failed"
@@ -210,6 +267,7 @@ func TestAgentHandoffReportsWorkspaceSetupFailure(t *testing.T) {
 }
 
 func TestAgentHandoffTimesOutWhileWorkspaceNeverBecomesReady(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	fixture := newAgentHandoffFixture(t, "creating")
 	fixture.handler.agentHandoffTimeout = 50 * time.Millisecond
@@ -221,6 +279,7 @@ func TestAgentHandoffTimesOutWhileWorkspaceNeverBecomesReady(t *testing.T) {
 }
 
 func TestAgentHandoffSurvivesClientCancellationWhileWaiting(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	fixture := newAgentHandoffFixture(t, "creating")
@@ -228,74 +287,90 @@ func TestAgentHandoffSurvivesClientCancellationWhileWaiting(t *testing.T) {
 	// The client goes away while the workspace is still provisioning; the
 	// accepted handoff must still launch the agent and deliver the prompt.
 	requestCtx, cancelRequest := context.WithCancel(t.Context())
+	t.Cleanup(cancelRequest)
 	request := fixture.request(t, map[string]string{"target_key": "codex", "message": "rebase this"}).
 		WithContext(requestCtx)
 	done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		done <- fixture.serve(request)
 	}()
-	time.Sleep(40 * time.Millisecond)
-	cancelRequest()
-	time.Sleep(20 * time.Millisecond)
-	require.NoError(fixture.database.UpdateWorkspaceStatus(context.Background(), "ws-runtime-token", "ready", nil))
-
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		require.FailNow("handoff did not finish after the client canceled")
-	}
+	// Cancel only after validation has transferred ownership to the handoff.
 	require.Eventually(func() bool {
-		return fixture.owner.pty != nil && string(fixture.owner.pty.written()) == "\x1b[200~rebase this\x1b[201~\r"
+		fixture.handler.lifecycleMu.Lock()
+		defer fixture.handler.lifecycleMu.Unlock()
+		return fixture.handler.agentHandoffCtx != nil
 	}, time.Second, 5*time.Millisecond)
-	assert.Len(fixture.handler.runtime.ListSessions("ws-runtime-token"), 1)
-}
-
-func TestAgentHandoffCancelsPromptlyOnShutdown(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	fixture := newAgentHandoffFixture(t, "creating")
-	fixture.handler.agentHandoffTimeout = time.Minute
-
-	request := fixture.request(t, map[string]string{"target_key": "codex", "message": "hi"})
-	done := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		done <- fixture.serve(request)
-	}()
-	time.Sleep(40 * time.Millisecond)
-	started := time.Now()
-	fixture.handler.CancelAgentHandoffs()
+	cancelRequest()
+	require.NoError(fixture.database.UpdateWorkspaceStatus(t.Context(), "ws-runtime-token", "ready", nil))
 
 	var response *httptest.ResponseRecorder
 	select {
 	case response = <-done:
-	case <-time.After(2 * time.Second):
-		require.FailNow("handoff kept waiting after shutdown cancellation")
+	case <-time.After(3 * time.Second):
+		require.FailNow("handoff did not finish after the client canceled")
 	}
-	assert.Less(time.Since(started), time.Second)
-	assert.Equal(http.StatusServiceUnavailable, response.Code, response.Body.String())
-	assert.Contains(response.Body.String(), "canceled by shutdown")
-	assert.Empty(fixture.handler.runtime.ListSessions("ws-runtime-token"))
+	require.Equal(http.StatusOK, response.Code, response.Body.String())
+	require.NotNil(fixture.owner.pty)
+	assert.Equal("\x1b[200~rebase this\x1b[201~\r", string(fixture.owner.pty.written()))
+	assert.Len(fixture.handler.runtime.ListSessions("ws-runtime-token"), 1)
 }
 
-func TestAgentHandoffRefusesToWaitAfterShutdownCancellation(t *testing.T) {
-	// Shutdown may cancel before any handoff has created the shared
-	// context. A request arriving after that must not start a fresh wait
-	// that only the later workspace shutdown could end.
-	assert := assert.New(t)
-	fixture := newAgentHandoffFixture(t, "creating")
-	fixture.handler.agentHandoffTimeout = time.Minute
-	fixture.handler.CancelAgentHandoffs()
-
-	started := time.Now()
-	response := fixture.post(t, map[string]string{"target_key": "codex", "message": "hi"})
-
-	assert.Less(time.Since(started), time.Second)
-	assert.Equal(http.StatusServiceUnavailable, response.Code, response.Body.String())
-	assert.Contains(response.Body.String(), "canceled by shutdown")
-	assert.Empty(fixture.handler.runtime.ListSessions("ws-runtime-token"))
+func TestAgentHandoffCancelsOnShutdown(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		cancelBeforeRequest bool
+	}{
+		{name: "while waiting"},
+		{name: "before request", cancelBeforeRequest: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert := assert.New(t)
+			require := require.New(t)
+			fixture := newAgentHandoffFixture(t, "creating")
+			fixture.handler.agentHandoffTimeout = time.Minute
+			pending := make(chan struct{}, 1)
+			if !tc.cancelBeforeRequest {
+				fixture.handler.onAgentHandoffPending = func() {
+					select {
+					case pending <- struct{}{}:
+					default:
+					}
+				}
+			}
+			if tc.cancelBeforeRequest {
+				// Cancellation before shared-context creation must prevent a fresh wait.
+				fixture.handler.CancelAgentHandoffs()
+			}
+			request := fixture.request(t, map[string]string{"target_key": "codex", "message": "hi"})
+			done := make(chan *httptest.ResponseRecorder, 1)
+			started := time.Now()
+			go func() { done <- fixture.serve(request) }()
+			if !tc.cancelBeforeRequest {
+				select {
+				case <-pending:
+				case <-time.After(3 * time.Second):
+					require.FailNow("handoff did not observe the pending workspace")
+				}
+				started = time.Now()
+				fixture.handler.CancelAgentHandoffs()
+			}
+			var response *httptest.ResponseRecorder
+			select {
+			case response = <-done:
+			case <-time.After(2 * time.Second):
+				require.FailNow("handoff kept waiting after shutdown cancellation")
+			}
+			assert.Less(time.Since(started), time.Second)
+			assert.Equal(http.StatusServiceUnavailable, response.Code, response.Body.String())
+			assert.Contains(response.Body.String(), "agent handoff canceled by shutdown while waiting for workspace to become ready")
+			assert.Empty(fixture.handler.runtime.ListSessions("ws-runtime-token"))
+		})
+	}
 }
 
 func TestAgentHandoffReportsLaunchedSessionWhenPromptDeliveryTimesOut(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	fixture := newAgentHandoffFixture(t, "ready")
@@ -324,6 +399,7 @@ func TestAgentHandoffReportsLaunchedSessionWhenPromptDeliveryTimesOut(t *testing
 }
 
 func TestAgentHandoffDeliveryPreservesCancellationCause(t *testing.T) {
+	t.Parallel()
 	for _, cause := range []error{context.DeadlineExceeded, context.Canceled} {
 		t.Run(cause.Error(), func(t *testing.T) {
 			fixture := newAgentHandoffFixture(t, "ready")

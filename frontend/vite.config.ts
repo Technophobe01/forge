@@ -1,6 +1,7 @@
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { brotliCompressSync, constants } from "node:zlib";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { svelteTesting } from "@testing-library/svelte/vite";
 import { defaultClientConditions, searchForWorkspaceRoot, type Plugin, type ProxyOptions, type UserConfig } from "vite";
@@ -8,12 +9,16 @@ import { defineProject, type TestProjectInlineConfiguration } from "vite-plus/te
 import type { InlineConfig } from "vite-plus/test/node";
 import { resolveDevApiUrl } from "./src/lib/dev/apiProxyTarget.ts";
 import { apiFailureLogging } from "./src/lib/dev/apiFailureLogging.ts";
+import { authBootstrapProxy } from "./src/lib/dev/authBootstrapProxy.ts";
 import { healthcheckPlugin } from "./src/lib/dev/healthcheckPlugin.ts";
 import { frontendApiClient } from "./scripts/generate-api-client.mjs";
 import { nodeUnitTestFiles } from "./vitest.node-files.ts";
 
 const require = createRequire(import.meta.url);
 const testingLibrarySvelteEntry = require.resolve("@testing-library/svelte");
+// kata-ui imports kit-ui too, but Bun links kata from its global cache with no
+// node_modules beside it. Point every kit-ui import at this app's copy.
+const kitUiEntry = require.resolve("@kenn-io/kit-ui");
 const kitUiMarkdownEntry = require.resolve("@kenn-io/kit-ui/utils/markdown");
 const kitUiTimeEntry = require.resolve("@kenn-io/kit-ui/utils/time");
 // kit-ui is consumed as source and Bun links it from its global cache, which
@@ -29,6 +34,27 @@ const devServerPort = resolveViteServerPort();
 const devServerAllowedHosts = resolveViteAllowedHosts();
 const devServerHmr = resolveViteHmr();
 const workspaceRoot = searchForWorkspaceRoot(process.cwd());
+
+function precompressAssets(): Plugin {
+  return {
+    name: "kenn-forge-precompress-assets",
+    apply: "build",
+    enforce: "post",
+    writeBundle(options, bundle) {
+      if (!options.dir) this.error("Asset precompression requires an output directory");
+      for (const fileName of Object.keys(bundle)) {
+        if (!/^assets\/.*\.(?:css|html|js|json|mjs|svg|txt|xml)$/.test(fileName)) continue;
+        // Vite's generateBundle hooks still rewrite preload URLs. Compress the final files.
+        const assetPath = path.join(options.dir, fileName);
+        const body = readFileSync(assetPath);
+        writeFileSync(
+          `${assetPath}.br`,
+          brotliCompressSync(body, { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }),
+        );
+      }
+    },
+  };
+}
 
 function devApiUrlPlugin(url: string): Plugin {
   return {
@@ -230,6 +256,11 @@ const browserTestProject = defineProject(async () => {
 
 const config = {
   base: "/",
+  define: {
+    __FORGE_APP_ICON__: JSON.stringify(
+      `data:image/svg+xml,${encodeURIComponent(readFileSync(new URL("./public/favicon.svg", import.meta.url), "utf8"))}`,
+    ),
+  },
   // The Go server serves this build under a configurable base_path (default
   // "/", e.g. "/kenn-forge/" behind a reverse proxy) by rewriting index.html's
   // <script src>/<link href> at request time. That rewrite only reaches HTML,
@@ -247,6 +278,7 @@ const config = {
   },
   plugins: [
     frontendApiClient(),
+    precompressAssets(),
     healthcheckPlugin(),
     devApiUrlPlugin(apiUrl),
     svelte(),
@@ -257,6 +289,10 @@ const config = {
       {
         find: /^@testing-library\/svelte$/,
         replacement: testingLibrarySvelteEntry,
+      },
+      {
+        find: /^@kenn-io\/kit-ui$/,
+        replacement: kitUiEntry,
       },
       {
         find: /^@kenn-io\/kit-ui\/utils\/markdown$/,
@@ -300,6 +336,27 @@ const config = {
       "@kenn-io/kit-ui > marked",
       "@kenn-io/kit-ui > shiki",
       "@kenn-io/kit-ui > dompurify",
+      "@kenn-io/kit-ui > @videojs/html/video/player",
+      "@kenn-io/kit-ui > @videojs/html/ui/container",
+      "@kenn-io/kit-ui > @videojs/html/ui/controls",
+      "@kenn-io/kit-ui > @videojs/html/ui/controls-backdrop",
+      "@kenn-io/kit-ui > @videojs/html/ui/controls-content",
+      "@kenn-io/kit-ui > @videojs/html/ui/controls-group",
+      "@kenn-io/kit-ui > @videojs/html/ui/play-button",
+      "@kenn-io/kit-ui > @videojs/html/ui/mute-button",
+      "@kenn-io/kit-ui > @videojs/html/ui/volume-slider",
+      "@kenn-io/kit-ui > @videojs/html/ui/time-slider",
+      "@kenn-io/kit-ui > @videojs/html/ui/slider-track",
+      "@kenn-io/kit-ui > @videojs/html/ui/slider-fill",
+      "@kenn-io/kit-ui > @videojs/html/ui/slider-buffer",
+      "@kenn-io/kit-ui > @videojs/html/ui/slider-thumb",
+      "@kenn-io/kit-ui > @videojs/html/ui/time",
+      "@kenn-io/kit-ui > @videojs/html/ui/time-group",
+      "@kenn-io/kit-ui > @videojs/html/ui/time-separator",
+      "@kenn-io/kit-ui > @videojs/html/ui/fullscreen-button",
+      "@kenn-io/kit-ui > @videojs/html/ui/playback-rate-button",
+      "@kenn-io/kit-ui > @videojs/html/ui/hotkey",
+      "@kenn-io/kit-ui > @videojs/html/ui/gesture",
       "@kenn-io/kit-ui > @lucide/svelte/icons/arrow-down",
       "@kenn-io/kit-ui > @lucide/svelte/icons/arrow-up",
       "@kenn-io/kit-ui > @lucide/svelte/icons/arrow-up-down",
@@ -313,15 +370,21 @@ const config = {
       "@kenn-io/kit-ui > @lucide/svelte/icons/ellipsis",
       "@kenn-io/kit-ui > @lucide/svelte/icons/funnel",
       "@kenn-io/kit-ui > @lucide/svelte/icons/key-round",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/maximize",
       "@kenn-io/kit-ui > @lucide/svelte/icons/maximize-2",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/minimize",
       "@kenn-io/kit-ui > @lucide/svelte/icons/monitor",
       "@kenn-io/kit-ui > @lucide/svelte/icons/moon",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/pause",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/play",
       "@kenn-io/kit-ui > @lucide/svelte/icons/panel-left-close",
       "@kenn-io/kit-ui > @lucide/svelte/icons/panel-left-open",
       "@kenn-io/kit-ui > @lucide/svelte/icons/refresh-cw",
       "@kenn-io/kit-ui > @lucide/svelte/icons/rotate-ccw",
       "@kenn-io/kit-ui > @lucide/svelte/icons/search",
       "@kenn-io/kit-ui > @lucide/svelte/icons/sun",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/volume-2",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/volume-x",
       "@kenn-io/kit-ui > @lucide/svelte/icons/wrap-text",
       "@kenn-io/kit-ui > @lucide/svelte/icons/x",
       // Frontend-resolvable deps the barrel also pulls in.
@@ -334,6 +397,7 @@ const config = {
       "@lucide/svelte/icons/grip-vertical",
       "@lucide/svelte/icons/maximize",
       "@lucide/svelte/icons/sliders-horizontal",
+      "@lucide/svelte/icons/settings-2",
       "@lucide/svelte/icons/minimize",
       "@lucide/svelte/icons/alarm-clock",
       "@lucide/svelte/icons/alert-triangle",
@@ -348,6 +412,7 @@ const config = {
       "@lucide/svelte/icons/ban",
       "@lucide/svelte/icons/book-open",
       "@lucide/svelte/icons/box",
+      "@lucide/svelte/icons/brain",
       "@lucide/svelte/icons/calendar",
       "@lucide/svelte/icons/calendar-clock",
       "@lucide/svelte/icons/calendar-days",
@@ -367,7 +432,9 @@ const config = {
       "@lucide/svelte/icons/circle-check",
       "@lucide/svelte/icons/circle-check-big",
       "@lucide/svelte/icons/circle-dashed",
+      "@lucide/svelte/icons/circle-dot",
       "@lucide/svelte/icons/circle-help",
+      "@lucide/svelte/icons/circle-x",
       "@lucide/svelte/icons/clock",
       "@lucide/svelte/icons/clock-3",
       "@lucide/svelte/icons/command",
@@ -380,6 +447,7 @@ const config = {
       "@lucide/svelte/icons/eraser",
       "@lucide/svelte/icons/eye-off",
       "@lucide/svelte/icons/external-link",
+      "@lucide/svelte/icons/file-pen",
       "@lucide/svelte/icons/file-search",
       "@lucide/svelte/icons/file-text",
       "@lucide/svelte/icons/flag",
@@ -393,8 +461,11 @@ const config = {
       "@lucide/svelte/icons/git-commit-horizontal",
       "@lucide/svelte/icons/git-merge",
       "@lucide/svelte/icons/git-pull-request",
+      "@lucide/svelte/icons/git-pull-request-closed",
+      "@lucide/svelte/icons/globe",
       "@lucide/svelte/icons/history",
       "@lucide/svelte/icons/house",
+      "@lucide/svelte/icons/image",
       "@lucide/svelte/icons/inbox",
       "@lucide/svelte/icons/info",
       "@lucide/svelte/icons/keyboard",
@@ -406,16 +477,23 @@ const config = {
       "@lucide/svelte/icons/list-checks",
       "@lucide/svelte/icons/list-chevrons-down-up",
       "@lucide/svelte/icons/list-chevrons-up-down",
+      "@lucide/svelte/icons/list-ordered",
+      "@lucide/svelte/icons/list-plus",
+      "@lucide/svelte/icons/list-todo",
       "@lucide/svelte/icons/loader-circle",
+      "@lucide/svelte/icons/menu",
       "@lucide/svelte/icons/message-square",
       "@lucide/svelte/icons/message-square-reply",
+      "@lucide/svelte/icons/messages-square",
       "@lucide/svelte/icons/minus",
       "@lucide/svelte/icons/monitor",
       "@lucide/svelte/icons/monitor-up",
       "@lucide/svelte/icons/moon",
       "@lucide/svelte/icons/more-horizontal",
       "@lucide/svelte/icons/move",
+      "@lucide/svelte/icons/music",
       "@lucide/svelte/icons/network",
+      "@lucide/svelte/icons/octagon-alert",
       "@lucide/svelte/icons/octagon-x",
       "@lucide/svelte/icons/package-plus",
       "@lucide/svelte/icons/panel-bottom",
@@ -427,6 +505,8 @@ const config = {
       "@lucide/svelte/icons/panel-top",
       "@lucide/svelte/icons/paperclip",
       "@lucide/svelte/icons/pencil",
+      "@lucide/svelte/icons/pin",
+      "@lucide/svelte/icons/pin-off",
       "@lucide/svelte/icons/play",
       "@lucide/svelte/icons/plus",
       "@lucide/svelte/icons/refresh-ccw",
@@ -456,6 +536,7 @@ const config = {
       "@lucide/svelte/icons/user-round",
       "@lucide/svelte/icons/users",
       "@lucide/svelte/icons/workflow",
+      "@lucide/svelte/icons/wrench",
       "@lucide/svelte/icons/x",
       "@lucide/svelte/icons/zap",
     ],
@@ -468,6 +549,9 @@ const config = {
     hmr: devServerHmr,
     fs: { allow: [workspaceRoot, kitUiSourceRoot] },
     proxy: {
+      // Let Forge establish its browser cookie and strip the token, then serve
+      // the redirected page through Vite so live reload stays available.
+      "^/.*[?&]auth_token=": authBootstrapProxy(apiUrl),
       "/api": {
         configure: apiFailureLogging(),
         target: apiUrl,

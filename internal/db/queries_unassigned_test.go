@@ -10,6 +10,8 @@ import (
 )
 
 func TestUnassignedFiltersPullsIssuesAndActivityBeforeLimit(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -85,6 +87,8 @@ func TestUnassignedFiltersPullsIssuesAndActivityBeforeLimit(t *testing.T) {
 }
 
 func TestListUnassignedWorkspaceSubjectKeysSupportsLargeSetsAndHidesRemovedItems(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	d := openTestDB(t)
@@ -107,11 +111,11 @@ func TestListUnassignedWorkspaceSubjectKeysSupportsLargeSetsAndHidesRemovedItems
 	)
 	require.NoError(err)
 
-	candidates := make([]WorkspaceSubjectKey, 11_000)
-	for i := range candidates {
-		candidates[i] = WorkspaceSubjectKey{
+	candidates := make([]WorkspaceSubjectKey, 0, 11_001)
+	for i := range 11_000 {
+		candidates = append(candidates, WorkspaceSubjectKey{
 			RepoID: repoID, ItemType: WorkspaceItemTypePullRequest, ItemNumber: i + 1,
-		}
+		})
 	}
 	candidates = append(candidates, WorkspaceSubjectKey{
 		RepoID: repoID, ItemType: WorkspaceItemTypeIssue, ItemNumber: 2,
@@ -122,4 +126,45 @@ func TestListUnassignedWorkspaceSubjectKeysSupportsLargeSetsAndHidesRemovedItems
 	assert.Equal(map[WorkspaceSubjectKey]struct{}{
 		{RepoID: repoID, ItemType: WorkspaceItemTypePullRequest, ItemNumber: 1}: {},
 	}, got)
+}
+
+func TestInclusionFiltersMatchAnySelectedOption(t *testing.T) {
+	t.Parallel()
+	d := openTestDB(t)
+	ctx := t.Context()
+	repoID := insertTestRepo(t, d, "acme", "widget")
+	viewer := []RepoViewerLogin{{RepoID: repoID, Login: "viewer"}}
+	for number := 1; number <= 3; number++ {
+		pr := testMR(repoID, number, withMRActivity(baseTime().Add(time.Duration(number)*time.Minute)))
+		issue := testIssue(repoID, number, withIssueActivity(baseTime().Add(time.Duration(number)*time.Minute)))
+		pr.AssigneesJSON, issue.AssigneesJSON = `["other"]`, `["other"]`
+		if number == 1 {
+			pr.Author, issue.Author = "viewer", "viewer"
+		}
+		if number == 2 {
+			pr.AssigneesJSON, issue.AssigneesJSON = `[]`, `[]`
+		}
+		insertTestMRWithOptions(t, d, pr)
+		insertTestIssueWithOptions(t, d, issue)
+	}
+	pulls, err := d.ListMergeRequests(ctx, ListMergeRequestsOpts{ViewerLogins: viewer, Unassigned: true, Limit: 2})
+	require.NoError(t, err)
+	require.Len(t, pulls, 2)
+	assert.Equal(t, []int{2, 1}, []int{pulls[0].Number, pulls[1].Number})
+	issues, err := d.ListIssues(ctx, ListIssuesOpts{ViewerLogins: viewer, Unassigned: true, Limit: 2})
+	require.NoError(t, err)
+	require.Len(t, issues, 2)
+	assert.Equal(t, []int{2, 1}, []int{issues[0].Number, issues[1].Number})
+	activity, err := d.ListActivity(ctx, ListActivityOpts{ViewerLogins: viewer, Unassigned: true, Limit: 4})
+	require.NoError(t, err)
+	require.Len(t, activity, 4)
+	for _, item := range activity {
+		assert.Contains(t, []int{1, 2}, item.ItemNumber)
+	}
+	projection, err := d.ListCollapsedActivityProjection(ctx, ListActivityProjectionOpts{ViewerLogins: viewer, Unassigned: true, Limit: 4, SubjectLimit: 4})
+	require.NoError(t, err)
+	require.Len(t, projection.Subjects, 4)
+	for _, subject := range projection.Subjects {
+		assert.Contains(t, []int{1, 2}, subject.Subject.Key.ItemNumber)
+	}
 }

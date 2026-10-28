@@ -9,10 +9,11 @@ import (
 type SourceKind string
 
 const (
-	SourceKindEnv       SourceKind = "env"
-	SourceKindFile      SourceKind = "file"
-	SourceKindGitHubCLI SourceKind = "github_cli"
-	SourceKindGitHubApp SourceKind = "github_app"
+	SourceKindEnv          SourceKind = "env"
+	SourceKindBitbucketEnv SourceKind = "bitbucket_env"
+	SourceKindFile         SourceKind = "file"
+	SourceKindGitHubCLI    SourceKind = "github_cli"
+	SourceKindGitHubApp    SourceKind = "github_app"
 	// SourceKindGitLabCLI reads the token the glab CLI stores for Host.
 	SourceKindGitLabCLI SourceKind = "gitlab_cli"
 	// SourceKindForgejoCLI reads the token the fj (forgejo-cli) CLI stores
@@ -75,10 +76,12 @@ type Candidate struct {
 
 func (c Candidate) SafeString() string {
 	switch c.Kind {
+	case SourceKindBitbucketEnv:
+		return "bitbucket_env:" + c.Host
 	case SourceKindEnv:
-		return fmt.Sprintf("env:%s", c.EnvName)
+		return "env:" + c.EnvName
 	case SourceKindFile:
-		return fmt.Sprintf("file:%s", c.FilePath)
+		return "file:" + c.FilePath
 	case SourceKindGitHubCLI, SourceKindGitLabCLI, SourceKindForgejoCLI:
 		return fmt.Sprintf("%s:%s", c.Kind, c.Host)
 	case SourceKindGitHubApp:
@@ -188,6 +191,8 @@ func canonicalCandidates(candidates []Candidate) []Candidate {
 
 func canonicalCandidate(candidate Candidate) Candidate {
 	switch candidate.Kind {
+	case SourceKindBitbucketEnv:
+		return Candidate{Kind: candidate.Kind, Host: candidate.Host}
 	case SourceKindEnv:
 		return Candidate{Kind: candidate.Kind, EnvName: candidate.EnvName}
 	case SourceKindFile:

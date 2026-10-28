@@ -10,9 +10,9 @@ Provider support is split into three layers:
 
 1. Public `platform` owns provider-neutral domain types, capability
    interfaces, typed platform errors and registry lookup; SQL projections stay internal.
-2. Public `platform/<provider>` owns provider API transport and normalization
+1. Public `platform/<provider>` owns provider API transport and normalization
    into `platform` types.
-3. Existing orchestration packages (`internal/github` sync compatibility,
+1. Existing orchestration packages (`internal/github` sync compatibility,
    server handlers, config startup, clone setup, and UI stores) consume the
    neutral interfaces or persisted DB rows.
 
@@ -34,6 +34,10 @@ config or credential-discovery dependency. Application credential selection,
 cache policy and admission remain internal
 (`cmd/kenn-forge/provider_startup.go::defaultProviderFactories`,
 `internal/tokenauth/source.go::githubAppTokenStore`).
+
+Scoped installation tokens stay outside ordinary sync credential caches; callers
+validate returned grants and key any scoped cache by the complete scope
+(`githubapp/client.go::Client.CreateInstallationToken`).
 
 App discovery pages are observations, not atomic inventories; callers own total
 budgets and must not equate stopping with exhaustion
@@ -74,16 +78,32 @@ Git's commit-graph can outlive commit objects; verify required commits physicall
 including each landing's first parent (`landedwork/git.go::parents`, `landedwork/proof.go::proveAt`).
 Rewritten ranges compare exact edit bytes, not whitespace-insensitive patch IDs;
 empty or duplicate rewritten edits stay unproven (`landedwork/range.go::rangeCorrespondence`).
-Squash proof compares the net source-boundary delta, not concatenated patches;
-even an explicit method label requires a complete linear source chain
-(`landedwork/single_parent.go::proveSquash`).
-Offset-free text proof requires uniquely occurring removed bytes or a unique
-insertion neighborhood; repeated locations stay unproven (`landedwork/edits.go::fileEdits`).
+Nonlinear squash sources require complete ancestry, a unique merge base, and an
+exact three-way tree match; rewritten ranges still require a linear source (`landedwork/single_parent.go::squashCorrespondence`).
+Across different bases, repeated text needs an exact three-way location witness
+(`landedwork/edits.go::compareTreeEdits`).
+A squash onto a target already carrying some source edits needs an exact
+three-way tree witness and must exclude a longer rebase: the terminal and its
+parent must not replay source commits in order (`landedwork/squash_witness.go::witnessedSquash`).
+An empty terminal uses the same witness. Another change's declared terminal, or
+an ancestor of the source head outside the source, is never a replay (`landedwork/squash_witness.go::rebaseReplayPossible`).
+A rewritten range cannot contain another change's declared terminal (outside that
+change's source) or an ancestor of its own source head (`landedwork/range.go::rangeCorrespondence`).
+A terminal outside the interval with a complete source owns none of it unless its
+first max(1, source length) first parents reach an interval commit that is a
+source commit or not an ancestor of the source head (`landedwork/origins.go::reachesInterval`).
+Synthesized merge objects belong only to the disposable view; caller objects
+are read-only alternates (`landedwork/git.go::openView`).
+Read blobs and commit checks through the view's one `cat-file --batch` process,
+charging the meter as the per-object commands did (`landedwork/objects.go::objectBatch`).
+Merge proofs need only Git 2.38, as shipped by Debian 12 and macOS: pin the base
+with synthesized commits, not `merge-tree --merge-base` (Git 2.40)
+(`landedwork/merge_tree.go::withMergeBase`).
 Overlap conflicts block the proven landing ranges, not unrelated earlier
 commits; unknown-start candidate gaps still block from the base (`landedwork/origins.go::rejectOverlaps`).
 Collection must preserve unfinished candidates and the exact prepared query;
 missing provider evidence is never direct-push evidence (`landedwork/collect/collect.go::Collect`).
-Roles and lifecycle times belong to observations, not landing proof; complete
+Titles, roles and lifecycle times belong to observations, not landing proof; complete
 landing coverage does not certify complete attribution (`platform/landing_evidence.go::LandingChange`).
 Metadata-only rechecks replace the entire observation, including absent fields;
 proof changes retain the initial incomplete observation (`landedwork/collect/candidates.go::observe`).
@@ -95,8 +115,12 @@ Reject an over-budget query without a result; never trim commits or gaps to fit.
 Even incomplete preparation and unsupported discovery retain query records that
 must be charged (`landedwork/collect/limits.go::validate`).
 GitHub associations can name upstream PRs when querying a fork. Preserve their
-target identity without fetching that PR number locally; foreign associations
-do not prove local absence (`landedwork/collect/collect.go::Collect`).
+target identity without fetching that PR number locally. Foreign associations
+prove local absence only after the complete list of the repository's own merged
+changes becomes candidates (`landedwork/collect/collect.go::collector.establishLocalAbsence`).
+A change above its list cap is complete only through its reported base's
+three-dot range at the reported count and head; GitHub ranges cap at 10,000
+(`landedwork/collect/candidates.go::observe`, `platform/github/landing_evidence.go::Provider.LandingEvidenceSupport`).
 Collector call limits do not bound HTTP retries or absence-confirmation reads;
 callers put wire limits below authentication (`platform/landing_evidence.go::LandingEvidenceReader`).
 GitHub collection relies on REST 2022-11-28 terminal semantics, not the newer
@@ -168,7 +192,7 @@ Rules:
   state; the UI hides a confirmed deletion while ordinary sync converges. Authoritative
   replacement updates comment rows and the parent count in one transaction
   (`internal/server/pullapi/routes.go::Handler.deleteComment`,
-  `internal/server/huma_routes.go::deleteIssueComment`,
+  `internal/server/issueapi/mutation_handlers.go::Handler.deleteIssueComment`,
   `internal/db/queries.go::ReplaceMRCommentEvents`,
   `internal/db/queries.go::ReplaceIssueCommentEvents`).
 - Keep operation availability split by scope. `repoOperations` handles
@@ -183,8 +207,8 @@ Rules:
   the provider mutation remains authoritative. Server code must not shell out
   to provider CLIs or do provider-specific identity matching. Do not put
   item-level gates in repo settings or list summaries
-  (`internal/server/operation_availability.go::repoOperations`,
-  `internal/server/operation_availability.go::repoOperationsForMergeRequest`).
+  (`internal/server/operationapi/operation_availability.go::Handlers.RepoOperations`,
+  `internal/server/operationapi/operation_availability.go::Handlers.RepoOperationsForMergeRequest`).
 - Enforce item-level gates at every mutation entry point and every UI
   availability signal, not only the detail response. Self-approval both rejects
   (`selfApprovalProblem`: review-draft publish, direct `/approve`) and hides the
@@ -300,10 +324,10 @@ Repository label editing is provider-neutral:
 
 - Every documented operation is hub-only provider, provider with a
   spoke-local overlay, or spoke-local; live-registry coverage rejects gaps
-  (`internal/server/provider_route_policy.go::providerRouteDeclarations`).
+  (`internal/server/routepolicy/provider_route_policy.go::ProviderRouteDeclarations`).
 - Spokes proxy hub-only operations; mixed reads fetch provider rows and
   attach only the connected spoke's workspace references. Federation callers get
-  provider-only responses (`internal/server/huma_routes.go::Server.providerActivityResponse`).
+  provider-only responses (`internal/server/activityapi/huma_routes.go::providerActivityResponse`).
 - Mixed reads preserve hub membership, order, and cursors. Their local
   overlay joins by provider item identity, never numeric SQLite IDs
   (`internal/providerplane/descriptor.go::ItemIdentity`).
@@ -325,9 +349,9 @@ Repository label editing is provider-neutral:
   route, records the provider observation in the local repository catalog, and
   fetches the clone on the spoke. The hub sends metadata and SHAs, never
   Git file content; the spoke never creates a provider-item cache from a
-  descriptor (`internal/server/provider_descriptors.go`,
+  descriptor (`internal/server/providerapi/provider_descriptors.go`,
   `internal/server/pullapi/routes.go::Handler.resolvePullCloneSnapshot`).
-- Repository descriptors are route-generation snapshots. Diff descriptors add
+- Repository descriptors carry the repository's provider ID and current route. Diff descriptors add
   all platform, diff, and merge-base SHAs plus the pull snapshot revision from
   one serialized hub read. An invalid, mismatched, or older descriptor
   fails closed, and hub outage returns `hubUnavailable` even
@@ -335,12 +359,12 @@ Repository label editing is provider-neutral:
   `internal/db/repository_catalog.go::DB.GetPullDiffProviderSnapshot`).
 - Review drafts, MCP workflow state, notification state, and other
   provider-adjacent records share the hub's ownership and provider
-  scopes (`internal/server/provider_route_policy.go::providerRouteDeclarations`).
+  scopes (`internal/server/routepolicy/provider_route_policy.go::ProviderRouteDeclarations`).
 - Settings compose hub-owned provider policy with spoke-owned execution
   policy for local users. Federation peers use a provider-only settings DTO;
   the general settings route remains local-only, and peer mutations cannot
   carry hub-local execution policy
-  (`internal/server/federation_provider_settings.go::providerSettingsResponse`,
+  (`internal/server/spokeapi/federation_provider_settings.go::ProviderSettingsResponse`,
   `internal/server/settings_handlers.go::Server.updateSettings`).
 
 Repo-scoped REST routes are provider-aware. The default-host route shape omits
@@ -422,3 +446,17 @@ Choose the smallest boundary that catches the regression:
 
 Run Go tests with `-shuffle=on`. Regenerate OpenAPI and generated clients with
 `make api-generate` after Huma route, route metadata, or API type changes.
+
+## Cached archive consumers
+
+- Archive export reads one saved database view and never refreshes provider data or marks items hot;
+  consumers must retain coverage gaps instead of treating export time as source freshness
+  (`internal/archive/snapshot.go::Service.Snapshot`).
+- Author association belongs to each authored item or review, never to the enclosing PR's author;
+  missing association is unknown and conveys no trust decision (`internal/platformdb/persist.go::DBMREvent`).
+- Cached zero size values lack observation metadata; export them as unavailable until storage can
+  distinguish measured zero from missing data (`internal/archive/snapshot.go::Service.Snapshot`).
+- Archive references must survive renames; ambiguous route reuse or an out-of-scope target must
+  remain a coverage gap, never an invented link (`internal/archive/snapshot.go::Service.Snapshot`).
+- Reject oversized exports before loading item and review text; callers can narrow repository scope
+  but exports must never silently discard candidates (`internal/db/queries_archive_snapshot.go::MeasureArchiveSnapshot`).

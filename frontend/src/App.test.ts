@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { Cause, Effect } from "effect";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import * as telemetry from "./lib/app/telemetry.js";
 import { mountApplication } from "./lib/app/mount.js";
 import type { AppExecution, OwnedAppRuntime } from "./lib/app/runtime.js";
 import { makeTestAppRuntime } from "./lib/testing/effect-layers.js";
@@ -12,6 +13,7 @@ import "./App.svelte";
 const featureImports = vi.hoisted(() => ({
   docs: 0,
   failDocsOnce: false,
+  coldScreens: [] as string[],
 }));
 
 const startup = vi.hoisted(() => ({
@@ -51,9 +53,6 @@ vi.mock("./lib/views/ActivityFeedView.svelte", async () => ({
   default: (await import("./lib/testing/AppViewStub.svelte")).default,
 }));
 vi.mock("./lib/views/MobileActivityView.svelte", async () => ({
-  default: (await import("./lib/testing/AppViewStub.svelte")).default,
-}));
-vi.mock("./lib/views/ReviewsView.svelte", async () => ({
   default: (await import("./lib/testing/AppViewStub.svelte")).default,
 }));
 vi.mock("./lib/views/FocusListView.svelte", async () => ({
@@ -97,16 +96,22 @@ vi.mock("./lib/components/keyboard/Cheatsheet.svelte", async () => ({
 vi.mock("./lib/components/repositories/RepoSummaryPage.svelte", async () => ({
   default: (await import("./lib/testing/AppViewStub.svelte")).default,
 }));
-vi.mock("./lib/components/settings/SettingsPage.svelte", async () => ({
-  default: (await import("./lib/testing/AppViewStub.svelte")).default,
-}));
+vi.mock("./lib/components/settings/SettingsPage.svelte", async () => {
+  featureImports.coldScreens.push("settings");
+  return { default: (await import("./lib/testing/AppViewStub.svelte")).default };
+});
+vi.mock("./lib/components/actions/ActionsPage.svelte", async () => {
+  featureImports.coldScreens.push("actions");
+  return { default: (await import("./lib/testing/AppViewStub.svelte")).default };
+});
 vi.mock("./lib/components/terminal/WorkspaceTerminalView.svelte", async () => ({
   default: (await import("./lib/testing/AppViewStub.svelte")).default,
 }));
 
-vi.mock("./lib/components/design-system/DesignSystemPage.svelte", async () => ({
-  default: (await import("./lib/testing/AppViewStub.svelte")).default,
-}));
+vi.mock("./lib/components/design-system/DesignSystemPage.svelte", async () => {
+  featureImports.coldScreens.push("design-system");
+  return { default: (await import("./lib/testing/AppViewStub.svelte")).default };
+});
 vi.mock("./lib/features/docs/DocsFeature.svelte", async () => {
   featureImports.docs += 1;
   if (featureImports.failDocsOnce) {
@@ -215,6 +220,7 @@ const appRuntime = makeTestAppRuntime(makeGeneratedClient());
 
 describe("App feature routes", () => {
   beforeEach(async () => {
+    localStorage.clear();
     vi.clearAllMocks();
     featureImports.docs = 0;
     featureImports.failDocsOnce = false;
@@ -235,6 +241,7 @@ describe("App feature routes", () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   afterAll(async () => {
@@ -255,6 +262,19 @@ describe("App feature routes", () => {
 
     expect(replaceState).toHaveBeenCalledWith(null, "", "/issues");
     expect(pushState).not.toHaveBeenCalled();
+  });
+
+  it("loads infrequent screens only when their route is opened", async () => {
+    const { default: App } = await import("./App.svelte");
+    render(App, { target: createAppTarget(), props: { runtime: appRuntime } });
+    await waitFor(() => expect(screen.queryByText("Loading")).toBeNull());
+    expect(featureImports.coldScreens).toEqual([]);
+
+    const { navigate } = await import("./lib/stores/router.svelte.ts");
+    navigate("/settings");
+    await waitFor(() => expect(featureImports.coldScreens).toEqual(["settings"]));
+    navigate("/design-system");
+    await waitFor(() => expect(featureImports.coldScreens).toEqual(["settings", "design-system"]));
   });
 
   it("retries lazy feature imports after a chunk load failure", async () => {
@@ -465,6 +485,190 @@ describe("App feature routes", () => {
 
     expect(target.childElementCount).toBe(0);
     expect(finalized).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    [59_999, "under_1m"],
+    [60_000, "1_to_5m"],
+    [120_000, "1_to_5m"],
+    [300_000, "5_to_30m"],
+    [1_800_000, "5_to_30m"],
+    [1_800_001, "30m_to_2h"],
+    [7_200_000, "30m_to_2h"],
+    [7_200_001, "over_2h"],
+  ])("reports %i visible milliseconds as %s through the daemon route", async (elapsed, bucket) => {
+    startup.autoReady = false;
+    let now = 0;
+    let hidden = true;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+    const posts: Array<{ url: string; body: unknown; keepalive: boolean }> = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      posts.push({ url: request.url, body: await request.json(), keepalive: request.keepalive });
+      return Response.json({ status: "queued" }, { status: 202 });
+    });
+    let appOpens: { interruptUnsafe: () => void } | undefined;
+    const runtime: OwnedAppRuntime = {
+      ...testAppRuntime(() => {}),
+      runCommand: <A, E>(program: unknown, options: { readonly operation: string }): AppExecution<A, E> => {
+        if (options.operation === "report app opens") appOpens = Effect.runFork(program as Effect.Effect<A, E>);
+        return { interrupt: () => appOpens?.interruptUnsafe(), await: Effect.never, exit: new Promise(() => {}) };
+      },
+    };
+    const mounted = mountApplication(createAppTarget(), runtime);
+
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0]?.url).toMatch(/\/api\/v1\/telemetry\/events$/);
+    expect(posts[0]?.body).toEqual({ event: "app_opened", properties: { surface: "web" } });
+    now = 600_000;
+    window.dispatchEvent(new Event("pagehide"));
+    hidden = false;
+    document.dispatchEvent(new Event("visibilitychange"));
+    now += elapsed;
+    hidden = true;
+    document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("pagehide"));
+    await waitFor(() => expect(posts).toHaveLength(2));
+    expect(posts[1]?.url).toBe(posts[0]?.url);
+    expect(posts[1]?.keepalive).toBe(true);
+    expect(posts[1]?.body).toEqual({ event: "session_ended", properties: { surface: "web", duration_bucket: bucket } });
+    now += 600_000;
+    hidden = false;
+    window.dispatchEvent(new Event("pageshow"));
+    now += 120_000;
+    window.dispatchEvent(new Event("pagehide"));
+    await waitFor(() => expect(posts).toHaveLength(3));
+    expect(posts[2]?.body).toEqual({
+      event: "session_ended",
+      properties: { surface: "web", duration_bucket: "1_to_5m" },
+    });
+    await Effect.runPromise(mounted.dispose);
+    window.dispatchEvent(new Event("pageshow"));
+    window.dispatchEvent(new Event("pagehide"));
+    expect(posts).toHaveLength(3);
+  });
+
+  it("reports mapped screens after startup, navigation, and history", async () => {
+    startup.autoReady = false;
+    const reportScreen = vi.spyOn(telemetry, "reportScreen");
+    const runtime = testAppRuntime(() => {});
+    const { replaceUrl, navigate } = await import("./lib/stores/router.svelte.ts");
+    replaceUrl("/docs?folder=notes&doc=README.md");
+    const mounted = mountApplication(createAppTarget(), runtime);
+    try {
+      await waitFor(() => expect(startup.readyCallbacks).toHaveLength(1));
+      expect(reportScreen).not.toHaveBeenCalled();
+      startup.readyCallbacks[0]!();
+      await waitFor(() => expect(reportScreen).toHaveBeenLastCalledWith(runtime, "docs"));
+      navigate("/settings");
+      await waitFor(() => expect(reportScreen).toHaveBeenLastCalledWith(runtime, "settings"));
+      window.history.replaceState(null, "", "/issues");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+      await waitFor(() => expect(reportScreen).toHaveBeenLastCalledWith(runtime, "issues"));
+    } finally {
+      await Effect.runPromise(mounted.dispose);
+    }
+  });
+
+  it("preserves visible duration while a later-day permission check pauses tracking", async () => {
+    startup.autoReady = false;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-17T23:58:00Z"));
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+    const receipt = Promise.withResolvers<Response>();
+    const posts: Array<{ event: string; properties: Record<string, string> }> = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      posts.push(await new Request(input, init).json());
+      return posts.length === 2 ? receipt.promise : Response.json({ status: "queued" }, { status: 202 });
+    });
+    const startReporter = vi.spyOn(telemetry, "startRuntimeTelemetry");
+    const owner = makeTestAppRuntime();
+    const runtime: OwnedAppRuntime = {
+      ...testAppRuntime(() => {}),
+      disposeEffect: owner.disposeEffect,
+      runCommand: (program, options) =>
+        options.operation === "report app opens"
+          ? owner.runCommand(program, options)
+          : testAppRuntime(() => {}).runCommand(program, options),
+    };
+    const mounted = mountApplication(createAppTarget(), runtime);
+    try {
+      const quiet = vi.fn();
+      startReporter.mock.results[0]!.value.onQuietChange(quiet);
+      await vi.waitFor(() => expect(quiet).toHaveBeenLastCalledWith(false, "enabled"));
+      now = 240_000;
+      vi.setSystemTime(new Date("2026-10-18T00:02:00Z"));
+      window.dispatchEvent(new Event("focus"));
+      await vi.waitFor(() => expect(quiet).toHaveBeenLastCalledWith(true, "checking"));
+      now += 2_400_000;
+      receipt.resolve(Response.json({ status: "queued" }, { status: 202 }));
+      await vi.waitFor(() => expect(quiet).toHaveBeenLastCalledWith(false, "enabled"));
+      now += 120_000;
+      window.dispatchEvent(new Event("pagehide"));
+      await vi.waitFor(() =>
+        expect(posts.at(-1)).toEqual({
+          event: "session_ended",
+          properties: { surface: "web", duration_bucket: "5_to_30m" },
+        }),
+      );
+    } finally {
+      await Effect.runPromise(mounted.dispose);
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops session reporting after a disabled receipt", async () => {
+    startup.autoReady = false;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-01-02T12:00:00Z"));
+    let hidden = false;
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const body = (await new Request(input, init).json()) as { event: string };
+      return Response.json({ status: body.event === "screen_viewed" ? "disabled" : "queued" }, { status: 202 });
+    });
+    const startReporter = vi.spyOn(telemetry, "startRuntimeTelemetry");
+    const owner = makeTestAppRuntime();
+    const runtime: OwnedAppRuntime = {
+      ...testAppRuntime(() => {}),
+      disposeEffect: owner.disposeEffect,
+      runCommand: (program, options) =>
+        options.operation === "report app opens"
+          ? owner.runCommand(program, options)
+          : testAppRuntime(() => {}).runCommand(program, options),
+    };
+    const mounted = mountApplication(createAppTarget(), runtime);
+    try {
+      const reporter = startReporter.mock.results[0]!.value;
+      const quiet = vi.fn();
+      reporter.onQuietChange(quiet);
+      await vi.waitFor(() => expect(quiet).toHaveBeenLastCalledWith(false, "enabled"));
+      const reportVisit = vi.spyOn(reporter, "reportVisit");
+      now = 120_000;
+      window.dispatchEvent(new Event("pagehide"));
+      await vi.waitFor(() => expect(reportVisit).toHaveBeenCalledOnce());
+      window.dispatchEvent(new Event("pageshow"));
+      now = 240_000;
+      hidden = true;
+      document.dispatchEvent(new Event("visibilitychange"));
+      reporter.reportScreen("settings");
+      await vi.waitFor(() => expect(quiet).toHaveBeenLastCalledWith(true, "disabled"));
+      reportVisit.mockClear();
+      window.dispatchEvent(new Event("pagehide"));
+      hidden = false;
+      window.dispatchEvent(new Event("pageshow"));
+      now += 120_000;
+      window.dispatchEvent(new Event("pagehide"));
+      expect(reportVisit).not.toHaveBeenCalled();
+    } finally {
+      await Effect.runPromise(mounted.dispose);
+      vi.useRealTimers();
+    }
   });
 
   it("reports a non-interruption root finalizer defect", async () => {

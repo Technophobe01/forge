@@ -3,6 +3,9 @@ package mcpserver
 import (
 	"context"
 	"time"
+
+	"go.kenn.io/forge/platform"
+	"go.kenn.io/forge/worklist"
 )
 
 // ProviderBackend owns provider data shared by every Forge node.
@@ -16,10 +19,20 @@ type ProviderBackend interface {
 	GetPullStack(context.Context, ItemIdentity) (Stack, error)
 	ListWorkflowStates(context.Context, WorkflowQuery) (WorkflowPage, error)
 	SetWorkflowState(context.Context, ItemIdentity, WorkflowUpdate) (WorkflowMutation, error)
+	PutWorklist(context.Context, WorklistPut) (WorklistPutResult, error)
+	GetWorklist(context.Context, int64) (Worklist, error)
+	ListWorklists(context.Context, bool) ([]WorklistSummary, error)
+	DismissWorklist(context.Context, int64) (WorklistDismissal, error)
+	ClearWorklistMarks(context.Context, int64) (WorklistMarksCleared, error)
+	ImportWorklist(context.Context, string) (WorklistImportResult, error)
 }
 
 // LocalBackend owns data and execution that belong to the connected node.
 type LocalBackend interface {
+	KataTargetsAvailable() bool
+	AddWorkspaceTarget(context.Context, string, WorkspaceTargetRequest) (WorkspaceTarget, error)
+	ListWorkspaceTargets(context.Context, string) (WorkspaceTargets, error)
+	RemoveWorkspaceTarget(context.Context, string, string, int64) error
 	GetPullDiff(context.Context, ItemIdentity, bool) (Diff, error)
 	ListLaunchTargets(context.Context) ([]LaunchTarget, error)
 	PreferredWorkspaceAgentTarget(context.Context, time.Time, []string) (string, bool, error)
@@ -28,7 +41,7 @@ type LocalBackend interface {
 	CreatePullWorkspace(context.Context, ItemIdentity, bool) (Workspace, error)
 	CreateIssueWorkspace(context.Context, ItemIdentity, bool) (Workspace, error)
 	CreateAdHocWorkspace(context.Context, RepositoryIdentity, string) (Workspace, error)
-	LaunchWorkspaceRuntime(context.Context, string, string) (RuntimeSession, error)
+	LaunchWorkspaceRuntime(context.Context, string, string, string) (RuntimeSession, error)
 	GetWorkspaceRuntime(context.Context, string) (WorkspaceRuntime, error)
 	SubmitAgentMessage(context.Context, AgentMessageRequest) (AgentMessageResult, error)
 	SubmitInitialMessage(context.Context, InitialMessageRequest) (InitialMessageStatus, error)
@@ -53,13 +66,26 @@ func NewFederatedBackend(provider ProviderBackend, local LocalBackend) Backend {
 	return federatedBackend{ProviderBackend: provider, LocalBackend: local}
 }
 
+// RepositoryIdentity names a repository by its provider-verified key plus
+// its current route. JSON encodes the key flat as platform_repo_id, or
+// bitbucket_repository_uuid for a Bitbucket Cloud key.
 type RepositoryIdentity struct {
-	Provider       string `json:"provider"`
-	PlatformHost   string `json:"platform_host"`
-	PlatformRepoID string `json:"platform_repo_id"`
-	RepoPath       string `json:"repo_path"`
-	Owner          string `json:"owner"`
-	Name           string `json:"name"`
+	Provider     string                 `json:"provider"`
+	PlatformHost string                 `json:"platform_host"`
+	Key          platform.RepositoryKey `json:"-" repokey:"platform_repo_id,bitbucket_repository_uuid"`
+	RepoPath     string                 `json:"repo_path"`
+	Owner        string                 `json:"owner"`
+	Name         string                 `json:"name"`
+}
+
+func (r RepositoryIdentity) MarshalJSON() ([]byte, error) {
+	type plain RepositoryIdentity
+	return platform.MarshalKeyedJSON(plain(r))
+}
+
+func (r *RepositoryIdentity) UnmarshalJSON(data []byte) error {
+	type plain RepositoryIdentity
+	return platform.UnmarshalKeyedJSON(data, (*plain)(r))
 }
 
 type RepositorySummary struct {
@@ -96,6 +122,7 @@ type ActivityItem struct {
 	ItemState      string
 	Workspace      *WorkspaceRef
 	Author         string
+	CommitAuthor   string
 	ItemAuthor     string
 	CreatedAt      string
 	BodyPreview    string
@@ -165,14 +192,26 @@ type Issue struct {
 	DetailFetchedAt string
 }
 
+// ItemIdentity names a PR or issue within a keyed repository. JSON encodes
+// the key as RepositoryIdentity does.
 type ItemIdentity struct {
-	Type           string `json:"type"`
-	Provider       string `json:"provider"`
-	PlatformHost   string `json:"platform_host"`
-	PlatformRepoID string `json:"platform_repo_id"`
-	Owner          string `json:"owner"`
-	Name           string `json:"name"`
-	Number         int    `json:"number"`
+	Type         string                 `json:"type"`
+	Provider     string                 `json:"provider"`
+	PlatformHost string                 `json:"platform_host"`
+	RepoKey      platform.RepositoryKey `json:"-" repokey:"platform_repo_id,bitbucket_repository_uuid"`
+	Owner        string                 `json:"owner"`
+	Name         string                 `json:"name"`
+	Number       int                    `json:"number"`
+}
+
+func (i ItemIdentity) MarshalJSON() ([]byte, error) {
+	type plain ItemIdentity
+	return platform.MarshalKeyedJSON(plain(i))
+}
+
+func (i *ItemIdentity) UnmarshalJSON(data []byte) error {
+	type plain ItemIdentity
+	return platform.UnmarshalKeyedJSON(data, (*plain)(i))
 }
 
 type DetailEvent struct {
@@ -290,6 +329,125 @@ type WorkflowMutation struct {
 	State          WorkflowState `json:"state"`
 }
 
+// WorklistPut creates a worklist when WorklistID is zero and replaces the
+// named worklist otherwise. WorkspaceID names the ACP workspace that wrote it.
+// LinkKey names the worklist link a new list comes from; a key already stored
+// returns that list instead of creating another.
+type WorklistPut struct {
+	WorklistID  int64             `json:"worklist_id,omitempty"`
+	Title       string            `json:"title"`
+	Recipe      string            `json:"recipe"`
+	CreatedBy   string            `json:"created_by"`
+	WorkspaceID string            `json:"workspace_id"`
+	LinkKey     string            `json:"link_key,omitempty"`
+	Items       []WorklistPutItem `json:"items" nullable:"false"`
+}
+
+type WorklistPutItem struct {
+	Item        ItemIdentity         `json:"item"`
+	Score       *int                 `json:"score,omitempty"`
+	Section     string               `json:"section"`
+	Note        string               `json:"note"`
+	Caveat      string               `json:"caveat"`
+	CaveatLevel worklist.CaveatLevel `json:"caveat_level"`
+}
+
+type WorklistPutResult struct {
+	WorklistID int64 `json:"worklist_id"`
+	ItemCount  int   `json:"item_count"`
+	Created    bool  `json:"created"`
+}
+
+// WorklistImportResult names the list a worklist link created or reopened.
+// ItemCount and SkippedCount describe the link: the items Forge can show now
+// and the ones it skipped.
+type WorklistImportResult struct {
+	WorklistID   int64 `json:"worklist_id"`
+	ItemCount    int   `json:"item_count"`
+	SkippedCount int   `json:"skipped_count"`
+}
+
+type WorklistSummary struct {
+	ID             int64  `json:"id"`
+	Title          string `json:"title"`
+	Recipe         string `json:"recipe"`
+	CreatedBy      string `json:"created_by"`
+	ItemCount      int    `json:"item_count"`
+	ChangedCount   int    `json:"changed_count"`
+	GoneCount      int    `json:"gone_count"`
+	HandledCount   int    `json:"handled_count"`
+	RemainingCount int    `json:"remaining_count"`
+	CreatedAt      string `json:"created_at"`
+	UpdatedAt      string `json:"updated_at"`
+	DismissedAt    string `json:"dismissed_at,omitempty"`
+}
+
+type Worklist struct {
+	ID          int64          `json:"id"`
+	Title       string         `json:"title"`
+	Recipe      string         `json:"recipe"`
+	CreatedBy   string         `json:"created_by"`
+	WorkspaceID string         `json:"workspace_id"`
+	CreatedAt   string         `json:"created_at"`
+	UpdatedAt   string         `json:"updated_at"`
+	DismissedAt string         `json:"dismissed_at,omitempty"`
+	Items       []WorklistItem `json:"items"`
+}
+
+// WorklistItem reports an item's recorded and live synced state. Live is nil
+// once the item is no longer a visible synced row.
+type WorklistItem struct {
+	Position    int                `json:"position"`
+	Item        ItemIdentity       `json:"item"`
+	Title       string             `json:"title"`
+	URL         string             `json:"url"`
+	Score       *int               `json:"score,omitempty"`
+	Section     string             `json:"section"`
+	Note        string             `json:"note"`
+	Caveat      string             `json:"caveat"`
+	CaveatLevel string             `json:"caveat_level"`
+	WrittenAt   string             `json:"written_at"`
+	Snapshot    WorklistItemState  `json:"snapshot"`
+	Live        *WorklistItemState `json:"live"`
+	Freshness   string             `json:"freshness"`
+	Changes     WorklistChanges    `json:"changes"`
+	// HandledAt is when the maintainer marked the item handled; nil when
+	// unhandled. It is independent of freshness.
+	HandledAt *string `json:"handled_at"`
+}
+
+type WorklistItemState struct {
+	State          string `json:"state"`
+	HeadSHA        string `json:"head_sha"`
+	CommentCount   int    `json:"comment_count"`
+	CIStatus       string `json:"ci_status"`
+	ReviewDecision string `json:"review_decision"`
+	LastActivityAt string `json:"last_activity_at,omitempty"`
+}
+
+// WorklistChanges names what changed since the item was written. Paired
+// fields appear only when the values differ.
+type WorklistChanges struct {
+	StateFrom   string `json:"state_from,omitempty"`
+	StateTo     string `json:"state_to,omitempty"`
+	NewCommits  bool   `json:"new_commits"`
+	NewComments int    `json:"new_comments"`
+	CIFrom      string `json:"ci_from,omitempty"`
+	CITo        string `json:"ci_to,omitempty"`
+	ReviewFrom  string `json:"review_from,omitempty"`
+	ReviewTo    string `json:"review_to,omitempty"`
+}
+
+type WorklistDismissal struct {
+	WorklistID  int64  `json:"worklist_id"`
+	DismissedAt string `json:"dismissed_at"`
+}
+
+type WorklistMarksCleared struct {
+	WorklistID int64 `json:"worklist_id"`
+	Cleared    int   `json:"cleared"`
+}
+
 type LaunchTarget struct {
 	Key            string
 	Label          string
@@ -355,6 +513,7 @@ type InitialMessageRequest struct {
 }
 
 const (
+	ErrorCodeValidation                      = "validationError"
 	ErrorCodeWorkspaceAlreadyExists          = "workspaceAlreadyExists"
 	ErrorCodeInitialMessageInputModeNotReady = "initialMessageInputModeNotReady"
 )
@@ -370,3 +529,32 @@ type Error struct {
 }
 
 func (e *Error) Error() string { return e.Message }
+
+// Workspace targets are tracking references; their provider or Kata owns the item.
+type WorkspaceKataTarget struct {
+	DaemonID   string `json:"daemon_id"`
+	ProjectUID string `json:"project_uid"`
+	IssueUID   string `json:"issue_uid"`
+	Reference  string `json:"reference,omitempty"`
+}
+type WorkspaceTargetRequest struct {
+	Item ItemIdentity
+	URL  string
+	Kata *WorkspaceKataTarget
+}
+type WorkspaceTarget struct {
+	ID          int64                `json:"id"`
+	Repository  *RepositoryIdentity  `json:"repository,omitempty"`
+	Type        string               `json:"type"`
+	Number      int                  `json:"number,omitempty"`
+	URL         string               `json:"url,omitempty"`
+	Title       string               `json:"title"`
+	State       string               `json:"state"`
+	Source      string               `json:"source"`
+	Unavailable bool                 `json:"unavailable"`
+	Kata        *WorkspaceKataTarget `json:"kata,omitempty"`
+}
+type WorkspaceTargets struct {
+	Targets       []WorkspaceTarget `json:"targets"`
+	KataAvailable bool              `json:"kata_available"`
+}

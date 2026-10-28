@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	apiruntime "github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
-	"go.kenn.io/forge/internal/apiclient"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,7 +16,11 @@ import (
 	"testing"
 	"time"
 
-	gh "github.com/google/go-github/v91/github"
+	apiruntime "github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
+	"go.kenn.io/forge/internal/apiclient"
+	"go.kenn.io/forge/platform"
+
+	gh "github.com/google/go-github/v92/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/apiclient/generated"
@@ -29,9 +31,12 @@ import (
 	"go.kenn.io/forge/internal/fleet"
 	"go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
+	"go.kenn.io/forge/internal/testutil"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/gitsafe"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/testutil/servertest"
-	gitcmd "go.kenn.io/kit/git/cmd"
 )
 
 func doServerJSON(
@@ -61,6 +66,7 @@ func doServerJSON(
 }
 
 func TestSettingsAPIE2EReadUpdateAndValidation(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, _, cfgPath := setupTestServerWithConfig(t)
@@ -95,8 +101,10 @@ func TestSettingsAPIE2EReadUpdateAndValidation(t *testing.T) {
 		ts.URL+"/api/v1/settings",
 		generated.UpdateSettingsRequest{
 			Activity: &generated.Activity{
-				ViewMode:  "kanban",
-				TimeRange: "7d",
+				ViewMode:   "kanban",
+				TimeRange:  "7d",
+				ItemTypes:  []string{"pr", "issue"},
+				EventTypes: []string{"comment", "review", "commit", "force_push"},
 			},
 		},
 	)
@@ -121,6 +129,8 @@ func TestSettingsAPIE2EReadUpdateAndValidation(t *testing.T) {
 				HideClosed:      true,
 				HideBots:        true,
 				CollapseThreads: true,
+				ItemTypes:       []string{"pr", "issue"},
+				EventTypes:      []string{"comment", "review", "commit", "force_push"},
 			},
 			Terminal: &generated.Terminal{
 				FontFamily:     "\"Iosevka Term\", monospace",
@@ -176,6 +186,7 @@ func TestSettingsAPIE2EReadUpdateAndValidation(t *testing.T) {
 }
 
 func TestFleetSettingsPublishesOnlyCommittedRuntimeSnapshot(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	const (
@@ -320,6 +331,7 @@ func findSettingsLaunchTarget(
 }
 
 func TestSettingsAPIE2EHideTmuxStatusUpdateAffectsRuntimeSessions(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
@@ -420,6 +432,7 @@ name = "widget"
 }
 
 func TestSettingsAPIE2EPreservesStartupConfigThroughSettingsSave(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, _, cfgPath := setupTestServerWithConfigContent(t, `
@@ -458,8 +471,10 @@ command = ["systemd-run", "--user", "--scope", "--pty", "bash"]
 		ts.URL+"/kenn-forge/api/v1/settings",
 		generated.UpdateSettingsRequest{
 			Activity: &generated.Activity{
-				ViewMode:  "flat",
-				TimeRange: "30d",
+				ViewMode:   "flat",
+				TimeRange:  "30d",
+				ItemTypes:  []string{"pr", "issue"},
+				EventTypes: []string{"comment", "review", "commit", "force_push"},
 			},
 		},
 	)
@@ -491,6 +506,7 @@ command = ["systemd-run", "--user", "--scope", "--pty", "bash"]
 }
 
 func TestSettingsAPIE2EFleetReadUpdateAndValidation(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	const memberID = "fedcba9876543210fedcba9876543210"
@@ -598,6 +614,7 @@ state = "active"
 }
 
 func TestRepoConfigAPIE2EAddDeleteAndErrors(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, _, cfgPath := setupTestServerWithConfig(t)
@@ -657,6 +674,7 @@ func TestRepoConfigAPIE2EAddDeleteAndErrors(t *testing.T) {
 }
 
 func TestRepoConfigAPIE2EUpdatesWorktreeBasePath(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, _, cfgPath := setupTestServerWithConfig(t)
@@ -703,6 +721,7 @@ func TestRepoConfigAPIE2EUpdatesWorktreeBasePath(t *testing.T) {
 }
 
 func TestRepoConfigAPIE2EAcceptsForkStyleWorktreeBase(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, _, cfgPath := setupTestServerWithConfig(t)
@@ -739,26 +758,31 @@ func TestRepoConfigAPIE2EAcceptsForkStyleWorktreeBase(t *testing.T) {
 }
 
 func TestRepoConfigAPIE2EUpdatesUIVisibility(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, database, _ := setupTestServerWithConfig(t)
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	entry, _, err := database.ReconcileRepositoryObservation(
+	entry, err := database.ObserveRepository(
 		t.Context(), db.RepoIdentity{
-			Platform:       "github",
-			PlatformHost:   "github.com",
-			PlatformRepoID: "repo-acme-widget",
-			Owner:          "acme",
-			Name:           "widget",
-		}, time.Now().UTC(),
+			Platform:     "github",
+			PlatformHost: "github.com",
+			Key:          platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")),
+			Owner:        "acme",
+			Name:         "widget",
+		},
 	)
 	require.NoError(err)
 	require.NotNil(entry)
 
 	summaryNames := func() []string {
-		resp, err := ts.Client().Get(ts.URL + "/api/v1/repos/summary")
+		respReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+"/api/v1/repos/summary", nil)
+		require.NoError(err)
+		httpClient := ts.Client()
+		httpClient.Timeout = 5 * time.Second
+		resp, err := httpClient.Do(respReq)
 		require.NoError(err)
 		defer resp.Body.Close()
 		require.Equal(http.StatusOK, resp.StatusCode)
@@ -804,6 +828,7 @@ func TestRepoConfigAPIE2EUpdatesUIVisibility(t *testing.T) {
 }
 
 func TestRepoConfigAPIE2ERejectsUnsafeWorktreeScopedBaseConfig(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, _, cfgPath := setupTestServerWithConfig(t)
@@ -875,21 +900,20 @@ name = "widget"
 
 	database := dbtest.Open(t)
 	identity := db.GitHubRepoIdentity(platformHost, "acme", "widget")
-	identity.PlatformRepoID = "repo-acme-widget"
-	repoID, err := database.UpsertRepo(
-		t.Context(), identity,
+	identity.Key = platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget"))
+	repoID, err := reposeed.Seed(
+		t.Context(), database, identity,
 	)
 	require.NoError(err)
 	cloneURL := strings.TrimSpace(string(runSettingsGitOutput(
 		t, localRepo, "remote", "get-url", "origin",
 	)))
-	require.NoError(database.UpdateRepoProviderMetadata(
+	require.NoError(database.UpdateRepoProviderObservation(
 		t.Context(), repoID, db.RepoProviderMetadata{
-			PlatformRepoID: "repo-acme-widget",
-			WebURL:         strings.TrimSuffix(cloneURL, ".git"),
-			CloneURL:       cloneURL,
-			DefaultBranch:  "main",
-		},
+			WebURL:        strings.TrimSuffix(cloneURL, ".git"),
+			CloneURL:      cloneURL,
+			DefaultBranch: "main",
+		}, nil, nil,
 	))
 	seed(database, repoID)
 
@@ -898,7 +922,6 @@ name = "widget"
 		database, nil,
 		[]github.RepoRef{{
 			Owner: "acme", Name: "widget", PlatformHost: platformHost,
-			PlatformExternalID: "repo-acme-widget",
 		}},
 		time.Minute, nil, nil,
 	)
@@ -946,6 +969,7 @@ func (env settingsWorkspaceEnv) setWorktreeBase(t *testing.T) {
 }
 
 func TestRepoConfigAPIE2EWorkspaceCreationUsesWorktreeBasePath(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -991,6 +1015,7 @@ func TestRepoConfigAPIE2EWorkspaceCreationUsesWorktreeBasePath(t *testing.T) {
 }
 
 func TestRepoConfigAPIE2EWorkspaceCreationUsesFallbackBranchWhenPreferredCheckedOut(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -1043,6 +1068,7 @@ func TestRepoConfigAPIE2EWorkspaceCreationUsesFallbackBranchWhenPreferredChecked
 }
 
 func TestWorkspaceAPIE2ERejectsEmptyProviderForAmbiguousRepo(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
@@ -1059,7 +1085,7 @@ func TestWorkspaceAPIE2ERejectsEmptyProviderForAmbiguousRepo(t *testing.T) {
 	defer ts.Close()
 
 	for _, provider := range []string{"github", "gitlab"} {
-		repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		repoID, err := reposeed.Seed(ctx, database, db.RepoIdentity{
 			Platform:     provider,
 			PlatformHost: "forge.example.com",
 			Owner:        "acme",
@@ -1094,6 +1120,7 @@ func TestWorkspaceAPIE2ERejectsEmptyProviderForAmbiguousRepo(t *testing.T) {
 }
 
 func TestRepoConfigAPIE2EDeleteReusedIssueBranchKeepsLocalBranch(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -1140,6 +1167,7 @@ func TestRepoConfigAPIE2EDeleteReusedIssueBranchKeepsLocalBranch(t *testing.T) {
 }
 
 func TestRepoConfigAPIE2ERefreshGlobAndErrors(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	mock := &mockGH{
 		listReposByOwnerFn: func(
@@ -1248,13 +1276,13 @@ func setupSettingsLocalGitRepoForDefaultHost(t *testing.T) string {
 
 func runSettingsGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	out, stderr, err := gitcmd.New().Run(t.Context(), dir, nil, args...)
+	out, stderr, err := gitsafe.Runner().Run(t.Context(), dir, nil, args...)
 	require.NoError(t, err, "git %v failed: %s%s", args, out, stderr)
 }
 
 func runSettingsGitOutput(t *testing.T, dir string, args ...string) []byte {
 	t.Helper()
-	out, stderr, err := gitcmd.New().Run(t.Context(), dir, nil, args...)
+	out, stderr, err := gitsafe.Runner().Run(t.Context(), dir, nil, args...)
 	require.NoError(t, err, "git %v failed: %s%s", args, out, stderr)
 	return out
 }

@@ -85,10 +85,22 @@ func (c *Client) GetHealthzWithResponse(ctx context.Context, reqEditors ...runti
 			}
 		}
 		return out, nil
-	case 500:
-		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
 	default:
-		return out, runtime.NewClientAPIError(fmt.Errorf("unexpected status code: %d", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+		out.ApplicationProblemPlusJSONDefault = new(GetHealthzErrorResponse)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.ApplicationProblemPlusJSONDefault); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "GetHealthzErrorResponse",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
 	}
 }
 
@@ -140,10 +152,22 @@ func (c *Client) GetLivezWithResponse(ctx context.Context, reqEditors ...runtime
 			}
 		}
 		return out, nil
-	case 500:
-		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
 	default:
-		return out, runtime.NewClientAPIError(fmt.Errorf("unexpected status code: %d", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+		out.ApplicationProblemPlusJSONDefault = new(GetLivezErrorResponse)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.ApplicationProblemPlusJSONDefault); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "GetLivezErrorResponse",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
 	}
 }
 
@@ -229,6 +253,7 @@ const (
 	PayloadTooLarge               ProblemErrorCode = "payloadTooLarge"
 	ProjectNotFound               ProblemErrorCode = "projectNotFound"
 	PullNotFound                  ProblemErrorCode = "pullNotFound"
+	RangeNotSatisfiable           ProblemErrorCode = "rangeNotSatisfiable"
 	RateLimited                   ProblemErrorCode = "rateLimited"
 	RepoNotFound                  ProblemErrorCode = "repoNotFound"
 	ResyncRequired                ProblemErrorCode = "resyncRequired"
@@ -239,8 +264,10 @@ const (
 	ToolUnauthenticated           ProblemErrorCode = "toolUnauthenticated"
 	Unauthorized                  ProblemErrorCode = "unauthorized"
 	UnsupportedCapability         ProblemErrorCode = "unsupportedCapability"
+	UnsupportedMediaType          ProblemErrorCode = "unsupportedMediaType"
 	UpstreamError                 ProblemErrorCode = "upstreamError"
 	ValidationError               ProblemErrorCode = "validationError"
+	WorklistNotFound              ProblemErrorCode = "worklistNotFound"
 	WorkspaceAlreadyExists        ProblemErrorCode = "workspaceAlreadyExists"
 	WorkspaceDeletionInProgress   ProblemErrorCode = "workspaceDeletionInProgress"
 	WorkspaceDirectoryNotReusable ProblemErrorCode = "workspaceDirectoryNotReusable"
@@ -258,19 +285,21 @@ type GetLivezResponse = HealthResponse
 type GetLivezErrorResponse = ProblemError
 
 type GetHealthzResp struct {
-	HTTPResponse *http.Response
-	Body         []byte
-	StatusCode   int
-	Error        *GetHealthzErrorResponse
-	JSON200      *GetHealthzResponse
+	HTTPResponse                      *http.Response
+	Body                              []byte
+	StatusCode                        int
+	Error                             *GetHealthzErrorResponse
+	JSON200                           *GetHealthzResponse
+	ApplicationProblemPlusJSONDefault *GetHealthzErrorResponse
 }
 
 type GetLivezResp struct {
-	HTTPResponse *http.Response
-	Body         []byte
-	StatusCode   int
-	Error        *GetLivezErrorResponse
-	JSON200      *GetLivezResponse
+	HTTPResponse                      *http.Response
+	Body                              []byte
+	StatusCode                        int
+	Error                             *GetLivezErrorResponse
+	JSON200                           *GetLivezResponse
+	ApplicationProblemPlusJSONDefault *GetLivezErrorResponse
 }
 
 type ErrorDetail struct {
@@ -286,8 +315,11 @@ type ErrorDetail struct {
 
 type HealthResponse struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema *string `json:"$schema,omitempty"`
-	Status string  `json:"status"`
+	Schema   *string `json:"$schema,omitempty"`
+	Modified bool    `json:"modified"`
+	Revision string  `json:"revision"`
+	Status   string  `json:"status"`
+	Version  string  `json:"version"`
 }
 
 type ProblemError struct {

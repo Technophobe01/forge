@@ -13,6 +13,7 @@
   import type { ReviewThread } from "./review-thread-context.js";
 
   interface Props {
+    reportErrors?: boolean;
     provider: string;
     platformHost?: string | undefined;
     owner: string;
@@ -30,11 +31,15 @@
     onScrollTopChange?: ((scrollTop: number) => void) | undefined;
     keyboardActive?: boolean;
     pageKeyboardActive?: boolean;
+    /** Phone-like presentation: one-row toolbar, file tree hidden until the
+     * user turns on the file list from the overflow menu. */
+    phonePresentation?: boolean;
   }
 
   const {
     provider,
     platformHost,
+    reportErrors = false,
     owner,
     name,
     repoPath,
@@ -47,6 +52,7 @@
     onScrollTopChange,
     keyboardActive = true,
     pageKeyboardActive = keyboardActive,
+    phonePresentation = false,
   }: Props = $props();
 
   const reviewDraftGate = $derived(operationGate(operations?.review_draft));
@@ -120,7 +126,7 @@
   let filesLayout: HTMLDivElement | undefined = $state();
   let filesLayoutWidth = $state(0);
   let fileTreeWidth = $state(loadFileTreeWidth());
-  let fileTreeHidden = $state(false);
+  let fileTreeHidden = $state(untrack(() => phonePresentation));
 
   function toggleFileTree(): void {
     fileTreeHidden = !fileTreeHidden;
@@ -179,6 +185,7 @@
 
 <div class="files-view">
   <DiffToolbar
+    phone={phonePresentation}
     fileListHidden={fileTreeHidden}
     onToggleFileList={toggleFileTree}
   />
@@ -195,7 +202,6 @@
         />
       </aside>
       <SplitResizeHandle
-        class="files-resize-handle"
         ariaLabel="Resize file tree"
         orientation="horizontal"
         ariaValueMin={minAllowedFileTreeWidth()}
@@ -208,6 +214,7 @@
     {/if}
     <div class="files-main">
       <DiffView
+        {reportErrors}
         {provider}
         {platformHost}
         {owner}
@@ -251,7 +258,6 @@
   .files-sidebar {
     width: var(--diff-file-tree-width, 280px);
     flex-shrink: 0;
-    border-right: 1px solid var(--border-default);
     background: var(--bg-surface);
     overflow-y: auto;
     display: flex;
@@ -278,7 +284,7 @@
       border-bottom: 1px solid var(--border-default);
     }
 
-    :global(.files-resize-handle) {
+    .files-layout > :global(.kit-split-resize-handle) {
       display: none;
     }
 

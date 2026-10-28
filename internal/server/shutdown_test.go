@@ -14,6 +14,7 @@ import (
 
 	"go.kenn.io/forge/internal/federationauth"
 	"go.kenn.io/forge/internal/providerplane"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 )
 
 type blockingHubEventTransport struct {
@@ -73,11 +74,12 @@ func (r *pullLifecycleRecorder) Shutdown(ctx context.Context) error {
 // TestServerShutdownWaitsForBackgroundTask verifies that Shutdown
 // blocks until an in-flight runBackground task returns.
 func TestServerShutdownWaitsForBackgroundTask(t *testing.T) {
-	srv, _ := setupTestServer(t)
+	serverfake.RunParallelServerTest(t)
+	srv, _, _ := setupTestServer(t)
 
 	release := make(chan struct{})
 	var finished atomic.Bool
-	srv.runBackground(func(_ context.Context) {
+	srv.streamapi.RunBackground(func(_ context.Context) {
 		<-release
 		finished.Store(true)
 	})
@@ -92,7 +94,7 @@ func TestServerShutdownWaitsForBackgroundTask(t *testing.T) {
 	select {
 	case <-shutdownDone:
 		require.FailNow(t, "Shutdown returned before background task finished")
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // shows the event does not happen; the background task blocks Shutdown until release
 	}
 
 	close(release)
@@ -103,15 +105,16 @@ func TestServerShutdownWaitsForBackgroundTask(t *testing.T) {
 // TestServerShutdownTimesOut verifies that Shutdown honours the
 // caller's ctx when a background task ignores its own cancellation.
 func TestServerShutdownTimesOut(t *testing.T) {
-	srv, _ := setupTestServer(t)
+	serverfake.RunParallelServerTest(t)
+	srv, _, _ := setupTestServer(t)
 
 	stuck := make(chan struct{})
-	srv.runBackground(func(_ context.Context) {
+	srv.streamapi.RunBackground(func(_ context.Context) {
 		<-stuck
 	})
 	defer close(stuck)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond) //nolint:kennlint // the deadline is the expected result; the stuck background task keeps Shutdown waiting until it fires
 	defer cancel()
 	err := srv.Shutdown(ctx)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
@@ -121,14 +124,15 @@ func TestServerShutdownTimesOut(t *testing.T) {
 // Shutdown starts, runBackground drops new submissions so bg.Add
 // cannot race with bg.Wait.
 func TestServerShutdownPreventsNewBackgroundTasks(t *testing.T) {
-	srv, _ := setupTestServer(t)
+	serverfake.RunParallelServerTest(t)
+	srv, _, _ := setupTestServer(t)
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	require.NoError(t, srv.Shutdown(ctx))
 
 	var ran atomic.Bool
-	started := srv.runBackground(func(_ context.Context) {
+	started := srv.streamapi.RunBackground(func(_ context.Context) {
 		ran.Store(true)
 	})
 
@@ -136,26 +140,16 @@ func TestServerShutdownPreventsNewBackgroundTasks(t *testing.T) {
 	require.False(t, ran.Load(), "runBackground must not spawn work after Shutdown")
 }
 
-// TestServerShutdownIsIdempotent verifies that Shutdown can be called
-// more than once without panicking on the internal WaitGroup.
-func TestServerShutdownIsIdempotent(t *testing.T) {
-	srv, _ := setupTestServer(t)
-
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-	require.NoError(t, srv.Shutdown(ctx))
-	require.NoError(t, srv.Shutdown(ctx))
-}
-
 // TestServerShutdownRaceNoPanic exercises runBackground concurrently
 // with Shutdown to catch WaitGroup Add/Wait races under -race.
 func TestServerShutdownRaceNoPanic(t *testing.T) {
-	srv, _ := setupTestServer(t)
+	serverfake.RunParallelServerTest(t)
+	srv, _, _ := setupTestServer(t)
 
 	done := make(chan struct{})
 	go func() {
 		for range 200 {
-			srv.runBackground(func(_ context.Context) {})
+			srv.streamapi.RunBackground(func(_ context.Context) {})
 		}
 		close(done)
 	}()
@@ -166,59 +160,19 @@ func TestServerShutdownRaceNoPanic(t *testing.T) {
 	<-done
 }
 
-// TestServerShutdownStopsHTTPListener verifies that Shutdown closes
-// the HTTP listener passed to Serve and that subsequent requests
-// fail fast.
-func TestServerShutdownStopsHTTPListener(t *testing.T) {
-	req := require.New(t)
-	srv, _ := setupTestServer(t)
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	req.NoError(err)
-	addr := ln.Addr().String()
-
-	listenErrCh := make(chan error, 1)
-	go func() {
-		listenErrCh <- srv.Serve(ln)
-	}()
-
-	req.Eventually(func() bool {
-		resp, err := http.Get("http://" + addr + "/api/v1/version")
-		if err != nil {
-			return false
-		}
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-		return resp.StatusCode == http.StatusOK
-	}, 2*time.Second, 10*time.Millisecond, "server never accepted requests")
-
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-	req.NoError(srv.Shutdown(ctx))
-
-	select {
-	case listenErr := <-listenErrCh:
-		req.ErrorIs(listenErr, http.ErrServerClosed)
-	case <-time.After(time.Second):
-		req.FailNow("Serve did not return after Shutdown")
-	}
-
-	_, err = http.Get("http://" + addr + "/api/v1/version")
-	req.Error(err)
-}
-
 // TestServerShutdownRetryWithLongerCtx verifies that a second
 // Shutdown call with a longer deadline can still drain background
 // work that the first call timed out waiting for.
 func TestServerShutdownRetryWithLongerCtx(t *testing.T) {
-	srv, _ := setupTestServer(t)
+	serverfake.RunParallelServerTest(t)
+	srv, _, _ := setupTestServer(t)
 
 	release := make(chan struct{})
-	srv.runBackground(func(_ context.Context) {
+	srv.streamapi.RunBackground(func(_ context.Context) {
 		<-release
 	})
 
-	shortCtx, shortCancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	shortCtx, shortCancel := context.WithTimeout(t.Context(), 50*time.Millisecond) //nolint:kennlint // the deadline is the expected result; the background task blocks Shutdown until release
 	defer shortCancel()
 	err := srv.Shutdown(shortCtx)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
@@ -231,8 +185,9 @@ func TestServerShutdownRetryWithLongerCtx(t *testing.T) {
 }
 
 func TestServerShutdownDoesNotAdvancePastActiveWorkspaceConsumers(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
-	srv, _ := setupTestServer(t)
+	srv, _, _ := setupTestServer(t)
 	releaseConsumer := make(chan struct{})
 	releaseRootWork := make(chan struct{})
 	consumerReleased := false
@@ -247,23 +202,23 @@ func TestServerShutdownDoesNotAdvancePastActiveWorkspaceConsumers(t *testing.T) 
 	})
 	var workspaceStops atomic.Int32
 	var runtimeStops atomic.Int32
-	srv.runWorkspaceDependent(func(ctx context.Context) {
+	srv.streamapi.RunWorkspaceDependent(func(ctx context.Context) {
 		<-ctx.Done()
 		<-releaseConsumer
 	})
-	srv.runBackground(func(ctx context.Context) {
+	srv.streamapi.RunBackground(func(ctx context.Context) {
 		<-ctx.Done()
 		<-releaseRootWork
 	})
-	srv.workspaceDependencyStop.shutdownWorkspace = func(context.Context) error {
+	srv.workspaceDependencyStop.ShutdownWorkspace = func(context.Context) error {
 		workspaceStops.Add(1)
 		return nil
 	}
-	srv.workspaceDependencyStop.shutdownDependents = func() {
+	srv.workspaceDependencyStop.ShutdownDependents = func() {
 		runtimeStops.Add(1)
 	}
 
-	shortCtx, shortCancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	shortCtx, shortCancel := context.WithTimeout(t.Context(), 20*time.Millisecond) //nolint:kennlint // the deadline is the expected result; the workspace consumer blocks Shutdown until releaseConsumer
 	defer shortCancel()
 	require.ErrorIs(srv.Shutdown(shortCtx), context.DeadlineExceeded)
 	require.Zero(workspaceStops.Load(), "Workspace stopped before its consumer drained")
@@ -271,7 +226,7 @@ func TestServerShutdownDoesNotAdvancePastActiveWorkspaceConsumers(t *testing.T) 
 
 	close(releaseConsumer)
 	consumerReleased = true
-	rootCtx, rootCancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	rootCtx, rootCancel := context.WithTimeout(t.Context(), 20*time.Millisecond) //nolint:kennlint // the deadline is the expected result; root work blocks Shutdown until releaseRootWork
 	defer rootCancel()
 	require.ErrorIs(srv.Shutdown(rootCtx), context.DeadlineExceeded)
 	require.Zero(workspaceStops.Load(), "Workspace stopped before root work drained")
@@ -287,8 +242,9 @@ func TestServerShutdownDoesNotAdvancePastActiveWorkspaceConsumers(t *testing.T) 
 }
 
 func TestServerShutdownWaitsForHubEventClient(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
-	srv, _ := setupTestServer(t)
+	srv, _, _ := setupTestServer(t)
 	transport := &blockingHubEventTransport{
 		started: make(chan struct{}), canceled: make(chan struct{}), release: make(chan struct{}),
 	}
@@ -296,7 +252,7 @@ func TestServerShutdownWaitsForHubEventClient(t *testing.T) {
 		Client: transport,
 	})
 	require.NoError(err)
-	srv.runWorkspaceDependent(events.Run)
+	srv.streamapi.RunWorkspaceDependent(events.Run)
 	select {
 	case <-transport.started:
 	case <-time.After(time.Second):
@@ -317,43 +273,11 @@ func TestServerShutdownWaitsForHubEventClient(t *testing.T) {
 	select {
 	case <-shutdownDone:
 		require.FailNow("shutdown returned before hub event client exited")
-	case <-time.After(25 * time.Millisecond):
+	case <-time.After(25 * time.Millisecond): //nolint:kennlint // shows the event does not happen; the hub event client blocks Shutdown until its transport is released
 	}
 
 	close(transport.release)
 	require.NoError(<-shutdownDone)
-}
-
-func TestWorkspaceDependencyShutdownPreservesOrderAcrossTimeoutRetry(t *testing.T) {
-	require := require.New(t)
-	releaseWorkspace := make(chan struct{})
-	var runtimeStops atomic.Int32
-
-	shutdown := newWorkspaceDependencyShutdown(
-		nil,
-		func(ctx context.Context) error {
-			select {
-			case <-releaseWorkspace:
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		},
-		func() { runtimeStops.Add(1) },
-	)
-
-	shortCtx, shortCancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
-	defer shortCancel()
-	require.ErrorIs(shutdown.Shutdown(shortCtx), context.DeadlineExceeded)
-	require.Zero(runtimeStops.Load(), "runtime stopped before Workspace completed")
-
-	close(releaseWorkspace)
-	longCtx, longCancel := context.WithTimeout(t.Context(), time.Second)
-	defer longCancel()
-	require.NoError(shutdown.Shutdown(longCtx))
-	require.Equal(int32(1), runtimeStops.Load())
-	require.NoError(shutdown.Shutdown(longCtx))
-	require.Equal(int32(1), runtimeStops.Load(), "runtime shutdown must remain idempotent")
 }
 
 // TestServerShutdownRetryWaitsForHTTPHandler verifies that when the
@@ -361,8 +285,9 @@ func TestWorkspaceDependencyShutdownPreservesOrderAcrossTimeoutRetry(t *testing.
 // a later call with a longer deadline still invokes
 // http.Server.Shutdown and blocks until the handler drains.
 func TestServerShutdownRetryWaitsForHTTPHandler(t *testing.T) {
-	req := require.New(t)
-	srv, _ := setupTestServer(t)
+	serverfake.RunParallelServerTest(t)
+	require := require.New(t)
+	srv, _, _ := setupTestServer(t)
 
 	release := make(chan struct{})
 	started := make(chan struct{}, 1)
@@ -375,8 +300,8 @@ func TestServerShutdownRetryWaitsForHTTPHandler(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	req.NoError(err)
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(err)
 	addr := ln.Addr().String()
 
 	serveErr := make(chan error, 1)
@@ -386,9 +311,16 @@ func TestServerShutdownRetryWaitsForHTTPHandler(t *testing.T) {
 
 	reqDone := make(chan struct{})
 	go func() {
-		resp, err := http.Get("http://" + addr + "/slow")
-		if err == nil {
+		respReq, reqErr := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/slow", nil)
+		if reqErr != nil {
+			close(reqDone)
+			return
+		}
+		resp, reqErr := (&http.Client{Timeout: 5 * time.Second}).Do(respReq)
+		if reqErr == nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		} else if resp != nil {
 			_ = resp.Body.Close()
 		}
 		close(reqDone)
@@ -397,13 +329,13 @@ func TestServerShutdownRetryWaitsForHTTPHandler(t *testing.T) {
 	select {
 	case <-started:
 	case <-time.After(2 * time.Second):
-		req.FailNow("slow handler never started")
+		require.FailNow("slow handler never started")
 	}
 
-	shortCtx, shortCancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	shortCtx, shortCancel := context.WithTimeout(t.Context(), 100*time.Millisecond) //nolint:kennlint // the deadline is the expected result; the slow handler blocks the HTTP drain until release
 	defer shortCancel()
 	err = srv.Shutdown(shortCtx)
-	req.ErrorIs(err, context.DeadlineExceeded)
+	require.ErrorIs(err, context.DeadlineExceeded)
 
 	longErrCh := make(chan error, 1)
 	go func() {
@@ -414,37 +346,38 @@ func TestServerShutdownRetryWaitsForHTTPHandler(t *testing.T) {
 
 	select {
 	case <-longErrCh:
-		req.FailNow("second Shutdown returned before HTTP handler drained")
-	case <-time.After(100 * time.Millisecond):
+		require.FailNow("second Shutdown returned before HTTP handler drained")
+	case <-time.After(100 * time.Millisecond): //nolint:kennlint // shows the event does not happen; the slow handler blocks the second Shutdown until release
 	}
 
 	close(release)
 	<-reqDone
-	req.NoError(<-longErrCh)
+	require.NoError(<-longErrCh)
 
 	select {
 	case e := <-serveErr:
-		req.ErrorIs(e, http.ErrServerClosed)
+		require.ErrorIs(e, http.ErrServerClosed)
 	case <-time.After(time.Second):
-		req.FailNow("Serve did not return after Shutdown")
+		require.FailNow("Serve did not return after Shutdown")
 	}
 }
 
 func TestServerShutdownStopsPullBeforeHTTPDrainAndRetriesDependencyWait(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
-	srv, _ := setupTestServer(t)
+	srv, _, _ := setupTestServer(t)
 	pull := newPullLifecycleRecorder()
 	srv.pullLifecycle = pull
 
 	var dependencyOrder []string
-	srv.workspaceDependencyStop.shutdownWorkspace = func(ctx context.Context) error {
+	srv.workspaceDependencyStop.ShutdownWorkspace = func(ctx context.Context) error {
 		if err := srv.pullLifecycle.Shutdown(ctx); err != nil {
 			return err
 		}
 		dependencyOrder = append(dependencyOrder, "pull", "fleet", "workspace")
 		return nil
 	}
-	srv.workspaceDependencyStop.shutdownDependents = func() {
+	srv.workspaceDependencyStop.ShutdownDependents = func() {
 		dependencyOrder = append(dependencyOrder, "runtime")
 	}
 
@@ -459,15 +392,22 @@ func TestServerShutdownStopsPullBeforeHTTPDrainAndRetriesDependencyWait(t *testi
 		w.WriteHeader(http.StatusOK)
 	})
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(err)
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
 	requestDone := make(chan struct{})
 	go func() {
-		resp, requestErr := http.Get("http://" + ln.Addr().String() + "/slow")
+		slowReq, requestErr := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+ln.Addr().String()+"/slow", nil)
+		if requestErr != nil {
+			close(requestDone)
+			return
+		}
+		resp, requestErr := (&http.Client{Timeout: 5 * time.Second}).Do(slowReq)
 		if requestErr == nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		} else if resp != nil {
 			_ = resp.Body.Close()
 		}
 		close(requestDone)
@@ -479,7 +419,7 @@ func TestServerShutdownStopsPullBeforeHTTPDrainAndRetriesDependencyWait(t *testi
 		require.FailNow("slow HTTP handler did not start")
 	}
 
-	shortCtx, shortCancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	shortCtx, shortCancel := context.WithTimeout(t.Context(), 20*time.Millisecond) //nolint:kennlint // the deadline is the expected result; the slow handler blocks the HTTP drain until httpRelease
 	defer shortCancel()
 	require.ErrorIs(srv.Shutdown(shortCtx), context.DeadlineExceeded)
 	select {
@@ -502,7 +442,7 @@ func TestServerShutdownStopsPullBeforeHTTPDrainAndRetriesDependencyWait(t *testi
 	select {
 	case <-shutdownDone:
 		require.FailNow("shutdown advanced past an active Pull worker")
-	case <-time.After(20 * time.Millisecond):
+	case <-time.After(20 * time.Millisecond): //nolint:kennlint // shows the event does not happen; the Pull worker blocks Shutdown until pull.release
 	}
 	close(pull.release)
 	require.NoError(<-shutdownDone)
@@ -514,54 +454,5 @@ func TestServerShutdownStopsPullBeforeHTTPDrainAndRetriesDependencyWait(t *testi
 		require.ErrorIs(err, http.ErrServerClosed)
 	case <-time.After(time.Second):
 		require.FailNow("Serve did not return after Shutdown")
-	}
-}
-
-func TestServerShutdownClosesSSESubscribers(t *testing.T) {
-	req := require.New(t)
-	srv, _ := setupTestServer(t)
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	req.NoError(err)
-	addr := ln.Addr().String()
-
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.Serve(ln) }()
-
-	// Open an SSE connection and pull the first line so we know
-	// the handler is actively streaming.
-	resp, err := http.Get("http://" + addr + "/api/v1/events")
-	req.NoError(err)
-	defer resp.Body.Close()
-	req.Equal(http.StatusOK, resp.StatusCode)
-
-	// Read in a goroutine so we can observe the connection close.
-	readDone := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		close(readDone)
-	}()
-
-	// Shutdown must complete well within ctx — if the hub is not
-	// closed, http.Server.Shutdown would hang on the SSE handler
-	// until the 2 s deadline.
-	start := time.Now()
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
-	req.NoError(srv.Shutdown(ctx))
-	req.Less(time.Since(start), time.Second,
-		"Shutdown took too long; SSE hub likely not closed")
-
-	select {
-	case <-readDone:
-	case <-time.After(time.Second):
-		req.FailNow("SSE connection did not close after Shutdown")
-	}
-
-	select {
-	case e := <-serveErr:
-		req.ErrorIs(e, http.ErrServerClosed)
-	case <-time.After(time.Second):
-		req.FailNow("Serve did not return after Shutdown")
 	}
 }

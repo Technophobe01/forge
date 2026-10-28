@@ -139,7 +139,9 @@ On every machine:
 3. Log in to the Git host used for local clone, fetch, and push operations. For
    GitHub, `gh auth login` is the normal route.
 4. Choose one stable private HTTPS origin for that machine.
-5. Confirm every machine can resolve and reach every origin.
+5. Confirm every spoke can reach the hub. For hub-to-spoke workspace access,
+   confirm the hub can also reach that spoke; otherwise configure it as
+   [outbound-disabled](#spokes-the-hub-cannot-reach).
 
 `fleet setup` configures Forge and its service. It does not provision the
 operating system, install development tools, clone your repositories, or
@@ -244,6 +246,31 @@ Tailscale app when `tailscale` is not on `PATH`.
 Review the displayed plan and confirm it. For unattended setup, inspect the
 same plan with `--dry-run`, then repeat with `--yes`.
 
+With `--tailscale`, anyone whose Tailscale login is on the allowlist opens the
+UI without a token. Setup allowlists this device's login and keeps any logins
+you allowed before. If your phone or another machine signs in to Tailscale with
+a different login, for example because the device is shared from another
+tailnet, add it:
+
+```sh
+kenn-forge fleet setup hub --tailscale \
+  --tailscale-login you@example.com \
+  --tailscale-login you@work.example
+```
+
+Passing `--tailscale-login` replaces the device's own login in the new
+allowlist, so list every login you use. To remove a login, delete it from
+`[api.tailscale_serve] allowed_users` in the config and restart Forge.
+
+Serve publishes on HTTPS port 443 by default. To use another port, such as
+`https://build-a.example.ts.net:8091`, pass `--tailscale-https-port 8091`.
+Running setup again keeps the port of the existing origin.
+
+MCP access through Serve requires explicit `[mcp].enabled = true`. The same
+logins can then reach it at the Serve origin without a token, for example
+`https://build-a.example.ts.net/mcp`. The omitted default enables only the
+direct loopback companion.
+
 If your LAN, UniFi network, VPN, or reverse proxy already provides private
 HTTPS, give Forge its canonical origin instead:
 
@@ -310,6 +337,23 @@ If you want setup to own the service instead, back up the current definition
 and configuration, stop it, and explicitly move the old definition aside before
 running setup. Keep its data directory and installed binary path consistent
 with the displayed plan.
+
+## Spokes the hub cannot reach
+
+If a spoke can reach the hub but the hub cannot reach the spoke, add
+`outbound_disabled = true` to that spoke's existing `[[fleet.members]]` entry
+in the **hub's** config. Identify the entry by its `node_id`. The change reloads
+without a restart.
+
+The spoke stays enrolled and uses the hub's provider data. Open that spoke
+directly to work with its local workspaces and terminals. The hub skips its
+snapshot requests, excludes it from the workspace host selector, and refuses
+remote operations targeting it. It remains listed in Fleet settings and does
+not produce an unreachable-host warning in the workspace view.
+
+Revocation on the hub does not call this spoke; the spoke observes revocation
+when it next checks its activation with the hub. Set `outbound_disabled = false`
+or remove the setting when hub-to-spoke access becomes available.
 
 ## Keep credentials separate
 
@@ -529,8 +573,11 @@ the hub for the fleet-wide workspace view and remote mutations.
 
 ## Use the fleet
 
-Use the Forge selector in the top bar to open any fleet member directly. It is
-an ordinary link, so browser modifiers open another tab or window. Each origin
+Use the Forge selector in the top bar to open any fleet member directly.
+Choosing the hub from a spoke, or a spoke from the hub, signs you in to that
+Forge automatically and opens the same page there. From a spoke, other spokes
+open as ordinary links and use their own sign-in, such as Tailscale Serve.
+Browser modifiers open the plain link in another tab or window. Each origin
 keeps its own browser state, filters, searches, terminal connections, and event
 cursors; changing one Forge tab does not retarget another.
 
@@ -690,6 +737,39 @@ Keep the replacement hub stopped while this restored fleet is authoritative.
 Database rollback can discard changes made after the backup. Do not overwrite
 new worktree contents as part of restoring Forge state. Revoking a new
 enrollment alone does not restore the old enrollment or provider ownership.
+
+## Return a spoke to standalone operation
+
+For a normally reachable spoke, keep both machines reachable until revocation
+finishes. An outbound-disabled spoke is revoked on the hub without a callback.
+On the hub, run:
+
+```sh
+kenn-forge fleet revoke ENROLLMENT_ID --config /path/to/hub/config.toml
+```
+
+Stop the spoke's Forge service, leaving its worktrees and tmux sessions in place.
+Retain a matching backup of its current data directory, configuration, binary,
+and service definition, as described in [Move to a fresh hub](#move-to-a-fresh-hub).
+Then, on the stopped spoke, run:
+
+```sh
+kenn-forge fleet leave --config /path/to/spoke/config.toml
+```
+
+This disables federation and removes the old hub's credentials. It preserves
+the current node identity, local database, workspaces, and session records;
+repeating it after an interruption is supported. It does not restore an old
+database or copy the hub's provider archive, review drafts, or credentials.
+
+Configure this machine's own provider access and repository list before
+starting Forge. Sync its repositories, then check its local workspaces and
+terminals. Provider state created on the hub stays there. Pending enrollments
+use `fleet abort-preparation`, not `fleet leave`.
+
+After `abort-preparation --force`, finish pending revocation on the hub before
+disabling federation. `leave` must not remove the credential needed for that
+cleanup; an already-disabled standalone instance is left unchanged.
 
 ## Upgrade federation protocol 3 to 4
 

@@ -8,11 +8,12 @@ import (
 	"testing"
 	"time"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/forge/internal/db"
 	ghclient "go.kenn.io/forge/internal/github"
+	"go.kenn.io/forge/platform"
 	platformgithub "go.kenn.io/forge/platform/github"
 )
 
@@ -22,20 +23,42 @@ type SeedResult struct {
 	FixtureClient func() *FixtureClient
 }
 
+// Seeded acme/widgets PR #1 commit SHAs. SetupDiffRepo replaces the commits
+// that survive both force pushes (widgetsPR1SurvivingCommits) with real commits
+// in the diff fixture repository, so clone-verified commit liveness leaves only
+// the rebased-away w1Commit3 and w1OldHead obsolete.
+const (
+	w1Commit1             = "abc1111111111111111111111111111111111111"
+	w1Commit2             = "abc2222222222222222222222222222222222222"
+	w1Commit3             = "abc3333333333333333333333333333333333333"
+	w1OldHead             = "abc4444444444444444444444444444444444444"
+	w1NewCommit           = "def3333333333333333333333333333333333333"
+	w1NewHead             = "def5555555555555555555555555555555555555"
+	w1SecondMissingBefore = "abc9999999999999999999999999999999999999"
+	w1SecondHead          = "def7777777777777777777777777777777777777"
+	w1FollowUp            = "def6666666666666666666666666666666666666"
+)
+
+// widgetsPR1SurvivingCommits lists the seeded PR #1 commits still on the
+// branch after both force pushes, oldest first.
+var widgetsPR1SurvivingCommits = []string{
+	w1Commit1, w1Commit2, w1NewCommit, w1NewHead, w1SecondHead, w1FollowUp,
+}
+
 // SeedFixtures populates d with a synthetic data set for E2E tests and returns
 // a SeedResult containing a FixtureClient factory for the seeded open items.
 func SeedFixtures(ctx context.Context, d *db.DB) (*SeedResult, error) {
 	now := time.Now().UTC()
 
 	// --- Repos ---
-	widgetsID, err := d.UpsertRepo(ctx, fixtureRepoIdentity("acme", "widgets"))
+	widgetsID, err := upsertFixtureRepo(ctx, d, fixtureRepoIdentity("acme", "widgets"))
 	if err != nil {
 		return nil, fmt.Errorf("upsert acme/widgets: %w", err)
 	}
 	if err := d.UpdateRepoViewerCanMerge(ctx, widgetsID, true); err != nil {
 		return nil, fmt.Errorf("grant fixture merge permission for acme/widgets: %w", err)
 	}
-	toolsID, err := d.UpsertRepo(ctx, fixtureRepoIdentity("acme", "tools"))
+	toolsID, err := upsertFixtureRepo(ctx, d, fixtureRepoIdentity("acme", "tools"))
 	if err != nil {
 		return nil, fmt.Errorf("upsert acme/tools: %w", err)
 	}
@@ -43,14 +66,14 @@ func SeedFixtures(ctx context.Context, d *db.DB) (*SeedResult, error) {
 		return nil, fmt.Errorf("grant fixture merge permission for acme/tools: %w", err)
 	}
 	const toolsCloneURL = "https://github.com/acme/tools.git"
-	if err := d.UpdateRepoProviderMetadata(ctx, toolsID, db.RepoProviderMetadata{
+	if err := d.UpdateRepoProviderObservation(ctx, toolsID, db.RepoProviderMetadata{
 		WebURL:        "https://github.com/acme/tools",
 		CloneURL:      toolsCloneURL,
 		DefaultBranch: "main",
-	}); err != nil {
+	}, nil, nil); err != nil {
 		return nil, fmt.Errorf("update acme/tools metadata: %w", err)
 	}
-	_, err = d.UpsertRepo(ctx, fixtureRepoIdentity("acme", "archived"))
+	_, err = upsertFixtureRepo(ctx, d, fixtureRepoIdentity("acme", "archived"))
 	if err != nil {
 		return nil, fmt.Errorf("upsert acme/archived: %w", err)
 	}
@@ -562,15 +585,6 @@ func SeedFixtures(ctx context.Context, d *db.DB) (*SeedResult, error) {
 
 	// widgets PR#1: 2 comments (bob, carol), 1 review (bob APPROVED), commits around a force-push
 	commitBase := now.Add(-9 * 24 * time.Hour)
-	w1Commit1 := "abc1111111111111111111111111111111111111"
-	w1Commit2 := "abc2222222222222222222222222222222222222"
-	w1Commit3 := "abc3333333333333333333333333333333333333"
-	w1OldHead := "abc4444444444444444444444444444444444444"
-	w1NewCommit := "def3333333333333333333333333333333333333"
-	w1NewHead := "def5555555555555555555555555555555555555"
-	w1SecondMissingBefore := "abc9999999999999999999999999999999999999"
-	w1SecondHead := "def7777777777777777777777777777777777777"
-	w1FollowUp := "def6666666666666666666666666666666666666"
 	w1BobCommentUTC := time.Date(now.Year(), now.Month(), now.Day(), 1, 30, 0, 0, time.UTC).Add(-8 * 24 * time.Hour)
 	w1BobComment, err := time.Parse(
 		time.RFC3339,
@@ -1343,13 +1357,21 @@ func SeedFixtures(ctx context.Context, d *db.DB) (*SeedResult, error) {
 	return result, nil
 }
 
+func upsertFixtureRepo(ctx context.Context, d *db.DB, identity db.RepoIdentity) (int64, error) {
+	entry, err := d.ObserveRepository(ctx, identity)
+	if err != nil {
+		return 0, err
+	}
+	return entry.Repository.ID, nil
+}
+
 func fixtureRepoIdentity(owner, name string) db.RepoIdentity {
 	return db.RepoIdentity{
-		Platform:       "github",
-		PlatformHost:   "github.com",
-		PlatformRepoID: "repo-" + owner + "-" + name,
-		Owner:          owner,
-		Name:           name,
+		Platform:     "github",
+		PlatformHost: "github.com",
+		Key:          platform.RepositoryIDKey(FixtureRepoID(owner, name)),
+		Owner:        owner,
+		Name:         name,
 	}
 }
 
@@ -1489,7 +1511,7 @@ func OpenFixtureTestDB(t *testing.T) (*db.DB, *SeedResult) {
 	require.NoError(t, err)
 	t.Cleanup(func() { d.Close() })
 
-	result, err := SeedFixtures(context.Background(), d)
+	result, err := SeedFixtures(t.Context(), d)
 	require.NoError(t, err)
 	return d, result
 }

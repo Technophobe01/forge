@@ -19,7 +19,18 @@ export type WorkspaceDetail = Pick<
   | "tmux_session"
   | "worktree_path"
 > &
-  Partial<Pick<GeneratedWorkspace, "item_key" | "kata">> & {
+  Partial<
+    Pick<
+      GeneratedWorkspace,
+      | "item_key"
+      | "kata"
+      | "commit_attribution"
+      | "worktree_dirty"
+      | "commits_ahead"
+      | "commits_vs_pr_head"
+      | "branch_upstream_missing"
+    >
+  > & {
     readonly associated_pr_number?: Exclude<GeneratedWorkspace["associated_pr_number"], undefined> | null;
     readonly error_message?: Exclude<GeneratedWorkspace["error_message"], undefined> | null;
     readonly item_type: "pull_request" | "issue" | "kata_task" | "adhoc";
@@ -29,7 +40,7 @@ export type WorkspaceDetail = Pick<
     readonly mr_title?: Exclude<GeneratedWorkspace["mr_title"], undefined> | null;
     readonly repo: Pick<
       GeneratedRepo,
-      "name" | "owner" | "platform_host" | "platform_repo_id" | "provider" | "repo_path"
+      "bitbucket_repository_uuid" | "name" | "owner" | "platform_host" | "platform_repo_id" | "provider" | "repo_path"
     >;
     readonly fleet_host_key?: string | undefined;
   };
@@ -38,7 +49,8 @@ const Repo = Schema.Struct({
   name: Schema.String,
   owner: Schema.String,
   platform_host: Schema.String,
-  platform_repo_id: Schema.optionalKey(Schema.String),
+  platform_repo_id: Schema.optionalKey(Schema.Number),
+  bitbucket_repository_uuid: Schema.optionalKey(Schema.String),
   provider: Schema.String,
   repo_path: Schema.String,
 });
@@ -53,8 +65,28 @@ const Kata = Schema.Struct({
   title: Schema.optionalKey(Schema.String),
 });
 
+const Attribution = Schema.Struct({
+  repository: Schema.String,
+  branch: Schema.String,
+  oid: Schema.String,
+  pushed: Schema.Boolean,
+  status: Schema.Literals(["matched", "preserved_author", "mismatch", "unverified"]),
+  message: Schema.String,
+  expected_github_user_id: Schema.Number,
+  author_id: Schema.Number,
+  committer_id: Schema.Number,
+  author_name: Schema.String,
+  author_email: Schema.String,
+  committer_name: Schema.String,
+  committer_email: Schema.String,
+});
+
 const WorkspaceDetailSchema = Schema.Struct({
+  commit_attribution: Schema.optionalKey(Attribution),
   associated_pr_number: Schema.optionalKey(Schema.NullOr(Schema.Number)),
+  branch_upstream_missing: Schema.optionalKey(Schema.Boolean),
+  commits_ahead: Schema.optionalKey(Schema.Number),
+  commits_vs_pr_head: Schema.optionalKey(Schema.Boolean),
   created_at: Schema.String,
   enrichment_status: Schema.Literals(["not_applicable", "pending", "fresh", "stale", "failed"]),
   error_message: Schema.optionalKey(Schema.NullOr(Schema.String)),
@@ -74,6 +106,7 @@ const WorkspaceDetailSchema = Schema.Struct({
   repo_owner: Schema.String,
   status: Schema.String,
   tmux_session: Schema.String,
+  worktree_dirty: Schema.optionalKey(Schema.Boolean),
   worktree_path: Schema.String,
 });
 

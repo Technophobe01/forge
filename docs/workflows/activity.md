@@ -16,7 +16,24 @@ The filters can narrow the queue by:
 - pull requests, issues, and default-branch commits
 - event type, author, or text
 - open or closed state
+- draft pull requests
 - human or bot activity
+
+Each GitHub pull request's commit rows show their own original author.
+Default-branch rows use the author from the most recently synced pull request
+with the same repository and full SHA. Text search includes those displayed
+names. Other providers keep their existing author names.
+
+Text search matches every word you type. Put `!` or `NOT` before a word to
+exclude it: `fix NOT alice` finds items that match "fix" and hides anything
+that matches "alice", including items alice opened. Quote a phrase to keep it together, as in
+`!"needs review"`. The search box highlights `!` and `NOT` when they act as
+operators. The Pulls, Issues, and Workspaces search boxes read queries the same
+way.
+
+Choose your starting time range, item and event types, visibility filters, and
+commit rollup in **Settings → Activity**. Forge saves these defaults in
+`config.toml` and applies them when you open Activity.
 
 Filter choices stay in the Activity URL. You can bookmark a useful queue or
 send the link to another Kenn Forge user with access to the same repositories.

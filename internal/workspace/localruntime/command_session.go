@@ -245,6 +245,7 @@ func (m *Manager) ensureCommandSessionLocked(
 		return SessionInfo{}, errManagerShutdown
 	}
 	m.sessions[key] = started
+	delete(m.exited, key)
 	m.mu.Unlock()
 	go m.watchSession(started)
 	slog.Debug(
@@ -288,6 +289,7 @@ func (m *Manager) commandSessionLaunch(
 		os.Environ(), command, stripEnvVars, spec.Env,
 	)
 	prepared, err := tmuxLauncher{
+		EnvironmentDir:  m.tmuxEnvironmentDir,
 		TmuxCommand:     tmuxCommand,
 		Session:         tmuxSession,
 		CWD:             spec.CWD,

@@ -6,6 +6,7 @@ import type { ProblemBody } from "../api/problems.js";
 import type { GeneratedClient } from "../api/generated-api.js";
 import { makeTestAppRuntime } from "../testing/effect-layers.js";
 import { createDetailStore as createRuntimeDetailStore } from "./detail.svelte.js";
+import { dismissFlash, getFlashes } from "./flash.svelte.js";
 
 let runtime: OwnedAppRuntime | undefined;
 
@@ -25,6 +26,7 @@ afterEach(async () => {
 const routeRef = {
   provider: "github",
   platformHost: "github.com",
+  repositoryKey: { kind: "id", id: 7001 },
   owner: "octo",
   name: "repo",
   repoPath: "octo/repo",
@@ -37,6 +39,7 @@ function detail() {
     repo: {
       provider: "github",
       platform_host: "github.com",
+      platform_repo_id: 7001,
       owner: "octo",
       name: "repo",
       repo_path: "octo/repo",
@@ -70,6 +73,50 @@ function conflict(detail: string) {
 }
 
 describe("provider action mutations", () => {
+  it("keeps merges scoped to their PR across navigation and ignores duplicate submissions", async () => {
+    const merge = Promise.withResolvers<{ data: { merged: boolean } }>();
+    const post = vi.fn(() => merge.promise);
+    const store = createDetailStore({
+      client: {
+        GET: vi.fn(async (_path: string, options: { params: { path: { number: number } } }) => ({
+          data: { ...detail(), merge_request: { Number: options.params.path.number } },
+        })),
+        POST: post,
+        PUT: vi.fn(),
+        DELETE: vi.fn(),
+      } as unknown as GeneratedClient,
+    });
+    store.loadDetail("octo", "repo", 1, { ...routeRef, sync: false });
+    await vi.waitFor(() => expect(store.isDetailLoading()).toBe(false));
+    const input = { commit_message: "", commit_title: "Merge pull request", method: "squash" as const };
+    const onFailure = vi.fn();
+    store.mergePull({ ...routeRef, repositoryKey: undefined }, 1, input, false, { onFailure });
+    expect(onFailure).toHaveBeenCalledWith("Refresh the pull request to verify its repository before merging.");
+    const settled = Promise.withResolvers<void>();
+    store.mergePull(routeRef, 1, input, false, { onSettled: settled.resolve });
+    store.mergePull(routeRef, 1, input, false);
+    const renamed = { ...routeRef, name: "renamed", repoPath: "octo/renamed" };
+    store.mergePull(renamed, 1, input, false);
+    expect(store.isPullMerging(routeRef, 1)).toBe(true);
+    expect(store.isPullMerging(renamed, 1)).toBe(true);
+    expect(store.isPullMerging({ ...routeRef, repositoryKey: { kind: "id", id: 7999 } }, 1)).toBe(false);
+    expect(store.isPullMerging({ ...routeRef, repositoryKey: undefined }, 1)).toBe(false);
+    expect(store.isPullMerging({ ...routeRef, platformHost: "git.example.com" }, 1)).toBe(false);
+
+    store.loadDetail("octo", "repo", 2, { ...routeRef, sync: false });
+    await vi.waitFor(() => expect(store.getDetail()?.merge_request.Number).toBe(2));
+    expect(store.isPullMerging(routeRef, 1)).toBe(true);
+    expect(store.isPullMerging(routeRef, 2)).toBe(false);
+    await vi.waitFor(() => expect(post).toHaveBeenCalledOnce());
+
+    merge.resolve({ data: { merged: true } });
+    await settled.promise;
+    expect(store.isPullMerging(routeRef, 1)).toBe(false);
+    expect(store.isPullMerging(renamed, 1)).toBe(false);
+    expect(store.getDetail()?.merge_request.Number).toBe(2);
+    expect(post).toHaveBeenCalledOnce();
+  });
+
   it("rejects a captured route that no longer matches the displayed pull request", async () => {
     const post = vi.fn();
     const store = createDetailStore({
@@ -284,6 +331,44 @@ describe("provider action mutations", () => {
       _tag: "Merged",
       cleanupWarning: "workspace has uncommitted changes",
     });
+  });
+
+  it("treats a merge response that added the pull request to the merge queue as success", async () => {
+    const store = createDetailStore({
+      client: {
+        GET: vi.fn(async () => ({ data: detail() })),
+        POST: vi.fn().mockResolvedValue({
+          data: {
+            merged: false,
+            queued: true,
+            sha: "",
+            message: "Added to the merge queue",
+          },
+          response: new Response(null, { status: 200 }),
+        }),
+        PUT: vi.fn(),
+        DELETE: vi.fn(),
+      } as unknown as GeneratedClient,
+    });
+    store.loadDetail("octo", "repo", 1, { ...routeRef, sync: false });
+    await vi.waitFor(() => expect(store.isDetailLoading()).toBe(false));
+    for (const flash of getFlashes()) dismissFlash(flash.id);
+    const onSuccess = vi.fn();
+    const onFailure = vi.fn();
+    const settled = Promise.withResolvers<void>();
+
+    store.mergePull(routeRef, 1, { commit_message: "", commit_title: "Merge pull request", method: "squash" }, false, {
+      onSuccess,
+      onFailure,
+      onSettled: settled.resolve,
+    });
+    await settled.promise;
+
+    expect(onFailure).not.toHaveBeenCalled();
+    expect(onSuccess).toHaveBeenCalledWith({ _tag: "Enqueued" });
+    expect(getFlashes().map((flash) => [flash.message, flash.tone])).toEqual([
+      ["Added octo/repo #1 to the merge queue.", "success"],
+    ]);
   });
 
   it("reports a provider response that did not merge as a failed merge", async () => {

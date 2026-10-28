@@ -6,18 +6,24 @@ import (
 	"net/http"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	"go.kenn.io/forge/internal/agentactivity"
+	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/db"
+	"go.kenn.io/forge/internal/devbox"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/providerplane"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/systemclipboard"
+	"go.kenn.io/forge/internal/terminal"
 	"go.kenn.io/forge/internal/terminalpaste"
 	"go.kenn.io/forge/internal/workspace"
 	"go.kenn.io/forge/internal/workspace/localruntime"
+	"go.kenn.io/forge/platform"
+	"go.kenn.io/kwt/worktree"
 )
 
 // Event is the workspace domain's event-hub-neutral broadcast payload.
@@ -76,6 +82,8 @@ type workspaceDiffEventData struct {
 // the root server package while preserving the shared shutdown and event
 // ordering owned by the composition root.
 type Deps struct {
+	RepositoryWorktrees *worktree.Coordinator
+	ExecutionWorker     config.ExecutionWorker
 	DB                  *db.DB
 	Resolver            *httpapi.RepositoryResolver
 	Syncer              *ghclient.Syncer
@@ -95,9 +103,9 @@ type Deps struct {
 	RecomputeWorktreeLinks  func(context.Context)
 	RefreshWorktreeStats    func(context.Context, string, string) error
 	RefreshProjectInventory func(context.Context, string) error
-	LookupRepo              func(context.Context, string, string, string, string) (*db.Repo, error)
+	LookupRepo              func(context.Context, string, string, string, string) (*db.ActiveRepo, error)
 	ResolveRepository       func(
-		context.Context, providerplane.RepositoryRoute,
+		context.Context, providerplane.RepositoryRoute, platform.RepositoryKey,
 	) (*db.Repo, error)
 	EnqueueDetailSync func(
 		string, []any, func(context.Context) error, func(context.Context),
@@ -107,43 +115,52 @@ type Deps struct {
 	PullCandidates              workspace.PullCandidateSource
 	ProviderWorkspaceAutomation ProviderWorkspaceAutomation
 	MergeRequestWorktreeSource  MergeRequestWorktreeSource
+	WorkspaceTargetSource       WorkspaceTargetSource
 }
 
 // Handler implements both the workspace and local-project services so their
 // Git-heavy tests and process limits remain in one package and test binary.
 type Handler struct {
-	db            *db.DB
-	resolver      *httpapi.RepositoryResolver
-	syncer        *ghclient.Syncer
-	configMu      sync.RWMutex
-	config        ConfigSnapshot
-	workspaces    *workspace.Manager
-	runtime       *localruntime.Manager
-	clipboard     systemclipboard.Writer
-	pasteImages   *terminalpaste.Store
-	agentActivity *agentactivity.Store
-	tmuxCmd       []string
-	now           func() time.Time
-	broadcast     func(Event) uint64
-	subscribe     func(context.Context, bool) (<-chan RecordedEvent, <-chan struct{})
-	generation    func() uint64
+	repositoryWorktrees *worktree.Coordinator
+	executionWorker     config.ExecutionWorker
+	workerBroker        *devbox.BrokerClient
+	db                  *db.DB
+	resolver            *httpapi.RepositoryResolver
+	syncer              *ghclient.Syncer
+	configMu            sync.RWMutex
+	config              ConfigSnapshot
+	workspaces          *workspace.Manager
+	runtime             *localruntime.Manager
+	terminal            *terminal.Handler
+	clipboard           systemclipboard.Writer
+	pasteImages         *terminalpaste.Store
+	agentActivity       *agentactivity.Store
+	tmuxCmd             []string
+	now                 func() time.Time
+	broadcast           func(Event) uint64
+	subscribe           func(context.Context, bool) (<-chan RecordedEvent, <-chan struct{})
+	generation          func() uint64
 
 	recomputeWorktreeLinks         func(context.Context)
 	refreshWorktreeStats           func(context.Context, string, string) error
 	refreshProjectInventory        func(context.Context, string) error
-	lookupRepo                     func(context.Context, string, string, string, string) (*db.Repo, error)
-	resolveRepository              func(context.Context, providerplane.RepositoryRoute) (*db.Repo, error)
+	lookupRepo                     func(context.Context, string, string, string, string) (*db.ActiveRepo, error)
+	resolveRepository              func(context.Context, providerplane.RepositoryRoute, platform.RepositoryKey) (*db.Repo, error)
 	enqueueDetailSync              func(string, []any, func(context.Context) error, func(context.Context)) bool
 	providerWriteGate              providerplane.WriteAdmitter
 	launchSpecResolver             providerplane.WorkspaceLaunchSpecResolver
 	pullCandidates                 workspace.PullCandidateSource
 	providerWorkspaceAutomation    ProviderWorkspaceAutomation
 	mergeRequestWorktreeSource     MergeRequestWorktreeSource
+	workspaceTargetSource          WorkspaceTargetSource
+	kataTargets                    WorkspaceKataTargets
 	hub                            *eventHubAdapter
 	workspacePRMonitor             *workspace.PRMonitor
 	workspacePushedHeadObserver    *workspace.PushedHeadObserver
 	workspaceDiffCache             *workspaceDiffCache
 	tmuxActivity                   *tmuxActivityTracker
+	idle                           atomic.Pointer[idleRuntimes] // nil while idle stop is off
+	idleWake                       chan struct{}
 	workspaceEnrichmentMu          sync.Mutex
 	workspaceEnrichmentCache       map[string]workspaceEnrichmentCacheEntry
 	workspaceEnrichmentInFlight    map[string]uint64
@@ -164,26 +181,54 @@ type Handler struct {
 	// Agent handoff pacing; zero values select the package defaults.
 	agentHandoffTimeout        time.Duration
 	agentHandoffPollInterval   time.Duration
+	onAgentHandoffPending      func()
 	agentHandoffCtx            context.Context
 	agentHandoffCancel         context.CancelFunc
 	worktreeShellTransactions  sync.Map
 	workspaceTmuxPrunedAt      time.Time
 	workspaceTmuxPrunePending  bool
 	workspaceTmuxPruneInFlight bool
-	// workspaceSubjectAfterSummariesForTest pauses a snapshot between its two
-	// repository-identity reads so tests can prove the reconciliation fence.
-	workspaceSubjectAfterSummariesForTest func()
-	runtimeRecoveryCursor                 string
-	runtimeRestoreMu                      sync.Mutex
-	runtimeRecoveryMu                     sync.Mutex
-	runtimeRecoveryPending                map[string]bool
-	lifecycleMu                           sync.Mutex
-	lifecycleCtx                          context.Context
-	lifecycleCancel                       context.CancelFunc
-	lifecycleWG                           sync.WaitGroup
-	lifecycleStarted                      bool
-	lifecycleStopping                     bool
-	lifecycleDone                         chan struct{}
+	runtimeRecoveryCursor      string
+	runtimeRestoreMu           sync.Mutex
+	runtimeRecoveryMu          sync.Mutex
+	runtimeRecoveryPending     map[string]bool
+	// tmuxServerAtLaunch names the tmux server each agent runtime ran on, so
+	// its exit can tell a replaced server from its own session ending.
+	// runtimeRecoveryMu guards it.
+	tmuxServerAtLaunch map[string]string
+	// exitDecisionMu serializes tmux exit classification; exitDecisions caches
+	// each generation's answer so every caller sees the same one.
+	exitDecisionMu sync.Mutex
+	exitDecisions  map[string]exitDecision
+	// baseRestoreRemaining lists workspaces whose base terminal, lost with its
+	// tmux server or not restored at startup, is not restored yet; the
+	// missing-tmux prune waits until it is empty. A true value marks a
+	// workspace startup restored for its retained agents, which later passes
+	// restore whatever its status, as startup would. runtimeRecoveryMu guards
+	// it.
+	baseRestoreRemaining map[string]bool
+	// baseRestoreListPending asks the next pass to restore every workspace's
+	// base terminal, after a loss or a list that could not be read; it holds
+	// the prune like outstanding workspaces.
+	baseRestoreListPending bool
+	// baseRestoreCursor is the last workspace a restore pass reached.
+	baseRestoreCursor string
+	// baseRestoreBudget bounds base-terminal restoration within a recovery
+	// pass, leaving the rest of the pass for pending agents.
+	baseRestoreBudget time.Duration
+	// cannotReloadChats holds chats whose agent refused to reload them; see
+	// setChatCannotReload. runtimeRecoveryMu guards it.
+	cannotReloadChats map[string]bool
+	lifecycleMu       sync.Mutex
+	lifecycleCtx      context.Context
+	// startedAt is when this daemon's handler was built. A hook report older
+	// than it may predate hooks lost while no daemon was listening.
+	startedAt         time.Time
+	lifecycleCancel   context.CancelFunc
+	lifecycleWG       sync.WaitGroup
+	lifecycleStarted  bool
+	lifecycleStopping bool
+	lifecycleDone     chan struct{}
 }
 
 // New creates the workspace and project handler.
@@ -200,6 +245,9 @@ func New(deps Deps) *Handler {
 	}
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	h := &Handler{
+		startedAt:                      time.Now().UTC(),
+		repositoryWorktrees:            deps.RepositoryWorktrees,
+		executionWorker:                deps.ExecutionWorker,
 		db:                             deps.DB,
 		resolver:                       deps.Resolver,
 		syncer:                         deps.Syncer,
@@ -225,6 +273,7 @@ func New(deps Deps) *Handler {
 		pullCandidates:                 deps.PullCandidates,
 		providerWorkspaceAutomation:    deps.ProviderWorkspaceAutomation,
 		mergeRequestWorktreeSource:     deps.MergeRequestWorktreeSource,
+		workspaceTargetSource:          deps.WorkspaceTargetSource,
 		hub:                            &eventHubAdapter{broadcast: deps.Broadcast, subscribe: deps.Subscribe, generation: deps.Generation},
 		workspaceEnrichmentCache:       make(map[string]workspaceEnrichmentCacheEntry),
 		workspaceEnrichmentInFlight:    make(map[string]uint64),
@@ -236,6 +285,7 @@ func New(deps Deps) *Handler {
 		workspaceEnrichmentDisabled:    deps.EnrichmentDisabled,
 		workspaceSetupDone:             make(map[string]chan struct{}),
 		workspaceWarmWake:              make(chan struct{}, 1),
+		baseRestoreBudget:              10 * time.Second,
 		workspaceDeleting:              make(map[string]*workspaceDeletion),
 		initialMessages:                make(map[initialMessageKey]initialMessageAttempt),
 		tmuxActivity:                   newTmuxActivityTracker(now),
@@ -243,7 +293,10 @@ func New(deps Deps) *Handler {
 		lifecycleCancel:                lifecycleCancel,
 		lifecycleDone:                  make(chan struct{}),
 	}
-	if deps.DB != nil && deps.Workspaces != nil {
+	if deps.ExecutionWorker.Enabled {
+		h.workerBroker = devbox.NewBrokerClient(deps.ExecutionWorker.BrokerSocket)
+	}
+	if deps.DB != nil && deps.Workspaces != nil && !deps.ExecutionWorker.Enabled {
 		monitorOptions := workspace.PRMonitorOptions{
 			LaunchSpecs: deps.Workspaces, PullCandidates: deps.PullCandidates,
 			RetireUnresolvedWorkspace: func(_ context.Context, workspaceID string) error {
@@ -252,8 +305,12 @@ func New(deps Deps) *Handler {
 		}
 		h.workspacePRMonitor = workspace.NewPRMonitor(deps.DB, monitorOptions)
 		h.workspacePushedHeadObserver = workspace.NewPushedHeadObserver(
-			deps.DB, monitorOptions,
+			deps.DB, deps.Workspaces, monitorOptions,
 		)
+	}
+	h.idleWake = make(chan struct{}, 1)
+	if h.runtime != nil {
+		h.runtime.SetInputObserver(func(workspaceID string) { h.idle.Load().Typed(workspaceID) })
 	}
 	h.workspaceDiffCache = newWorkspaceDiffCache(lifecycleCtx, workspaceDiffCacheDeps{
 		onReady: func(workspaceID string, revision uint64, version string) {
@@ -294,6 +351,12 @@ func (h *Handler) enqueueDetailSyncWithCompletion(
 
 // Register registers workspace and local-project REST operations.
 func (s *Handler) Register(api huma.API) {
+	s.RegisterExecution(api)
+	s.registerProjects(api)
+}
+
+// RegisterExecution registers only workspace, agent, and terminal operations.
+func (s *Handler) RegisterExecution(api huma.API) {
 	s.RegisterTerminalClipboard(api, true)
 	s.registerTerminalPasteImage(api)
 	huma.Register(api, huma.Operation{
@@ -303,18 +366,26 @@ func (s *Handler) Register(api huma.API) {
 		Summary:     "Receive agent lifecycle hook",
 		Tags:        []string{"Activity"},
 	}, s.receiveAgentHook)
-	huma.Register(api, huma.Operation{
-		OperationID:   "create-workspace",
-		Method:        http.MethodPost,
-		Path:          "/workspaces",
-		DefaultStatus: http.StatusAccepted,
-		Summary:       "Create workspace",
-		Tags:          []string{"Workspaces"},
-	}, s.createWorkspace)
+	if s == nil || !s.executionWorker.Enabled {
+		huma.Register(api, huma.Operation{
+			OperationID:   "create-workspace",
+			Method:        http.MethodPost,
+			Path:          "/workspaces",
+			DefaultStatus: http.StatusAccepted,
+			Summary:       "Create workspace",
+			Tags:          []string{"Workspaces"},
+		}, s.createWorkspace)
+	}
 	huma.Get(api, "/workspaces", s.listWorkspaces,
 		httpapi.DocumentOperation("list-workspaces", "List workspaces", "Workspaces"))
 	huma.Get(api, "/workspaces/{id}", s.getWorkspace,
 		httpapi.DocumentOperation("get-workspace", "Get workspace", "Workspaces"))
+	huma.Get(api, "/workspaces/{id}/targets", s.listWorkspaceTargets, httpapi.DocumentOperation("list-workspace-targets", "List workspace targets", "Workspaces"))
+	huma.Put(api, "/workspaces/{id}/targets", s.updateWorkspaceTarget, httpapi.DocumentOperation("update-workspace-target", "Track or hide a workspace target", "Workspaces"))
+	huma.Get(api, "/workspaces/{id}/view-state", s.getWorkspaceViewState,
+		httpapi.DocumentOperation("get-workspace-view-state", "Get workspace view state", "Workspaces"))
+	huma.Put(api, "/workspaces/{id}/view-state", s.updateWorkspaceViewState,
+		httpapi.DocumentOperation("update-workspace-view-state", "Update workspace view state", "Workspaces"))
 	huma.Get(api, "/workspaces/{id}/agent-sessions", s.listWorkspaceAgentSessions,
 		httpapi.DocumentOperation("list-workspace-agent-sessions", "List live coding sessions", "Workspaces"))
 	huma.Get(api, "/workspaces/{id}/commits", s.getWorkspaceCommits,
@@ -397,6 +468,27 @@ func (s *Handler) Register(api huma.API) {
 		s.getInitialMessageStatus,
 		httpapi.DocumentOperation("get-workspace-runtime-session-initial-message", "Get initial agent message status", "Workspaces"))
 	huma.Register(api, huma.Operation{
+		OperationID: "get-workspace-chat",
+		Method:      http.MethodGet,
+		Path:        "/workspaces/{id}/runtime/sessions/{session_key}/chat",
+		Summary:     "Get workspace chat",
+		Tags:        []string{"Workspaces"},
+	}, s.getWorkspaceChat)
+	huma.Register(api, huma.Operation{
+		OperationID: "run-workspace-chat-command",
+		Method:      http.MethodPost,
+		Path:        "/workspaces/{id}/runtime/sessions/{session_key}/chat/commands",
+		Summary:     "Run workspace chat command",
+		Tags:        []string{"Workspaces"},
+	}, s.runWorkspaceChatCommand)
+	huma.Register(api, huma.Operation{
+		OperationID: "restore-workspace-chat",
+		Method:      http.MethodPost,
+		Path:        "/workspaces/{id}/runtime/sessions/{session_key}/chat/restore",
+		Summary:     "Restore supervised workspace chat",
+		Tags:        []string{"Workspaces"},
+	}, s.restoreWorkspaceChat)
+	huma.Register(api, huma.Operation{
 		OperationID: "launch-workspace-agent-handoff",
 		Method:      http.MethodPost,
 		Path:        "/workspaces/{id}/runtime/agent-handoffs",
@@ -427,7 +519,9 @@ func (s *Handler) Register(api huma.API) {
 		Summary:       "Delete workspace",
 		Tags:          []string{"Workspaces"},
 	}, s.DeleteWorkspace)
+}
 
+func (s *Handler) registerProjects(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID:   "register-project",
 		Method:        http.MethodPost,

@@ -3,6 +3,7 @@ import {
   navigate,
   replaceUrl,
   getRoute,
+  getCommentNavigation,
   getDetailTab,
   isDiffView,
   getSelectedPRFromRoute,
@@ -12,6 +13,7 @@ import {
   forgetWorkspaceRoute,
   buildMobileWorkspaceRoute,
   buildMobileWorkspaceItemRoute,
+  getURLChangeCount,
 } from "./router.svelte.js";
 
 const prRoute = "/pulls/github/acme/widgets/42";
@@ -554,5 +556,104 @@ describe("Activity preferences after Settings", () => {
     expect(restored.get("range")).toBe("90d");
     expect(restored.get("view")).toBe("threaded");
     expect(restored.get("hide_closed")).toBe(hideClosed);
+  });
+});
+
+describe("router /worklists routes", () => {
+  afterEach(() => {
+    navigate("/");
+  });
+
+  it("parses the bare page as no list chosen yet", () => {
+    navigate("/worklists");
+    expect(getRoute()).toEqual({ page: "worklists", worklistId: null });
+  });
+
+  it("parses a list id with the selected item from the query", () => {
+    navigate(
+      "/worklists/7?selected=pr%3A42&provider=gitlab&platform_host=gitlab.example.com&repo_path=acme%2Fplatform%2Fwidgets&selected_tab=files",
+    );
+    expect(getRoute()).toEqual({
+      page: "worklists",
+      worklistId: 7,
+      selected: {
+        itemType: "pr",
+        provider: "gitlab",
+        platformHost: "gitlab.example.com",
+        repoPath: "acme/platform/widgets",
+        owner: "acme/platform",
+        name: "widgets",
+        number: 42,
+        detailTab: "files",
+      },
+    });
+  });
+
+  it("ignores an incomplete selection and keeps the list", () => {
+    navigate("/worklists/7?selected=issue%3A9&provider=github");
+    expect(getRoute()).toEqual({ page: "worklists", worklistId: 7 });
+  });
+
+  it("parses a worklist link as an import carrying its fragment", () => {
+    navigate("/worklists/import#v1.ZY9Ba8Mw-_x");
+    expect(getRoute()).toEqual({ page: "worklists", worklistId: null, importFragment: "v1.ZY9Ba8Mw-_x" });
+    navigate("/worklists/import");
+    expect(getRoute()).toEqual({ page: "worklists", worklistId: null, importFragment: "" });
+  });
+
+  it("treats a malformed id as no list chosen", () => {
+    navigate("/worklists/0");
+    expect(getRoute()).toEqual({ page: "worklists", worklistId: null });
+    navigate("/worklists/abc");
+    expect(getRoute()).toEqual({ page: "worklists", worklistId: null });
+  });
+});
+
+describe("comment navigation", () => {
+  it.each([
+    ["/pulls/gh/acme/widgets/42", "pull"],
+    ["/issues/gh/acme/widgets/42", "issue"],
+    ["/focus/pulls/gh/acme/widgets/42", "pull"],
+    ["/focus/issues/gh/acme/widgets/42", "issue"],
+  ] as const)("recognizes GitHub comment targets through %s", (path, itemType) => {
+    navigate(`${path}#issuecomment-123`);
+    expect(getCommentNavigation({ ...prRef, itemType })?.commentAnchor).toBe("issuecomment-123");
+  });
+
+  it("preserves targets for selected items and creates a request for every navigation", () => {
+    const item = { ...prRef, itemType: "pull" as const };
+    const path = "/host/github.com/pulls/github/acme/widgets/42#issuecomment-123";
+    navigate(path);
+    const first = getCommentNavigation(item);
+    expect(first?.commentAnchor).toBe("issuecomment-123");
+    navigate(path);
+    expect(getCommentNavigation(item)).not.toBe(first);
+    expect(getCommentNavigation({ ...item, number: 43 })).toBeNull();
+    expect(getCommentNavigation({ ...item, platformHost: "code.example" })).toBeNull();
+    expect(getCommentNavigation({ ...item, itemType: "issue" })).toBeNull();
+    navigate("/host/github.com/pulls/github/acme/widgets/42/files#issuecomment-123");
+    expect(getCommentNavigation(item)).toBeNull();
+    navigate("/pulls#issuecomment-123");
+    expect(getCommentNavigation(item)).toBeNull();
+  });
+});
+
+describe("router URL change count", () => {
+  it.each([
+    ["navigate", () => navigate("/settings")],
+    ["replaceUrl", () => replaceUrl("/?selected=pr:1")],
+    ["a direct history.replaceState", () => window.history.replaceState(null, "", "/?range=7d")],
+    ["browser back or forward", () => window.dispatchEvent(new PopStateEvent("popstate"))],
+  ])("advances on a URL change made by %s", (_label, change) => {
+    const before = getURLChangeCount();
+    change();
+    expect(getURLChangeCount()).toBeGreaterThan(before);
+  });
+
+  it("does not advance when history.replaceState leaves the URL unchanged", () => {
+    navigate("/?range=7d");
+    const before = getURLChangeCount();
+    window.history.replaceState(null, "", "/?range=7d");
+    expect(getURLChangeCount()).toBe(before);
   });
 });

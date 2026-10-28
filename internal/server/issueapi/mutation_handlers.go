@@ -10,7 +10,7 @@ import (
 
 	"go.kenn.io/forge/internal/platformdb"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"go.kenn.io/forge/internal/db"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server/httpapi"
@@ -26,21 +26,21 @@ func (s *Handler) postIssueComment(ctx context.Context, input *postIssueCommentI
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSyncerCapability(*repo, capabilityCommentMutation); err != nil {
+	if err := s.requireSyncerCapability(repo.Repo, capabilityCommentMutation); err != nil {
 		return nil, err
 	}
-	issueID, err := s.lookupIssueID(ctx, repo, input.Number)
+	issueID, err := s.lookupIssueID(ctx, repo.Row(), input.Number)
 	if err != nil {
 		return nil, err
 	}
-	mutator, err := s.syncer.CommentMutator(httpapi.ProviderKind(*repo), httpapi.ProviderHost(*repo))
+	mutator, err := s.syncer.CommentMutator(httpapi.ProviderKind(repo.Repo), httpapi.ProviderHost(repo.Repo))
 	if err != nil {
-		return nil, httpapi.UnsupportedCapability(*repo, capabilityCommentMutation)
+		return nil, httpapi.UnsupportedCapability(repo.Repo, capabilityCommentMutation)
 	}
-	providerEvent, err := mutator.CreateIssueComment(ctx, httpapi.PlatformRepoRef(*repo), input.Number, input.Body.Body)
+	providerEvent, err := mutator.CreateIssueComment(ctx, httpapi.PlatformRepoRef(repo.Repo), input.Number, input.Body.Body)
 	if err != nil {
 		return nil, httpapi.ProviderCallProblemWithDetail(
-			err, string(httpapi.ProviderKind(*repo)), httpapi.ProviderHost(*repo),
+			err, string(httpapi.ProviderKind(repo.Repo)), httpapi.ProviderHost(repo.Repo),
 			"create comment on provider failed",
 		)
 	}
@@ -61,16 +61,16 @@ func (s *Handler) editIssueComment(ctx context.Context, input *editIssueCommentI
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSyncerCapability(*repo, capabilityCommentMutation); err != nil {
+	if err := s.requireSyncerCapability(repo.Repo, capabilityCommentMutation); err != nil {
 		return nil, err
 	}
-	issueID, err := s.lookupIssueID(ctx, repo, input.Number)
+	issueID, err := s.lookupIssueID(ctx, repo.Row(), input.Number)
 	if err != nil {
 		return nil, err
 	}
-	mutator, err := s.syncer.CommentMutator(httpapi.ProviderKind(*repo), httpapi.ProviderHost(*repo))
+	mutator, err := s.syncer.CommentMutator(httpapi.ProviderKind(repo.Repo), httpapi.ProviderHost(repo.Repo))
 	if err != nil {
-		return nil, httpapi.UnsupportedCapability(*repo, capabilityCommentMutation)
+		return nil, httpapi.UnsupportedCapability(repo.Repo, capabilityCommentMutation)
 	}
 	exists, err := s.db.IssueCommentEventExists(ctx, issueID, input.CommentID)
 	if err != nil {
@@ -80,11 +80,11 @@ func (s *Handler) editIssueComment(ctx context.Context, input *editIssueCommentI
 		return nil, httpapi.NotFound(httpapi.CodeCommentNotFound, "comment not found for issue", nil)
 	}
 	providerEvent, err := mutator.EditIssueComment(
-		ctx, httpapi.PlatformRepoRef(*repo), input.Number, input.CommentID, input.Body.Body,
+		ctx, httpapi.PlatformRepoRef(repo.Repo), input.Number, input.CommentID, input.Body.Body,
 	)
 	if err != nil {
 		return nil, httpapi.ProviderCallProblemWithDetail(
-			err, string(httpapi.ProviderKind(*repo)), httpapi.ProviderHost(*repo),
+			err, string(httpapi.ProviderKind(repo.Repo)), httpapi.ProviderHost(repo.Repo),
 			"edit comment on provider failed",
 		)
 	}
@@ -116,16 +116,16 @@ func (s *Handler) deleteIssueComment(ctx context.Context, input *deleteIssueComm
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSyncerCapability(*repo, capabilityCommentMutation); err != nil {
+	if err := s.requireSyncerCapability(repo.Repo, capabilityCommentMutation); err != nil {
 		return nil, err
 	}
-	issueID, err := s.lookupIssueID(ctx, repo, input.Number)
+	issueID, err := s.lookupIssueID(ctx, repo.Row(), input.Number)
 	if err != nil {
 		return nil, err
 	}
-	mutator, err := s.syncer.CommentMutator(httpapi.ProviderKind(*repo), httpapi.ProviderHost(*repo))
+	mutator, err := s.syncer.CommentMutator(httpapi.ProviderKind(repo.Repo), httpapi.ProviderHost(repo.Repo))
 	if err != nil {
-		return nil, httpapi.UnsupportedCapability(*repo, capabilityCommentMutation)
+		return nil, httpapi.UnsupportedCapability(repo.Repo, capabilityCommentMutation)
 	}
 	exists, err := s.db.IssueCommentEventExists(ctx, issueID, input.CommentID)
 	if err != nil {
@@ -134,9 +134,9 @@ func (s *Handler) deleteIssueComment(ctx context.Context, input *deleteIssueComm
 	if !exists {
 		return nil, httpapi.NotFound(httpapi.CodeCommentNotFound, "comment not found for issue", nil)
 	}
-	if err := mutator.DeleteIssueComment(ctx, httpapi.PlatformRepoRef(*repo), input.Number, input.CommentID); err != nil {
+	if err := mutator.DeleteIssueComment(ctx, httpapi.PlatformRepoRef(repo.Repo), input.Number, input.CommentID); err != nil {
 		return nil, httpapi.ProviderCallProblemWithDetail(
-			err, string(httpapi.ProviderKind(*repo)), httpapi.ProviderHost(*repo),
+			err, string(httpapi.ProviderKind(repo.Repo)), httpapi.ProviderHost(repo.Repo),
 			"delete comment on provider failed",
 		)
 	}
@@ -170,7 +170,9 @@ func (s *Handler) requireVisibleIssue(
 	return issue, nil
 }
 
-func (s *Handler) setIssueLabels(ctx context.Context, input *setIssueLabelsInput) (*setLabelsOutput, error) {
+// writeIssueLabels replaces an issue's labels. Callers hold the item's labels
+// lock.
+func (s *Handler) writeIssueLabels(ctx context.Context, input *setIssueLabelsInput) (*setLabelsOutput, error) {
 	repo, issue, names, err := s.resolveRequestedLabelNames(
 		ctx, input.Provider, input.PlatformHost, input.Owner, input.Name,
 		input.Number, input.Body.LabelNames(),
@@ -212,14 +214,14 @@ func (s *Handler) resolveRequestedLabelNames(
 	if err != nil {
 		return nil, nil, nil, httpapi.ProviderRouteLookupError(err)
 	}
-	caps := s.resolver.CapabilitiesForRepo(*repo)
+	caps := s.resolver.CapabilitiesForRepo(repo.Repo)
 	if !httpapi.CapabilityEnabled(caps, capabilityReadLabels) {
-		return nil, nil, nil, httpapi.UnsupportedCapability(*repo, capabilityReadLabels)
+		return nil, nil, nil, httpapi.UnsupportedCapability(repo.Repo, capabilityReadLabels)
 	}
 	if !httpapi.CapabilityEnabled(caps, capabilityLabelMutation) {
-		return nil, nil, nil, httpapi.UnsupportedCapability(*repo, capabilityLabelMutation)
+		return nil, nil, nil, httpapi.UnsupportedCapability(repo.Repo, capabilityLabelMutation)
 	}
-	issue, err := s.requireVisibleIssue(ctx, repo, number)
+	issue, err := s.requireVisibleIssue(ctx, repo.Row(), number)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -231,7 +233,7 @@ func (s *Handler) resolveRequestedLabelNames(
 		return nil, nil, nil, httpapi.Internal("list repo labels failed")
 	}
 	if labelCatalogStale(freshness, time.Now().UTC()) && s.syncer != nil {
-		_ = s.syncer.RefreshRepoLabelCatalog(ctx, *repo)
+		_ = s.syncer.RefreshRepoLabelCatalog(ctx, repo.Repo)
 		catalog, _, err = s.db.ListRepoLabelCatalog(ctx, repo.ID)
 		if err != nil {
 			return nil, nil, nil, httpapi.Internal("list repo labels failed")
@@ -261,10 +263,12 @@ func (s *Handler) resolveRequestedLabelNames(
 		seen[label] = struct{}{}
 		resolved = append(resolved, label)
 	}
-	return repo, issue, resolved, nil
+	return repo.Row(), issue, resolved, nil
 }
 
-func (s *Handler) setIssueAssignees(ctx context.Context, input *setIssueAssigneesInput) (*setAssigneesOutput, error) {
+// writeIssueAssignees replaces an issue's assignees. Callers hold the item's
+// assignees lock.
+func (s *Handler) writeIssueAssignees(ctx context.Context, input *setIssueAssigneesInput) (*setAssigneesOutput, error) {
 	repo, names, err := s.resolveAssignees(
 		ctx, input.Provider, input.PlatformHost, input.Owner, input.Name, input.Body.Assignees,
 	)
@@ -303,7 +307,7 @@ func (s *Handler) resolveAssignees(
 		return nil, nil, err
 	}
 	if s.syncer == nil {
-		return nil, nil, httpapi.UnsupportedCapability(*repo, capabilityAssigneeMutation)
+		return nil, nil, httpapi.UnsupportedCapability(repo.Repo, capabilityAssigneeMutation)
 	}
 	if raw == nil {
 		return nil, nil, httpapi.Validation("body.assignees", "value must be an array of usernames")
@@ -322,7 +326,7 @@ func (s *Handler) resolveAssignees(
 		seen[key] = struct{}{}
 		resolved = append(resolved, username)
 	}
-	return repo, resolved, nil
+	return repo.Row(), resolved, nil
 }
 
 func (s *Handler) setIssueGitHubState(ctx context.Context, input *githubStateInput) (*githubStateOutput, error) {
@@ -335,36 +339,35 @@ func (s *Handler) setIssueGitHubState(ctx context.Context, input *githubStateInp
 	if err != nil {
 		return nil, err
 	}
-	issue, err := s.requireVisibleIssue(ctx, repo, input.Number)
+	issue, err := s.requireVisibleIssue(ctx, repo.Row(), input.Number)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSyncerCapability(*repo, capabilityStateMutation); err != nil {
+	if err := s.requireSyncerCapability(repo.Repo, capabilityStateMutation); err != nil {
 		return nil, err
 	}
-	mutator, err := s.syncer.StateMutator(httpapi.ProviderKind(*repo), httpapi.ProviderHost(*repo))
+	mutator, err := s.syncer.StateMutator(httpapi.ProviderKind(repo.Repo), httpapi.ProviderHost(repo.Repo))
 	if err != nil {
-		return nil, httpapi.UnsupportedCapability(*repo, capabilityStateMutation)
+		return nil, httpapi.UnsupportedCapability(repo.Repo, capabilityStateMutation)
 	}
-	if _, err := mutator.SetIssueState(ctx, httpapi.PlatformRepoRef(*repo), input.Number, input.Body.State); err != nil {
-		var githubError *gh.ErrorResponse
-		if errors.As(err, &githubError) && githubError != nil && githubError.Response != nil &&
+	if _, err := mutator.SetIssueState(ctx, httpapi.PlatformRepoRef(repo.Repo), input.Number, input.Body.State); err != nil {
+		if githubError, ok := errors.AsType[*gh.ErrorResponse](err); ok && githubError != nil && githubError.Response != nil &&
 			githubError.Response.StatusCode == http.StatusUnprocessableEntity {
 			client, clientErr := s.syncer.ClientForHost(repo.PlatformHost)
 			if clientErr != nil {
 				return nil, httpapi.ProviderCallProblemWithDetail(
-					clientErr, string(httpapi.ProviderKind(*repo)), httpapi.ProviderHost(*repo),
+					clientErr, string(httpapi.ProviderKind(repo.Repo)), httpapi.ProviderHost(repo.Repo),
 					"GitHub API error: "+err.Error(),
 				)
 			}
 			githubIssue, fetchErr := client.GetIssue(ctx, input.Owner, input.Name, input.Number)
 			if fetchErr == nil {
 				if githubIssue == nil {
-					return nil, httpapi.Upstream("GitHub API returned no issue", string(httpapi.ProviderKind(*repo)), httpapi.ProviderHost(*repo))
+					return nil, httpapi.Upstream("GitHub API returned no issue", string(httpapi.ProviderKind(repo.Repo)), httpapi.ProviderHost(repo.Repo))
 				}
 				normalized, normalizeErr := ghclient.NormalizeIssue(repo.ID, githubIssue)
 				if normalizeErr != nil {
-					return nil, httpapi.Upstream("GitHub API error: "+normalizeErr.Error(), string(httpapi.ProviderKind(*repo)), httpapi.ProviderHost(*repo))
+					return nil, httpapi.Upstream("GitHub API error: "+normalizeErr.Error(), string(httpapi.ProviderKind(repo.Repo)), httpapi.ProviderHost(repo.Repo))
 				}
 				_, _ = s.db.UpsertIssue(ctx, normalized)
 				s.markClosedLinkedNotificationsDone(ctx)
@@ -376,7 +379,7 @@ func (s *Handler) setIssueGitHubState(ctx context.Context, input *githubStateInp
 			}
 		}
 		return nil, httpapi.ProviderCallProblemWithDetail(
-			err, string(httpapi.ProviderKind(*repo)), httpapi.ProviderHost(*repo), "GitHub API error: "+err.Error(),
+			err, string(httpapi.ProviderKind(repo.Repo)), httpapi.ProviderHost(repo.Repo), "GitHub API error: "+err.Error(),
 		)
 	}
 	var closedAt *time.Time

@@ -8,13 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"go.kenn.io/forge/platform"
 )
 
@@ -32,23 +33,24 @@ type PullRequestReviewThread struct {
 }
 
 type PullRequestReviewThreadComment struct {
-	NodeID           string
-	DatabaseID       int64
-	ReviewDatabaseID int64
-	SubjectType      string
-	Body             string
-	AuthorLogin      string
-	Path             string
-	Line             int
-	OriginalLine     int
-	DiffHunk         string
-	URL              string
-	CommitID         string
-	OriginalCommitID string
-	IsMinimized      bool
-	MinimizedReason  string
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	NodeID            string
+	DatabaseID        int64
+	ReviewDatabaseID  int64
+	SubjectType       string
+	Body              string
+	AuthorLogin       string
+	AuthorAssociation *string
+	Path              string
+	Line              int
+	OriginalLine      int
+	DiffHunk          string
+	URL               string
+	CommitID          string
+	OriginalCommitID  string
+	IsMinimized       bool
+	MinimizedReason   string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 // EditPullRequestOpts holds optional fields for editing a pull request.
@@ -98,6 +100,8 @@ type Client struct {
 	now                     func() time.Time
 	viewerCacheTTL          time.Duration
 	readOnlyContext         func(context.Context) bool
+	writesDisabled          bool
+	ownerContext            func(context.Context, string) context.Context
 	graphQLContext          func(context.Context) context.Context
 	progressFactory         func(string, string, string) Progress
 	warning                 func(string, ...any)
@@ -105,6 +109,19 @@ type Client struct {
 	viewerLogin             string
 	viewerLoginAt           time.Time
 	viewerLoginCacheKey     string
+	viewerRepoMu            sync.Mutex
+	viewerRepos             map[string]viewerRepoOverlay
+}
+
+// viewerRepoOverlay is the user's view of a repository, kept with the ETag
+// that revalidates it.
+type viewerRepoOverlay struct {
+	permissions   *gh.RepositoryPermissions
+	mergeSettings bool
+	allowSquash   bool
+	allowMerge    bool
+	allowRebase   bool
+	etag          string
 }
 
 func (c *Client) writeGH() *gh.Client {
@@ -152,7 +169,6 @@ func (c *Client) SetWriteGraphQLRateTracker(rateTracker platform.RateObserver) {
 // GitHub App installation token while writes use the user's own
 // credential (the mutation-marked chain skips the app candidate).
 func (c *Client) splitAuthActive() bool {
-
 	return c.auth.InstallationActive != nil && c.auth.InstallationActive("")
 }
 
@@ -164,7 +180,6 @@ func (c *Client) splitAuthActive() bool {
 // installation-token-only endpoints on this so a PAT-backed owner on a
 // host that also hosts another owner's app is not routed there.
 func (c *Client) splitAuthActiveForOwner(owner string) bool {
-
 	return c.auth.InstallationActive != nil && c.auth.InstallationActive(owner)
 }
 
@@ -222,6 +237,70 @@ func (c *Client) ListNotifications(ctx context.Context, opts platform.Notificati
 		threads = append(threads, c.normalizeNotification(notification))
 	}
 	return threads, resp != nil && resp.NextPage != 0, nil
+}
+
+// NotificationPage is one page of the authenticated user's notifications
+// across every repository. NotModified reports a 304 for a conditional
+// request; LastModified is the validator GitHub returned.
+type NotificationPage struct {
+	Threads      []platform.NotificationThread
+	HasNext      bool
+	LastModified string
+	NotModified  bool
+}
+
+// NotificationPageAPI lists the authenticated user's notifications across
+// every repository. GitHub scopes Last-Modified to the user's whole
+// notification set rather than to the URL, and a 304 costs no rate limit, so
+// one conditional request proves nothing changed anywhere.
+type NotificationPageAPI interface {
+	ListNotificationPage(
+		ctx context.Context, opts platform.NotificationListOptions, ifModifiedSince string,
+	) (NotificationPage, error)
+}
+
+var _ NotificationPageAPI = (*Client)(nil)
+
+func (c *Client) ListNotificationPage(
+	ctx context.Context, opts platform.NotificationListOptions, ifModifiedSince string,
+) (NotificationPage, error) {
+	query := url.Values{}
+	query.Set("all", strconv.FormatBool(opts.All))
+	query.Set("participating", strconv.FormatBool(opts.Participating))
+	if opts.Since != nil {
+		query.Set("since", opts.Since.UTC().Format(time.RFC3339))
+	}
+	query.Set("page", strconv.Itoa(max(opts.Page, 1)))
+	query.Set("per_page", "100")
+	req, err := c.notificationGH().NewRequest(
+		ctx, http.MethodGet, "notifications?"+query.Encode(), nil,
+	)
+	if err != nil {
+		return NotificationPage{}, err
+	}
+	if ifModifiedSince != "" {
+		req.Header.Set("If-Modified-Since", ifModifiedSince)
+	}
+	var notifications []*gh.Notification
+	resp, err := c.notificationGH().Do(req, &notifications)
+	c.trackNotificationRate(resp)
+	if err != nil {
+		if IsNotModified(err) {
+			return NotificationPage{NotModified: true, LastModified: ifModifiedSince}, nil
+		}
+		return NotificationPage{}, err
+	}
+	page := NotificationPage{
+		Threads: make([]platform.NotificationThread, 0, len(notifications)),
+		HasNext: resp.NextPage != 0,
+	}
+	if resp.Response != nil {
+		page.LastModified = resp.Header.Get("Last-Modified")
+	}
+	for _, notification := range notifications {
+		page.Threads = append(page.Threads, c.normalizeNotification(notification))
+	}
+	return page, nil
 }
 
 func (c *Client) GetNotificationThread(ctx context.Context, threadID string) (platform.NotificationThread, error) {
@@ -290,7 +369,7 @@ func (c *Client) notificationItem(subjectType, apiURL, owner, repo string) (stri
 	}
 	segments := strings.Split(strings.TrimRight(apiURL, "/"), "/")
 	lastSegment := func(prefix string) (string, bool) {
-		for i := 0; i < len(segments)-1; i++ {
+		for i := range len(segments) - 1 {
 			if segments[i] == prefix {
 				return segments[i+1], true
 			}
@@ -657,6 +736,7 @@ mutation($pullRequestId: ID!) {
       locked
       body
       url
+      authorAssociation
       author {
         login
       }
@@ -714,6 +794,7 @@ query($threadID: ID!, $cursor: String) {
           diffHunk
           url
           author { login }
+          authorAssociation
           commit { oid }
           originalCommit { oid }
           pullRequestReview { databaseId }
@@ -742,17 +823,18 @@ type graphQLError struct {
 }
 
 type graphQLReviewThreadComment struct {
-	NodeID         string       `json:"id"`
-	DatabaseID     GraphQLInt64 `json:"databaseId"`
-	FullDatabaseID GraphQLInt64 `json:"fullDatabaseId"`
-	Body           string       `json:"body"`
-	Path           string       `json:"path"`
-	Line           int          `json:"line"`
-	OriginalLine   int          `json:"originalLine"`
-	SubjectType    string       `json:"subjectType"`
-	DiffHunk       string       `json:"diffHunk"`
-	URL            string       `json:"url"`
-	Author         *struct {
+	AuthorAssociation *string      `json:"authorAssociation"`
+	NodeID            string       `json:"id"`
+	DatabaseID        GraphQLInt64 `json:"databaseId"`
+	FullDatabaseID    GraphQLInt64 `json:"fullDatabaseId"`
+	Body              string       `json:"body"`
+	Path              string       `json:"path"`
+	Line              int          `json:"line"`
+	OriginalLine      int          `json:"originalLine"`
+	SubjectType       string       `json:"subjectType"`
+	DiffHunk          string       `json:"diffHunk"`
+	URL               string       `json:"url"`
+	Author            *struct {
 		Login string `json:"login"`
 	} `json:"author"`
 	Commit *struct {
@@ -901,7 +983,7 @@ func (c *Client) trackNotificationRate(resp *gh.Response) {
 }
 
 func (c *Client) GetRateLimitSnapshot(ctx context.Context) (*RateLimitSnapshot, error) {
-	limits, _, err := c.gh.RateLimit.Get(ctx)
+	limits, resp, err := c.gh.RateLimit.Get(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get GitHub rate limit snapshot: %w", err)
 	}
@@ -911,6 +993,13 @@ func (c *Client) GetRateLimitSnapshot(ctx context.Context) (*RateLimitSnapshot, 
 	snapshot := &RateLimitSnapshot{}
 	if limits.Core != nil {
 		rate := RateFromGitHub(*limits.Core)
+		snapshot.Core = &rate
+	}
+	// GitHub can return an optimistic core body while the same response's
+	// headers report exhausted quota. Preserve the enforced window.
+	if resp != nil && resp.Header.Get("X-RateLimit-Resource") == "core" &&
+		resp.Rate.Limit > 0 && !resp.Rate.Reset.IsZero() {
+		rate := RateFromGitHub(resp.Rate)
 		snapshot.Core = &rate
 	}
 	if limits.GraphQL != nil {
@@ -1136,7 +1225,7 @@ func (c *Client) ListRepositoriesByOwner(
 	)
 	if userErr != nil {
 		return nil, fmt.Errorf(
-			"listing repositories for %s: org=%v user=%w",
+			"listing repositories for %s: org=%w user=%w",
 			owner, err, userErr,
 		)
 	}
@@ -1159,7 +1248,7 @@ func (c *Client) authenticatedLogin(ctx context.Context) (string, error) {
 	}
 	login := user.GetLogin()
 	if login == "" {
-		return "", fmt.Errorf("authenticated user login is empty")
+		return "", errors.New("authenticated user login is empty")
 	}
 	c.viewerLogin = login
 	c.viewerLoginAt = c.now()
@@ -1372,19 +1461,20 @@ func githubReviewThreadCommentFromGraphQL(
 	comment graphQLReviewThreadComment,
 ) PullRequestReviewThreadComment {
 	next := PullRequestReviewThreadComment{
-		NodeID:          comment.NodeID,
-		DatabaseID:      FirstPositiveInt64(int64(comment.FullDatabaseID), int64(comment.DatabaseID)),
-		SubjectType:     comment.SubjectType,
-		Body:            comment.Body,
-		Path:            comment.Path,
-		Line:            comment.Line,
-		OriginalLine:    comment.OriginalLine,
-		DiffHunk:        comment.DiffHunk,
-		URL:             comment.URL,
-		IsMinimized:     comment.IsMinimized,
-		MinimizedReason: comment.MinimizedReason,
-		CreatedAt:       comment.CreatedAt,
-		UpdatedAt:       comment.UpdatedAt,
+		NodeID:            comment.NodeID,
+		DatabaseID:        FirstPositiveInt64(int64(comment.FullDatabaseID), int64(comment.DatabaseID)),
+		SubjectType:       comment.SubjectType,
+		Body:              comment.Body,
+		AuthorAssociation: comment.AuthorAssociation,
+		Path:              comment.Path,
+		Line:              comment.Line,
+		OriginalLine:      comment.OriginalLine,
+		DiffHunk:          comment.DiffHunk,
+		URL:               comment.URL,
+		IsMinimized:       comment.IsMinimized,
+		MinimizedReason:   comment.MinimizedReason,
+		CreatedAt:         comment.CreatedAt,
+		UpdatedAt:         comment.UpdatedAt,
 	}
 	if comment.Author != nil {
 		next.AuthorLogin = comment.Author.Login
@@ -1971,8 +2061,7 @@ func (c *Client) DeleteIssueComment(
 	resp, err := c.writeGH().Issues.DeleteComment(ctx, owner, repo, commentID)
 	c.trackWriteRate(resp)
 	if err != nil {
-		var responseErr *gh.ErrorResponse
-		if errors.As(err, &responseErr) && responseErr.Response != nil && responseErr.Response.StatusCode == http.StatusNotFound {
+		if responseErr, ok := errors.AsType[*gh.ErrorResponse](err); ok && responseErr.Response != nil && responseErr.Response.StatusCode == http.StatusNotFound {
 			return &platform.Error{
 				Code:         platform.ErrCodeNotFound,
 				Provider:     platform.KindGitHub,
@@ -2017,7 +2106,35 @@ func (c *Client) GetRepository(
 	if err != nil {
 		return nil, fmt.Errorf("getting repository %s/%s: %w", owner, repo, err)
 	}
+	return c.withViewerOverlay(ctx, r)
+}
+
+// GetRepositoryByID reads a repository by its integer ID, so a renamed or
+// transferred repository resolves to its current route. owner, the last known
+// owner, only selects credentials; the ID alone decides the repository.
+func (c *Client) GetRepositoryByID(
+	ctx context.Context, owner string, id int64,
+) (*gh.Repository, error) {
+	if c.ownerContext != nil {
+		ctx = c.ownerContext(ctx, owner)
+	}
+	r, resp, err := c.gh.Repositories.GetByID(ctx, id)
+	c.trackRate(resp)
+	if err != nil {
+		return nil, fmt.Errorf("getting repository %d: %w", id, err)
+	}
+	return c.withViewerOverlay(ctx, r)
+}
+
+func (c *Client) withViewerOverlay(
+	ctx context.Context, r *gh.Repository,
+) (*gh.Repository, error) {
+	owner, repo := r.GetOwner().GetLogin(), r.GetName()
 	if !c.splitAuthActive() {
+		return r, nil
+	}
+	if c.writesDisabled {
+		r.Permissions = nil
 		return r, nil
 	}
 	if c.readOnlyContext != nil && c.readOnlyContext(ctx) {
@@ -2029,23 +2146,78 @@ func (c *Client) GetRepository(
 		r.Permissions = nil
 		return r, nil
 	}
-	viewerRepo, viewerResp, viewerErr := c.writeGH().Repositories.Get(ctx, owner, repo)
-	c.trackWriteRate(viewerResp)
-	if viewerErr != nil {
+	overlay, err := c.viewerRepoOverlay(ctx, owner, repo)
+	if err != nil {
 		c.warn(
 			"viewer permission refresh failed; merge permission unknown until it succeeds",
-			"repo", owner+"/"+repo, "err", viewerErr,
+			"repo", owner+"/"+repo, "err", err,
 		)
 		r.Permissions = nil
 		return r, nil
 	}
-	r.Permissions = viewerRepo.Permissions
-	if MergeSettingsComplete(viewerRepo) {
-		r.AllowSquashMerge = viewerRepo.AllowSquashMerge
-		r.AllowMergeCommit = viewerRepo.AllowMergeCommit
-		r.AllowRebaseMerge = viewerRepo.AllowRebaseMerge
+	if overlay.permissions != nil {
+		permissions := *overlay.permissions
+		r.Permissions = &permissions
+	} else {
+		r.Permissions = nil
+	}
+	if overlay.mergeSettings {
+		r.AllowSquashMerge = new(overlay.allowSquash)
+		r.AllowMergeCommit = new(overlay.allowMerge)
+		r.AllowRebaseMerge = new(overlay.allowRebase)
 	}
 	return r, nil
+}
+
+// viewerRepoOverlay returns the user's view of a repository. Sync reads every
+// tracked repository on each pass, so the overlay is revalidated with its ETag:
+// GitHub answers an unchanged repository with a 304 that costs no rate limit,
+// and the cached overlay stays current without spending the user's credential.
+func (c *Client) viewerRepoOverlay(
+	ctx context.Context, owner, repo string,
+) (viewerRepoOverlay, error) {
+	key := strings.ToLower(owner) + "/" + strings.ToLower(repo)
+	if c.auth.CredentialKey != nil {
+		key = c.auth.CredentialKey() + "\x00" + key
+	}
+	c.viewerRepoMu.Lock()
+	cached, ok := c.viewerRepos[key]
+	c.viewerRepoMu.Unlock()
+	req, err := c.writeGH().NewRequest(
+		ctx, http.MethodGet, fmt.Sprintf("repos/%v/%v", owner, repo), nil,
+	)
+	if err != nil {
+		return viewerRepoOverlay{}, err
+	}
+	if ok && cached.etag != "" {
+		req.Header.Set("If-None-Match", cached.etag)
+	}
+	viewerRepo := new(gh.Repository)
+	resp, err := c.writeGH().Do(req, viewerRepo)
+	c.trackWriteRate(resp)
+	if err != nil {
+		if ok && IsNotModified(err) {
+			return cached, nil
+		}
+		return viewerRepoOverlay{}, err
+	}
+	overlay := viewerRepoOverlay{
+		permissions:   viewerRepo.Permissions,
+		mergeSettings: MergeSettingsComplete(viewerRepo),
+		allowSquash:   viewerRepo.GetAllowSquashMerge(),
+		allowMerge:    viewerRepo.GetAllowMergeCommit(),
+		allowRebase:   viewerRepo.GetAllowRebaseMerge(),
+	}
+	if resp.Response != nil {
+		overlay.etag = resp.Header.Get("ETag")
+	}
+	c.viewerRepoMu.Lock()
+	if c.viewerRepos == nil {
+		c.viewerRepos = map[string]viewerRepoOverlay{}
+	}
+	c.viewerRepos[key] = overlay
+	c.viewerRepoMu.Unlock()
+	return overlay, nil
 }
 
 func MergeSettingsComplete(repo *gh.Repository) bool {
@@ -2262,8 +2434,8 @@ func githubSuggestionLiveHeadRepoFullName(pr *gh.PullRequest) string {
 }
 
 func githubSuggestionHeadRepoUnavailable(err error) bool {
-	var ghErr *gh.ErrorResponse
-	if !errors.As(err, &ghErr) || ghErr.Response == nil {
+	ghErr, ok := errors.AsType[*gh.ErrorResponse](err)
+	if !ok || ghErr.Response == nil {
 		return false
 	}
 	switch ghErr.Response.StatusCode {
@@ -2536,15 +2708,14 @@ func applyReviewSuggestionEdits(
 	})
 	for i := 1; i < len(edits); i += 1 {
 		if edits[i].start <= edits[i-1].end {
-			return "", fmt.Errorf("suggestions contain overlapping line ranges")
+			return "", errors.New("suggestions contain overlapping line ranges")
 		}
 	}
 	for i := len(edits) - 1; i >= 0; i -= 1 {
 		edit := edits[i]
 		prefix := append([]string{}, lines[:edit.start-1]...)
-		next := append(prefix, edit.replacement...)
-		next = append(next, lines[edit.end:]...)
-		lines = next
+		prefix = append(prefix, edit.replacement...)
+		lines = append(prefix, lines[edit.end:]...)
 	}
 	return joinGitHubSuggestionContent(lines, newline, trailingNewline), nil
 }
@@ -2664,7 +2835,11 @@ func (c *Client) MarkPullRequestReadyForReview(
 		},
 	}
 	var idResult readyForReviewIDResponse
-	if _, err := postGraphQL(idPayload, &idResult); err != nil {
+	resp, err := postGraphQL(idPayload, &idResult)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil {
 		return nil, fmt.Errorf(
 			"marking %s/%s#%d ready for review: resolve pull request id: %w",
 			owner, repo, number, err,
@@ -2695,7 +2870,11 @@ func (c *Client) MarkPullRequestReadyForReview(
 		},
 	}
 	var mutationResult readyForReviewMutationResponse
-	if _, err := postGraphQL(mutationPayload, &mutationResult); err != nil {
+	resp, err = postGraphQL(mutationPayload, &mutationResult)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil {
 		return nil, fmt.Errorf(
 			"marking %s/%s#%d ready for review: %w",
 			owner, repo, number, err,
@@ -2794,7 +2973,11 @@ func (c *Client) ConvertPullRequestToDraft(
 		},
 	}
 	var idResult draftIDResponse
-	if _, err := postGraphQL(idPayload, &idResult); err != nil {
+	resp, err := postGraphQL(idPayload, &idResult)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil {
 		return nil, fmt.Errorf(
 			"converting %s/%s#%d to draft: resolve pull request id: %w",
 			owner, repo, number, err,
@@ -2825,7 +3008,11 @@ func (c *Client) ConvertPullRequestToDraft(
 		},
 	}
 	var mutationResult draftMutationResponse
-	if _, err := postGraphQL(mutationPayload, &mutationResult); err != nil {
+	resp, err = postGraphQL(mutationPayload, &mutationResult)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil {
 		return nil, fmt.Errorf(
 			"converting %s/%s#%d to draft: %w",
 			owner, repo, number, err,
@@ -3050,7 +3237,7 @@ func (c *Client) ListManualWorkflowRuns(
 			return platform.Page[*gh.WorkflowRun]{}, &platform.Error{
 				Code: platform.ErrCodeInvalidArgument, Provider: platform.KindGitHub,
 				PlatformHost: c.platformHost, Field: "cursor",
-				Err: fmt.Errorf("cursor must be a positive decimal GitHub page number"),
+				Err: errors.New("cursor must be a positive decimal GitHub page number"),
 			}
 		}
 		page = parsed

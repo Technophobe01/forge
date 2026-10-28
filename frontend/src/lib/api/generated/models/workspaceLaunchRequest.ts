@@ -6,11 +6,13 @@ import type { RepositoryRoute } from "./repositoryRoute.ts";
 export interface WorkspaceLaunchRequest {
   /** A URL to the JSON Schema for this object. */
   readonly $schema?: string;
+  bitbucket_repository_uuid?: string;
+  for_creation?: boolean;
   git_head_ref?: string;
   issue_branch_slug?: boolean;
   item_key?: string;
   item_number: number;
   item_type: string;
-  platform_repo_id?: string;
+  platform_repo_id?: number;
   repository: RepositoryRoute;
 }

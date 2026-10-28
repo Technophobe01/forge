@@ -3,22 +3,24 @@ package e2etest
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/apiclient"
 	"go.kenn.io/forge/internal/apiclient/generated"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
+	"go.kenn.io/forge/internal/testutil"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/testutil/servertest"
 	"go.kenn.io/forge/platform"
 	platformgithub "go.kenn.io/forge/platform/github"
@@ -26,6 +28,7 @@ import (
 )
 
 func TestSyncRoutesWithoutProviderSyncerE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -70,6 +73,7 @@ func TestSyncRoutesWithoutProviderSyncerE2E(t *testing.T) {
 // If an accepted queued sync reports completion before its provider pass,
 // clients stop waiting while SQLite still holds the earlier snapshot.
 func TestAcceptedFullSyncStaysRunningUntilQueuedProviderDataPersistsE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 
 	firstSnapshot := make(chan struct{})
@@ -83,15 +87,13 @@ func TestAcceptedFullSyncStaysRunningUntilQueuedProviderDataPersistsE2E(t *testi
 		getRepositoryFn: func(
 			_ context.Context, owner, repo string,
 		) (*gh.Repository, error) {
-			id := int64(1)
-			nodeID := "repo-acme-widget"
+			id := testutil.FixtureRepoID(owner, repo)
 			defaultBranch := "stale"
 			if providerFresh.Load() {
 				defaultBranch = "fresh"
 			}
 			return &gh.Repository{
 				ID:            &id,
-				NodeID:        &nodeID,
 				Name:          &repo,
 				Owner:         &gh.User{Login: &owner},
 				Archived:      new(bool),
@@ -119,11 +121,10 @@ func TestAcceptedFullSyncStaysRunningUntilQueuedProviderDataPersistsE2E(t *testi
 		database,
 		nil,
 		[]ghclient.RepoRef{{
-			Platform:           platform.KindGitHub,
-			Owner:              "acme",
-			Name:               "widget",
-			PlatformHost:       "github.com",
-			PlatformExternalID: "repo-acme-widget",
+			Platform:     platform.KindGitHub,
+			Owner:        "acme",
+			Name:         "widget",
+			PlatformHost: "github.com",
 		}},
 		time.Minute,
 		nil,
@@ -201,6 +202,7 @@ func TestAcceptedFullSyncStaysRunningUntilQueuedProviderDataPersistsE2E(t *testi
 // If an HTTP-scoped refresh loses its repository binding while coalescing
 // with background work, unrelated repositories bypass their cadence gate.
 func TestQueuedScopedHTTPRefreshKeepsBypassRepositoryBoundE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 
 	selectedEntered := make(chan struct{})
@@ -216,11 +218,7 @@ func TestQueuedScopedHTTPRefreshKeepsBypassRepositoryBoundE2E(t *testing.T) {
 		getRepositoryFn: func(
 			_ context.Context, owner, repo string,
 		) (*gh.Repository, error) {
-			id := int64(1)
-			if repo == "unrelated" {
-				id = 2
-			}
-			nodeID := "repo-acme-" + repo
+			id := testutil.FixtureRepoID(owner, repo)
 			defaultBranch := "seed"
 			if repo == "selected" {
 				switch phase.Load() {
@@ -232,7 +230,6 @@ func TestQueuedScopedHTTPRefreshKeepsBypassRepositoryBoundE2E(t *testing.T) {
 			}
 			return &gh.Repository{
 				ID:            &id,
-				NodeID:        &nodeID,
 				Name:          &repo,
 				Owner:         &gh.User{Login: &owner},
 				Archived:      new(bool),
@@ -263,18 +260,16 @@ func TestQueuedScopedHTTPRefreshKeepsBypassRepositoryBoundE2E(t *testing.T) {
 	bucket := ghclient.RateBucketKey("github", "github.com", "host")
 	repos := []ghclient.RepoRef{
 		{
-			Platform:           platform.KindGitHub,
-			Owner:              "acme",
-			Name:               "selected",
-			PlatformHost:       "github.com",
-			PlatformExternalID: "repo-acme-selected",
+			Platform:     platform.KindGitHub,
+			Owner:        "acme",
+			Name:         "selected",
+			PlatformHost: "github.com",
 		},
 		{
-			Platform:           platform.KindGitHub,
-			Owner:              "acme",
-			Name:               "unrelated",
-			PlatformHost:       "github.com",
-			PlatformExternalID: "repo-acme-unrelated",
+			Platform:     platform.KindGitHub,
+			Owner:        "acme",
+			Name:         "unrelated",
+			PlatformHost: "github.com",
 		},
 	}
 	syncer := ghclient.NewSyncer(
@@ -357,6 +352,7 @@ func TestQueuedScopedHTTPRefreshKeepsBypassRepositoryBoundE2E(t *testing.T) {
 }
 
 func TestSyncListNotModifiedDoesNotChangeRateLimitBudgetE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -402,9 +398,8 @@ func TestSyncListNotModifiedDoesNotChangeRateLimitBudgetE2E(t *testing.T) {
 		nil,
 		[]ghclient.RepoRef{{
 			Owner: "acme", Name: "widget",
-			PlatformHost:       "github.com",
-			PlatformRepoID:     101,
-			PlatformExternalID: "R_101",
+			PlatformHost: "github.com",
+			Key:          platform.RepositoryIDKey(101),
 		}},
 		time.Minute,
 		map[string]*ghclient.RateTracker{"github.com": restTracker},
@@ -492,6 +487,7 @@ func TestSyncListNotModifiedDoesNotChangeRateLimitBudgetE2E(t *testing.T) {
 }
 
 func TestSyncItemBudgetExhaustionIdentifiesLocalCeilingE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 
 	var commentRequests atomic.Int32
@@ -544,9 +540,8 @@ func TestSyncItemBudgetExhaustionIdentifiesLocalCeilingE2E(t *testing.T) {
 		nil,
 		[]ghclient.RepoRef{{
 			Owner: "acme", Name: "widget",
-			PlatformHost:       "github.com",
-			PlatformRepoID:     101,
-			PlatformExternalID: "R_101",
+			PlatformHost: "github.com",
+			Key:          platform.RepositoryIDKey(101),
 		}},
 		time.Minute,
 		map[string]*ghclient.RateTracker{"github.com": restTracker},
@@ -574,7 +569,11 @@ func TestSyncItemBudgetExhaustionIdentifiesLocalCeilingE2E(t *testing.T) {
 		return !syncer.Status().Running && !syncer.Status().LastRunAt.IsZero()
 	}, 5*time.Second, 10*time.Millisecond)
 
-	statusResponse, err := forge.Client().Get(forge.URL + "/api/v1/sync/status")
+	statusResponseReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, forge.URL+"/api/v1/sync/status", nil)
+	require.NoError(err)
+	httpClient := forge.Client()
+	httpClient.Timeout = 5 * time.Second
+	statusResponse, err := httpClient.Do(statusResponseReq)
 	require.NoError(err)
 	defer statusResponse.Body.Close()
 	require.Equal(http.StatusOK, statusResponse.StatusCode)
@@ -591,6 +590,7 @@ func TestSyncItemBudgetExhaustionIdentifiesLocalCeilingE2E(t *testing.T) {
 }
 
 func TestGitLabSyncBudgetExhaustionIncludesWindowE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	var requests atomic.Int32
 	gitlabAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -617,13 +617,12 @@ func TestGitLabSyncBudgetExhaustionIncludesWindowE2E(t *testing.T) {
 		database,
 		nil,
 		[]ghclient.RepoRef{{
-			Platform:           platform.KindGitLab,
-			PlatformHost:       "gitlab.example.com",
-			PlatformRepoID:     42,
-			PlatformExternalID: "42",
-			Owner:              "group",
-			Name:               "project",
-			RepoPath:           "group/project",
+			Platform:     platform.KindGitLab,
+			PlatformHost: "gitlab.example.com",
+			Key:          platform.RepositoryIDKey(42),
+			Owner:        "group",
+			Name:         "project",
+			RepoPath:     "group/project",
 		}},
 		time.Minute,
 		nil,
@@ -768,7 +767,7 @@ func writeGitHubListResponse(
 ) {
 	w.Header().Set("X-RateLimit-Limit", "5000")
 	w.Header().Set("X-RateLimit-Remaining", "4990")
-	w.Header().Set("X-RateLimit-Reset", fmt.Sprint(time.Now().Add(time.Hour).Unix()))
+	w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
 	if r.Header.Get("If-None-Match") == etag {
 		notModified.Add(1)
 		w.WriteHeader(http.StatusNotModified)

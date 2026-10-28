@@ -75,7 +75,9 @@ func withFreshObserverState(
 	view.Projects = replaceObserverProjects(aggregate.Projects, local.Projects, key)
 	view.Worktrees = replaceObserverWorktrees(aggregate.Worktrees, local.Worktrees, key)
 	view.Sessions = replaceObserverSessions(aggregate.Sessions, local.Sessions, key)
-	view.Workspaces = replaceObserverWorkspaces(aggregate.Workspaces, local.Workspaces, key)
+	view.Workspaces = replaceObserverWorkspaces(
+		aggregate.Workspaces, local.Workspaces, key, !observer.LocalProviderState,
+	)
 	return view
 }
 
@@ -159,7 +161,12 @@ func replaceObserverSessions(all, local []RawSession, observer string) []RawSess
 	return append(out, stampedSessions(local, observer)...)
 }
 
-func replaceObserverWorkspaces(all, local []RawWorkspace, observer string) []RawWorkspace {
+// replaceObserverWorkspaces swaps the observer's aggregate rows for fresh local
+// ones and copies the aggregate's provider state onto them, unless the
+// observer already pulled that state for its own rows.
+func replaceObserverWorkspaces(
+	all, local []RawWorkspace, observer string, copyProviderState bool,
+) []RawWorkspace {
 	provider := make(map[string]RawWorkspace)
 	out := make([]RawWorkspace, 0, len(all)+len(local))
 	for _, workspace := range all {
@@ -170,15 +177,18 @@ func replaceObserverWorkspaces(all, local []RawWorkspace, observer string) []Raw
 		out = append(out, workspace)
 	}
 	local = stampedWorkspaces(local, observer)
-	for index := range local {
-		if enriched, ok := provider[local[index].ID]; ok {
-			copyProviderWorkspaceFields(&local[index], enriched)
+	if copyProviderState {
+		for index := range local {
+			if enriched, ok := provider[local[index].ID]; ok {
+				copyProviderWorkspaceFields(&local[index], enriched)
+			}
 		}
 	}
 	return append(out, local...)
 }
 
 func copyProviderWorkspaceFields(target *RawWorkspace, source RawWorkspace) {
+	target.ItemAuthor = source.ItemAuthor
 	target.ItemLastActivityAt = source.ItemLastActivityAt
 	target.MRTitle = source.MRTitle
 	target.MRState = source.MRState
@@ -221,6 +231,9 @@ func buildHost(host NeutralHost, observer Observer, identity Identity) HostSumma
 	kind := "remote"
 	transport := "http"
 	policy := AvailabilityPolicy(RealCapabilityPolicy{})
+	if host.FederationRole == RoleDevbox {
+		kind = "devbox"
+	}
 	if isSelf {
 		kind = "self"
 		transport = "local"
@@ -268,6 +281,13 @@ func buildHost(host NeutralHost, observer Observer, identity Identity) HostSumma
 	if diags == nil {
 		diags = []HostDiagnostic{}
 	}
+	if host.Maintenance {
+		diags = append(diags, HostDiagnostic{
+			Code: "maintenance", Severity: "warning", Summary: "Devbox is in maintenance",
+			RecoverySuggestion: "This devbox is in maintenance. Choose another machine or wait for maintenance to finish.",
+			BlocksOperations:   []string{OpWorkspaceWrite},
+		})
+	}
 	h.Diagnostics = diags
 	if host.Capabilities != nil {
 		h.OperationAvailability = OperationAvailabilityFromState(
@@ -275,7 +295,7 @@ func buildHost(host NeutralHost, observer Observer, identity Identity) HostSumma
 		)
 	} else {
 		h.OperationAvailability = OperationAvailabilityFromState(
-			nil, CommandCapabilities{}, host.Reachable, policy,
+			diags, CommandCapabilities{}, host.Reachable, policy,
 		)
 	}
 	h.Error = host.Error
@@ -410,9 +430,9 @@ func buildWorkspaceSummaries(
 			ID: workspace.ID,
 			Repo: WorkspaceRepositorySummary{
 				Provider: repository.Provider, PlatformHost: repository.PlatformHost,
-				PlatformRepoID: repository.PlatformRepoID,
-				RepoPath:       repository.Owner + "/" + repository.Name,
-				Owner:          repository.Owner, Name: repository.Name,
+				Key:      repository.Key,
+				RepoPath: repository.Owner + "/" + repository.Name,
+				Owner:    repository.Owner, Name: repository.Name,
 			},
 			PlatformHost: repository.PlatformHost,
 			RepoOwner:    repository.Owner, RepoName: repository.Name,
@@ -428,6 +448,7 @@ func buildWorkspaceSummaries(
 			Status:              workspace.Status, ErrorMessage: workspace.ErrorMessage,
 			CreatedAt:          workspace.CreatedAt,
 			ItemLastActivityAt: workspace.ItemLastActivityAt,
+			ItemAuthor:         workspace.ItemAuthor,
 			MRTitle:            workspace.MRTitle, MRState: lowerPtr(workspace.MRState),
 			MRIsDraft: workspace.MRIsDraft, MRCIStatus: lowerPtr(workspace.MRCIStatus),
 			MRReviewDecision: lowerPtr(workspace.MRReviewDecision),

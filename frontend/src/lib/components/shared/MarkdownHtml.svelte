@@ -4,6 +4,7 @@
   import { getAppRuntime } from "../../app/runtime-context.js";
   import {
     renderMarkdownEffect,
+    renderMarkdownKnownMediaEffect,
     renderMarkdownSync,
     type RenderMarkdownOpts,
     type RepoContext,
@@ -29,7 +30,6 @@
     repoKey: string;
     interactiveTasks: boolean;
     collapseSingleLineBreaks: boolean;
-    transformHtml: ((html: string) => string) | undefined;
     html: string;
   }
 
@@ -41,20 +41,21 @@
   );
   const interactiveTasks = $derived(options?.interactiveTasks ?? false);
   const collapseSingleLineBreaks = $derived(options?.collapseSingleLineBreaks ?? false);
-  const html = $derived.by(() => {
+  const renderedHtml = $derived.by(() => {
     if (
       resolved !== null
       && resolved.raw === raw
       && resolved.repoKey === repoKey
       && resolved.interactiveTasks === interactiveTasks
       && resolved.collapseSingleLineBreaks === collapseSingleLineBreaks
-      && resolved.transformHtml === transformHtml
     ) {
       return resolved.html;
     }
-    const fallback = renderMarkdownSync(raw, repo, { collapseSingleLineBreaks });
-    return transformHtml?.(fallback) ?? fallback;
+    return renderMarkdownSync(raw, repo, { interactiveTasks, collapseSingleLineBreaks });
   });
+  // Parent refreshes can recreate the transform without changing the markdown.
+  // Apply it separately so highlighted content never falls back to plain HTML.
+  const html = $derived(transformHtml?.(renderedHtml) ?? renderedHtml);
 
   $effect(() => {
     const currentRaw = raw;
@@ -62,24 +63,25 @@
     const currentRepoKey = repoKey;
     const currentInteractiveTasks = interactiveTasks;
     const currentCollapse = collapseSingleLineBreaks;
-    const currentTransform = transformHtml;
-    const execution = untrack(() => runtime.runCommand(
-      renderMarkdownEffect(currentRaw, currentRepo, {
+    const opts = {
+      interactiveTasks: currentInteractiveTasks,
+      collapseSingleLineBreaks: currentCollapse,
+    };
+    const publish = (rendered: string) => Effect.sync(() => {
+      resolved = {
+        raw: currentRaw,
+        repoKey: currentRepoKey,
         interactiveTasks: currentInteractiveTasks,
         collapseSingleLineBreaks: currentCollapse,
-      }).pipe(
-        Effect.map((rendered) => currentTransform?.(rendered) ?? rendered),
-        Effect.tap((rendered) => Effect.sync(() => {
-          resolved = {
-            raw: currentRaw,
-            repoKey: currentRepoKey,
-            interactiveTasks: currentInteractiveTasks,
-            collapseSingleLineBreaks: currentCollapse,
-            transformHtml: currentTransform,
-            html: rendered,
-          };
-        })),
-        Effect.asVoid,
+        html: rendered,
+      };
+    });
+    // Highlighted HTML first, then again once attachment probes answer.
+    const execution = untrack(() => runtime.runCommand(
+      renderMarkdownKnownMediaEffect(currentRaw, currentRepo, opts).pipe(
+        Effect.flatMap(publish),
+        Effect.andThen(renderMarkdownEffect(currentRaw, currentRepo, opts)),
+        Effect.flatMap(publish),
       ),
       {
         operation: "render markdown",

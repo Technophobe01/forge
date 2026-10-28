@@ -69,22 +69,13 @@ The provider may still have quota available.
 
 To give a large or active repository more capacity:
 
-1. Open `~/.kenn/forge/config.toml`, or `$KENN_FORGE_HOME/config.toml` if you
-    set a custom home.
-2. Add or update this top-level setting, before any `[section]` or `[[repos]]`
-    header. This example raises the allowance to 3,000 requests per hour:
+1. Open **Settings > Sync**.
+2. Raise **Hourly sync budget**, for example to 3,000 requests per hour.
+3. Check that the local ceiling now shows a limit of 3,000. The new limit
+    applies immediately and Forge starts a sync.
 
-    ```toml
-    sync_budget_per_hour = 3000
-    ```
-
-3. Restart Forge to apply the new limit:
-
-    ```sh
-    kenn-forge daemon restart
-    ```
-
-4. Retry sync and check that the local ceiling now shows a limit of 3,000.
+The same setting is `sync_budget_per_hour` in `config.toml`. See
+[Sync budget](configuration.md#sync-budget).
 
 You can also wait for the local hourly window to reset. Clicking sync again
 does not clear the spent allowance.
@@ -207,14 +198,17 @@ If Roborev listens elsewhere, update the endpoint and restart Forge:
 endpoint = "http://127.0.0.1:17373"
 ```
 
-The Reviews page shows the configured scheme and host when the connection
-fails. It does not expose credentials or a path from the configured URL.
+Enabling **Initialize Roborev in managed clones** requires `roborev` on `PATH`,
+a running daemon, and a loopback HTTP endpoint. Initialization failures appear
+in Forge's logs as `workspace Roborev setup incomplete`. Forge restores the
+previous hooks and still opens the workspace.
 
-If workspace setup fails in the `repository_hooks` stage, check the error in
-the workspace setup history. Enabling **Initialize Roborev in managed clones**
-requires `roborev` on `PATH`, a running daemon, and a loopback HTTP endpoint.
-Fix the reported issue and retry the workspace; Forge keeps the created
-worktree but waits to start the terminal until hook setup succeeds.
+After fixing the reported issue, retry from the workspace terminal, using
+the endpoint configured in Forge:
+
+```sh
+roborev --server http://127.0.0.1:7373 init --no-daemon
+```
 
 ## The database will not migrate
 

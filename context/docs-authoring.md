@@ -17,6 +17,12 @@ screenshots, or the Zensical site.
   `context/` topic docs, delete the artifacts, and do not convert them into ADRs.
 - Verify candidate documentation against implementation and tests before
   promoting it into living documentation.
+- Devbox App registration is a one-time manual GitHub workflow. Keep the complete
+  generic procedure in `docs/devboxes.md`; private deployments follow that guide
+  rather than adding registration commands or a separate setup flow.
+- The public devbox guide must stand alone for outside operators. Document host
+  roles, service setup and recovery without depending on a private provisioning
+  repository or exposing its infrastructure details.
 - Review substantial docs changes as rendered before-and-after blocks; source
   diffs miss navigation, theme, and generated screenshot changes.
   (`skills/docs-diff-review/SKILL.md`)
@@ -40,8 +46,10 @@ screenshots, or the Zensical site.
   plus `/docs/<page>.md`; index as `/docs/index.md`, so relative links resolve
   from the page's own directory) listed in the hand-maintained
   `docs/llms.txt`, and the build fails when any half or listing is missing —
-  a new page must be added to the file, nav, allowlist, and `llms.txt`.
-  (`scripts/build-docs.mjs::verifySiteRoot`)
+  a new page must be added to the file, nav, `publishedFiles`, `llms.txt`,
+  and `.vercelignore`. Local builds read the whole checkout, so only a script
+  test catches a page Vercel never receives. (`scripts/build-docs.mjs::verifySiteRoot`,
+  `scripts/build-docs.test.mjs`)
 - User-facing workflow screenshots are generated only by `make docs-screenshots`
   and must not be tracked on the main branch. Publish one complete current set
   at the root of the orphan `docs-assets` branch, then review its full commit
@@ -55,9 +63,6 @@ screenshots, or the Zensical site.
 - Static Codex terminal overlays reproduce a one-off real Codex TUI capture,
   including its composer and model/path status; sanitize local paths to the
   public synthetic repository. (`docs/screenshots/docs-screenshots.spec.ts::embedSyntheticCodexTranscript`)
-- Roborev workflow captures use a synthetic loopback daemon through the
-  isolated server's real proxy, never an installed daemon or database.
-  (`docs/screenshots/docs-screenshots.spec.ts::startSyntheticRoborevDaemon`)
 - Vercel deployments are static docs builds: install Zensical, sync the
   published `docs-assets` set, and render `site/`. Go, the application frontend,
   screenshot capture, and browser verification stay out of the Vercel build.

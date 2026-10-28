@@ -7,12 +7,7 @@ import { executeGeneratedApiRequest } from "./api/generated-api.js";
 import { ProblemCodes } from "./api/problems.js";
 import type { ProviderRouteRef } from "./api/provider-routes.js";
 import { retryIdempotentRead } from "./api/retry-policy.js";
-import { createDaemonStore } from "./stores/roborev/daemon.svelte.js";
-import { createJobsStore } from "./stores/roborev/jobs.svelte.js";
-import { createReviewStore } from "./stores/roborev/review.svelte.js";
-import { createLogStore } from "./stores/roborev/log.svelte.js";
-import { makeRoborevOwner } from "./stores/roborev/roborev-workflow.js";
-import type { NavigateCallback, HostStateAccessors, StoreInstances, UIConfig } from "./types.js";
+import type { HostStateAccessors, StoreInstances, UIConfig } from "./types.js";
 import type { AppRuntime, AppServices } from "./app/runtime.js";
 import type { ProviderEventsError } from "./stores/provider-events-workflow.js";
 import type { PullsStoreOptions } from "./stores/pulls.svelte.js";
@@ -33,17 +28,20 @@ import { createDetailActivityViewStore } from "./stores/detail-activity-view.sve
 import { createCollapsedReposStore } from "./stores/collapsedRepos.svelte.js";
 import { createSettingsStore } from "./stores/settings.svelte.js";
 import { createWorkflowActionsStore } from "./stores/workflow-actions.svelte.js";
+import { ExternalContextWorkflow } from "./stores/external-context-workflow.svelte.js";
+import { createWorkspaceItemSearchStore } from "./stores/workspace-item-search.svelte.js";
 import { beginTerminalSettingsHydration } from "./stores/terminal-settings-persistence.js";
 import { beginWorkspaceSettingsHydration } from "./stores/workspace-settings-persistence.js";
 import { beginRoborevSettingsHydration } from "./stores/roborev-settings-persistence.js";
+import { beginACPSettingsHydration } from "./stores/acp-settings-persistence.js";
 import { applySettingsHydration } from "./stores/settings-hydration.js";
 import { createEventsStore } from "./stores/events.svelte.js";
+import { createWorklistsStore } from "./stores/worklists.svelte.js";
 import type { RoutedItemRef } from "./routes.js";
 import { notifyWorkspaceDeleted } from "./stores/workspace-host.svelte.js";
 
 export interface AppStoreOptions {
   runtime: AppRuntime;
-  onNavigate?: NavigateCallback;
   hostState?: HostStateAccessors;
   config?: UIConfig;
   getPage?: () => string;
@@ -63,7 +61,6 @@ export interface AppStoreComposition {
 export function createAppStores(options: AppStoreOptions): AppStoreComposition {
   const {
     runtime,
-    onNavigate = () => {},
     hostState = {},
     config = {},
     getPage = () => "",
@@ -76,7 +73,6 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
   const appRuntime = runtime;
   const hs = hostState;
   const cfg = config;
-  const nav = onNavigate;
   const gp = getPage;
   const getSelectedActivity = getActivitySelection;
   const roborevBase = roborevBaseUrl;
@@ -88,6 +84,10 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
   const collapsedRepos = createCollapsedReposStore();
   const settingsStore = createSettingsStore();
   const workflowActions = createWorkflowActionsStore({ runtime: appRuntime });
+  const workspaceItemSearch = createWorkspaceItemSearchStore(appRuntime);
+  // Startup, the worklists view, and live updates all read worklists; the store
+  // reports each failed read here so a hub outage raises the same banner.
+  const worklistsStore = createWorklistsStore({ onReadFailure: noteHubFailure });
   const detailStarProjection: {
     current?: (ref: ProviderRouteRef, number: number, starred: boolean, envelopeTick: number) => void;
   } = {};
@@ -100,6 +100,8 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
   pullsOpts.optimisticDetailStarUpdate = (ref, number, starred, envelopeTick) => {
     detailStarProjection.current?.(ref, number, starred, envelopeTick);
   };
+  pullsOpts.getGroupByWorkflow = () => grouping.getGroupingMode() === "byWorkflow";
+  pullsOpts.getUseWorkspaceActivityForRecency = () => activityStore.getUseWorkspaceActivityForRecency();
   const pullsStore = createPullsStore(pullsOpts);
 
   const syncStore = createSyncStore({
@@ -118,7 +120,7 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
   const activityStore = createActivityStore(activityOpts);
 
   function reconcileActivityAfterDetailSync(): void {
-    if (gp() !== "activity" && gp() !== "mobile-activity") return;
+    if (gp() !== "activity" && gp() !== "mobile-activity" && !activityStore.isInitialized()) return;
     appRuntime.runCommand(activityStore.reconcileActivityEffect(), {
       operation: "reconcile activity after detail sync",
       safeContext: {},
@@ -129,6 +131,7 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
   const detailOpts: DetailStoreOptions = {
     runtime: appRuntime,
     getPage: gp,
+    getAirplaneMode: settingsStore.getAirplaneMode,
     onDetailSynchronized: reconcileActivityAfterDetailSync,
     pulls: {
       loadPulls: pullsStore.loadPulls,
@@ -144,6 +147,7 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
   const issuesOpts: IssuesStoreOptions = {
     runtime: appRuntime,
     getPage: gp,
+    getAirplaneMode: settingsStore.getAirplaneMode,
     onDetailSynchronized: reconcileActivityAfterDetailSync,
     sync: {
       refreshSyncStatus: syncStore.refreshSyncStatus,
@@ -180,9 +184,11 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
   function handleConfigChanged(event: { valid: boolean }) {
     if (!event.valid) return Effect.void;
     return Effect.gen(function* () {
+      yield* (yield* ExternalContextWorkflow).invalidate;
       const terminalHydration = yield* Effect.sync(() => beginTerminalSettingsHydration(settingsStore));
       const workspaceHydration = yield* Effect.sync(() => beginWorkspaceSettingsHydration(settingsStore));
       const roborevHydration = yield* Effect.sync(() => beginRoborevSettingsHydration(settingsStore));
+      const acpHydration = yield* Effect.sync(() => beginACPSettingsHydration(settingsStore));
       const settings = yield* executeGeneratedApiRequest("GET settings after config change", (client, signal) =>
         client.SettingsService.getSettings({ signal }),
       ).pipe(retryIdempotentRead);
@@ -193,9 +199,12 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
           terminalHydration,
           workspaceHydration,
           roborevHydration,
+          acpHydration,
         );
       });
       yield* refreshVisibleData();
+      yield* workspaceItemSearch.refreshEffect;
+      yield* refreshWorklistSummaries();
     });
   }
 
@@ -210,18 +219,27 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
     });
   }
 
+  function noteHubFailure(failure: unknown): void {
+    if (failure instanceof ApiProblemError && failure.problem.code === ProblemCodes.hubUnavailable) {
+      syncStore.setProviderAvailable(false);
+    }
+  }
+
   function observeHubFailure<A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> {
-    return effect.pipe(
-      Effect.tapError((failure) =>
-        failure instanceof ApiProblemError && failure.problem.code === ProblemCodes.hubUnavailable
-          ? Effect.sync(() => syncStore.setProviderAvailable(false))
-          : Effect.void,
-      ),
-    );
+    return effect.pipe(Effect.tapError((failure) => Effect.sync(() => noteHubFailure(failure))));
+  }
+
+  // The store records a failed read and reports a hub outage, so it must not
+  // fail the refresh it rides on.
+  function refreshWorklistSummaries() {
+    return worklistsStore.refreshSummariesEffect().pipe(Effect.ignore);
   }
 
   function refreshVisibleData(refreshDetail = true): Effect.Effect<void, ProviderEventsError, AppServices> {
     switch (gp()) {
+      case "terminal":
+      case "mobile-workspace-item":
+        return refreshDetail ? observeHubFailure(detailStore.refreshActiveDetailEffect()) : Effect.void;
       case "pulls":
       case "mobile-pulls":
         return observeHubFailure(pullsStore.reconcilePullsEffect());
@@ -239,6 +257,8 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
             },
           ),
         );
+      case "worklists":
+        return worklistsStore.refreshOpenDetailEffect();
       case "focus":
         return observeHubFailure(
           Effect.all([pullsStore.reconcilePullsEffect(), issuesStore.reconcileIssuesEffect()], {
@@ -251,15 +271,21 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
     }
   }
 
+  function refreshRetainedActivity() {
+    return gp() !== "activity" && gp() !== "mobile-activity" && activityStore.isInitialized()
+      ? activityStore.reconcileActivityEffect()
+      : Effect.void;
+  }
+
   function reconcileProviderState() {
     return Effect.all(
       [
-        pullsStore.reconcilePullsEffect(),
-        issuesStore.reconcileIssuesEffect(),
-        activityStore.reconcileActivityEffect(),
-        refreshSelectedActivityDetail(),
+        refreshVisibleData(),
+        refreshRetainedActivity(),
         issuesStore.refreshActiveIssueDetailEffect(),
         syncStore.reconcileSyncStatusEffect,
+        workspaceItemSearch.refreshEffect,
+        refreshWorklistSummaries(),
       ],
       { concurrency: "unbounded", discard: true },
     );
@@ -286,13 +312,23 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
     }),
     onDataChanged: () =>
       observeHubFailure(
-        Effect.all([refreshVisibleData(), issuesStore.refreshActiveIssueDetailEffect()], {
-          concurrency: "unbounded",
-          discard: true,
-        }),
+        Effect.all(
+          [
+            refreshVisibleData(),
+            refreshRetainedActivity(),
+            issuesStore.refreshActiveIssueDetailEffect(),
+            workspaceItemSearch.refreshEffect,
+            refreshWorklistSummaries(),
+          ],
+          {
+            concurrency: "unbounded",
+            discard: true,
+          },
+        ),
       ),
     onWorkspaceStatus: () =>
       settingsStore.getWorkspaceSettings().show_agent_status_in_lists ? refreshVisibleData(false) : Effect.void,
+    onConnectionStateChange: (state) => syncStore.setLiveUpdatesConnected(state === "connected"),
     onSyncStatus: (status) => Effect.sync(() => syncStore.setSyncStatus(status)),
     onHubConnectionChanged: ({ connected }) => {
       if (!connected) {
@@ -304,6 +340,7 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
       );
     },
     onConfigChanged: handleConfigChanged,
+    onWorklistsChanged: () => worklistsStore.refreshAllEffect(),
     onWorkspaceDeleted: (event) =>
       Effect.gen(function* () {
         yield* Effect.sync(() =>
@@ -390,6 +427,10 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
             } else {
               notificationCb?.(`${event.owner}/${event.name}#${event.number} merged after CI passed.`);
             }
+          } else if (event.status === "queued") {
+            notificationCb?.(
+              `${event.owner}/${event.name}#${event.number} was added to the merge queue after CI passed.`,
+            );
           } else {
             errorCb?.(
               `Deferred merge for ${event.owner}/${event.name}#${event.number} failed: ${event.error ?? "checks did not pass"}`,
@@ -401,9 +442,8 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
       const markUnavailable = Effect.sync(() => syncStore.setProviderAvailable(false));
       if (hub_connected === false) return markUnavailable;
       // The replay ring rolled past the client's cursor while it was
-      // disconnected. Hide cached provider projections until every
-      // authoritative read succeeds because no missed event can be assumed
-      // to replay.
+      // disconnected. Keep cached provider projections visible and marked stale until
+      // the visible view is reconciled; missed events cannot be assumed to replay.
       return markUnavailable.pipe(
         Effect.andThen(reconcileProviderStateAfterHubConnection()),
         Effect.andThen(Effect.sync(() => syncStore.setProviderAvailable(true))),
@@ -412,6 +452,7 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
   });
 
   const si: StoreInstances = {
+    workspaceItemSearch,
     pulls: pullsStore,
     issues: issuesStore,
     detail: detailStore,
@@ -426,49 +467,20 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
     settings: settingsStore,
     events: eventsStore,
     workflowActions,
+    worklists: worklistsStore,
   };
 
   let roborevClient: RoborevClient | undefined;
   if (roborevBase) {
     const bp = (cfg.basePath ?? "/").replace(/\/$/, "");
     roborevClient = createRoborevClient(bp + roborevBase);
-    const roborevOwner = makeRoborevOwner("app-reviews");
-
-    const jobsOpts: Parameters<typeof createJobsStore>[0] = {
-      client: roborevClient,
-      runtime: appRuntime,
-      owner: roborevOwner,
-      navigate: nav,
-    };
-    if (errorCb) jobsOpts.onError = errorCb;
-    const jobsStore = createJobsStore(jobsOpts);
-    si.roborevJobs = jobsStore;
-
-    const reviewOpts: Parameters<typeof createReviewStore>[0] = {
-      client: roborevClient,
-      runtime: appRuntime,
-      owner: roborevOwner,
-    };
-    if (errorCb) reviewOpts.onError = errorCb;
-    const reviewStore = createReviewStore(reviewOpts);
-    si.roborevReview = reviewStore;
-
-    const logStore = createLogStore({
-      runtime: appRuntime,
-      baseUrl: bp + roborevBase,
-      ...(errorCb !== undefined && { onError: errorCb }),
-    });
-    si.roborevLog = logStore;
-
-    const daemon = createDaemonStore({
-      client: roborevClient,
-      runtime: appRuntime,
-    });
-    si.roborevDaemon = daemon;
   }
 
+  // The poll never reads worklists; workspace status events still refresh the open list.
   const listAgentStatusPolling = pollWhileVisible(
-    Effect.suspend(() => refreshVisibleData(false)).pipe(Effect.catch(() => Effect.void)),
+    Effect.suspend(() => (gp() === "worklists" ? Effect.void : refreshVisibleData(false))).pipe(
+      Effect.catch(() => Effect.void),
+    ),
     "5 seconds",
     { immediate: true },
   );

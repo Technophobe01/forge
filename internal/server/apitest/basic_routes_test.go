@@ -1,20 +1,34 @@
 package apitest
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/apiclient/generated"
+	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/db"
+	ghclient "go.kenn.io/forge/internal/github"
+	"go.kenn.io/forge/internal/server"
+	"go.kenn.io/forge/internal/server/authapi"
+	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
+	"go.kenn.io/forge/internal/testutil/servertest"
+	"go.kenn.io/forge/internal/tokenauth"
+	"go.kenn.io/forge/platform"
 )
 
 func TestAPIClientConstruction(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	srv, _ := setupTestServer(t)
 	client := setupTestClient(t, srv)
 	require.NotNil(t, client)
@@ -22,6 +36,7 @@ func TestAPIClientConstruction(t *testing.T) {
 }
 
 func TestAPIGetPullIncludesDeletedCommentTimelineEvent(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database := setupTestServer(t)
@@ -53,6 +68,7 @@ func TestAPIGetPullIncludesDeletedCommentTimelineEvent(t *testing.T) {
 }
 
 func TestAPIGetPullNotFound(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	srv, _ := setupTestServer(t)
 	client := setupTestClient(t, srv)
 
@@ -63,6 +79,7 @@ func TestAPIGetPullNotFound(t *testing.T) {
 }
 
 func TestAPISetKanbanState(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	seedPR(t, database, "acme", "widget", 1)
@@ -79,6 +96,7 @@ func TestAPISetKanbanState(t *testing.T) {
 }
 
 func TestAPISetKanbanStateRejectsInvalidStatus(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	srv, database := setupTestServer(t)
 	seedPR(t, database, "acme", "widget", 1)
 	client := setupTestClient(t, srv)
@@ -90,11 +108,12 @@ func TestAPISetKanbanStateRejectsInvalidStatus(t *testing.T) {
 }
 
 func TestAPIListRepos(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
 
-	_, err := database.UpsertRepo(t.Context(), verifiedGitHubRepoIdentity("github.com", "acme", "widget"))
+	_, err := reposeed.Seed(t.Context(), database, verifiedGitHubRepoIdentity("github.com", "acme", "widget"))
 	require.NoError(err)
 
 	resp, err := client.HTTP.ListReposWithResponse(t.Context())
@@ -106,7 +125,103 @@ func TestAPIListRepos(t *testing.T) {
 	require.Equal("widget", (*resp.JSON200)[0].Name)
 }
 
+func TestAPIListReposDoesNotWaitForWriteCredentials(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	database := dbtest.Open(t)
+	identities := []db.RepoIdentity{
+		{Platform: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(101), Owner: "acme", Name: "widget", RepoPath: "acme/widget"},
+		{Platform: "gitlab", PlatformHost: "gitlab.example.com", Key: platform.RepositoryIDKey(202), Owner: "group/subgroup", Name: "widget", RepoPath: "group/subgroup/widget"},
+		{Platform: "forgejo", PlatformHost: "forge.example.com", Key: platform.RepositoryIDKey(303), Owner: "acme", Name: "widget", RepoPath: "acme/widget"},
+		{Platform: "gitea", PlatformHost: "forge.example.com", Key: platform.RepositoryIDKey(404), Owner: "acme", Name: "widget", RepoPath: "acme/widget"},
+		{Platform: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(505), Owner: "acme", Name: "hidden", RepoPath: "acme/hidden"},
+	}
+	tracked := make([]ghclient.RepoRef, 0, len(identities))
+	cfg := &config.Config{}
+	for _, identity := range identities {
+		id, err := reposeed.Seed(t.Context(), database, identity)
+		require.NoError(err)
+		if identity.Name == "hidden" {
+			require.NoError(database.SetRepoHiddenFromUI(t.Context(), id, true))
+		}
+		tracked = append(tracked, ghclient.RepoRef{
+			Platform: platform.Kind(identity.Platform), PlatformHost: identity.PlatformHost,
+			Owner: identity.Owner, Name: identity.Name, RepoPath: identity.RepoPath,
+		})
+		configured := config.Repo{
+			Platform: identity.Platform, PlatformHost: identity.PlatformHost,
+			Owner: identity.Owner, Name: identity.Name,
+		}
+		configured.SetRepositoryKey(identity.Key)
+		cfg.Repos = append(cfg.Repos, configured)
+	}
+	_, err := reposeed.Seed(t.Context(), database, verifiedGitHubRepoIdentity("github.com", "acme", "untracked"))
+	require.NoError(err)
+	syncer := ghclient.NewSyncer(nil, database, nil, tracked, time.Minute, nil, nil)
+	t.Cleanup(syncer.Stop)
+	credentialStarted := make(chan struct{}, 1)
+	credentialRelease := make(chan struct{})
+	releaseCredential := sync.OnceFunc(func() { close(credentialRelease) })
+	defer releaseCredential()
+	sources := tokenauth.NewSourceSet(tokenauth.Options{
+		GitHubCLI: func(ctx context.Context, _ string) (string, error) {
+			credentialStarted <- struct{}{}
+			select {
+			case <-credentialRelease:
+				return "", nil
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		},
+	})
+	sources.Upsert(tokenauth.Descriptor{
+		Key: tokenauth.Key{Platform: "github", Host: "github.com"},
+		Candidates: []tokenauth.Candidate{
+			{Kind: tokenauth.SourceKindGitHubApp, Host: "github.com", FilePath: "/unused/app.pem", AppID: 7, InstallationID: 11},
+			{Kind: tokenauth.SourceKindGitHubCLI, Host: "github.com"},
+		},
+	})
+	srv := servertest.New(t, database, syncer, nil, "/", cfg, server.ServerOptions{
+		TokenSources: sources,
+		HostCheck: authapi.HostCheckOptions{
+			Bind:    config.HostKey{Host: "127.0.0.1", Port: "8091"},
+			Allowed: []config.HostKey{{Host: "forge.test"}},
+		},
+	})
+	client := setupTestClient(t, srv)
+	completed := make(chan struct{})
+	var response *generated.ListReposResp
+	var responseErr error
+	go func() {
+		response, responseErr = client.HTTP.ListReposWithResponse(t.Context())
+		close(completed)
+	}()
+	select {
+	case <-credentialStarted:
+		releaseCredential()
+		<-completed
+		require.FailNow("repository catalog waited for a write credential")
+	case <-completed:
+	case <-t.Context().Done():
+		require.FailNow("repository catalog did not complete")
+	}
+	require.NoError(responseErr)
+	require.Equal(http.StatusOK, response.StatusCode)
+	require.NotNil(response.JSON200)
+	var got []string
+	for _, repo := range *response.JSON200 {
+		got = append(got, repo.Platform+"|"+repo.PlatformHost+"|"+strconv.FormatInt(repo.PlatformRepoID, 10)+"|"+repo.Owner+"/"+repo.Name)
+	}
+	require.ElementsMatch([]string{
+		"github|github.com|101|acme/widget",
+		"gitlab|gitlab.example.com|202|group/subgroup/widget",
+		"forgejo|forge.example.com|303|acme/widget",
+		"gitea|forge.example.com|404|acme/widget",
+	}, got)
+}
+
 func TestAPISetStarred(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	seedPR(t, database, "acme", "widget", 1)
@@ -129,6 +244,7 @@ func TestAPISetStarred(t *testing.T) {
 }
 
 func TestAPIUnsetStarred(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	seedPR(t, database, "acme", "widget", 1)
@@ -152,6 +268,7 @@ func TestAPIUnsetStarred(t *testing.T) {
 }
 
 func TestAPISetStarredRejectsInvalidItemType(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	srv, _ := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -173,10 +290,11 @@ func TestAPISetStarredRejectsInvalidItemType(t *testing.T) {
 }
 
 func TestOpenAPIEndpointReflectsHumaContract(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	srv, _ := setupTestServer(t)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.json", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/openapi.json", nil)
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 
@@ -196,6 +314,7 @@ func TestOpenAPIEndpointReflectsHumaContract(t *testing.T) {
 }
 
 func TestAPIClosePRRejectsMerged(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	seedPR(t, database, "acme", "widget", 1)
@@ -214,6 +333,7 @@ func TestAPIClosePRRejectsMerged(t *testing.T) {
 }
 
 func TestAPIClosePRInvalidState(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	srv, database := setupTestServer(t)
 	seedPR(t, database, "acme", "widget", 1)
 	client := setupTestClient(t, srv)
@@ -224,6 +344,7 @@ func TestAPIClosePRInvalidState(t *testing.T) {
 }
 
 func TestAPIListItemsHonorsLimit(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database := setupTestServer(t)
@@ -268,6 +389,7 @@ func TestAPIListItemsHonorsLimit(t *testing.T) {
 }
 
 func TestAPIListIssuesIncludesLabels(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	seedIssueWithLabels(t, database, "acme", "widget", 5, "open", []db.Label{{
@@ -291,6 +413,7 @@ func TestAPIListIssuesIncludesLabels(t *testing.T) {
 }
 
 func TestAPIGetIssueAcceptsMixedCaseRepoPath(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	seedIssue(t, database, "acme", "widget", 5, "open")
@@ -305,6 +428,7 @@ func TestAPIGetIssueAcceptsMixedCaseRepoPath(t *testing.T) {
 }
 
 func TestAPIListIssuesAcceptsMixedCaseProviderQualifiedRepoFilter(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	seedIssue(t, database, "acme", "widget", 5, "open")
@@ -321,6 +445,7 @@ func TestAPIListIssuesAcceptsMixedCaseProviderQualifiedRepoFilter(t *testing.T) 
 }
 
 func TestResolveItem_UntrackedRepo(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	srv, _ := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -335,11 +460,12 @@ func TestResolveItem_UntrackedRepo(t *testing.T) {
 }
 
 func TestAPIGetMRImportMetadata(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
 
-	repoID, err := database.UpsertRepo(ctx, verifiedGitHubRepoIdentity("github.com", "acme", "widget"))
+	repoID, err := reposeed.Seed(ctx, database, verifiedGitHubRepoIdentity("github.com", "acme", "widget"))
 	require.NoError(err)
 
 	now := time.Now().UTC().Truncate(time.Second)
@@ -365,7 +491,7 @@ func TestAPIGetMRImportMetadata(t *testing.T) {
 	require.NoError(err)
 	require.NoError(database.EnsureKanbanState(ctx, prID))
 
-	req := httptest.NewRequest(http.MethodGet,
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet,
 		"/api/v1/pulls/gh/acme/widget/42/import-metadata", nil)
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
@@ -382,9 +508,10 @@ func TestAPIGetMRImportMetadata(t *testing.T) {
 }
 
 func TestAPIGetMRImportMetadataNotFound(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	srv, _ := setupTestServer(t)
 
-	req := httptest.NewRequest(http.MethodGet,
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet,
 		"/api/v1/pulls/gh/acme/widget/999/import-metadata", nil)
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
@@ -393,10 +520,11 @@ func TestAPIGetMRImportMetadataNotFound(t *testing.T) {
 }
 
 func TestOpenAPIDocumentsCustomStatusCodes(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	srv, _ := setupTestServer(t)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.json", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/openapi.json", nil)
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 
@@ -434,6 +562,7 @@ func TestOpenAPIDocumentsCustomStatusCodes(t *testing.T) {
 }
 
 func TestProviderIssueRouteGeneratedClientEscapesGitLabRepoPath(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database := setupTestServer(t)
@@ -445,13 +574,13 @@ func TestProviderIssueRouteGeneratedClientEscapesGitLabRepoPath(t *testing.T) {
 	host := "gitlab.example.test:8443"
 	repoPath := "Team One/Sub Team/project+#1"
 	number := int64(7)
-	repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
-		Platform:       provider,
-		PlatformHost:   host,
-		PlatformRepoID: "gid://gitlab/Project/7000",
-		Owner:          "Team One/Sub Team",
-		Name:           "project+#1",
-		RepoPath:       repoPath,
+	repoID, err := reposeed.Seed(ctx, database, db.RepoIdentity{
+		Platform:     provider,
+		PlatformHost: host,
+		Key:          platform.RepositoryIDKey(7000),
+		Owner:        "Team One/Sub Team",
+		Name:         "project+#1",
+		RepoPath:     repoPath,
 	})
 	require.NoError(err)
 	_, err = database.UpsertIssue(ctx, &db.Issue{
@@ -468,7 +597,7 @@ func TestProviderIssueRouteGeneratedClientEscapesGitLabRepoPath(t *testing.T) {
 	})
 	require.NoError(err)
 
-	resp, err := client.HTTP.GetIssueOnHostWithResponse(ctx, &generated.GetIssueOnHostRequestOptions{PathParams: &generated.GetIssueOnHostPath{PlatformHost: host, Provider: provider, Owner: "Team One/Sub Team", Name: "project+#1", Number: int64(number)}})
+	resp, err := client.HTTP.GetIssueOnHostWithResponse(ctx, &generated.GetIssueOnHostRequestOptions{PathParams: &generated.GetIssueOnHostPath{PlatformHost: host, Provider: provider, Owner: "Team One/Sub Team", Name: "project+#1", Number: number}})
 	require.NoError(err)
 	require.Equal(http.StatusOK, resp.StatusCode, string(resp.Body))
 	require.NotNil(resp.JSON200)
@@ -482,19 +611,20 @@ func TestProviderIssueRouteGeneratedClientEscapesGitLabRepoPath(t *testing.T) {
 }
 
 func TestProviderIssueRouteHandlesNestedGitLabRepoPathOverHTTP(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
 	now := time.Now().UTC().Truncate(time.Second)
 
-	repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
-		Platform:       "gitlab",
-		PlatformHost:   "git.example.com",
-		PlatformRepoID: "gid://gitlab/Project/7007",
-		Owner:          "group/subgroup",
-		Name:           "project",
-		RepoPath:       "group/subgroup/project",
+	repoID, err := reposeed.Seed(ctx, database, db.RepoIdentity{
+		Platform:     "gitlab",
+		PlatformHost: "git.example.com",
+		Key:          platform.RepositoryIDKey(7007),
+		Owner:        "group/subgroup",
+		Name:         "project",
+		RepoPath:     "group/subgroup/project",
 	})
 	require.NoError(err)
 	_, err = database.UpsertIssue(ctx, &db.Issue{
@@ -511,7 +641,7 @@ func TestProviderIssueRouteHandlesNestedGitLabRepoPathOverHTTP(t *testing.T) {
 	})
 	require.NoError(err)
 
-	req := httptest.NewRequest(
+	req := httptest.NewRequestWithContext(t.Context(),
 		http.MethodGet,
 		"/api/v1/host/git.example.com/issues/gitlab/group%2Fsubgroup/project/7",
 		nil,
@@ -544,11 +674,12 @@ func TestProviderIssueRouteHandlesNestedGitLabRepoPathOverHTTP(t *testing.T) {
 }
 
 func TestMRListEmptyLinksWhenNone(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	seedPR(t, database, "acme", "widget", 1)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/pulls", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/pulls", nil)
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 
@@ -559,6 +690,7 @@ func TestMRListEmptyLinksWhenNone(t *testing.T) {
 }
 
 func TestAPIGetFiles503WhenCloneManagerNil(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 
 	srv, database := setupTestServer(t)
@@ -572,6 +704,7 @@ func TestAPIGetFiles503WhenCloneManagerNil(t *testing.T) {
 }
 
 func TestSetActiveWorktreeKey(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	srv, _ := setupTestServer(t)
 
@@ -591,6 +724,7 @@ func TestSetActiveWorktreeKey(t *testing.T) {
 }
 
 func TestAPIGetPullDetailRecordsHotView(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	ctx := t.Context()
@@ -637,11 +771,12 @@ func TestAPIGetPullDetailRecordsHotView(t *testing.T) {
 }
 
 func TestAPIGetPullDetailIncludesDiffSummaryRevisionFields(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
-	repoID, err := database.UpsertRepo(ctx, verifiedGitHubRepoIdentity("github.com", "acme", "widget"))
+	repoID, err := reposeed.Seed(ctx, database, verifiedGitHubRepoIdentity("github.com", "acme", "widget"))
 	require.NoError(err)
 
 	now := time.Now().UTC().Truncate(time.Second)
@@ -664,7 +799,7 @@ func TestAPIGetPullDetailIncludesDiffSummaryRevisionFields(t *testing.T) {
 	require.NoError(err)
 	require.NoError(database.UpdateDiffSHAs(ctx, repoID, 1, "diff-head", "diff-base", "merge-base"))
 
-	req := httptest.NewRequest(http.MethodGet,
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet,
 		"/api/v1/pulls/gh/acme/widget/1", nil)
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
@@ -678,6 +813,7 @@ func TestAPIGetPullDetailIncludesDiffSummaryRevisionFields(t *testing.T) {
 }
 
 func TestAPIActivityCommentCarriesPRAuthor(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -719,6 +855,7 @@ func TestAPIActivityCommentCarriesPRAuthor(t *testing.T) {
 }
 
 func TestAPIListActivitySearchEventDeltaDoesNotReadBeforeCursor(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -760,6 +897,7 @@ func TestAPIListActivitySearchEventDeltaDoesNotReadBeforeCursor(t *testing.T) {
 }
 
 func TestAPIListActivityAcceptsProviderAndHostQualifiedRepoFilter(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
@@ -784,6 +922,7 @@ func TestAPIListActivityAcceptsProviderAndHostQualifiedRepoFilter(t *testing.T) 
 }
 
 func TestAPIListStacks_Empty(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	srv, _ := setupTestServer(t)
 	client := setupTestClient(t, srv)

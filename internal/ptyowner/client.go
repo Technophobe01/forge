@@ -79,6 +79,12 @@ const (
 	ownerOutputLimit       = 64 * 1024
 )
 
+var ErrCommandLineTooLong = errors.New("command line exceeds the Windows limit of 32,767 UTF-16 code units; shorten the prompt or launch arguments")
+
+// ErrOwnerGone means no owner is running for a session, as after a reboot or
+// a killed owner; Attach and Snapshot return it when the owner is absent.
+var ErrOwnerGone = errors.New("pty owner is not running")
+
 type Attachment struct {
 	Output <-chan []byte
 	Done   <-chan struct{}
@@ -132,6 +138,9 @@ func (c *Client) Ensure(ctx context.Context, session, cwd string) error {
 	if len(command) == 0 {
 		command = defaultShellCommand()
 	}
+	if err := validateCommandLine(command); err != nil {
+		return err
+	}
 	commandJSON, err := json.Marshal(command)
 	if err != nil {
 		return err
@@ -151,6 +160,9 @@ func (c *Client) Ensure(ctx context.Context, session, cwd string) error {
 	}
 	exe, args := c.ownerCommand(exe, session, cwd, string(commandJSON))
 	cmd := procutil.Command(exe, args...)
+	if err := validateCommandLine(cmd.Args); err != nil {
+		return err
+	}
 	cmd.Env = c.ownerHelperEnvironment(os.Environ())
 	detachCommand(cmd)
 	stdout := newBoundedOutputBuffer(ownerOutputLimit)
@@ -342,9 +354,18 @@ func (c *Client) Ping(ctx context.Context, session string) error {
 	return nil
 }
 
+// Gone reports whether no owner runs for session, as after a reboot or crash.
+func (c *Client) Gone(ctx context.Context, session string) bool {
+	err := c.Ping(ctx, session)
+	return err != nil && isAbsentOwner(err)
+}
+
 func (c *Client) Snapshot(ctx context.Context, session string) (Status, error) {
 	conn, state, err := c.connect(ctx, session)
 	if err != nil {
+		if isAbsentOwner(err) {
+			return Status{}, fmt.Errorf("%w: %w", ErrOwnerGone, err)
+		}
 		return Status{}, err
 	}
 	defer conn.Close()
@@ -375,6 +396,9 @@ func (c *Client) Attach(
 ) (*Attachment, error) {
 	conn, state, err := c.connect(ctx, session)
 	if err != nil {
+		if isAbsentOwner(err) {
+			return nil, fmt.Errorf("%w: %w", ErrOwnerGone, err)
+		}
 		return nil, err
 	}
 	clearDeadline := applyRPCDeadline(ctx, conn)
@@ -493,6 +517,10 @@ func cleanupAbsentOwner(paths SessionPaths) {
 	removeSocketDir(paths)
 }
 
+// IsAbsentOwner reports whether err, from reaching a session's owner, means
+// no owner runs for it.
+func IsAbsentOwner(err error) bool { return isAbsentOwner(err) }
+
 func isAbsentOwner(err error) bool {
 	return errors.Is(err, os.ErrNotExist) ||
 		errors.Is(err, io.EOF) ||
@@ -505,8 +533,7 @@ func isStaleOwnerConnection(err error) bool {
 		errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-	var netErr *net.OpError
-	if errors.As(err, &netErr) && netErr.Timeout() {
+	if netErr, ok := errors.AsType[*net.OpError](err); ok && netErr.Timeout() {
 		return false
 	}
 	return errors.Is(err, io.EOF) ||
@@ -597,7 +624,7 @@ func (c *Client) waitStopped(ctx context.Context, session, dir string) error {
 	if lastErr != nil {
 		return fmt.Errorf("pty owner did not stop: %w", lastErr)
 	}
-	return fmt.Errorf("pty owner did not stop")
+	return errors.New("pty owner did not stop")
 }
 
 func (c *Client) connect(
@@ -641,7 +668,7 @@ func ownerDialTarget(raw string) (string, string, error) {
 
 func (a *Attachment) Write(data []byte) error {
 	if a == nil || a.enc == nil {
-		return fmt.Errorf("pty owner attachment is closed")
+		return errors.New("pty owner attachment is closed")
 	}
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
@@ -652,7 +679,7 @@ func (a *Attachment) Write(data []byte) error {
 
 func (a *Attachment) Resize(geometry ptysize.Geometry) error {
 	if a == nil || a.enc == nil {
-		return fmt.Errorf("pty owner attachment is closed")
+		return errors.New("pty owner attachment is closed")
 	}
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()

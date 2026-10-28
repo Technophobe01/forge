@@ -25,6 +25,8 @@ func insertTestMRWithBranches(
 }
 
 func TestListPRsForStackDetection(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	d := openTestDB(t)
 	repoID := insertTestRepo(t, d, "org", "repo")
@@ -44,6 +46,8 @@ func TestListPRsForStackDetection(t *testing.T) {
 }
 
 func TestUpsertStackAndReplaceMembers(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -54,12 +58,12 @@ func TestUpsertStackAndReplaceMembers(t *testing.T) {
 	mrID2 := insertTestMRWithBranches(t, d, repoID, 2, "feature/b", "feature/a", "open")
 
 	// Create stack (keyed by repo_id + base_number)
-	stackID, err := d.UpsertStack(ctx, repoID, 1, "feature")
+	stackID, err := d.UpsertStack(ctx, repoID, 1, "feature", false)
 	require.NoError(err)
 	assert.Positive(stackID)
 
 	// Idempotent upsert returns same ID
-	stackID2, err := d.UpsertStack(ctx, repoID, 1, "feature")
+	stackID2, err := d.UpsertStack(ctx, repoID, 1, "feature", false)
 	require.NoError(err)
 	assert.Equal(stackID, stackID2)
 
@@ -84,6 +88,8 @@ func TestUpsertStackAndReplaceMembers(t *testing.T) {
 }
 
 func TestStackMembersRenumberAfterRemovedMembersAreFiltered(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name          string
 		removedNumber int
@@ -107,7 +113,7 @@ func TestStackMembersRenumberAfterRemovedMembersAreFiltered(t *testing.T) {
 					fmt.Sprintf("feature/%d", number), "main", MergeRequestStateOpen,
 				))
 			}
-			stackID, err := d.UpsertStack(ctx, repoID, 1, "feature")
+			stackID, err := d.UpsertStack(ctx, repoID, 1, "feature", false)
 			require.NoError(err)
 			require.NoError(d.ReplaceStackMembers(ctx, stackID, []StackMember{
 				{MergeRequestID: memberIDs[0], Position: 1},
@@ -149,6 +155,8 @@ func TestStackMembersRenumberAfterRemovedMembersAreFiltered(t *testing.T) {
 }
 
 func TestStackMembersIncludeMergeableState(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -159,7 +167,7 @@ func TestStackMembersIncludeMergeableState(t *testing.T) {
 		t, d, repoID, 1, "feature/a", "main", "open", withMRMergeableState("dirty"),
 	)
 	mrID2 := insertTestMRWithBranches(t, d, repoID, 2, "feature/b", "feature/a", "open")
-	stackID, err := d.UpsertStack(ctx, repoID, 1, "feature")
+	stackID, err := d.UpsertStack(ctx, repoID, 1, "feature", false)
 	require.NoError(err)
 	err = d.ReplaceStackMembers(ctx, stackID, []StackMember{
 		{StackID: stackID, MergeRequestID: mrID1, Position: 1},
@@ -175,6 +183,8 @@ func TestStackMembersIncludeMergeableState(t *testing.T) {
 }
 
 func TestListMRsBlockedByStackConflicts(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -186,7 +196,7 @@ func TestListMRsBlockedByStackConflicts(t *testing.T) {
 	)
 	mrID2 := insertTestMRWithBranches(t, d, repoID, 2, "feature/b", "feature/a", "open")
 	mrID3 := insertTestMRWithBranches(t, d, repoID, 3, "feature/c", "feature/b", "open")
-	stackID, err := d.UpsertStack(ctx, repoID, 1, "feature")
+	stackID, err := d.UpsertStack(ctx, repoID, 1, "feature", false)
 	require.NoError(err)
 	err = d.ReplaceStackMembers(ctx, stackID, []StackMember{
 		{StackID: stackID, MergeRequestID: mrID1, Position: 1},
@@ -203,6 +213,8 @@ func TestListMRsBlockedByStackConflicts(t *testing.T) {
 }
 
 func TestListStackPlacementsForMRs(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -214,7 +226,7 @@ func TestListStackPlacementsForMRs(t *testing.T) {
 	mrID3 := insertTestMRWithBranches(t, d, repoID, 3, "feature/c", "feature/b", "open")
 	mrID4 := insertTestMRWithBranches(t, d, repoID, 4, "feature/d", "feature/c", "open")
 	soloID := insertTestMRWithBranches(t, d, repoID, 9, "solo", "main", "open")
-	stackID, err := d.UpsertStack(ctx, repoID, 1, "feature")
+	stackID, err := d.UpsertStack(ctx, repoID, 1, "feature", false)
 	require.NoError(err)
 	err = d.ReplaceStackMembers(ctx, stackID, []StackMember{
 		{StackID: stackID, MergeRequestID: mrID1, Position: 1},
@@ -226,8 +238,8 @@ func TestListStackPlacementsForMRs(t *testing.T) {
 
 	placements, err := d.ListStackPlacementsForMRs(ctx, []int64{mrID2, mrID4, soloID})
 	require.NoError(err)
-	assert.Equal(StackPlacement{Position: 2, Size: 4}, placements[mrID2])
-	assert.Equal(StackPlacement{Position: 4, Size: 4}, placements[mrID4])
+	assert.Equal(StackPlacement{StackID: stackID, Position: 2, Size: 4}, placements[mrID2])
+	assert.Equal(StackPlacement{StackID: stackID, Position: 4, Size: 4}, placements[mrID4])
 	_, requested := placements[mrID1]
 	assert.False(requested, "unrequested members must not be returned")
 	_, inStack := placements[soloID]
@@ -247,8 +259,8 @@ func TestListStackPlacementsForMRs(t *testing.T) {
 	require.NoError(err)
 	_, hidden := placements[mrID2]
 	assert.False(hidden, "hidden members must not be returned")
-	assert.Equal(StackPlacement{Position: 2, Size: 3}, placements[mrID3])
-	assert.Equal(StackPlacement{Position: 3, Size: 3}, placements[mrID4])
+	assert.Equal(StackPlacement{StackID: stackID, Position: 2, Size: 3}, placements[mrID3])
+	assert.Equal(StackPlacement{StackID: stackID, Position: 3, Size: 3}, placements[mrID4])
 
 	empty, err := d.ListStackPlacementsForMRs(ctx, nil)
 	require.NoError(err)
@@ -264,19 +276,21 @@ func TestListStackPlacementsForMRs(t *testing.T) {
 	placements, err = d.ListStackPlacementsForMRs(ctx, large)
 	require.NoError(err)
 	assert.Len(placements, 2)
-	assert.Equal(StackPlacement{Position: 2, Size: 3}, placements[mrID3])
+	assert.Equal(StackPlacement{StackID: stackID, Position: 2, Size: 3}, placements[mrID3])
 }
 
 func TestDeleteStaleStacks(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
 	repoID := insertTestRepo(t, d, "org", "repo")
 
-	id1, err := d.UpsertStack(ctx, repoID, 1, "keep")
+	id1, err := d.UpsertStack(ctx, repoID, 1, "keep", false)
 	require.NoError(err)
-	_, err = d.UpsertStack(ctx, repoID, 2, "delete-me")
+	_, err = d.UpsertStack(ctx, repoID, 2, "delete-me", false)
 	require.NoError(err)
 
 	err = d.DeleteStaleStacks(ctx, repoID, []int64{id1})
@@ -292,6 +306,8 @@ func TestDeleteStaleStacks(t *testing.T) {
 }
 
 func TestListStacksWithMembers_MalformedFilter(t *testing.T) {
+	t.Parallel()
+
 	d := openTestDB(t)
 	ctx := t.Context()
 
@@ -305,6 +321,8 @@ func TestListStacksWithMembers_MalformedFilter(t *testing.T) {
 }
 
 func TestReplaceStackMembersReassignsAcrossStacks(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -314,7 +332,7 @@ func TestReplaceStackMembersReassignsAcrossStacks(t *testing.T) {
 	mrID := insertTestMRWithBranches(t, d, repoID, 1, "feature/a", "main", "open")
 
 	// Put PR in stackA.
-	stackA, err := d.UpsertStack(ctx, repoID, 1, "stackA")
+	stackA, err := d.UpsertStack(ctx, repoID, 1, "stackA", false)
 	require.NoError(err)
 	err = d.ReplaceStackMembers(ctx, stackA, []StackMember{
 		{StackID: stackA, MergeRequestID: mrID, Position: 1},
@@ -322,7 +340,7 @@ func TestReplaceStackMembersReassignsAcrossStacks(t *testing.T) {
 	require.NoError(err)
 
 	// Reassigning same PR to stackB should succeed by evicting from stackA.
-	stackB, err := d.UpsertStack(ctx, repoID, 2, "stackB")
+	stackB, err := d.UpsertStack(ctx, repoID, 2, "stackB", false)
 	require.NoError(err)
 	err = d.ReplaceStackMembers(ctx, stackB, []StackMember{
 		{StackID: stackB, MergeRequestID: mrID, Position: 1},
@@ -348,6 +366,8 @@ func TestReplaceStackMembersReassignsAcrossStacks(t *testing.T) {
 }
 
 func TestGetStackForPR(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -357,7 +377,7 @@ func TestGetStackForPR(t *testing.T) {
 	mrID1 := insertTestMRWithBranches(t, d, repoID, 10, "feature/a", "main", "open")
 	mrID2 := insertTestMRWithBranches(t, d, repoID, 11, "feature/b", "feature/a", "open")
 
-	stackID, err := d.UpsertStack(ctx, repoID, 10, "feature")
+	stackID, err := d.UpsertStack(ctx, repoID, 10, "feature", false)
 	require.NoError(err)
 	err = d.ReplaceStackMembers(ctx, stackID, []StackMember{
 		{StackID: stackID, MergeRequestID: mrID1, Position: 1},

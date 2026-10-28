@@ -1,22 +1,23 @@
 package workspace
 
 import (
-	"context"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/db"
-	"os"
 )
 
 // TestPruneMissingTmuxSessionsKeepsReadyWorkspacesWhenServerIsEmpty pins
 // the bulk-gone case: after a machine reboot or the dedicated-socket
 // upgrade, no session lives, base sessions recreate lazily on attach,
 // and ready workspaces must stay ready rather than flip to an error
-// whose retry force-removes worktrees.
+// whose retry force-removes worktrees. Runtime rows stay too: they hold
+// the agents that recovery resumes.
 func TestPruneMissingTmuxSessionsKeepsReadyWorkspacesWhenServerIsEmpty(
 	t *testing.T,
 ) {
@@ -39,9 +40,9 @@ func TestPruneMissingTmuxSessionsKeepsReadyWorkspacesWhenServerIsEmpty(
 	require.NoError(os.WriteFile(script, []byte(body), 0o755))
 
 	d := openTestDB(t)
-	mgr := NewManager(d, t.TempDir())
+	mgr := newWorkspaceTestManager(t, d, t.TempDir())
 	mgr.SetTmuxCommand([]string{script})
-	ctx := context.Background()
+	ctx := t.Context()
 	require.NoError(d.InsertWorkspace(ctx, &Workspace{
 		ID:           "0000000000000009",
 		PlatformHost: "github.com",
@@ -54,8 +55,12 @@ func TestPruneMissingTmuxSessionsKeepsReadyWorkspacesWhenServerIsEmpty(
 		TmuxSession:  "kenn-forge-0000000000000009",
 		Status:       "ready",
 	}))
+	recordRuntimeTmuxSessionForTest(
+		t, d, "0000000000000009", "0000000000000009_claude",
+		"claude", "forge-0000000000000009-c857d09db23e6822", time.Time{},
+	)
 
-	changed, err := mgr.PruneMissingTmuxSessions(ctx, nil)
+	changed, err := mgr.PruneMissingTmuxSessions(ctx, TmuxPruneHooks{})
 	require.NoError(err)
 	assert.False(changed)
 
@@ -64,4 +69,7 @@ func TestPruneMissingTmuxSessionsKeepsReadyWorkspacesWhenServerIsEmpty(
 	require.NotNil(ws)
 	assert.Equal("ready", ws.Status,
 		"an empty server must not error ready workspaces")
+	stored, err := d.ListWorkspaceRuntimeTmuxSessions(ctx, "0000000000000009")
+	require.NoError(err)
+	assert.Len(stored, 1, "an empty server must not forget runtime sessions")
 }

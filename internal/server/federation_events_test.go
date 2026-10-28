@@ -2,29 +2,25 @@ package server
 
 import (
 	"bufio"
-	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
-	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
 	"go.kenn.io/forge/internal/config"
-	"go.kenn.io/forge/internal/federation"
 	"go.kenn.io/forge/internal/federationauth"
 	"go.kenn.io/forge/internal/providerplane"
+	"go.kenn.io/forge/internal/server/authapi"
+	"go.kenn.io/forge/internal/server/syncevents"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 )
-
-const federationEventTestNodeID = "55555555555555555555555555555555"
 
 type testSSEFrame struct {
 	ID   string
@@ -38,48 +34,30 @@ type testFederationEventStream struct {
 }
 
 func TestReconnectStaleEventCarriesHubConnection(t *testing.T) {
-	hub := NewEventHubWithCapacity(4)
+	serverfake.RunParallelServerTest(t)
+	hub := syncevents.NewEventHubWithCapacity(4)
 	t.Cleanup(hub.Close)
-	server := &Server{hub: hub}
+	server := wiredServer(&Server{hub: hub})
 
 	for i := 1; i <= 10; i++ {
-		hub.Broadcast(Event{Type: "data_changed", Data: i})
+		hub.Broadcast(syncevents.Event{Type: "data_changed", Data: i})
 	}
-	server.broadcastHubConnection(false)
+	server.syncevents.BroadcastHubConnection(false)
 
-	event := server.reconnectStaleEvent()
-	state, ok := event.Data.(reconnectStaleState)
+	event := server.syncevents.ReconnectStaleEvent()
+	state, ok := event.Data.(syncevents.ReconnectStaleState)
 	require.True(t, ok)
 	require.NotNil(t, state.HubConnected)
 	assert.False(t, *state.HubConnected)
 }
 
-func TestFederationEventEndpointFiltersNodeLocalEvents(t *testing.T) {
-	server, httpServer, token := newFederationEventServer(t)
-	// A fresh spoke refreshes sync status at the replay barrier, so the
-	// hub must not inject an older cached value after that barrier.
-	server.Hub().Broadcast(Event{Type: "sync_status", Data: map[string]bool{"running": true}})
-	stream := openFederationEventStream(t, httpServer, token, "")
-	defer stream.response.Body.Close()
-
-	server.Hub().Broadcast(Event{Type: "workspace_created", Data: map[string]string{"id": "ws-1"}})
-	server.Hub().Broadcast(Event{Type: "workspace_status", Data: map[string]string{"id": "ws-1"}})
-	server.Hub().Broadcast(Event{Type: "config.changed", Data: map[string]bool{"valid": true}})
-	providerID := server.Hub().Broadcast(Event{Type: "data_changed", Data: struct{}{}})
-
-	frame := nextTestSSEFrame(t, stream.frames)
-	assert.Equal(t, providerID, mustEventID(t, frame.ID))
-	assert.Equal(t, "data_changed", frame.Type)
-	assert.JSONEq(t, `{}`, frame.Data)
-	assertNoTestSSEFrame(t, stream.frames)
-}
-
 func TestFederationEventEndpointReplaysFilteredEventsAndSignalsStale(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	server, httpServer, token := newFederationEventServer(t)
-	server.Hub().Broadcast(Event{Type: "workspace_created", Data: struct{}{}})
-	firstProviderID := server.Hub().Broadcast(Event{Type: "data_changed", Data: struct{}{}})
-	secondProviderID := server.Hub().Broadcast(Event{
+	server.Hub().Broadcast(syncevents.Event{Type: "workspace_created", Data: struct{}{}})
+	firstProviderID := server.Hub().Broadcast(syncevents.Event{Type: "data_changed", Data: struct{}{}})
+	secondProviderID := server.Hub().Broadcast(syncevents.Event{
 		Type: "sync_status", Data: map[string]bool{"running": true},
 	})
 
@@ -91,10 +69,10 @@ func TestFederationEventEndpointReplaysFilteredEventsAndSignalsStale(t *testing.
 	replay.response.Body.Close()
 
 	server.hub.Close()
-	server.hub = NewEventHubWithCapacity(2)
-	server.Hub().Broadcast(Event{Type: "data_changed", Data: struct{}{}})
-	server.Hub().Broadcast(Event{Type: "sync_status", Data: struct{}{}})
-	server.Hub().Broadcast(Event{Type: "pr_ci_refreshed", Data: struct{}{}})
+	server.hub = syncevents.NewEventHubWithCapacity(2)
+	server.Hub().Broadcast(syncevents.Event{Type: "data_changed", Data: struct{}{}})
+	server.Hub().Broadcast(syncevents.Event{Type: "sync_status", Data: struct{}{}})
+	server.Hub().Broadcast(syncevents.Event{Type: "pr_ci_refreshed", Data: struct{}{}})
 	stale := openFederationEventStream(t, httpServer, token, "0")
 	defer stale.response.Body.Close()
 	frame := nextTestSSEFrame(t, stale.frames)
@@ -102,17 +80,8 @@ func TestFederationEventEndpointReplaysFilteredEventsAndSignalsStale(t *testing.
 	assert.JSONEq(`{}`, frame.Data)
 }
 
-func TestFederationEventEndpointTreatsMalformedCursorAsFresh(t *testing.T) {
-	server, httpServer, token := newFederationEventServer(t)
-	stream := openFederationEventStream(t, httpServer, token, "not-a-number")
-	defer stream.response.Body.Close()
-
-	server.Hub().Broadcast(Event{Type: "pr_ci_refresh_queued", Data: struct{}{}})
-
-	assert.Equal(t, "pr_ci_refresh_queued", nextTestSSEFrame(t, stream.frames).Type)
-}
-
 func TestFederationEventEndpointEnforcesCredentialProtocolAndRequestBounds(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	server, httpServer, token := newFederationEventServer(t)
 	wrongScopeNodeID := "88888888888888888888888888888888"
 	wrongScopeToken, err := server.options.FederationCredentials.MintInbound(
@@ -132,12 +101,12 @@ func TestFederationEventEndpointEnforcesCredentialProtocolAndRequestBounds(t *te
 		{name: "missing credential", protocol: providerplane.ProtocolVersionHeaderValue(), wantStatus: http.StatusUnauthorized},
 		{name: "wrong scope", token: wrongScopeToken, nodeID: wrongScopeNodeID, protocol: providerplane.ProtocolVersionHeaderValue(), wantStatus: http.StatusForbidden},
 		{name: "wrong protocol", token: token, protocol: "999", wantStatus: http.StatusConflict},
-		{name: "oversized cursor", token: token, protocol: providerplane.ProtocolVersionHeaderValue(), cursor: strings.Repeat("9", maxFederationCursorLength+1), wantStatus: http.StatusBadRequest},
+		{name: "oversized cursor", token: token, protocol: providerplane.ProtocolVersionHeaderValue(), cursor: strings.Repeat("9", syncevents.MaxFederationCursorLength+1), wantStatus: http.StatusBadRequest},
 		{name: "request body", token: token, protocol: providerplane.ProtocolVersionHeaderValue(), body: strings.NewReader("not allowed"), wantStatus: http.StatusBadRequest},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			request, err := http.NewRequest(
+			request, err := http.NewRequestWithContext(t.Context(),
 				http.MethodGet, httpServer.URL+"/api/v1/federation/events", test.body,
 			)
 			require.NoError(t, err)
@@ -145,7 +114,7 @@ func TestFederationEventEndpointEnforcesCredentialProtocolAndRequestBounds(t *te
 				request.Header.Set("Authorization", "Bearer "+test.token)
 				nodeID := test.nodeID
 				if nodeID == "" {
-					nodeID = federationEventTestNodeID
+					nodeID = serverfake.FederationEventTestNodeID
 				}
 				request.Header.Set(federationauth.NodeIDHeader, nodeID)
 			}
@@ -160,6 +129,7 @@ func TestFederationEventEndpointEnforcesCredentialProtocolAndRequestBounds(t *te
 }
 
 func TestFederationEventCredentialRevocationAppliesToNextConnection(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	server, httpServer, token := newFederationEventServer(t)
 	stream := openFederationEventStream(t, httpServer, token, "")
@@ -169,7 +139,7 @@ func TestFederationEventCredentialRevocationAppliesToNextConnection(t *testing.T
 	}, time.Second, time.Millisecond)
 
 	require.NoError(server.options.FederationCredentials.RevokeInbound(token))
-	request, err := federationEventRequest(httpServer.URL, token, "")
+	request, err := federationEventRequest(t, httpServer.URL, token, "")
 	require.NoError(err)
 	response, err := httpServer.Client().Do(request)
 	require.NoError(err)
@@ -177,113 +147,20 @@ func TestFederationEventCredentialRevocationAppliesToNextConnection(t *testing.T
 	assert.Equal(t, http.StatusUnauthorized, response.StatusCode)
 }
 
-func TestEnrollmentRevocationClosesExistingFederationEventStream(t *testing.T) {
-	require := require.New(t)
-	const (
-		hubID        = "0123456789abcdef0123456789abcdef"
-		enrollmentID = "11111111111111111111111111111111"
-	)
-	spoke := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodDelete, r.Method)
-		assert.Equal(t, "/api/v1/fleet/enrollments/"+enrollmentID, r.URL.Path)
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	t.Cleanup(spoke.Close)
-	dir := t.TempDir()
-	enrollments, err := federation.Open(
-		filepath.Join(dir, "enrollments.json"), federation.StoreOptions{},
-	)
-	require.NoError(err)
-	oneTime, err := enrollments.CreateOneTimeToken(federation.Identity{
-		NodeID: hubID, BaseURL: "https://hub.example",
-	}, time.Now().Add(time.Minute))
-	require.NoError(err)
-	_, err = enrollments.Begin(t.Context(), oneTime.Token, federation.JoinRequest{
-		EnrollmentID: enrollmentID, NodeID: federationEventTestNodeID,
-		BaseURL: spoke.URL, Platform: "linux",
-		ProtocolVersion: federation.ProtocolVersion,
-		HubCredential:   "hub-credential",
-	})
-	require.NoError(err)
-	require.NoError(enrollments.Activate(
-		t.Context(), enrollmentID, time.Now().Add(time.Hour),
-	))
-
-	credentials, err := federationauth.Open(filepath.Join(dir, "credentials.json"))
-	require.NoError(err)
-	token, err := credentials.MintInbound(
-		federationEventTestNodeID, federationauth.SpokeToHubScopes(),
-	)
-	require.NoError(err)
-	require.NoError(credentials.StoreOutbound(
-		federationEventTestNodeID, "hub-calls-spoke-token",
-		federationauth.HubToSpokeScopes(),
-	))
-	cfg := &config.Config{
-		Host: "127.0.0.1", Port: 8091, DataDir: dir, BasePath: "/",
-		SyncInterval: "5m", Activity: config.Activity{ViewMode: "threaded", TimeRange: "7d"},
-		API: config.API{RequireAuth: true}, Fleet: config.Fleet{
-			Enabled: true, Role: config.FleetRoleHub,
-			BaseURL: "https://hub.example",
-			Members: []config.FleetMember{{
-				NodeID: federationEventTestNodeID, BaseURL: spoke.URL,
-				State: federation.EnrollmentActive,
-			}},
-		}}
-	cfgPath := filepath.Join(dir, "config.toml")
-	require.NoError(cfg.Save(cfgPath))
-	server := NewWithConfig(dbtest.Open(t), nil, nil, nil, cfg, cfgPath, ServerOptions{
-		DaemonAccess: DaemonAccessOptions{
-			Token: "local-daemon-secret", RequireAPIAuth: true,
-		},
-		FederationCredentials:              credentials,
-		FederationEnrollments:              enrollments,
-		FederationSpokeID:                  hubID,
-		FederationHTTPClient:               spoke.Client(),
-		HostCheckAllowLoopbackAnyPort:      true,
-		DisableWorkspaceBackgroundMonitors: true,
-	})
-	t.Cleanup(func() { gracefulShutdown(t, server) })
-	httpServer := httptest.NewServer(server)
-	t.Cleanup(httpServer.Close)
-	stream := openFederationEventStream(t, httpServer, token, "")
-	defer stream.response.Body.Close()
-
-	request, err := http.NewRequest(
-		http.MethodDelete,
-		httpServer.URL+"/api/v1/fleet/enrollments/"+enrollmentID,
-		nil,
-	)
-	require.NoError(err)
-	request.Header.Set("Authorization", "Bearer local-daemon-secret")
-	request.Header.Set("Content-Type", "application/json")
-	response, err := httpServer.Client().Do(request)
-	require.NoError(err)
-	response.Body.Close()
-	require.Equal(http.StatusNoContent, response.StatusCode)
-
-	server.Hub().Broadcast(Event{Type: "data_changed", Data: struct{}{}})
-	select {
-	case _, open := <-stream.frames:
-		require.False(open, "revoked spoke event stream remained open")
-	case <-time.After(time.Second):
-		require.FailNow("revoked spoke event stream did not close")
-	}
-}
-
 func TestHubEventReceiveAssignsFreshLocalIDs(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	server := newTestServer(t)
 	for range 7 {
-		server.Hub().Broadcast(Event{Type: "workspace_status", Data: struct{}{}})
+		server.Hub().Broadcast(syncevents.Event{Type: "workspace_status", Data: struct{}{}})
 	}
 	stream, _ := server.Hub().Subscribe(t.Context(), false)
 
-	require.NoError(server.receiveHubEvent(t.Context(), providerplane.Event{
+	require.NoError(server.syncevents.ReceiveHubEvent(t.Context(), providerplane.Event{
 		ID: 40, Type: "data_changed", Data: []byte(`{}`),
 	}))
-	require.NoError(server.receiveHubEvent(t.Context(), providerplane.Event{
+	require.NoError(server.syncevents.ReceiveHubEvent(t.Context(), providerplane.Event{
 		ID: 900, Type: "pr_detail_refreshed", Data: []byte(`{"number":1}`),
 	}))
 
@@ -296,98 +173,20 @@ func TestHubEventReceiveAssignsFreshLocalIDs(t *testing.T) {
 }
 
 func TestHubEventsStopWhileFleetIsDisabled(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	server := newTestServer(t)
 	server.cfg = &config.Config{Fleet: config.Fleet{Enabled: false}}
 	before := server.Hub().Generation()
 
-	err := server.receiveHubEvent(t.Context(), providerplane.Event{
+	err := server.syncevents.ReceiveHubEvent(t.Context(), providerplane.Event{
 		ID: 40, Type: "data_changed", Data: []byte(`{}`),
 	})
 	require.ErrorIs(t, err, providerplane.ErrHubUnavailable)
 	assert.Equal(t, before, server.Hub().Generation())
 }
 
-func TestHubEventLifecyclePausesUntilFleetIsEnabled(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		assert := assert.New(t)
-		require := require.New(t)
-		started := make(chan struct{}, 2)
-		stopped := make(chan struct{}, 2)
-		lifecycle := newHubEventLifecycle(true, func(ctx context.Context) {
-			started <- struct{}{}
-			<-ctx.Done()
-			stopped <- struct{}{}
-		})
-		ctx, cancel := context.WithCancel(t.Context())
-		done := make(chan struct{})
-		go func() {
-			lifecycle.Run(ctx)
-			close(done)
-		}()
-
-		synctest.Wait()
-		require.Len(started, 1)
-		lifecycle.SetEnabled(false)
-		synctest.Wait()
-		require.Len(stopped, 1)
-		synctest.Wait()
-		assert.Len(started, 1)
-
-		lifecycle.SetEnabled(true)
-		synctest.Wait()
-		require.Len(started, 2)
-		cancel()
-		synctest.Wait()
-		require.Len(stopped, 2)
-		synctest.Wait()
-		<-done
-	})
-}
-
-func TestHubEventLifecycleCanStopAfterCleanReturn(t *testing.T) {
-	runs := 0
-	lifecycle := newHubEventLifecycleStoppingOnCleanReturn(true, func(context.Context) {
-		runs++
-	})
-
-	lifecycle.Run(t.Context())
-
-	assert.Equal(t, 1, runs)
-}
-
-func TestDisabledFederationSpokeSeedsDisconnectedStateForFreshSubscriber(t *testing.T) {
-	const hubID = "66666666666666666666666666666666"
-	require := require.New(t)
-	credentials, err := federationauth.Open(t.TempDir() + "/credentials.json")
-	require.NoError(err)
-	require.NoError(credentials.StoreOutbound(
-		hubID, "disabled-spoke-secret",
-		federationauth.SpokeToHubScopes(),
-	))
-	spoke := New(dbtest.Open(t), nil, nil, "/", &config.Config{Fleet: config.Fleet{
-		Enabled: false, Role: config.FleetRoleSpoke,
-		Hub: &config.FleetHub{
-			NodeID: hubID, BaseURL: "https://hub.example",
-		},
-	}}, ServerOptions{
-		FederationSpokeID: federationEventTestNodeID, FederationSpokeActive: true,
-		FederationCredentials: credentials, DisableWorkspaceBackgroundMonitors: true,
-	})
-	t.Cleanup(func() { gracefulShutdown(t, spoke) })
-
-	events, _ := spoke.Hub().Subscribe(t.Context(), true)
-	select {
-	case record := <-events:
-		require.Equal("hub_connection_changed", record.Event.Type)
-		state, ok := record.Event.Data.(hubConnectionState)
-		require.True(ok)
-		assert.False(t, state.Connected)
-	case <-time.After(time.Second):
-		require.FailNow("fresh subscriber did not receive hub availability")
-	}
-}
-
 func TestNodeStreamsHubEventsWithNodeLocalCursorIDs(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	hubID := "66666666666666666666666666666666"
 	nodeID := "77777777777777777777777777777777"
@@ -396,15 +195,15 @@ func TestNodeStreamsHubEventsWithNodeLocalCursorIDs(t *testing.T) {
 	token, err := hubCredentials.MintInbound(nodeID, federationauth.SpokeToHubScopes())
 	require.NoError(err)
 	hub := New(dbtest.Open(t), nil, nil, "/", nil, ServerOptions{
-		DaemonAccess:      DaemonAccessOptions{Token: "hub-secret", RequireAPIAuth: true},
+		DaemonAccess:      authapi.DaemonAccessOptions{Token: "hub-secret", RequireAPIAuth: true},
 		FederationSpokeID: hubID, FederationCredentials: hubCredentials,
 		DisableWorkspaceBackgroundMonitors: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, hub) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, hub) })
 	hubHTTP := httptest.NewTLSServer(hub)
 	t.Cleanup(hubHTTP.Close)
 	for range 40 {
-		hub.Hub().Broadcast(Event{Type: "workspace_status", Data: struct{}{}})
+		hub.Hub().Broadcast(syncevents.Event{Type: "workspace_status", Data: struct{}{}})
 	}
 
 	spokeCredentials, err := federationauth.Open(t.TempDir() + "/spoke-credentials.json")
@@ -420,7 +219,7 @@ func TestNodeStreamsHubEventsWithNodeLocalCursorIDs(t *testing.T) {
 		FederationSpokeActive: true,
 		FederationHTTPClient:  hubHTTP.Client(), DisableWorkspaceBackgroundMonitors: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, spoke) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, spoke) })
 
 	require.Eventually(func() bool {
 		records, _ := spoke.Hub().RingSnapshotSince(0)
@@ -428,7 +227,7 @@ func TestNodeStreamsHubEventsWithNodeLocalCursorIDs(t *testing.T) {
 			if record.Event.Type != "hub_connection_changed" {
 				continue
 			}
-			state, ok := record.Event.Data.(hubConnectionState)
+			state, ok := record.Event.Data.(syncevents.HubConnectionState)
 			if ok && state.Connected {
 				return true
 			}
@@ -436,7 +235,7 @@ func TestNodeStreamsHubEventsWithNodeLocalCursorIDs(t *testing.T) {
 		return false
 	}, 2*time.Second, 5*time.Millisecond)
 	localFloor := spoke.Hub().Generation()
-	remoteID := hub.Hub().Broadcast(Event{Type: "data_changed", Data: struct{}{}})
+	remoteID := hub.Hub().Broadcast(syncevents.Event{Type: "data_changed", Data: struct{}{}})
 	require.Greater(remoteID, localFloor+1)
 
 	require.Eventually(func() bool {
@@ -450,29 +249,29 @@ func TestNodeStreamsHubEventsWithNodeLocalCursorIDs(t *testing.T) {
 
 	spoke.cfgMu.Lock()
 	spoke.cfg.Fleet.Enabled = false
-	spoke.applyFleetConfigLocked()
+	spoke.streamapi.ApplyFleetConfigLocked()
 	spoke.cfgMu.Unlock()
 	require.Eventually(func() bool {
 		return hub.SubscriberCount() == 0
 	}, time.Second, 5*time.Millisecond)
 	disabledFloor := spoke.Hub().Generation()
-	hub.Hub().Broadcast(Event{
+	hub.Hub().Broadcast(syncevents.Event{
 		Type: "pr_detail_refreshed", Data: map[string]int{"number": 7},
 	})
 	assert.Never(t, func() bool {
 		records, _ := spoke.Hub().RingSnapshotSince(disabledFloor)
-		return slices.ContainsFunc(records, func(record RecordedEvent) bool {
+		return slices.ContainsFunc(records, func(record syncevents.RecordedEvent) bool {
 			return record.Event.Type == "pr_detail_refreshed"
 		})
 	}, 50*time.Millisecond, 5*time.Millisecond)
 
 	spoke.cfgMu.Lock()
 	spoke.cfg.Fleet.Enabled = true
-	spoke.applyFleetConfigLocked()
+	spoke.streamapi.ApplyFleetConfigLocked()
 	spoke.cfgMu.Unlock()
 	require.Eventually(func() bool {
 		records, _ := spoke.Hub().RingSnapshotSince(disabledFloor)
-		return slices.ContainsFunc(records, func(record RecordedEvent) bool {
+		return slices.ContainsFunc(records, func(record syncevents.RecordedEvent) bool {
 			return record.Event.Type == "data_changed"
 		})
 	}, 2*time.Second, 5*time.Millisecond)
@@ -485,17 +284,17 @@ func newFederationEventServer(
 	credentials, err := federationauth.Open(t.TempDir() + "/credentials.json")
 	require.NoError(t, err)
 	token, err := credentials.MintInbound(
-		federationEventTestNodeID, federationauth.SpokeToHubScopes(),
+		serverfake.FederationEventTestNodeID, federationauth.SpokeToHubScopes(),
 	)
 	require.NoError(t, err)
 	server := New(dbtest.Open(t), nil, nil, "/", nil, ServerOptions{
-		DaemonAccess: DaemonAccessOptions{
+		DaemonAccess: authapi.DaemonAccessOptions{
 			Token: "local-daemon-secret", RequireAPIAuth: true,
 		},
 		FederationCredentials:              credentials,
 		DisableWorkspaceBackgroundMonitors: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, server) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, server) })
 	httpServer := httptest.NewServer(server)
 	t.Cleanup(httpServer.Close)
 	return server, httpServer, token
@@ -505,10 +304,18 @@ func openFederationEventStream(
 	t *testing.T, server *httptest.Server, token, cursor string,
 ) testFederationEventStream {
 	t.Helper()
-	request, err := federationEventRequest(server.URL, token, cursor)
+	request, err := federationEventRequest(t, server.URL, token, cursor)
 	require.NoError(t, err)
+	// The scanner can still be exiting when the test closes its stream.
+	// Keep that connection out of the client's idle pool during cleanup.
+	request.Close = true
 	response, err := server.Client().Do(request)
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+	})
 	require.Equal(t, http.StatusOK, response.StatusCode)
 	require.Equal(t, "text/event-stream", response.Header.Get("Content-Type"))
 	frames := make(chan testSSEFrame, 8)
@@ -516,15 +323,16 @@ func openFederationEventStream(
 	return testFederationEventStream{response: response, frames: frames}
 }
 
-func federationEventRequest(baseURL, token, cursor string) (*http.Request, error) {
-	request, err := http.NewRequest(
+func federationEventRequest(t *testing.T, baseURL, token, cursor string) (*http.Request, error) {
+	t.Helper()
+	request, err := http.NewRequestWithContext(t.Context(),
 		http.MethodGet, baseURL+"/api/v1/federation/events", nil,
 	)
 	if err != nil {
 		return nil, err
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
-	request.Header.Set(federationauth.NodeIDHeader, federationEventTestNodeID)
+	request.Header.Set(federationauth.NodeIDHeader, serverfake.FederationEventTestNodeID)
 	request.Header.Set(providerplane.ProtocolVersionHeader, providerplane.ProtocolVersionHeaderValue())
 	if cursor != "" {
 		request.Header.Set("Last-Event-ID", cursor)
@@ -566,15 +374,6 @@ func nextTestSSEFrame(t *testing.T, frames <-chan testSSEFrame) testSSEFrame {
 	case <-time.After(time.Second):
 		require.FailNow(t, "timed out waiting for federation event")
 		return testSSEFrame{}
-	}
-}
-
-func assertNoTestSSEFrame(t *testing.T, frames <-chan testSSEFrame) {
-	t.Helper()
-	select {
-	case frame := <-frames:
-		require.Fail(t, "unexpected federation event", "%+v", frame)
-	case <-time.After(50 * time.Millisecond):
 	}
 }
 

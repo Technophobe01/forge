@@ -9,7 +9,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/testutil/gitsafe"
-	gitcmd "go.kenn.io/kit/git/cmd"
 )
 
 func TestParseRemoteURL_GitHubFormats(t *testing.T) {
@@ -138,6 +137,37 @@ func TestParseRemoteURL_ConfiguredSelfHostedGitLabWithURLPort(t *testing.T) {
 	assert.Equal("project", got.Name)
 }
 
+func TestParseRemoteURL_ConfiguredBitbucketDataCenter(t *testing.T) {
+	for _, tc := range []struct{ name, remote, apiHost string }{
+		{"https", "https://bitbucket.example.com/scm/PROJECT/widgets.git", "bitbucket.example.com"},
+		{"ssh", "ssh://git@bitbucket.example.com:7999/PROJECT/widgets.git", "bitbucket.example.com"},
+		{"ssh_api_port", "ssh://git@bitbucket.example.com:7999/PROJECT/widgets.git", "bitbucket.example.com:8443"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			got := ParseRemoteURLWithKnownPlatforms(tc.remote, []KnownPlatformHost{{Platform: "bitbucket", Host: tc.apiHost}})
+			require.NotNil(got)
+			assert.Equal("bitbucket", got.Platform)
+			assert.Equal(tc.apiHost, got.Host)
+			assert.Equal("PROJECT", got.Owner)
+			assert.Equal("widgets", got.Name)
+		})
+	}
+}
+
+func TestParseRemoteURL_DataCenterNormalizationRequiresConfiguredProvider(t *testing.T) {
+	assert := assert.New(t)
+	assert.Nil(ParseRemoteURL("https://bitbucket.example.com/scm/PROJECT/widgets.git"))
+	assert.Nil(ParseRemoteURL("ssh://git@bitbucket.example.com:7999/PROJECT/widgets.git"))
+	assert.Nil(ParseRemoteURL("https://bitbucket.org/team/widgets.git"))
+	known := []KnownPlatformHost{{Platform: "gitlab", Host: "bitbucket.example.com"}}
+	got := ParseRemoteURLWithKnownPlatforms("https://bitbucket.example.com/scm/PROJECT/widgets.git", known)
+	require.NotNil(t, got)
+	assert.Equal("gitlab", got.Platform)
+	assert.Equal("scm/PROJECT", got.Owner)
+}
+
 func TestParseRemoteURL_NestedGitLabRepoPath(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -263,7 +293,7 @@ func TestResolveIdentityFromPath_RequiresPath(t *testing.T) {
 
 func runGit(t *testing.T, dir string, args ...string) error {
 	t.Helper()
-	cmd := gitcmd.New().Command(t.Context(), dir, args...)
+	cmd := gitsafe.Runner().Command(t.Context(), dir, args...)
 	cmd.Env = append(cmd.Env,
 		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=kenn-forge-fixture@example.invalid",
 		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=kenn-forge-fixture@example.invalid",

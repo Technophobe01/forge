@@ -16,8 +16,11 @@ import (
 	dbpkg "go.kenn.io/forge/internal/db"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
+	"go.kenn.io/forge/internal/server/authapi"
 	"go.kenn.io/forge/internal/server/fleetapi"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/testutil/servertest"
 )
 
@@ -30,6 +33,7 @@ import (
 // clients rely on instead of embedder hooks; the mutation path is
 // covered separately by the in-package fanout unit test.
 func TestE2E_WorktreeLinkChangeReachesSSE(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	ctx := t.Context()
 
@@ -41,7 +45,7 @@ func TestE2E_WorktreeLinkChangeReachesSSE(t *testing.T) {
 	srv := servertest.New(t, database, syncer, nil, "/", cfg, server.ServerOptions{
 		WorktreeDir:                        t.TempDir(),
 		DisableWorkspaceBackgroundMonitors: true,
-		HostCheck: server.HostCheckOptions{
+		HostCheck: authapi.HostCheckOptions{
 			Bind:                 config.HostKey{Host: "127.0.0.1", Port: "8091"},
 			AllowLoopbackAnyPort: true,
 		},
@@ -49,8 +53,8 @@ func TestE2E_WorktreeLinkChangeReachesSSE(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
 
-	repoID, err := database.UpsertRepo(
-		ctx, verifiedRepoIdentity(
+	repoID, err := reposeed.Seed(
+		ctx, database, verifiedRepoIdentity(
 			dbpkg.GitHubRepoIdentity("github.com", "acme", "widget"),
 		),
 	)

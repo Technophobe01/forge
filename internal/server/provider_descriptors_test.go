@@ -6,33 +6,41 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/federationauth"
 	"go.kenn.io/forge/internal/gitclone"
 	"go.kenn.io/forge/internal/providerplane"
+	"go.kenn.io/forge/internal/server/authapi"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/server/pullapi"
+	"go.kenn.io/forge/internal/server/spokeapi"
+	"go.kenn.io/forge/internal/server/workspaceapi"
 	"go.kenn.io/forge/internal/testutil"
 	"go.kenn.io/forge/internal/testutil/dbtest"
 	"go.kenn.io/forge/internal/testutil/gitfixture"
+	"go.kenn.io/forge/internal/testutil/gitsafe"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/tokenauth"
-	gitcmd "go.kenn.io/kit/git/cmd"
+	"go.kenn.io/forge/platform"
 )
 
 type descriptorCloneRoutes struct {
-	source tokenauth.Source
+	source     tokenauth.Source
+	readSource tokenauth.Source
 }
 
 func (r descriptorCloneRoutes) SourceForRepo(
@@ -44,15 +52,115 @@ func (r descriptorCloneRoutes) SourceForRepo(
 	return nil
 }
 
+func TestSpokeAdHocCreationFollowsCachedRepositoryRename(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
+	assert, require := assert.New(t), require.New(t)
+	hubDB := dbtest.Open(t)
+	serverfake.SeedPR(t, hubDB, "acme", "widget", 42)
+	renamed, err := hubDB.ObserveRepository(t.Context(), db.RepoIdentity{
+		Platform: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")),
+		Owner: "acme", Name: "widgets",
+	})
+	require.NoError(err)
+	require.NoError(hubDB.UpdateRepoProviderObservation(t.Context(), renamed.Repository.ID, db.RepoProviderMetadata{
+		CloneURL: "https://github.com/acme/widgets.git", DefaultBranch: "main",
+	}, nil, nil))
+	hubCredentials, err := federationauth.Open(filepath.Join(t.TempDir(), "hub-credentials.json"))
+	require.NoError(err)
+	token, err := hubCredentials.MintInbound(proxyTestNodeID, federationauth.SpokeToHubScopes())
+	require.NoError(err)
+	hubServer := New(hubDB, nil, nil, "/", nil, ServerOptions{
+		FederationSpokeID: proxyTestHubID, FederationCredentials: hubCredentials,
+		DisableWorkspaceBackgroundMonitors: true,
+	})
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, hubServer) })
+	hub := httptest.NewTLSServer(hubServer)
+	t.Cleanup(hub.Close)
+	credentials, err := federationauth.Open(filepath.Join(t.TempDir(), "spoke-credentials.json"))
+	require.NoError(err)
+	require.NoError(credentials.StoreOutbound(proxyTestHubID, token, federationauth.SpokeToHubScopes()))
+	nodeDB := dbtest.Open(t)
+	node := New(nodeDB, nil, nil, "/", &config.Config{
+		Fleet: config.Fleet{Enabled: true, Role: config.FleetRoleSpoke, Hub: &config.FleetHub{NodeID: proxyTestHubID, BaseURL: hub.URL}},
+		Tmux:  config.Tmux{Command: []string{"kenn-forge-no-such-tmux"}},
+	}, ServerOptions{
+		FederationSpokeID: proxyTestNodeID, FederationSpokeActive: true,
+		FederationCredentials: credentials, FederationHTTPClient: hub.Client(),
+		WorktreeDir: filepath.Join(t.TempDir(), "worktrees"), PtyOwnerInProcess: true,
+		DisableWorkspaceBackgroundMonitors: true,
+	})
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, node) })
+
+	response := testutil.DoJSON(t, node, http.MethodPost, "/api/v1/fleet/hosts/self/repo/gh/acme/widget/workspaces", map[string]any{
+		"branch": "work/cached-rename", "platform_repo_id": testutil.FixtureRepoID("acme", "widget"),
+	})
+	require.Equal(http.StatusAccepted, response.Code, response.Body.String())
+	var created workspaceapi.WorkspaceResponse
+	require.NoError(json.Unmarshal(response.Body.Bytes(), &created))
+	stored, err := nodeDB.GetWorkspace(t.Context(), created.ID)
+	require.NoError(err)
+	require.NotNil(stored)
+	identity, err := nodeDB.GetRepoByID(t.Context(), stored.RepoID)
+	require.NoError(err)
+	require.NotNil(identity)
+	assert.Equal(platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")), identity.Key)
+	assert.Equal("widgets", stored.RepoName)
+	assert.Equal("https://github.com/acme/widgets.git", identity.CloneURL)
+
+	// A new owner at the cached route must not redirect that same selection.
+	_, err = hubDB.ObserveRepository(t.Context(), db.RepoIdentity{
+		Platform: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(2002),
+		Owner: "acme", Name: "widget",
+	})
+	require.NoError(err)
+	response = testutil.DoJSON(t, node, http.MethodPost, "/api/v1/fleet/hosts/self/repo/gh/acme/widget/workspaces", map[string]any{
+		"branch": "work/cached-rename", "platform_repo_id": testutil.FixtureRepoID("acme", "widget"),
+	})
+	assert.Equal(http.StatusNotFound, response.Code, response.Body.String())
+}
+
+func TestRepositorySelectionRejectsDifferentHubIdentity(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
+	assert, require := assert.New(t), require.New(t)
+	descriptor, err := providerplane.BuildRepositoryDescriptor(providerplane.RepositorySnapshot{
+		Provider: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(2002),
+		Owner: "acme", Name: "widget", CloneURL: "https://github.com/acme/widget.git", DefaultBranch: "main",
+		ObservedAt: time.Now().UTC(),
+	})
+	require.NoError(err)
+	raw, err := json.Marshal(descriptor)
+	require.NoError(err)
+	database := dbtest.Open(t)
+	source := &spokeapi.HubProviderSource{Db: database, Client: providerPlaneClientFunc(func(
+		_ context.Context, _ federationauth.Scope, request *http.Request,
+	) (*http.Response, error) {
+		body, err := io.ReadAll(request.Body)
+		require.NoError(err)
+		assert.JSONEq(`{"provider":"github","platform_host":"github.com","owner":"acme","name":"widget","platform_repo_id":1001}`, string(body))
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(raw))}, nil
+	})}
+	_, err = source.ResolveRepositoryRoute(t.Context(), providerplane.RepositoryRoute{
+		Provider: "github", PlatformHost: "github.com", Owner: "acme", Name: "widget",
+	}, platform.RepositoryIDKey(1001))
+	require.Error(err)
+	problem, ok := errors.AsType[*httpapi.ProblemError](err)
+	require.True(ok)
+	assert.Equal(httpapi.CodeUpstreamError, problem.Code)
+	repositories, err := database.ListRepos(t.Context())
+	require.NoError(err)
+	assert.Empty(repositories, "reject the mismatched identity before observing it locally")
+}
+
 func TestWorkspaceLaunchRefreshFollowsStableRepositoryRename(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	database := dbtest.Open(t)
-	seedPR(t, database, "acme", "widget", 42)
+	serverfake.SeedPR(t, database, "acme", "widget", 42)
 	server := New(database, nil, nil, "/", nil, ServerOptions{
 		DisableWorkspaceBackgroundMonitors: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, server) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, server) })
 
 	current, err := server.ResolveWorkspaceLaunchSpec(
 		t.Context(), providerplane.WorkspaceLaunchRequest{
@@ -66,37 +174,36 @@ func TestWorkspaceLaunchRefreshFollowsStableRepositoryRename(t *testing.T) {
 	require.NoError(err)
 
 	renameTime := time.Now().UTC().Add(time.Minute)
-	_, accepted, err := database.ReconcileRepositoryObservation(
+	renamed, err := database.ObserveRepository(
 		t.Context(), db.RepoIdentity{
 			Platform: "github", PlatformHost: "github.com",
-			PlatformRepoID: current.Repository.PlatformRepoID,
-			Owner:          "acme-renamed", Name: "widget-renamed",
-		}, renameTime,
-	)
-	require.NoError(err)
-	require.True(accepted)
-	renamed, err := database.GetRepositoryByProviderID(
-		t.Context(), "github", "github.com", current.Repository.PlatformRepoID,
-	)
-	require.NoError(err)
-	require.NotNil(renamed)
-	require.NoError(database.UpdateRepoProviderMetadata(
-		t.Context(), renamed.Repository.ID, db.RepoProviderMetadata{
-			PlatformRepoID: current.Repository.PlatformRepoID,
-			CloneURL:       "https://github.com/acme-renamed/widget-renamed.git",
-			DefaultBranch:  "main",
+			Key:   current.Repository.Key,
+			Owner: "acme-renamed", Name: "widget-renamed",
 		},
+	)
+	require.NoError(err)
+	require.NoError(database.UpdateRepoProviderObservation(
+		t.Context(), renamed.Repository.ID, db.RepoProviderMetadata{
+			CloneURL:      "https://github.com/acme-renamed/widget-renamed.git",
+			DefaultBranch: "main",
+		}, nil, nil,
 	))
 	server.now = func() time.Time { return renameTime.Add(time.Minute) }
+	_, err = database.ObserveRepository(t.Context(), db.RepoIdentity{
+		Platform: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(2002),
+		Owner: "acme", Name: "widget",
+	})
+	require.NoError(err)
 
 	refreshed, err := server.RefreshWorkspaceLaunchSpec(t.Context(), current)
 	require.NoError(err)
-	assert.Equal(current.Repository.PlatformRepoID, refreshed.Repository.PlatformRepoID)
+	assert.Equal(current.Repository.Key, refreshed.Repository.Key)
 	assert.Equal("acme-renamed", refreshed.Repository.Owner)
 	assert.Equal("widget-renamed", refreshed.Repository.Name)
 }
 
 func TestNodeGitLabCloneReadsFetchMergeRequestHead(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	const mrNumber = 7
@@ -115,25 +222,24 @@ func TestNodeGitLabCloneReadsFetchMergeRequestHead(t *testing.T) {
 	cloneURL := "http://" + platformHost + "/acme/widget.git"
 
 	hubDB := dbtest.Open(t)
-	repoID, err := hubDB.UpsertRepo(t.Context(), db.RepoIdentity{
+	repoID, err := reposeed.Seed(t.Context(), hubDB, db.RepoIdentity{
 		Platform: "gitlab", PlatformHost: platformHost,
-		PlatformRepoID: "gid://gitlab/Project/7",
-		Owner:          "acme", Name: "widget", RepoPath: "acme/widget",
+		Key:   platform.RepositoryIDKey(7),
+		Owner: "acme", Name: "widget", RepoPath: "acme/widget",
 	})
 	require.NoError(err)
-	seedPRForRepo(
+	serverfake.SeedPRForRepo(
 		t, hubDB, repoID, platformHost, "acme", "widget", mrNumber,
-		withSeedPRHeadSHA(headSHA), withSeedPRBaseSHA(baseSHA),
+		serverfake.WithSeedPRHeadSHA(headSHA), serverfake.WithSeedPRBaseSHA(baseSHA),
 		withSeedPRHeadRepoCloneURL(cloneURL),
 	)
 	require.NoError(hubDB.UpdateDiffSHAs(
 		t.Context(), repoID, mrNumber, headSHA, baseSHA, baseSHA,
 	))
-	require.NoError(hubDB.UpdateRepoProviderMetadata(
+	require.NoError(hubDB.UpdateRepoProviderObservation(
 		t.Context(), repoID, db.RepoProviderMetadata{
-			PlatformRepoID: "gid://gitlab/Project/7",
-			CloneURL:       cloneURL, DefaultBranch: "main",
-		},
+			CloneURL: cloneURL, DefaultBranch: "main",
+		}, nil, nil,
 	))
 
 	hubCredentials, err := federationauth.Open(
@@ -147,7 +253,7 @@ func TestNodeGitLabCloneReadsFetchMergeRequestHead(t *testing.T) {
 	hubServer := New(
 		hubDB, nil, nil, "/", nil,
 		ServerOptions{
-			DaemonAccess: DaemonAccessOptions{
+			DaemonAccess: authapi.DaemonAccessOptions{
 				Token: "hub-local-secret", RequireAPIAuth: true,
 			},
 			FederationSpokeID:                  proxyTestHubID,
@@ -155,7 +261,7 @@ func TestNodeGitLabCloneReadsFetchMergeRequestHead(t *testing.T) {
 			DisableWorkspaceBackgroundMonitors: true,
 		},
 	)
-	t.Cleanup(func() { gracefulShutdown(t, hubServer) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, hubServer) })
 	hub := httptest.NewTLSServer(hubServer)
 	t.Cleanup(hub.Close)
 
@@ -175,11 +281,11 @@ func TestNodeGitLabCloneReadsFetchMergeRequestHead(t *testing.T) {
 		FederationCredentials: spokeCredentials,
 		FederationHTTPClient:  hub.Client(),
 		Clones: gitclone.New(t.TempDir(), descriptorCloneRoutes{
-			source: testTokenSource("spoke-git-token"),
+			source: serverfake.TestTokenSource("spoke-git-token"),
 		}),
 		DisableWorkspaceBackgroundMonitors: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, nodeServer) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, nodeServer) })
 
 	response := testutil.DoJSON(
 		t, nodeServer, http.MethodGet,
@@ -189,15 +295,25 @@ func TestNodeGitLabCloneReadsFetchMergeRequestHead(t *testing.T) {
 	assert.Contains(response.Body.String(), headSHA)
 }
 
+func (r descriptorCloneRoutes) ReadSourceForRepo(
+	platformName, host, owner, name string,
+) tokenauth.Source {
+	if r.readSource != nil && owner == "acme" && (name == "widget" || name == "widgets") {
+		return r.readSource
+	}
+	return r.SourceForRepo(platformName, host, owner, name)
+}
+
 func (descriptorCloneRoutes) FallbackSource(string) tokenauth.Source { return nil }
 
 func TestDiffDescriptorRoundTripSeedsNodeRepositoryCatalog(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	hubDB := dbtest.Open(t)
-	seedPR(
+	serverfake.SeedPR(
 		t, hubDB, "acme", "widget", 42,
-		withSeedPRHeadSHA("head-sha"), withSeedPRBaseSHA("base-sha"),
+		serverfake.WithSeedPRHeadSHA("head-sha"), serverfake.WithSeedPRBaseSHA("base-sha"),
 	)
 	repo, err := hubDB.GetRepoByIdentity(t.Context(), db.RepoIdentity{
 		Platform: "github", PlatformHost: "github.com",
@@ -205,12 +321,11 @@ func TestDiffDescriptorRoundTripSeedsNodeRepositoryCatalog(t *testing.T) {
 	})
 	require.NoError(err)
 	require.NotNil(repo)
-	require.NoError(hubDB.UpdateRepoProviderMetadata(
+	require.NoError(hubDB.UpdateRepoProviderObservation(
 		t.Context(), repo.ID, db.RepoProviderMetadata{
-			PlatformRepoID: repo.PlatformRepoID,
-			CloneURL:       "https://github.com/acme/widget.git",
-			DefaultBranch:  "main",
-		},
+			CloneURL:      "https://github.com/acme/widget.git",
+			DefaultBranch: "main",
+		}, nil, nil,
 	))
 
 	hubCredentials, err := federationauth.Open(
@@ -224,7 +339,7 @@ func TestDiffDescriptorRoundTripSeedsNodeRepositoryCatalog(t *testing.T) {
 	hubServer := New(
 		hubDB, nil, nil, "/", nil,
 		ServerOptions{
-			DaemonAccess: DaemonAccessOptions{
+			DaemonAccess: authapi.DaemonAccessOptions{
 				Token: "hub-local-secret", RequireAPIAuth: true,
 			},
 			FederationSpokeID:                  proxyTestHubID,
@@ -234,7 +349,7 @@ func TestDiffDescriptorRoundTripSeedsNodeRepositoryCatalog(t *testing.T) {
 	)
 	observedAt := time.Date(2026, time.August, 22, 14, 0, 0, 0, time.UTC)
 	hubServer.now = func() time.Time { return observedAt }
-	t.Cleanup(func() { gracefulShutdown(t, hubServer) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, hubServer) })
 	hub := httptest.NewTLSServer(hubServer)
 	t.Cleanup(hub.Close)
 
@@ -257,7 +372,7 @@ func TestDiffDescriptorRoundTripSeedsNodeRepositoryCatalog(t *testing.T) {
 		FederationHTTPClient:               hub.Client(),
 		DisableWorkspaceBackgroundMonitors: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, nodeServer) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, nodeServer) })
 
 	descriptor, err := nodeServer.providerSource.GetDiffDescriptor(
 		t.Context(), pullapi.ItemIdentity{
@@ -272,7 +387,9 @@ func TestDiffDescriptorRoundTripSeedsNodeRepositoryCatalog(t *testing.T) {
 	assert.Equal(observedAt, descriptor.Repository.ObservedAt)
 
 	observed, err := nodeDB.GetRepositoryByProviderID(
-		t.Context(), "github", "github.com", repo.PlatformRepoID,
+		t.Context(), platform.RepositoryIdentity{
+			Provider: "github", PlatformHost: "github.com", Key: repo.Key,
+		},
 	)
 	require.NoError(err)
 	require.NotNil(observed)
@@ -286,20 +403,20 @@ func TestDiffDescriptorRoundTripSeedsNodeRepositoryCatalog(t *testing.T) {
 }
 
 func TestRemoteAdHocWorkspaceCreationSeedsSpokeRepositoryCatalog(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	hubDB := dbtest.Open(t)
-	repoID, err := hubDB.UpsertRepo(t.Context(), db.RepoIdentity{
+	repoID, err := reposeed.Seed(t.Context(), hubDB, db.RepoIdentity{
 		Platform: "github", PlatformHost: "github.com",
-		PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget",
+		Key: platform.RepositoryIDKey(1001), Owner: "acme", Name: "widget",
 	})
 	require.NoError(err)
-	require.NoError(hubDB.UpdateRepoProviderMetadata(
+	require.NoError(hubDB.UpdateRepoProviderObservation(
 		t.Context(), repoID, db.RepoProviderMetadata{
-			PlatformRepoID: "repo-acme-widget",
-			CloneURL:       "https://github.com/acme/widget.git",
-			DefaultBranch:  "main",
-		},
+			CloneURL:      "https://github.com/acme/widget.git",
+			DefaultBranch: "main",
+		}, nil, nil,
 	))
 
 	hubCredentials, err := federationauth.Open(
@@ -311,14 +428,14 @@ func TestRemoteAdHocWorkspaceCreationSeedsSpokeRepositoryCatalog(t *testing.T) {
 	)
 	require.NoError(err)
 	hubServer := New(hubDB, nil, nil, "/", nil, ServerOptions{
-		DaemonAccess: DaemonAccessOptions{
+		DaemonAccess: authapi.DaemonAccessOptions{
 			Token: "hub-local-secret", RequireAPIAuth: true,
 		},
 		FederationSpokeID:                  proxyTestHubID,
 		FederationCredentials:              hubCredentials,
 		DisableWorkspaceBackgroundMonitors: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, hubServer) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, hubServer) })
 	hub := httptest.NewTLSServer(hubServer)
 	t.Cleanup(hub.Close)
 
@@ -342,7 +459,7 @@ func TestRemoteAdHocWorkspaceCreationSeedsSpokeRepositoryCatalog(t *testing.T) {
 		WorktreeDir:                        t.TempDir(),
 		DisableWorkspaceBackgroundMonitors: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, spokeServer) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, spokeServer) })
 
 	response := testutil.DoJSON(
 		t, spokeServer, http.MethodPost,
@@ -351,7 +468,9 @@ func TestRemoteAdHocWorkspaceCreationSeedsSpokeRepositoryCatalog(t *testing.T) {
 
 	require.Equal(http.StatusAccepted, response.Code, response.Body.String())
 	observed, err := spokeDB.GetRepositoryByProviderID(
-		t.Context(), "github", "github.com", "repo-acme-widget",
+		t.Context(), platform.RepositoryIdentity{
+			Provider: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(1001),
+		},
 	)
 	require.NoError(err)
 	require.NotNil(observed)
@@ -359,81 +478,12 @@ func TestRemoteAdHocWorkspaceCreationSeedsSpokeRepositoryCatalog(t *testing.T) {
 	assert.Equal("widget", observed.Repository.Name)
 }
 
-func TestRepositoryDescriptorOrdersObservationTimeWithRepositoryIdentity(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	database := dbtest.Open(t)
-	seedPR(t, database, "acme", "widget", 42)
-	identity := verifiedGitHubRepoIdentity("github.com", "acme", "widget")
-
-	server := New(database, nil, nil, "/", nil, ServerOptions{
-		DisableWorkspaceBackgroundMonitors: true,
-	})
-	t.Cleanup(func() { gracefulShutdown(t, server) })
-	clockCalled := make(chan struct{}, 1)
-	observedAt := time.Date(2026, time.August, 22, 18, 0, 0, 0, time.UTC)
-	server.now = func() time.Time {
-		clockCalled <- struct{}{}
-		return observedAt
-	}
-	descriptorAdmitted := make(chan struct{})
-	server.providerDescriptorBeforeSnapshotForTest = func() {
-		close(descriptorAdmitted)
-	}
-
-	releaseRead, err := database.LockRepositoryReconciliationRead(t.Context())
-	require.NoError(err)
-	releaseReadOnce := sync.OnceFunc(releaseRead)
-	defer releaseReadOnce()
-	writeAttempted := make(chan struct{})
-	restoreHook := database.SetBeforeRepositoryReconciliationWriteLockForTest(func() {
-		close(writeAttempted)
-	})
-	t.Cleanup(restoreHook)
-	writeDone := make(chan error, 1)
-	go func() {
-		_, _, writeErr := database.ReconcileRepositoryObservation(
-			context.Background(), identity, observedAt,
-		)
-		writeDone <- writeErr
-	}()
-	<-writeAttempted
-
-	type descriptorResult struct {
-		output *federationRepositoryDescriptorOutput
-		err    error
-	}
-	descriptorDone := make(chan descriptorResult, 1)
-	go func() {
-		output, descriptorErr := server.federationRepositoryDescriptor(
-			context.Background(), &federationRepositoryDescriptorInput{Body: providerplane.RepositoryRoute{
-				Provider: "github", PlatformHost: "github.com",
-				Owner: "acme", Name: "widget",
-			}},
-		)
-		descriptorDone <- descriptorResult{output: output, err: descriptorErr}
-	}()
-	<-descriptorAdmitted
-	select {
-	case <-clockCalled:
-		require.Fail("descriptor clock ran before the queued identity writer")
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	releaseReadOnce()
-	require.NoError(<-writeDone)
-	result := <-descriptorDone
-	require.NoError(result.err)
-	require.NotNil(result.output)
-	assert.Equal(identity.PlatformRepoID, result.output.Body.PlatformRepoID)
-	assert.Equal(observedAt, result.output.Body.ObservedAt)
-}
-
 func TestWorkspaceLaunchSpecRoundTripSeedsNodeRepositoryCatalog(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	hubDB := dbtest.Open(t)
-	seedPR(t, hubDB, "acme", "widgets", 42)
+	serverfake.SeedPR(t, hubDB, "acme", "widgets", 42)
 
 	hubCredentials, err := federationauth.Open(
 		filepath.Join(t.TempDir(), "hub-credentials.json"),
@@ -446,7 +496,7 @@ func TestWorkspaceLaunchSpecRoundTripSeedsNodeRepositoryCatalog(t *testing.T) {
 	hubServer := New(
 		hubDB, nil, nil, "/", nil,
 		ServerOptions{
-			DaemonAccess: DaemonAccessOptions{
+			DaemonAccess: authapi.DaemonAccessOptions{
 				Token: "hub-local-secret", RequireAPIAuth: true,
 			},
 			FederationSpokeID:                  proxyTestHubID,
@@ -456,7 +506,7 @@ func TestWorkspaceLaunchSpecRoundTripSeedsNodeRepositoryCatalog(t *testing.T) {
 	)
 	issuedAt := time.Date(2026, time.August, 22, 16, 30, 0, 0, time.UTC)
 	hubServer.now = func() time.Time { return issuedAt }
-	t.Cleanup(func() { gracefulShutdown(t, hubServer) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, hubServer) })
 	hub := httptest.NewTLSServer(hubServer)
 	t.Cleanup(hub.Close)
 
@@ -480,11 +530,11 @@ func TestWorkspaceLaunchSpecRoundTripSeedsNodeRepositoryCatalog(t *testing.T) {
 		FederationCredentials: spokeCredentials,
 		FederationHTTPClient:  hub.Client(),
 		Clones: gitclone.New(t.TempDir(), descriptorCloneRoutes{
-			source: testTokenSource("spoke-git-token"),
+			source: serverfake.TestTokenSource("spoke-git-token"),
 		}),
 		DisableWorkspaceBackgroundMonitors: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, nodeServer) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, nodeServer) })
 
 	spec, err := nodeServer.providerSource.ResolveWorkspaceLaunchSpec(
 		t.Context(), providerplane.WorkspaceLaunchRequest{
@@ -496,11 +546,13 @@ func TestWorkspaceLaunchSpecRoundTripSeedsNodeRepositoryCatalog(t *testing.T) {
 		},
 	)
 	require.NoError(err)
-	assert.Equal("repo-acme-widgets", spec.Repository.PlatformRepoID)
+	assert.Equal(platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widgets")), spec.Repository.Key)
 	assert.Equal(issuedAt, spec.IssuedAt)
 
 	observed, err := nodeDB.GetRepositoryByProviderID(
-		t.Context(), "github", "github.com", "repo-acme-widgets",
+		t.Context(), platform.RepositoryIdentity{
+			Provider: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widgets")),
+		},
 	)
 	require.NoError(err)
 	require.NotNil(observed)
@@ -512,12 +564,14 @@ func TestWorkspaceLaunchSpecRoundTripSeedsNodeRepositoryCatalog(t *testing.T) {
 	require.NoError(err)
 	assert.Nil(nodePull, "launch facts must not become a spoke-side provider item cache")
 
-	credentialless := &hubProviderSource{
-		client: nodeServer.providerSource.client,
-		db:     dbtest.Open(t),
-		clones: gitclone.New(t.TempDir(), nil),
+	readOnly := &spokeapi.HubProviderSource{
+		Client: nodeServer.providerSource.Client,
+		Db:     dbtest.Open(t),
+		Clones: gitclone.New(t.TempDir(), descriptorCloneRoutes{
+			readSource: serverfake.TestTokenSource("spoke-read-token"),
+		}),
 	}
-	_, err = credentialless.ResolveWorkspaceLaunchSpec(
+	_, err = readOnly.ResolveWorkspaceLaunchSpec(
 		t.Context(), providerplane.WorkspaceLaunchRequest{
 			Repository: providerplane.RepositoryRoute{
 				Provider: "github", PlatformHost: "github.com",
@@ -527,87 +581,37 @@ func TestWorkspaceLaunchSpecRoundTripSeedsNodeRepositoryCatalog(t *testing.T) {
 		},
 	)
 	require.Error(err)
-	problem, ok := err.(*httpapi.ProblemError)
+	problem, ok := errors.AsType[*httpapi.ProblemError](err)
 	require.True(ok)
 	assert.Equal(httpapi.CodeGitCredentialUnavailable, problem.Code)
-}
-
-func TestWorkspaceLaunchSpecRequiresForkCredentialRoute(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	issuedAt := time.Date(2026, time.August, 22, 16, 30, 0, 0, time.UTC)
-	spec := db.WorkspaceLaunchSpec{
-		Version: db.WorkspaceLaunchSpecVersion,
-		Repository: db.WorkspaceLaunchRepository{
-			Provider: "github", PlatformHost: "github.com",
-			PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget",
-			CloneURL: "https://github.com/acme/widget.git", DefaultBranch: "main",
-		},
-		ItemType: db.WorkspaceItemTypePullRequest, ItemNumber: 42,
-		ItemKey: "42", GitHeadRef: "feature/fork",
-		Pull: &db.WorkspaceLaunchPull{
-			HeadBranch: "feature/fork", HeadRepoKind: "fork",
-			HeadRepoCloneURL: "https://github.com/contributor/widget.git",
-			SnapshotRevision: 1,
-		},
-		SourceVisible: true, IssuedAt: issuedAt,
-		SourceVisibleUntil: issuedAt.Add(db.WorkspaceLaunchSpecVisibilityLease),
-	}
-	encoded, err := json.Marshal(spec)
-	require.NoError(err)
-	source := &hubProviderSource{
-		client: providerPlaneClientFunc(func(
-			_ context.Context, _ federationauth.Scope, _ *http.Request,
-		) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader(encoded)),
-			}, nil
-		}),
-		clones: gitclone.New(t.TempDir(), descriptorCloneRoutes{
-			source: testTokenSource("spoke-git-token"),
-		}),
-	}
-
-	_, err = source.ResolveWorkspaceLaunchSpec(
-		t.Context(), providerplane.WorkspaceLaunchRequest{
-			Repository: providerplane.RepositoryRoute{
-				Provider: "github", PlatformHost: "github.com",
-				Owner: "acme", Name: "widget",
-			},
-			ItemType: db.WorkspaceItemTypePullRequest, ItemNumber: 42,
-		},
-	)
-	require.Error(err)
-	problem, ok := err.(*httpapi.ProblemError)
-	require.True(ok)
-	assert.Equal(httpapi.CodeGitCredentialUnavailable, problem.Code)
-	assert.Equal("contributor/widget", problem.Details["repoPath"])
 }
 
 func TestNodeCloneReadsRequireFreshDescriptorAndComputeLocally(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	hubDB := dbtest.Open(t)
-	seedPR(t, hubDB, "acme", "widgets", 1)
+	serverfake.SeedPR(t, hubDB, "acme", "widgets", 1)
 	diffRepo, err := testutil.SetupDiffRepo(t.Context(), t.TempDir(), hubDB)
 	require.NoError(err)
 	const hostedCloneURL = "https://github.com/acme/widgets.git"
 	sourceClone, err := diffRepo.Manager.ClonePathForContext(
-		gitclone.WithRepositoryIdentity(t.Context(), diffRepo.PlatformRepoID),
+		gitclone.WithRepositoryIdentity(t.Context(), platform.RepositoryIdentity{Key: diffRepo.Key}),
 		"github", "github.com", "acme", "widgets",
 	)
 	require.NoError(err)
 	repository, err := hubDB.GetRepositoryByProviderID(
-		t.Context(), "github", "github.com", diffRepo.PlatformRepoID,
+		t.Context(), platform.RepositoryIdentity{
+			Provider: "github", PlatformHost: "github.com", Key: diffRepo.Key,
+		},
 	)
 	require.NoError(err)
 	require.NotNil(repository)
-	require.NoError(hubDB.UpdateRepoProviderMetadata(
+	require.NoError(hubDB.UpdateRepoProviderObservation(
 		t.Context(), repository.Repository.ID, db.RepoProviderMetadata{
 			WebURL: "https://github.com/acme/widgets", CloneURL: hostedCloneURL,
 			DefaultBranch: "main",
-		},
+		}, nil, nil,
 	))
 
 	hubCredentials, err := federationauth.Open(
@@ -621,7 +625,7 @@ func TestNodeCloneReadsRequireFreshDescriptorAndComputeLocally(t *testing.T) {
 	hubServer := New(
 		hubDB, nil, nil, "/", nil,
 		ServerOptions{
-			DaemonAccess: DaemonAccessOptions{
+			DaemonAccess: authapi.DaemonAccessOptions{
 				Token: "hub-local-secret", RequireAPIAuth: true,
 			},
 			FederationSpokeID:                  proxyTestHubID,
@@ -631,7 +635,7 @@ func TestNodeCloneReadsRequireFreshDescriptorAndComputeLocally(t *testing.T) {
 	)
 	observedAt := time.Date(2026, time.August, 22, 15, 0, 0, 0, time.UTC)
 	hubServer.now = func() time.Time { return observedAt }
-	t.Cleanup(func() { gracefulShutdown(t, hubServer) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, hubServer) })
 	hub := httptest.NewTLSServer(hubServer)
 
 	spokeCredentials, err := federationauth.Open(t.TempDir() + "/spoke-credentials.json")
@@ -648,41 +652,41 @@ func TestNodeCloneReadsRequireFreshDescriptorAndComputeLocally(t *testing.T) {
 	nodeDB := dbtest.Open(t)
 	nodeClones := gitclone.New(
 		filepath.Join(t.TempDir(), "spoke-clones"),
-		descriptorCloneRoutes{source: testTokenSource("spoke-git-token")},
+		descriptorCloneRoutes{readSource: serverfake.TestTokenSource("spoke-read-token")},
 	)
 	nodeClone, err := nodeClones.ClonePathForContext(
-		gitclone.WithRepositoryIdentity(t.Context(), diffRepo.PlatformRepoID),
+		gitclone.WithRepositoryIdentity(t.Context(), platform.RepositoryIdentity{Key: diffRepo.Key}),
 		"github", "github.com", "acme", "widgets",
 	)
 	require.NoError(err)
 	seedNodeClone := func(target string) {
 		require.NoError(os.MkdirAll(filepath.Dir(target), 0o755))
-		_, stderr, runErr := gitcmd.New().Run(
+		_, stderr, runErr := gitsafe.Runner().Run(
 			t.Context(), "", nil, "clone", "--bare", sourceClone, target,
 		)
 		require.NoError(runErr, string(stderr))
-		_, stderr, runErr = gitcmd.New().Run(
+		_, stderr, runErr = gitsafe.Runner().Run(
 			t.Context(), target, nil, "config", "remote.origin.url", hostedCloneURL,
 		)
 		require.NoError(runErr, string(stderr))
-		_, stderr, runErr = gitcmd.New().Run(
+		_, stderr, runErr = gitsafe.Runner().Run(
 			t.Context(), target, nil, "config", "--add",
 			"url."+sourceClone+".insteadOf", hostedCloneURL,
 		)
 		require.NoError(runErr, string(stderr))
-		_, stderr, runErr = gitcmd.New().Run(
+		_, stderr, runErr = gitsafe.Runner().Run(
 			t.Context(), target, nil, "update-ref",
 			"refs/remotes/origin/main", "refs/heads/main",
 		)
 		require.NoError(runErr, string(stderr))
-		_, stderr, runErr = gitcmd.New().Run(
+		_, stderr, runErr = gitsafe.Runner().Run(
 			t.Context(), target, nil, "symbolic-ref",
 			"refs/remotes/origin/HEAD", "refs/remotes/origin/main",
 		)
 		require.NoError(runErr, string(stderr))
 	}
 	seedNodeClone(nodeClone)
-	browserNamespaceInput := "github\x00github.com\x00acme/widgets\x00" + diffRepo.PlatformRepoID
+	browserNamespaceInput := "github\x00github.com\x00acme/widgets\x00" + diffRepo.Key.String()
 	browserNamespaceSum := sha256.Sum256([]byte(browserNamespaceInput))
 	browserClone, err := nodeClones.ClonePathInNamespace(
 		"repo-browser-"+hex.EncodeToString(browserNamespaceSum[:8]),
@@ -698,7 +702,7 @@ func TestNodeCloneReadsRequireFreshDescriptorAndComputeLocally(t *testing.T) {
 		Clones:                             nodeClones,
 		DisableWorkspaceBackgroundMonitors: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, nodeServer) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, nodeServer) })
 
 	for _, path := range []string{
 		"/api/v1/pulls/github/acme/widgets/1/diff",
@@ -708,11 +712,13 @@ func TestNodeCloneReadsRequireFreshDescriptorAndComputeLocally(t *testing.T) {
 		"/api/v1/repo/github/acme/widgets/browser/refs",
 	} {
 		response := testutil.DoJSON(t, nodeServer, http.MethodGet, path, nil)
-		require.Equal(http.StatusOK, response.Code, response.Body.String())
+		assert.Equal(http.StatusOK, response.Code, "%s: %s", path, response.Body.String())
 	}
 
 	observed, err := nodeDB.GetRepositoryByProviderID(
-		t.Context(), "github", "github.com", diffRepo.PlatformRepoID,
+		t.Context(), platform.RepositoryIdentity{
+			Provider: "github", PlatformHost: "github.com", Key: diffRepo.Key,
+		},
 	)
 	require.NoError(err)
 	require.NotNil(observed)
@@ -734,7 +740,7 @@ func TestNodeCloneReadsRequireFreshDescriptorAndComputeLocally(t *testing.T) {
 			DisableWorkspaceBackgroundMonitors: true,
 		},
 	)
-	t.Cleanup(func() { gracefulShutdown(t, credentiallessNode) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, credentiallessNode) })
 	credentialProblem := testutil.DoJSON(
 		t, credentiallessNode, http.MethodGet,
 		"/api/v1/pulls/github/acme/widgets/1/diff", nil)
@@ -772,7 +778,7 @@ func TestNodeCloneReadsRequireFreshDescriptorAndComputeLocally(t *testing.T) {
 	assert.Equal(httpapi.CodeHubUnavailable, problem.Code)
 
 	localCtx := gitclone.WithRepositoryIdentity(
-		context.Background(), diffRepo.PlatformRepoID,
+		t.Context(), platform.RepositoryIdentity{Key: diffRepo.Key},
 	)
 	localDiff, err := nodeClones.Diff(
 		localCtx, "github", "github.com", "acme", "widgets",

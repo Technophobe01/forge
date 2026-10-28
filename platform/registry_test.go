@@ -151,7 +151,7 @@ func TestRegistryFindsOptionalRepositoryReader(t *testing.T) {
 	reader, err := registry.RepositoryReader(KindGitLab, "gitlab.com")
 	require.NoError(err)
 
-	repo, err := reader.GetRepository(context.Background(), RepoRef{
+	repo, err := reader.GetRepository(t.Context(), RepoRef{
 		Platform: KindGitLab,
 		Host:     "gitlab.com",
 		RepoPath: "group/project",
@@ -169,7 +169,8 @@ func TestRegistryFindsWorkflowCapabilities(t *testing.T) {
 			ReadWorkflows:    true,
 			ReadWorkflowRuns: true,
 			WorkflowDispatch: true,
-		}}
+		},
+	}
 	registry, err := NewRegistry(provider)
 	require.NoError(err)
 
@@ -189,7 +190,8 @@ func TestRegistryReturnsUnsupportedCapabilityForMissingWorkflowCapabilities(t *t
 	require := require.New(t)
 	registry, err := NewRegistry(testWorkflowProvider{
 		kind: KindGitLab,
-		host: "gitlab.com"})
+		host: "gitlab.com",
+	})
 	require.NoError(err)
 
 	tests := []struct {
@@ -387,7 +389,7 @@ func TestRegistryFindsNotificationReaderAndMutator(t *testing.T) {
 	reader, err := registry.NotificationReader(KindGitHub, "github.com")
 	require.NoError(err)
 	threads, hasNext, err := reader.ListNotifications(
-		context.Background(), NotificationListOptions{},
+		t.Context(), NotificationListOptions{},
 	)
 	require.NoError(err)
 	assert := assert.New(t)
@@ -396,7 +398,7 @@ func TestRegistryFindsNotificationReaderAndMutator(t *testing.T) {
 
 	mutator, err := registry.NotificationMutator(KindGitHub, "github.com")
 	require.NoError(err)
-	assert.NoError(mutator.MarkNotificationThreadRead(context.Background(), "1"))
+	assert.NoError(mutator.MarkNotificationThreadRead(t.Context(), "1"))
 }
 
 // Providers ship stub notification methods before real support lands,
@@ -422,4 +424,56 @@ func TestRegistryReturnsUnsupportedCapabilityForStubNotificationProvider(t *test
 	require.ErrorAs(err, &platformErr)
 	require.ErrorIs(err, ErrUnsupportedCapability)
 	assert.Equal("notification_mutation", platformErr.Capability)
+}
+
+type testMarkdownMediaProvider struct {
+	testProvider
+}
+
+func (testMarkdownMediaProvider) OpenMarkdownMedia(
+	context.Context, RepoRef, string, string,
+) (MarkdownMedia, error) {
+	return MarkdownMedia{}, nil
+}
+
+func TestRegistryMarkdownMediaReaderRequiresCapability(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider Provider
+	}{
+		{
+			name: "method without capability flag",
+			provider: testMarkdownMediaProvider{testProvider{
+				kind: KindGitHub, host: "github.com", caps: Capabilities{ReadMarkdownMedia: false},
+			}},
+		},
+		{
+			name: "capability flag without method",
+			provider: testProvider{
+				kind: KindGitHub, host: "github.com", caps: Capabilities{ReadMarkdownMedia: true},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			registry, err := NewRegistry(tc.provider)
+			require.NoError(t, err)
+
+			_, err = registry.MarkdownMediaReader(KindGitHub, "github.com")
+
+			var platformErr *Error
+			require.ErrorAs(t, err, &platformErr)
+			assert.Equal(t, ErrCodeUnsupportedCapability, platformErr.Code)
+			assert.Equal(t, "read_markdown_media", platformErr.Capability)
+		})
+	}
+
+	provider := testMarkdownMediaProvider{testProvider{
+		kind: KindGitHub, host: "github.com", caps: Capabilities{ReadMarkdownMedia: true},
+	}}
+	registry, err := NewRegistry(provider)
+	require.NoError(t, err)
+	reader, err := registry.MarkdownMediaReader(KindGitHub, "github.com")
+	require.NoError(t, err)
+	assert.Equal(t, provider, reader)
 }

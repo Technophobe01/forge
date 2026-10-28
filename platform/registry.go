@@ -108,6 +108,19 @@ func (r *Registry) MarkdownImageReader(kind Kind, host string) (MarkdownImageRea
 	return reader, nil
 }
 
+func (r *Registry) MarkdownMediaReader(kind Kind, host string) (MarkdownMediaReader, error) {
+	provider, err := r.Provider(kind, host)
+	if err != nil {
+		return nil, err
+	}
+
+	reader, ok := provider.(MarkdownMediaReader)
+	if !ok || !provider.Capabilities().ReadMarkdownMedia {
+		return nil, UnsupportedCapability(kind, host, "read_markdown_media")
+	}
+	return reader, nil
+}
+
 func (r *Registry) MergeRequestReader(kind Kind, host string) (MergeRequestReader, error) {
 	provider, err := r.Provider(kind, host)
 	if err != nil {
@@ -361,6 +374,18 @@ func (r *Registry) MergeMutator(kind Kind, host string) (MergeMutator, error) {
 	mutator, ok := provider.(MergeMutator)
 	if !ok {
 		return nil, UnsupportedCapability(kind, host, "merge_mutation")
+	}
+	return mutator, nil
+}
+
+func (r *Registry) MergeQueueMutator(kind Kind, host string) (MergeQueueMutator, error) {
+	provider, err := r.Provider(kind, host)
+	if err != nil {
+		return nil, err
+	}
+	mutator, ok := provider.(MergeQueueMutator)
+	if !ok || !provider.Capabilities().MergeQueueMutation {
+		return nil, UnsupportedCapability(kind, host, "merge_queue_mutation")
 	}
 	return mutator, nil
 }

@@ -12,15 +12,17 @@ import (
 )
 
 func TestLiveGraphQLQueriesValidateAgainstGitHub(t *testing.T) {
+	t.Parallel()
+
 	skipUnlessLiveGitHubTests(t)
 	require := require.New(t)
 	token := requireLiveGitHubToken(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	httpClient := oauth2.NewClient(
-		context.Background(),
+		t.Context(),
 		oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token}),
 	)
 	client := githubv4.NewClient(httpClient)
@@ -67,4 +69,20 @@ func TestLiveGraphQLQueriesValidateAgainstGitHub(t *testing.T) {
 	err = client.Query(ctx, &issueQuery, vars)
 	require.NoError(err, "bulk issue GraphQL query should validate against GitHub")
 
+	var pullRequestQueueQuery gqlPullRequestMergeQueueQuery
+	err = client.Query(ctx, &pullRequestQueueQuery, map[string]any{
+		"owner":  githubv4.String("kenn-io"),
+		"name":   githubv4.String("forge"),
+		"number": githubv4.Int(830),
+	})
+	require.NoError(err, "pull request merge queue GraphQL query should validate against GitHub")
+	require.NotNil(pullRequestQueueQuery.Repository.PullRequest, "live PR fixture should exist")
+
+	var configurationQuery gqlMergeQueueConfigurationQuery
+	err = client.Query(ctx, &configurationQuery, map[string]any{
+		"owner":  githubv4.String("kenn-io"),
+		"name":   githubv4.String("forge"),
+		"branch": githubv4.String("main"),
+	})
+	require.NoError(err, "merge queue configuration GraphQL query should validate against GitHub")
 }

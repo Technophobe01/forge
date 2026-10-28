@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
@@ -10,20 +11,24 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"go.kenn.io/forge/internal/archive"
+	"go.kenn.io/forge/internal/cli/ghcli"
 	"go.kenn.io/forge/internal/cli/serve"
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/daemonruntime"
 	"go.kenn.io/forge/internal/db"
+	"go.kenn.io/forge/internal/devbox"
 	"go.kenn.io/forge/internal/federation"
 	"go.kenn.io/forge/internal/federationauth"
 	"go.kenn.io/forge/internal/gitclone"
@@ -34,7 +39,11 @@ import (
 	"go.kenn.io/forge/internal/ptyowner"
 	"go.kenn.io/forge/internal/runtimelock"
 	"go.kenn.io/forge/internal/server"
+	"go.kenn.io/forge/internal/server/authapi"
 	"go.kenn.io/forge/internal/server/fleetapi"
+	"go.kenn.io/forge/internal/server/hostapi"
+	"go.kenn.io/forge/internal/server/mcpapi"
+	"go.kenn.io/forge/internal/server/syncevents"
 	"go.kenn.io/forge/internal/shutdownbudget"
 	"go.kenn.io/forge/internal/stacks"
 	"go.kenn.io/forge/internal/telemetry"
@@ -71,15 +80,22 @@ func newMCPStartupHandler() http.Handler {
 
 func bindDaemonListeners(cfg *config.Config) (net.Listener, net.Listener, error) {
 	primaryAddr := cfg.ListenAddr()
-	primary, err := net.Listen("tcp", primaryAddr)
+	network := "tcp"
+	if ip := net.ParseIP(cfg.Host); ip != nil && ip.IsUnspecified() {
+		network = "tcp6"
+		if ip.To4() != nil {
+			network = "tcp4"
+		}
+	}
+	primary, err := (&net.ListenConfig{}).Listen(context.Background(), network, primaryAddr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("listen on %s: %w", primaryAddr, err)
 	}
-	if !cfg.MCP.Enabled {
+	if cfg.MCPPort() == 0 || cfg.MCPSharesMainListener() {
 		return primary, nil, nil
 	}
 	mcpAddr := cfg.MCPListenAddr()
-	mcpListener, err := net.Listen("tcp", mcpAddr)
+	mcpListener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", mcpAddr)
 	if err != nil {
 		_ = primary.Close()
 		return nil, nil, fmt.Errorf("listen for MCP on %s: %w", mcpAddr, err)
@@ -143,10 +159,14 @@ type versionOutput struct {
 }
 
 func main() {
+	os.Exit(runMain())
+}
+
+func runMain() int {
 	closeLog, err := configureLogging(os.Stderr)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "configure logging: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	defer func() {
 		if err := closeLog(); err != nil {
@@ -154,15 +174,18 @@ func main() {
 		}
 	}()
 
-	if err := runCLI(os.Args[1:], os.Stdout); err != nil {
+	if err := runCLI(cliArgs(os.Args), os.Stdout); err != nil {
+		if exit, ok := errors.AsType[*ghcli.ExitError](err); ok {
+			return exit.Code
+		}
 		if _, ok := errors.AsType[*apiVerbError](err); ok {
 			_, _ = fmt.Fprintln(os.Stderr, err)
-			os.Exit(exitCodeForAPIVerb(err))
-			return
+			return exitCodeForAPIVerb(err)
 		}
 		slog.Error("fatal", "err", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 func configureLogging(stderr io.Writer) (func() error, error) {
@@ -263,13 +286,13 @@ func writeVersion(stdout io.Writer, asJSON bool) error {
 
 func runPtyOwner(root, session, cwd, commandJSON string) error {
 	if session == "" {
-		return fmt.Errorf("pty-owner session is required")
+		return errors.New("pty-owner session is required")
 	}
 	if root == "" {
-		return fmt.Errorf("pty-owner root is required")
+		return errors.New("pty-owner root is required")
 	}
 	if cwd == "" {
-		return fmt.Errorf("pty-owner cwd is required")
+		return errors.New("pty-owner cwd is required")
 	}
 	var command []string
 	if commandJSON != "" {
@@ -318,14 +341,45 @@ func writeRuntimeStatus(dataDir string, asJSON bool, stdout io.Writer) error {
 	return runtimelock.FormatStatus(stdout, st, asJSON)
 }
 
+func logRuntimeConfig(logger *slog.Logger, cfg *config.Config) {
+	sources := cfg.RuntimeSources()
+	endpointValue := "configured"
+	if endpoint, err := url.Parse(cfg.RoborevEndpoint()); err == nil && endpoint.Host != "" {
+		endpointValue = endpoint.Scheme + "://" + endpoint.Host
+	}
+	logger.Info("runtime configuration",
+		"host", cfg.Host, "host_source", sources["host"],
+		"port", cfg.Port, "port_source", sources["port"],
+		"data_dir", cfg.DataDir, "data_dir_source", sources["data_dir"],
+		"allowed_hosts", cfg.AllowedHosts, "allowed_hosts_source", sources["allowed_hosts"],
+		"require_auth", cfg.API.RequireAuth, "require_auth_source", sources["api.require_auth"],
+		"trust_reverse_proxy", cfg.TrustReverseProxy, "trust_reverse_proxy_source", sources["trust_reverse_proxy"],
+		"roborev_endpoint", endpointValue, "roborev_endpoint_source", sources["roborev.endpoint"],
+	)
+}
+
+func detachRuntimeSessionsForRestart(executionWorker bool) bool {
+	return executionWorker || cmp.Or(os.Getenv("KENN_FORGE_DEV_RESTART"), "1") == "1"
+}
+
 func run(opts serve.Options) error {
+	return runWithTelemetry(context.Background(), opts, func(opts telemetry.Options) telemetry.Client {
+		return telemetry.NewReporterOrDisabled(opts)
+	})
+}
+
+func runWithTelemetry(parent context.Context, opts serve.Options, newReporter func(telemetry.Options) telemetry.Client) error {
 	configPath := opts.ConfigPath
-	cfg, err := config.LoadOrCreate(configPath)
+	cfg, err := config.LoadOrCreateWithOverrides(configPath, opts.ConfigOverrides)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	logRuntimeConfig(slog.Default(), cfg)
 	if err := validateBackgroundLaunchConfig(cfg); err != nil {
 		return err
+	}
+	if cfg.ExecutionWorker.Enabled && (runtime.GOOS != "linux" || uint32(os.Getuid()) != cfg.ExecutionWorker.UID) {
+		return errors.New("execution worker must run as its configured non-root Linux account")
 	}
 	slog.Debug(
 		"config loaded",
@@ -362,7 +416,7 @@ func run(opts serve.Options) error {
 	}()
 
 	ctx, stopSignals := signal.NotifyContext(
-		context.Background(),
+		parent,
 		syscall.SIGINT,
 		syscall.SIGTERM,
 	)
@@ -381,30 +435,33 @@ func run(opts serve.Options) error {
 	if err != nil {
 		return fmt.Errorf("ensure auth token: %w", err)
 	}
-	federationCredentials, err := federationauth.Open(
-		federationauth.DefaultStorePath(cfg.DataDir),
-	)
-	if err != nil {
-		return fmt.Errorf("open federation credential store: %w", err)
-	}
-	federationEnrollments, err := federation.Open(
-		federation.DefaultStorePath(cfg.DataDir), federation.StoreOptions{},
-	)
-	if err != nil {
-		return fmt.Errorf("open federation enrollment store: %w", err)
-	}
-	if err := validateFederationHubOrigin(cfg, federationEnrollments); err != nil {
-		return err
+	var federationCredentials *federationauth.Store
+	var federationEnrollments *federation.Store
+	if !cfg.ExecutionWorker.Enabled {
+		federationCredentials, err = federationauth.Open(
+			federationauth.DefaultStorePath(cfg.DataDir),
+		)
+		if err != nil {
+			return fmt.Errorf("open federation credential store: %w", err)
+		}
+		federationEnrollments, err = federation.Open(
+			federation.DefaultStorePath(cfg.DataDir), federation.StoreOptions{},
+		)
+		if err != nil {
+			return fmt.Errorf("open federation enrollment store: %w", err)
+		}
+		if err := validateFederationHubOrigin(cfg, federationEnrollments); err != nil {
+			return err
+		}
 	}
 	ln, mcpLn, err := bindDaemonListeners(cfg)
 	if err != nil {
 		return err
 	}
-	mcpListenAddr := ""
-	mcpURL := ""
-	if mcpLn != nil {
-		mcpListenAddr = mcpLn.Addr().String()
-		mcpURL = "http://" + mcpListenAddr + "/mcp"
+	mcpListenAddr := cfg.MCPListenAddr()
+	mcpURL := cfg.MCPURL()
+	if cfg.MCP.Enabled == nil && cfg.MCPEnabled() {
+		slog.Info("MCP companion enabled by default; set [mcp] enabled = false to disable", "url", mcpURL)
 	}
 	closeListeners := func() {
 		_ = ln.Close()
@@ -412,7 +469,7 @@ func run(opts serve.Options) error {
 			_ = mcpLn.Close()
 		}
 	}
-	if ip := net.ParseIP(cfg.Host); ip != nil && !ip.IsLoopback() {
+	if ip := net.ParseIP(cfg.Host); ip != nil && !ip.IsLoopback() && !cfg.API.RequireAuth {
 		slog.Warn(
 			"binding a non-loopback address: the API has no"+
 				" authentication, so the bound network is the trust"+
@@ -443,39 +500,60 @@ func run(opts serve.Options) error {
 		closeListeners()
 		return fmt.Errorf("initialize daemon ping: %w", err)
 	}
-	daemonAccess := server.DaemonAccessOptions{
+	daemonAccess := authapi.DaemonAccessOptions{
 		Token: authToken, RequireAPIAuth: cfg.API.RequireAuth,
 		ProofHandler:          daemonProofHandler,
 		TailscaleServeEnabled: cfg.API.TailscaleServe.Enabled,
 		TailscaleServeUsers:   cfg.API.TailscaleServe.AllowedUsers,
 	}
 
-	startupOptions := server.ServerOptions{DaemonAccess: daemonAccess, MCPURL: mcpURL}
-	startupHandler := server.NewStartupHandler(assets, cfg, startupOptions, ln)
-	switcher := server.NewSwitchHandler(startupHandler)
+	startupOptions := server.ServerOptions{DaemonAccess: daemonAccess, MCPURL: mcpURL, ExecutionWorker: cfg.ExecutionWorker.Enabled}
+	if cfg.ExecutionWorker.Enabled {
+		assets = nil
+	}
+	buildInfo := server.BuildInfo{
+		Name: "kenn-forge", Version: version, Commit: commit, BuildDate: buildDate,
+	}
+	const primaryReadTimeout = 15 * time.Second
+	switcher := hostapi.NewStartupSwitch(
+		server.NewStartupHandler(cfg, startupOptions, ln, buildInfo), primaryReadTimeout,
+	)
 	httpSrv := &http.Server{
 		Handler:     switcher,
-		ReadTimeout: 15 * time.Second,
+		ReadTimeout: primaryReadTimeout,
 		// WriteTimeout is 0 (disabled) because SSE and proxy
 		// responses are long-lived by design.
 		IdleTimeout: 60 * time.Second,
 	}
 
 	var mcpHTTPSrv *http.Server
-	var mcpSwitcher *server.SwitchHandler
+	var mcpSwitcher *hostapi.SwitchHandler
+	var mcpGuard mcpapi.MCPHTTPGuardOptions
 	mcpRequestsCtx, cancelMCPRequests := context.WithCancel(context.Background())
 	defer cancelMCPRequests()
-	if mcpLn != nil {
+	// MCP handlers on the primary listener follow the MCP shutdown contract
+	// rather than the primary listener's drain.
+	mainMCPGate := mcpapi.NewRequestGate(mcpRequestsCtx)
+	agentMCPLn, agentMCPHTTPSrv, agentMCPSwitcher, err := newAgentMCPHTTP(mcpRequestsCtx, authToken)
+	if err != nil {
+		closeListeners()
+		return fmt.Errorf("listen for agent MCP: %w", err)
+	}
+	defer agentMCPLn.Close()
+	if mcpListenAddr != "" {
 		bind, parseErr := config.ParseHostKey(mcpListenAddr)
 		if parseErr != nil {
 			closeListeners()
 			return fmt.Errorf("parse MCP listener address %s: %w", mcpListenAddr, parseErr)
 		}
-		mcpSwitcher = server.NewSwitchHandler(newMCPStartupHandler())
+		mcpGuard = mcpapi.MCPHTTPGuardOptions{
+			Bind: bind, Token: authToken, RequireAuth: cfg.API.RequireAuth,
+		}
+	}
+	if mcpLn != nil {
+		mcpSwitcher = hostapi.NewSwitchHandler(newMCPStartupHandler())
 		mcpHTTPSrv = &http.Server{
-			Handler: server.NewMCPHTTPGuard(mcpSwitcher, server.MCPHTTPGuardOptions{
-				Bind: bind, Token: authToken, RequireAuth: cfg.API.RequireAuth,
-			}),
+			Handler:           mcpapi.NewMCPHTTPGuard(mcpSwitcher, mcpGuard),
 			ReadHeaderTimeout: 5 * time.Second,
 			// Handlers inherit this context so shutdown can cancel
 			// long-running MCP requests once the grace period expires.
@@ -483,7 +561,7 @@ func run(opts serve.Options) error {
 		}
 	}
 
-	readyCount := 1
+	readyCount := 2
 	if mcpLn != nil {
 		readyCount++
 	}
@@ -510,11 +588,22 @@ func run(opts serve.Options) error {
 		}()
 	}
 
+	agentMCPReadyListener := serveReadyListener{
+		Listener:    agentMCPLn,
+		notifyReady: sync.OnceFunc(func() { serveReady <- struct{}{} }),
+	}
+	go func() {
+		if serveErr := agentMCPHTTPSrv.Serve(agentMCPReadyListener); !errors.Is(serveErr, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("agent MCP HTTP server: %w", serveErr)
+		}
+	}()
+
 	var database *db.DB
 	var srv *server.Server
 	var mcpSrv *mcpserver.Server
 	var syncer *ghclient.Syncer
-	var telemetryReporter *telemetry.Reporter
+	var telemetryReporter telemetry.Client
+	var setup *setupFinished
 	var profilerSrv *profiler.Server
 	var backgroundLoops *backgroundLoopHandle
 	defer func() {
@@ -532,19 +621,18 @@ func run(opts serve.Options) error {
 					return backgroundLoops.Stop(ctx)
 				},
 				ShutdownMCPHTTP: func(shutdownCtx context.Context) error {
-					if mcpHTTPSrv == nil {
-						return nil
+					// Every MCP surface must stop before the shared backend closes.
+					mainMCPGate.Stop()
+					var shutdownErr error
+					for _, httpServer := range []*http.Server{agentMCPHTTPSrv, mcpHTTPSrv} {
+						if httpServer == nil {
+							continue
+						}
+						shutdownErr = errors.Join(shutdownErr, httpServer.Shutdown(shutdownCtx), httpServer.Close())
 					}
-					// Stop admission and wait out the grace period, then
-					// cancel still-running MCP handlers and force-close
-					// their connections so later cleanup never closes
-					// shared services beneath an in-flight handoff.
-					err := mcpHTTPSrv.Shutdown(shutdownCtx)
+					shutdownErr = errors.Join(shutdownErr, mainMCPGate.Wait(shutdownCtx))
 					cancelMCPRequests()
-					if closeErr := mcpHTTPSrv.Close(); err == nil {
-						err = closeErr
-					}
-					return err
+					return shutdownErr
 				},
 				ShutdownPrimaryHTTP: func(shutdownCtx context.Context) error {
 					if srv != nil {
@@ -566,6 +654,13 @@ func run(opts serve.Options) error {
 				CloseTelemetry: func() error {
 					if telemetryReporter == nil {
 						return nil
+					}
+					if setup != nil {
+						ctx, cancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
+						if err := setup.capture(ctx); err != nil {
+							slog.Debug("capture setup finished", "err", err)
+						}
+						cancel()
 					}
 					return telemetryReporter.Close()
 				},
@@ -612,7 +707,7 @@ func run(opts serve.Options) error {
 		return err
 	}
 
-	slog.Info(fmt.Sprintf("starting server at http://%s", ln.Addr().String()))
+	slog.Info("starting server at http://" + ln.Addr().String())
 	if mcpListenAddr != "" {
 		slog.Info("starting MCP listener", "url", mcpURL)
 	}
@@ -655,10 +750,13 @@ func run(opts serve.Options) error {
 			)
 		},
 	})
-	spokeStartup := activateFederationSpokeAtStartup(
-		ctx, database, cfg, runtimeIdentity.LockMetadata.NodeID,
-		federationEnrollments, federationCredentials, nil,
-	)
+	spokeStartup := federationSpokeStartup{}
+	if federationEnrollments != nil {
+		spokeStartup = activateFederationSpokeAtStartup(
+			ctx, database, cfg, runtimeIdentity.LockMetadata.NodeID,
+			federationEnrollments, federationCredentials, nil,
+		)
+	}
 	if cfg.Fleet.RoleOrDefault() == config.FleetRoleSpoke && !spokeStartup.Active() {
 		slog.Warn(
 			"fleet spoke started with local execution only",
@@ -685,23 +783,29 @@ func run(opts serve.Options) error {
 		return nil
 	}
 	cloneMgr := gitclone.New(
-		filepath.Join(cfg.DataDir, "clones"), &controlPlanes.Git,
+		filepath.Join(cfg.DataDir, "clones"), controlPlanes.Git,
 	)
+	if broker, ok := controlPlanes.Git.(*devbox.BrokerClient); ok {
+		defer broker.Close()
+	}
 	configureCloneTransportPolicy(cloneMgr, cfg)
 
 	var archiveService *archive.Service
 	var repos []ghclient.RepoRef
+	var startupRouters map[string]*ghclient.HostRouter
 	if controlPlanes.Provider != nil {
 		controlPlane := controlPlanes.Provider
+		startupRouters = controlPlane.githubRouters
 		syncer = ghclient.NewSyncerWithRegistry(
 			controlPlane.registry, database, cloneMgr, nil,
 			cfg.SyncDuration(), controlPlane.rateTrackers, controlPlane.budgets,
 		)
+		syncer.SetAirplaneMode(cfg.AirplaneMode)
 		if opts.DisableSync {
 			syncer.DisableSync()
 		}
 		repos = resolveStartupRepos(
-			ctx, cfg, syncer.SyncRegistry(), database, controlPlane.githubRouters,
+			ctx, cfg, database, controlPlane.githubRouters,
 		)
 		slog.Debug("startup repos resolved", "count", len(repos))
 		syncer.SetBranchActivityLimits(
@@ -731,22 +835,39 @@ func run(opts serve.Options) error {
 		}
 	}
 
-	telemetryReporter = telemetry.NewReporterOrDisabled(telemetry.Options{
-		Database: database,
-		Version:  version,
-		Commit:   commit,
+	telemetryReporter = newReporter(telemetry.Options{
+		Database:        database,
+		DailyClaimsPath: filepath.Join(cfg.DataDir, "telemetry-daily.json"),
+		Version:         version,
+		Commit:          commit,
 	})
+	wireSyncFailed(syncer, telemetryReporter)
 	if telemetryReporter.Enabled() {
-		if err := telemetryReporter.Capture("daemon_active", map[string]any{
-			"repo_count": len(repos),
-		}); err != nil {
+		repoCount := func() int {
+			if syncer == nil {
+				return 0
+			}
+			return len(syncer.TrackedRepos())
+		}
+		if err := captureDaemonActive(telemetryReporter, repoCount); err != nil {
 			slog.Warn("capture telemetry event", "err", err)
 		}
+		startTelemetryHeartbeat(backgroundLoops, telemetryReporter, repoCount)
 	}
 
+	var devboxConnections *devbox.Connections
+	if !cfg.ExecutionWorker.Enabled && cfg.Fleet.RoleOrDefault() != config.FleetRoleSpoke {
+		devboxConnections, err = devbox.OpenConnections(cfg.DataDir)
+		if err != nil {
+			return err
+		}
+		defer devboxConnections.Close()
+	}
 	srv = server.NewWithConfig(
 		database, syncer, cloneMgr, assets,
 		cfg, configPath, server.ServerOptions{
+			ExecutionWorker:                  cfg.ExecutionWorker.Enabled,
+			Devboxes:                         devboxConnections,
 			DaemonAccess:                     daemonAccess,
 			FederationCredentials:            federationCredentials,
 			FederationEnrollments:            federationEnrollments,
@@ -759,15 +880,17 @@ func run(opts serve.Options) error {
 				)
 			},
 			MCPURL:                          mcpURL,
+			AgentMCPURL:                     "http://" + agentMCPLn.Addr().String() + "/mcp",
 			WorktreeDir:                     filepath.Join(cfg.DataDir, "worktrees"),
 			PtyOwnerManagerPath:             os.Getenv("KENN_FORGE_PTY_MANAGER"),
 			Telemetry:                       telemetryReporter,
 			TokenSources:                    tokenSources,
 			Archive:                         archiveService,
-			DetachRuntimeSessionsForRestart: os.Getenv("KENN_FORGE_DEV_RESTART") == "1",
+			DetachRuntimeSessionsForRestart: detachRuntimeSessionsForRestart(cfg.ExecutionWorker.Enabled),
 		},
 	)
 	srv.AttachHTTPServer(httpSrv, ln)
+	setup = startSetupFinished(backgroundLoops, cfg.ExecutionWorker.Enabled, database, telemetryReporter, srv.HasSetupWork)
 	slog.Debug(
 		"server initialized",
 		"base_path", cfg.BasePath,
@@ -778,10 +901,10 @@ func run(opts serve.Options) error {
 		// Wire status callbacks only when this process owns a provider plane.
 		wireSyncStatus(syncer, srv.Hub())
 		syncer.SetOnNotificationSyncComplete(func() {
-			srv.Hub().Broadcast(server.Event{Type: "data_changed", Data: struct{}{}})
+			srv.Hub().Broadcast(syncevents.Event{Type: "data_changed", Data: struct{}{}})
 		})
 		syncer.SetOnWatchedMRSyncCompleted(func() {
-			srv.Hub().Broadcast(server.Event{Type: "data_changed", Data: struct{}{}})
+			srv.Hub().Broadcast(syncevents.Event{Type: "data_changed", Data: struct{}{}})
 		})
 		syncer.SetOnSyncCompleted(
 			fleetapi.WorktreeLinksSyncHook(
@@ -790,7 +913,6 @@ func run(opts serve.Options) error {
 				stacks.SyncCompletedHook(ctx, database, nil),
 			),
 		)
-		syncer.Start(ctx)
 		if !opts.DisableSync && cfg.Relay.URL != "" {
 			backgroundLoops.start(func(runCtx context.Context) {
 				syncer.RunRelay(runCtx, ghclient.RelayOptions{URL: cfg.Relay.URL, Client: relayHTTPClient()})
@@ -815,24 +937,34 @@ func run(opts serve.Options) error {
 		}
 	}()
 
-	srv.SetBuildInfo(server.BuildInfo{
-		Name:      "kenn-forge",
-		Version:   version,
-		Commit:    commit,
-		BuildDate: buildDate,
+	srv.SetBuildInfo(buildInfo)
+	mcpSrv, err = mcpserver.New(mcpserver.Options{
+		Backend: srv.MCPBackend(), Version: version,
+		DiffCacheBytes: cfg.MCPDiffCacheBytes(),
 	})
-	if mcpSwitcher != nil {
-		mcpSrv, err = mcpserver.New(mcpserver.Options{
-			Backend: srv.MCPBackend(), Version: version,
-			DiffCacheBytes: cfg.MCPDiffCacheBytes(),
-		})
-		if err != nil {
-			return fmt.Errorf("initialize MCP server: %w", err)
-		}
+	if err != nil {
+		return fmt.Errorf("initialize MCP server: %w", err)
 	}
-	switcher.Swap(srv)
+	agentMCPSwitcher.Swap(mcpSrv.HTTPHandler())
+	if cfg.MCP.Enabled != nil && *cfg.MCP.Enabled {
+		srv.SetTailnetMCPHandler(mainMCPGate.Wrap(mcpSrv.TailnetHTTPHandler()))
+	}
 	if mcpSwitcher != nil {
 		mcpSwitcher.Swap(mcpSrv.HTTPHandler())
+	} else if mcpListenAddr != "" {
+		srv.SetLocalMCPHandler(mainMCPGate.Wrap(mcpSrv.HTTPHandler()), mcpGuard)
+	}
+	switcher.Swap(srv)
+
+	if syncer != nil && !opts.DisableSync {
+		backgroundLoops.start(func(runCtx context.Context) {
+			if err := srv.InitializeProviderRepositories(runCtx, func(resolveCtx context.Context, current *config.Config) []ghclient.RepoRef {
+				return resolveProviderRepos(resolveCtx, current, syncer.SyncRegistry(), database, startupRouters)
+			}); err != nil {
+				slog.Warn("initialize provider repositories", "err", err)
+			}
+			syncer.Start(runCtx)
+		})
 	}
 
 	select {
@@ -1032,7 +1164,34 @@ func configureCloneTransportPolicy(clones *gitclone.Manager, cfg *config.Config)
 	}
 }
 
+// resolveStartupRepos restores the configured catalog without contacting a provider.
+// Live discovery runs after the ready handler is installed.
 func resolveStartupRepos(
+	ctx context.Context,
+	cfg *config.Config,
+	database *db.DB,
+	githubRouters map[string]*ghclient.HostRouter,
+) []ghclient.RepoRef {
+	set := ghclient.NewExpandedRepoSet()
+	for _, raw := range cfg.Repos {
+		var repos []ghclient.RepoRef
+		if raw.HasNameGlob() {
+			repos = fallbackGlobFromDB(ctx, database, raw)
+		} else {
+			repos = fallbackExactFromDB(ctx, database, raw)
+		}
+		ghclient.RegisterConfiguredRepoCredentialAliases(githubRouters, raw, repos)
+		for _, repo := range repos {
+			if repo.Key.IsZero() {
+				continue
+			}
+			set.Add(repo, false)
+		}
+	}
+	return set.Refs()
+}
+
+func resolveProviderRepos(
 	ctx context.Context,
 	cfg *config.Config,
 	registry *platform.Registry,
@@ -1048,12 +1207,18 @@ func resolveStartupRepos(
 			// through its dedicated archive App on a fresh startup.
 			resolveCtx = ghclient.WithArchiveSyncBudget(ctx)
 		}
-		configuredProviderID := strings.TrimSpace(raw.PlatformRepoID)
-		_, expanded, err := ghclient.ResolveConfiguredRepoWithRegistry(
-			resolveCtx, registry, raw,
-		)
-		if err != nil {
-			slog.Warn("resolve configured repo", "err", err)
+		pinnedKey := raw.RepositoryKey()
+		var expanded []ghclient.RepoRef
+		var err error
+		if !cfg.AirplaneMode {
+			_, expanded, err = ghclient.ResolveConfiguredRepoWithRegistry(
+				resolveCtx, registry, raw,
+			)
+		}
+		if cfg.AirplaneMode || err != nil {
+			if err != nil {
+				slog.Warn("resolve configured repo", "err", err)
+			}
 			if raw.HasNameGlob() {
 				expanded = fallbackGlobFromDB(
 					ctx, database, raw,
@@ -1061,7 +1226,7 @@ func resolveStartupRepos(
 			} else {
 				expanded = fallbackExactFromDB(ctx, database, raw)
 				if len(expanded) == 0 {
-					if configuredProviderID == "" {
+					if pinnedKey.IsZero() {
 						expanded = ghclient.FallbackConfiguredRepoRefs(nil, raw)
 					}
 				} else {
@@ -1080,7 +1245,7 @@ func resolveStartupRepos(
 			)
 		}
 		for _, repo := range expanded {
-			set.Add(repo, err == nil)
+			set.Add(repo, err == nil && !cfg.AirplaneMode)
 		}
 	}
 	return set.Refs()
@@ -1120,8 +1285,8 @@ func fallbackExactFromDB(
 		PlatformHost: raw.PlatformHostOrDefault(),
 		Lifecycle:    db.RepositoryLifecycleActive,
 	}
-	if strings.TrimSpace(raw.PlatformRepoID) != "" {
-		filter.PlatformRepoID = raw.PlatformRepoID
+	if pinned := raw.RepositoryKey(); !pinned.IsZero() {
+		filter.RepoKey = pinned
 	} else {
 		filter.RepoPath = repoPath
 	}
@@ -1130,49 +1295,24 @@ func fallbackExactFromDB(
 		slog.Warn("fallback exact from db", "err", err)
 		return nil
 	}
-	var entry *db.RepositoryCatalogEntry
-	if filter.PlatformRepoID != "" {
-		if len(entries) == 1 {
-			entry = &entries[0]
-		}
-	} else {
-		entry = catalogEntryForConfiguredRoute(entries, repoPath)
-	}
-	if entry == nil {
+	// An ID filter matches one row, and a route has at most one active
+	// occupant.
+	if len(entries) != 1 {
 		return nil
 	}
+	entry := &entries[0]
 	return []ghclient.RepoRef{{
 		Platform:           platform.Kind(raw.PlatformOrDefault()),
 		Owner:              entry.Repository.Owner,
 		Name:               entry.Repository.Name,
 		PlatformHost:       entry.Repository.PlatformHost,
 		RepoPath:           entry.Repository.RepoPath,
-		PlatformExternalID: entry.Repository.PlatformRepoID,
+		Key:                entry.Repository.Key,
 		WebURL:             entry.Repository.WebURL,
 		CloneURL:           entry.Repository.CloneURL,
 		DefaultBranch:      entry.Repository.DefaultBranch,
 		ConfiguredRepoPath: repoPath,
 	}}
-}
-
-// catalogEntryForConfiguredRoute prefers the repository currently occupying
-// the configured route; a reused route may also historically match the
-// renamed repository that held it before. Multiple historical matches with
-// no current occupant cannot be attributed safely.
-func catalogEntryForConfiguredRoute(
-	entries []db.RepositoryCatalogEntry, repoPath string,
-) *db.RepositoryCatalogEntry {
-	for i := range entries {
-		for _, route := range entries[i].Routes {
-			if route.Current && strings.EqualFold(route.RepoPath, repoPath) {
-				return &entries[i]
-			}
-		}
-	}
-	if len(entries) == 1 {
-		return &entries[0]
-	}
-	return nil
 }
 
 // fallbackGlobFromDB returns repos from the database that match
@@ -1214,10 +1354,15 @@ func fallbackGlobFromDB(
 		)
 		if matched {
 			repo := ghclient.RepoRef{
-				Platform:     rawPlatform,
-				Owner:        r.Owner,
-				Name:         r.Name,
-				PlatformHost: dbHost,
+				Platform:      rawPlatform,
+				Owner:         r.Owner,
+				Name:          r.Name,
+				PlatformHost:  dbHost,
+				RepoPath:      r.RepoPath,
+				Key:           r.Key,
+				WebURL:        r.WebURL,
+				CloneURL:      r.CloneURL,
+				DefaultBranch: r.DefaultBranch,
 			}
 			matches = append(matches, repo)
 		}

@@ -21,6 +21,7 @@ import (
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/testutil/servertest"
 	"go.kenn.io/forge/platform"
 )
@@ -30,6 +31,7 @@ type archivePoisonClock struct{ now time.Time }
 func (c *archivePoisonClock) Now() time.Time { return c.now }
 
 func TestArchiveAPIPersistsTerminalAndBackoffOutcomesE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	clock := &archivePoisonClock{
@@ -60,7 +62,7 @@ func TestArchiveAPIPersistsTerminalAndBackoffOutcomesE2E(t *testing.T) {
 			],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}`))
 		case "/api/v3/repos/acme/widget/pulls":
 			_, _ = w.Write([]byte(`[]`))
-		case "/api/v3/repos/acme/widget":
+		case "/api/v3/repos/acme/widget", "/api/v3/repositories/1":
 			_, _ = w.Write([]byte(`{"id":1,"node_id":"R_widget","name":"widget","full_name":"acme/widget","owner":{"login":"acme"}}`))
 		case "/api/v3/repos/acme/widget/issues/11":
 			prShapedCalls.Add(1)
@@ -92,14 +94,14 @@ func TestArchiveAPIPersistsTerminalAndBackoffOutcomesE2E(t *testing.T) {
 	ref := platform.RepoRef{
 		Platform: platform.KindGitHub, Host: "github.com",
 		Owner: "acme", Name: "widget", RepoPath: "acme/widget",
-		PlatformExternalID: "R_widget",
+		Key: platform.RepositoryIDKey(1),
 	}
 	syncer := ghclient.NewSyncerWithRegistry(
 		registry, database, nil,
 		[]ghclient.RepoRef{{
 			Platform: ref.Platform, PlatformHost: ref.Host,
 			Owner: ref.Owner, Name: ref.Name, RepoPath: ref.RepoPath,
-			PlatformExternalID: ref.PlatformExternalID,
+			Key: ref.Key,
 		}},
 		time.Hour, nil, nil,
 	)

@@ -21,14 +21,18 @@ raw markdown at /docs/<page>.md, and the docs index at /docs/index.md.
 - [Review pull requests](https://forge.kenn.io/docs/workflows/code-reviewer.md): Pull request detail, line-by-line review, stacks, and merging
 - [Browse repositories](https://forge.kenn.io/docs/workflows/repositories.md): Repository source browser, refs, previews, and file history
 - [Work in local sessions](https://forge.kenn.io/docs/workflows/workspaces.md): Worktree workspaces, tmux sessions, and coding agents
+- [Work through worklists](https://forge.kenn.io/docs/workflows/worklists.md): Agent-ranked lists of pull requests and issues, handled marks, and worklist links
 - [Read and edit Docs](https://forge.kenn.io/docs/workflows/docs.md): Registered Markdown folders, editing, and git publishing
 - [Integrations](https://forge.kenn.io/docs/integrations.md): Roborev reviews, Kata tasks, and Docs folder setup
 - [Settings](https://forge.kenn.io/docs/settings.md): In-app settings for repositories, tokens, and modes
 - [Configuration](https://forge.kenn.io/docs/configuration.md): Config file reference and startup options
+- [External PR context](https://forge.kenn.io/docs/external-pr-context.md): Private PR cards and actions from configured CLI integrations
 - [Faster GitHub updates](https://forge.kenn.io/docs/activity-relay.md): Connect Forge to a shared relay, run the service, configure webhooks, and check a real update
 - [Commands](https://forge.kenn.io/docs/commands.md): CLI command reference for the kenn-forge binary
+- [Devboxes](https://forge.kenn.io/docs/devboxes.md): Run agent workspaces in Linux accounts over Tailscale, with organization-scoped GitHub App access
 - [Federated fleet](https://forge.kenn.io/docs/federated-fleet.md): Why to use a hub-and-spoke fleet, how ownership works, and how to set it up
 - [MCP companion](https://forge.kenn.io/docs/kenn-forge-mcp.md): Model Context Protocol server for agent access to the console
+- [GitHub CLI shim](https://forge.kenn.io/docs/gh-shim.md): Answer repeated agent gh pr list and view queries from synced Forge data
 - [Archive](https://forge.kenn.io/docs/archive.md): Historical activity archives beyond the live sync window
 - [Troubleshooting](https://forge.kenn.io/docs/troubleshooting.md): Startup, authentication, and sync problems
 

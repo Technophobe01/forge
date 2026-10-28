@@ -8,6 +8,7 @@ import type {
   RepoPreviewResponse as GeneratedRepoPreviewResponse,
   RepoPreviewRow as GeneratedRepoPreviewRow,
   SettingsResponse,
+  TestACPAgentResult,
   UpdateFleetSettingsInputBody,
   UpdateSettingsRequest as GeneratedUpdateSettingsRequest,
 } from "../api/generated/models/index.js";
@@ -36,6 +37,7 @@ export type RepoPreviewRow = GeneratedRepoPreviewRow;
 export type RepoPreset = GeneratedRepoPreset;
 export type RepoPresetRepository = GeneratedRepoPresetRepository;
 type SettingsCommand =
+  | { readonly _tag: "AwaitWrites" }
   | { readonly _tag: "Partial"; readonly request: () => UpdateSettingsRequest }
   | { readonly _tag: "Fleet"; readonly request: FleetSettingsUpdate }
   | { readonly _tag: "CreateRepoPreset"; readonly preset: RepoPreset }
@@ -71,6 +73,7 @@ type SettingsCommand =
       readonly exactRepoAlreadyAdded: boolean;
     };
 type SettingsCommandResult =
+  | { readonly _tag: "WritesFinished" }
   | { readonly _tag: "Settings"; readonly settings: SettingsSnapshot }
   | { readonly _tag: "Fleet"; readonly fleet: FleetSettingsSnapshot }
   | { readonly _tag: "RepoRemoved" };
@@ -122,6 +125,8 @@ export type SettingsReadError = ApiProblemError | TransientTransportError;
 export class SettingsWorkflow extends Context.Service<
   SettingsWorkflow,
   {
+    readonly readLocal: Effect.Effect<SettingsSnapshot, SettingsError>;
+    readonly testACP: (command: string[]) => Effect.Effect<TestACPAgentResult, SettingsReadError>;
     readonly persist: (request: () => UpdateSettingsRequest) => Effect.Effect<SettingsSnapshot, SettingsError>;
     readonly updateFleet: (request: FleetSettingsUpdate) => Effect.Effect<FleetSettingsSnapshot, SettingsError>;
     readonly createRepoPreset: (preset: RepoPreset) => Effect.Effect<SettingsSnapshot, SettingsError>;
@@ -216,6 +221,9 @@ function sameValue(left: unknown, right: unknown): boolean {
 
 function settingsMatchRequest(settings: SettingsSnapshot, request: UpdateSettingsRequest): boolean {
   return (
+    (request.acp === undefined ||
+      Object.entries(request.acp).every(([key, value]) => settings.acp[key as keyof typeof settings.acp] === value)) &&
+    (request.airplane_mode === undefined || settings.airplane_mode === request.airplane_mode) &&
     (request.activity === undefined || sameValue(settings.activity, request.activity)) &&
     (request.agents === undefined || sameValue(settings.agents, request.agents)) &&
     (request.detail === undefined || sameValue(settings.detail, request.detail)) &&
@@ -227,6 +235,10 @@ function settingsMatchRequest(settings: SettingsSnapshot, request: UpdateSetting
     (request.roborev === undefined ||
       Object.entries(request.roborev).every(
         ([key, value]) => settings.roborev[key as keyof typeof settings.roborev] === value,
+      )) &&
+    (request.sync === undefined ||
+      Object.entries(request.sync).every(
+        ([key, value]) => settings.sync[key as keyof typeof settings.sync] === value,
       )) &&
     (request.terminal === undefined || sameValue(settings.terminal, request.terminal)) &&
     (request.workspaces === undefined ||
@@ -330,6 +342,9 @@ export const SettingsWorkflowLive = Layer.effect(SettingsWorkflow)(
     const uncertainMutations = yield* Ref.make<ReadonlyMap<string, RetainedSettingsUncertainty>>(new Map());
     const readSettings = (operation: string) =>
       retryIdempotentRead(api.execute(operation, (signal) => api.client.SettingsService.getSettings({ signal })));
+    const readLocal = retryIdempotentRead(
+      api.execute("GET /settings/local", (signal) => api.client.SettingsService.getLocalSettings({ signal })),
+    );
     const retainUncertainty = (keys: readonly string[], uncertainty: RetainedSettingsUncertainty) =>
       Ref.update(uncertainMutations, (entries) => {
         const next = new Map(entries);
@@ -393,6 +408,9 @@ export const SettingsWorkflowLive = Layer.effect(SettingsWorkflow)(
       );
     });
     const persist = Effect.fn("SettingsWorkflow.persist")(function* (command: SettingsCommand) {
+      if (command._tag === "AwaitWrites") {
+        return { _tag: "WritesFinished" } as const;
+      }
       return yield* Effect.gen(function* () {
         switch (command._tag) {
           case "Partial": {
@@ -681,6 +699,10 @@ export const SettingsWorkflowLive = Layer.effect(SettingsWorkflow)(
           ),
         );
     return {
+      // Order after accepted saves, but let page teardown cancel the network read.
+      readLocal: queue.submit({ _tag: "AwaitWrites" }).pipe(Effect.andThen(readLocal)),
+      testACP: (command) =>
+        api.execute("test ACP agent", (signal) => api.client.SettingsService.testAcpAgent({ command }, { signal })),
       persist: (request: () => UpdateSettingsRequest) => submitSettings({ _tag: "Partial", request }),
       updateFleet: (request: FleetSettingsUpdate) =>
         queue

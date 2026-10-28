@@ -94,7 +94,7 @@ Use Settings or edit TOML for normal configuration changes.
 ## Set up and manage a fleet
 
 ```sh
-kenn-forge fleet setup hub --tailscale
+kenn-forge fleet setup hub --tailscale --tailscale-login you@example.com
 kenn-forge fleet setup spoke --tailscale
 kenn-forge fleet setup hub --origin https://forge.internal.example
 kenn-forge fleet setup spoke --origin https://spoke.internal.example
@@ -139,7 +139,19 @@ kenn-forge agent-hook uninstall --agent codex
 
 Without `--agent`, install or remove every supported integration. Installed
 hooks send lifecycle activity to the running daemon. Codex asks you to review
-the installed commands through `/hooks` once.
+the installed commands through `/hooks` once. On Windows, Claude hooks need
+Claude Code 2.1.139 or later. Rerun `kenn-forge agent-hook install` after
+upgrading Forge so it rewrites existing Claude hooks.
+
+## Stand in for the GitHub CLI
+
+```sh
+kenn-forge gh pr list --json number,title | cat
+```
+
+`kenn-forge gh` answers supported `gh` pull request queries from Forge data
+and passes everything else to the real `gh`. A `gh` link to `kenn-forge` does
+the same. See [GitHub CLI shim](gh-shim.md).
 
 ## Manage GitHub App credentials
 

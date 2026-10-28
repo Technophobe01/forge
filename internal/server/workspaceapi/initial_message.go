@@ -13,7 +13,9 @@ import (
 	"go.kenn.io/forge/internal/workspace/localruntime"
 )
 
-const maxInitialAgentMessageBytes = 64 << 10
+// maxTerminalAgentMessageBytes bounds a message pasted into a terminal
+// agent. ACP prompts travel as protocol messages and have no size limit.
+const maxTerminalAgentMessageBytes = 64 << 10
 
 const (
 	initialMessagePending   = "pending"
@@ -57,7 +59,11 @@ type initialMessageOutput struct {
 	Body agentInitialMessageStatusResponse
 }
 
-func normalizeInitialAgentMessage(message string) (string, int, error) {
+// normalizeAgentMessage validates a message for an agent of the given kind.
+// Every agent gets valid, non-blank UTF-8 with normalized line endings; only
+// terminal agents, which receive it as pasted input, also refuse control
+// characters and large messages.
+func normalizeAgentMessage(message string, kind localruntime.LaunchTargetKind) (string, int, error) {
 	if !utf8.ValidString(message) {
 		return "", 0, errors.New("message must be valid UTF-8")
 	}
@@ -66,16 +72,30 @@ func normalizeInitialAgentMessage(message string) (string, int, error) {
 	if strings.TrimSpace(message) == "" {
 		return "", 0, errors.New("message must not be blank")
 	}
+	if kind == localruntime.LaunchTargetACP {
+		return message, len(message), nil
+	}
 	for _, value := range message {
 		if value != '\n' && !unicode.IsPrint(value) {
 			return "", 0, fmt.Errorf("message contains unsafe control character U+%04X", value)
 		}
 	}
 	messageBytes := len(message)
-	if messageBytes > maxInitialAgentMessageBytes {
+	if messageBytes > maxTerminalAgentMessageBytes {
 		return "", 0, errors.New("message must not exceed 64 KiB after line-ending normalization")
 	}
 	return message, messageBytes, nil
+}
+
+// runtimeSessionKind is the kind of a workspace's runtime session, or empty
+// when there is none; an unknown session gets the terminal rules.
+func (s *Handler) runtimeSessionKind(workspaceID, sessionKey string) localruntime.LaunchTargetKind {
+	for _, session := range s.runtime.ListSessions(workspaceID) {
+		if session.Key == sessionKey {
+			return session.Kind
+		}
+	}
+	return ""
 }
 
 func (s *Handler) getInitialMessageStatus(
@@ -128,7 +148,7 @@ func (s *Handler) SubmitInitialMessageService(
 	if targetKey == "" {
 		return InitialMessageResult{}, httpapi.Validation("body.target_key", "target_key is required")
 	}
-	message, _, err := normalizeInitialAgentMessage(req.Message)
+	message, _, err := normalizeAgentMessage(req.Message, s.runtimeSessionKind(req.WorkspaceID, req.RuntimeSessionKey))
 	if err != nil {
 		return InitialMessageResult{}, httpapi.Validation("body.message", err.Error())
 	}
@@ -148,7 +168,7 @@ func (s *Handler) SubmitInitialMessageService(
 	liveTarget := ""
 	for _, runtimeSession := range s.runtime.ListSessions(req.WorkspaceID) {
 		if runtimeSession.Key == req.RuntimeSessionKey &&
-			runtimeSession.Kind == localruntime.LaunchTargetAgent &&
+			runtimeSession.Kind.IsAgent() &&
 			(runtimeSession.Status == localruntime.SessionStatusStarting ||
 				runtimeSession.Status == localruntime.SessionStatusRunning) {
 			liveTarget = strings.ToLower(strings.TrimSpace(runtimeSession.TargetKey))
@@ -169,7 +189,7 @@ func (s *Handler) SubmitInitialMessageService(
 	if !reserved {
 		return existingInitialMessageAttemptResult(attempt, proposed)
 	}
-	if err := s.runtime.SubmitInitialMessage(ctx, req.WorkspaceID, req.RuntimeSessionKey, message); err != nil {
+	if err := s.runtime.SubmitInitialMessage(ctx, req.WorkspaceID, req.RuntimeSessionKey, message, messageSender(req.FromAgent)); err != nil {
 		return s.handleInitialMessageSubmitError(
 			req.WorkspaceID, req.RuntimeSessionKey, proposed, err,
 		)
@@ -180,6 +200,17 @@ func (s *Handler) SubmitInitialMessageService(
 	return initialMessageAttemptResult(delivered), nil
 }
 
+// messageSender names who sends a message through these services. An agent's
+// is a coordinator's; ACP chats tag the prompt with it.
+func messageSender(fromAgent bool) localruntime.ACPSender {
+	if fromAgent {
+		return localruntime.ACPSender{Kind: localruntime.ACPSenderCoordinator}
+	}
+	return localruntime.ACPSender{Kind: localruntime.ACPSenderUser}
+}
+
+// SubmitAgentMessageService delivers a follow-up message an agent sends
+// through a Forge tool.
 func (s *Handler) SubmitAgentMessageService(
 	ctx context.Context, workspaceID, runtimeSessionKey, message string,
 ) (AgentMessageResult, error) {
@@ -196,13 +227,13 @@ func (s *Handler) SubmitAgentMessageService(
 			"runtime_session_key", "runtime_session_key is required",
 		)
 	}
-	message, messageBytes, err := normalizeInitialAgentMessage(message)
+	message, messageBytes, err := normalizeAgentMessage(message, s.runtimeSessionKind(workspaceID, runtimeSessionKey))
 	if err != nil {
 		return AgentMessageResult{}, httpapi.Validation("message", err.Error())
 	}
 	targetKey := ""
 	for _, session := range s.runtime.ListSessions(workspaceID) {
-		if session.Key == runtimeSessionKey && session.Kind == localruntime.LaunchTargetAgent &&
+		if session.Key == runtimeSessionKey && session.Kind.IsAgent() &&
 			(session.Status == localruntime.SessionStatusStarting ||
 				session.Status == localruntime.SessionStatusRunning) {
 			targetKey = session.TargetKey
@@ -214,11 +245,12 @@ func (s *Handler) SubmitAgentMessageService(
 			httpapi.CodeConflict, "agent runtime session is not live", nil,
 		)
 	}
-	if err := s.runtime.SubmitAgentMessage(ctx, workspaceID, runtimeSessionKey, message); err != nil {
+	if err := s.runtime.SubmitAgentMessage(ctx, workspaceID, runtimeSessionKey, message, messageSender(true)); err != nil {
 		if errors.Is(err, localruntime.ErrBracketedPasteInactive) {
 			return AgentMessageResult{}, ErrInitialMessageInputModeNotReady
 		}
-		if errors.Is(err, localruntime.ErrInitialMessageNotWritten) {
+		if errors.Is(err, localruntime.ErrInitialMessageNotWritten) ||
+			errors.Is(err, localruntime.ErrACPSupervised) {
 			return AgentMessageResult{}, httpapi.Conflict(httpapi.CodeConflict, err.Error(), nil)
 		}
 		return AgentMessageResult{}, httpapi.Internal("submit agent message failed")
@@ -238,7 +270,9 @@ func (s *Handler) handleInitialMessageSubmitError(
 		s.releaseInitialMessageAttempt(workspaceID, runtimeSessionKey, proposed)
 		return InitialMessageResult{}, ErrInitialMessageInputModeNotReady
 	}
-	if errors.Is(err, localruntime.ErrInitialMessageNotWritten) {
+	// A supervised chat refuses the message before anything is written.
+	if errors.Is(err, localruntime.ErrInitialMessageNotWritten) ||
+		errors.Is(err, localruntime.ErrACPSupervised) {
 		s.releaseInitialMessageAttempt(workspaceID, runtimeSessionKey, proposed)
 		return InitialMessageResult{}, httpapi.Conflict(
 			httpapi.CodeConflict, err.Error(), nil,

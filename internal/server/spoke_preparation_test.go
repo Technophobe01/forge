@@ -15,20 +15,21 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/federation"
 	"go.kenn.io/forge/internal/federationauth"
 	"go.kenn.io/forge/internal/gitclone"
 	"go.kenn.io/forge/internal/providerplane"
+	"go.kenn.io/forge/internal/server/authapi"
+	"go.kenn.io/forge/internal/server/spokeapi"
+	"go.kenn.io/forge/internal/testutil"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/tokenauth"
-)
-
-const (
-	preparationHubNodeID    = "0123456789abcdef0123456789abcdef"
-	preparationLocalNodeID  = "fedcba9876543210fedcba9876543210"
-	preparationEnrollmentID = "11111111111111111111111111111111"
+	"go.kenn.io/forge/platform"
 )
 
 func openFederationPreparationStores(
@@ -47,7 +48,7 @@ func openFederationPreparationStores(
 
 func prepareSpokeRequest(
 	t *testing.T, server *httptest.Server,
-) (SpokePreparationReport, int) {
+) (spokeapi.SpokePreparationReport, int) {
 	t.Helper()
 	request, err := http.NewRequestWithContext(
 		t.Context(), http.MethodPost, server.URL+"/api/v1/fleet/prepare-spoke",
@@ -59,159 +60,15 @@ func prepareSpokeRequest(
 	response, err := server.Client().Do(request)
 	require.NoError(t, err)
 	defer response.Body.Close()
-	var report SpokePreparationReport
+	var report spokeapi.SpokePreparationReport
 	if response.StatusCode == http.StatusOK {
 		require.NoError(t, json.NewDecoder(response.Body).Decode(&report))
 	}
 	return report, response.StatusCode
 }
 
-func TestAbortPreparationFromNodeShapedServerRequiresRestart(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	enrollments, credentials := openFederationPreparationStores(t, "abort-spoke")
-	require.NoError(enrollments.SaveLocal(t.Context(), federation.LocalEnrollment{
-		EnrollmentID: preparationEnrollmentID, NodeID: preparationLocalNodeID,
-		SpokeBaseURL:    "https://spoke.example",
-		HubID:           preparationHubNodeID,
-		HubURL:          "https://hub.example",
-		ProtocolVersion: federation.ProtocolVersion, State: federation.EnrollmentPending,
-		ExpiresAt: time.Now().Add(-time.Minute),
-	}))
-	srv, _, _ := setupTestServerWithConfigContentAndOptions(t, `
-host = "127.0.0.1"
-port = 8091
-
-[api]
-require_auth = true
-
-[fleet]
-enabled = true
-role = "spoke"
-base_url = "https://spoke.example"
-
-[fleet.hub]
-node_id = "0123456789abcdef0123456789abcdef"
-base_url = "https://hub.example"
-`, &mockGH{}, ServerOptions{
-		DaemonAccess:          DaemonAccessOptions{Token: "local-secret", RequireAPIAuth: true},
-		FederationCredentials: credentials, FederationEnrollments: enrollments,
-		FederationSpokeID: preparationLocalNodeID, HostCheckAllowLoopbackAnyPort: true,
-	})
-	daemon := httptest.NewServer(srv)
-	t.Cleanup(daemon.Close)
-	request, err := http.NewRequestWithContext(
-		t.Context(), http.MethodPost, daemon.URL+"/api/v1/fleet/prepare-spoke/abort",
-		bytes.NewReader([]byte(`{}`)),
-	)
-	require.NoError(err)
-	request.Header.Set("Authorization", "Bearer local-secret")
-	request.Header.Set("Content-Type", "application/json")
-	response, err := daemon.Client().Do(request)
-	require.NoError(err)
-	t.Cleanup(func() { require.NoError(response.Body.Close()) })
-	var report struct {
-		ProviderWritesOpen bool `json:"provider_writes_open"`
-		RestartRequired    bool `json:"restart_required"`
-	}
-	require.NoError(json.NewDecoder(response.Body).Decode(&report))
-
-	assert.Equal(http.StatusOK, response.StatusCode)
-	assert.False(report.ProviderWritesOpen)
-	assert.True(report.RestartRequired)
-}
-
-func TestForcedAbortPreservesHubRevocationPath(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	enrollments, credentials := openFederationPreparationStores(t, "forced-abort")
-	require.NoError(enrollments.SaveLocal(t.Context(), federation.LocalEnrollment{
-		EnrollmentID: preparationEnrollmentID, NodeID: preparationLocalNodeID,
-		SpokePlatform: "linux", SpokeBaseURL: "https://spoke.example",
-		HubID: preparationHubNodeID, HubURL: "https://hub.example",
-		ProtocolVersion: federation.ProtocolVersion, State: federation.EnrollmentPending,
-		ExpiresAt: time.Now().Add(time.Hour), PreparationRequired: true,
-	}))
-	require.NoError(credentials.StoreOutbound(
-		preparationHubNodeID, "spoke-to-hub-token",
-		federationauth.PendingSpokeToHubScopes(),
-	))
-	require.NoError(credentials.StoreInbound(
-		preparationHubNodeID, "hub-to-spoke-token",
-		federationauth.PendingHubToSpokeScopes(),
-	))
-	srv, _, _ := setupTestServerWithConfigContentAndOptions(t, `
-host = "127.0.0.1"
-port = 8091
-
-[api]
-require_auth = true
-
-[fleet]
-enabled = true
-role = "spoke"
-base_url = "https://spoke.example"
-
-[fleet.hub]
-node_id = "0123456789abcdef0123456789abcdef"
-base_url = "https://hub.example"
-`, &mockGH{}, ServerOptions{
-		DaemonAccess:          DaemonAccessOptions{Token: "local-secret", RequireAPIAuth: true},
-		FederationCredentials: credentials, FederationEnrollments: enrollments,
-		FederationSpokeID: preparationLocalNodeID,
-		FederationHTTPClient: &http.Client{Transport: roundTripFunc(func(
-			*http.Request,
-		) (*http.Response, error) {
-			return nil, fmt.Errorf("hub offline")
-		})},
-		HostCheckAllowLoopbackAnyPort: true,
-	})
-	server := httptest.NewServer(srv)
-	t.Cleanup(server.Close)
-	t.Cleanup(func() { gracefulShutdown(t, srv) })
-
-	abort, err := http.NewRequestWithContext(
-		t.Context(), http.MethodPost,
-		server.URL+"/api/v1/fleet/prepare-spoke/abort",
-		bytes.NewReader([]byte(`{"force":true}`)),
-	)
-	require.NoError(err)
-	abort.Header.Set("Authorization", "Bearer local-secret")
-	abort.Header.Set("Content-Type", "application/json")
-	response, err := server.Client().Do(abort)
-	require.NoError(err)
-	responseBody, err := io.ReadAll(response.Body)
-	require.NoError(err)
-	response.Body.Close()
-	require.Equal(http.StatusOK, response.StatusCode, string(responseBody))
-	local, ok := enrollments.Local()
-	require.True(ok)
-	assert.Equal(federation.EnrollmentRevoked, local.State)
-	_, ok = credentials.Outbound(preparationHubNodeID)
-	assert.False(ok)
-	principal, ok := credentials.Authenticate("hub-to-spoke-token")
-	require.True(ok)
-	assert.Equal(
-		map[federationauth.Scope]struct{}{federationauth.ScopeEnrollmentActivate: {}},
-		principal.Scopes,
-	)
-
-	revoke, err := http.NewRequestWithContext(
-		t.Context(), http.MethodDelete,
-		server.URL+"/api/v1/fleet/enrollments/"+preparationEnrollmentID,
-		http.NoBody,
-	)
-	require.NoError(err)
-	revoke.Header.Set("Authorization", "Bearer hub-to-spoke-token")
-	revoke.Header.Set(federationauth.NodeIDHeader, preparationHubNodeID)
-	revoke.Header.Set("Content-Type", "application/json")
-	response, err = server.Client().Do(revoke)
-	require.NoError(err)
-	response.Body.Close()
-	assert.Equal(http.StatusNoContent, response.StatusCode)
-}
-
 func TestPrepareFederationSpokeSealsAndPersistsRoleThroughDaemon(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	hubDB := dbtest.Open(t)
@@ -220,13 +77,13 @@ func TestPrepareFederationSpokeSealsAndPersistsRoleThroughDaemon(t *testing.T) {
 		Enabled: true, Role: config.FleetRoleHub,
 	}}
 	hub := New(hubDB, nil, nil, "/", hubConfig, ServerOptions{
-		DaemonAccess:                  DaemonAccessOptions{Token: "hub-local", RequireAPIAuth: true},
+		DaemonAccess:                  authapi.DaemonAccessOptions{Token: "hub-local", RequireAPIAuth: true},
 		FederationCredentials:         hubCredentials,
 		FederationEnrollments:         hubEnrollments,
-		FederationSpokeID:             preparationHubNodeID,
+		FederationSpokeID:             serverfake.PreparationHubNodeID,
 		HostCheckAllowLoopbackAnyPort: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, hub) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, hub) })
 	hubHTTP := httptest.NewTLSServer(hub)
 	t.Cleanup(hubHTTP.Close)
 
@@ -234,47 +91,47 @@ func TestPrepareFederationSpokeSealsAndPersistsRoleThroughDaemon(t *testing.T) {
 	spokeToHub := "spoke-to-hub-preparation-token"
 	hubToSpoke := "hub-to-spoke-preparation-token"
 	require.NoError(hubCredentials.StoreInbound(
-		preparationLocalNodeID, spokeToHub,
+		serverfake.PreparationLocalNodeID, spokeToHub,
 		federationauth.PendingSpokeToHubScopes(),
 	))
 	require.NoError(spokeCredentials.StoreOutbound(
-		preparationHubNodeID, spokeToHub,
+		serverfake.PreparationHubNodeID, spokeToHub,
 		federationauth.PendingSpokeToHubScopes(),
 	))
 	require.NoError(spokeCredentials.StoreInbound(
-		preparationHubNodeID, hubToSpoke,
+		serverfake.PreparationHubNodeID, hubToSpoke,
 		federationauth.PendingHubToSpokeScopes(),
 	))
 	require.NoError(hubCredentials.StoreOutbound(
-		preparationLocalNodeID, hubToSpoke,
+		serverfake.PreparationLocalNodeID, hubToSpoke,
 		federationauth.PendingHubToSpokeScopes(),
 	))
 
 	token, err := hubEnrollments.CreateOneTimeToken(federation.Identity{
-		NodeID: preparationHubNodeID, BaseURL: hubHTTP.URL,
+		NodeID: serverfake.PreparationHubNodeID, BaseURL: hubHTTP.URL,
 	}, time.Now().Add(time.Minute))
 	require.NoError(err)
 	_, err = hubEnrollments.Begin(t.Context(), token.Token, federation.JoinRequest{
-		EnrollmentID: preparationEnrollmentID, NodeID: preparationLocalNodeID,
+		EnrollmentID: serverfake.PreparationEnrollmentID, NodeID: serverfake.PreparationLocalNodeID,
 		Platform: "linux", BaseURL: "https://spoke.example",
 		ProtocolVersion: federation.ProtocolVersion,
 		HubCredential:   hubToSpoke,
 	})
 	require.NoError(err)
 	require.NoError(spokeEnrollments.SaveLocal(t.Context(), federation.LocalEnrollment{
-		EnrollmentID: preparationEnrollmentID, NodeID: preparationLocalNodeID,
+		EnrollmentID: serverfake.PreparationEnrollmentID, NodeID: serverfake.PreparationLocalNodeID,
 		SpokePlatform: "linux", SpokeBaseURL: "https://spoke.example",
-		HubID:           preparationHubNodeID,
+		HubID:           serverfake.PreparationHubNodeID,
 		HubURL:          hubHTTP.URL,
 		ProtocolVersion: federation.ProtocolVersion, State: federation.EnrollmentPending,
 		ExpiresAt: token.ExpiresAt, PreparationRequired: true,
 	}))
 
 	spokeDB := dbtest.Open(t)
-	spokeMRID := seedPR(t, spokeDB, "acme", "widget", 7)
-	seedPR(t, hubDB, "acme", "widget", 7)
-	seedPR(t, hubDB, "acme", "project-only", 8)
-	projectRepoID, err := spokeDB.UpsertRepo(t.Context(), db.RepoIdentity{
+	spokeMRID := serverfake.SeedPR(t, spokeDB, "acme", "widget", 7)
+	serverfake.SeedPR(t, hubDB, "acme", "widget", 7)
+	serverfake.SeedPR(t, hubDB, "acme", "project-only", 8)
+	projectRepoID, err := reposeed.Seed(t.Context(), spokeDB, db.RepoIdentity{
 		Platform: "github", PlatformHost: "github.com",
 		Owner: "acme", Name: "project-only",
 	})
@@ -306,18 +163,18 @@ base_url = "https://hub.example"
 [fleet.hub]
 node_id = %q
 base_url = %q
-`, t.TempDir(), preparationHubNodeID, hubHTTP.URL))
+`, t.TempDir(), serverfake.PreparationHubNodeID, hubHTTP.URL))
 	spokeConfig, err := config.Load(spokeConfigPath)
 	require.NoError(err)
 	spoke := NewWithConfig(spokeDB, nil, nil, nil, spokeConfig, spokeConfigPath, ServerOptions{
-		DaemonAccess:                  DaemonAccessOptions{Token: "local-secret", RequireAPIAuth: true},
+		DaemonAccess:                  authapi.DaemonAccessOptions{Token: "local-secret", RequireAPIAuth: true},
 		FederationCredentials:         spokeCredentials,
 		FederationEnrollments:         spokeEnrollments,
-		FederationSpokeID:             preparationLocalNodeID,
+		FederationSpokeID:             serverfake.PreparationLocalNodeID,
 		FederationHTTPClient:          hubHTTP.Client(),
 		HostCheckAllowLoopbackAnyPort: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, spoke) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, spoke) })
 	spokeHTTP := httptest.NewServer(spoke)
 	t.Cleanup(spokeHTTP.Close)
 
@@ -350,7 +207,7 @@ base_url = %q
 	projectRepo, err := spokeDB.GetRepoByID(t.Context(), projectRepoID)
 	require.NoError(err)
 	require.NotNil(projectRepo)
-	assert.NotEmpty(projectRepo.PlatformRepoID)
+	assert.NotEmpty(projectRepo.Key)
 
 	localState, err := spokeDB.GetSpokePreparation(t.Context())
 	require.NoError(err)
@@ -362,7 +219,7 @@ base_url = %q
 	assert.Equal(first.PreparationSeal, localEnrollment.Preparation.Seal)
 	assert.Equal(localState.PreparationDigest, localEnrollment.Preparation.PreparationDigest)
 	hubSeal, err := hubDB.GetSpokePreparationSeal(
-		t.Context(), preparationEnrollmentID,
+		t.Context(), serverfake.PreparationEnrollmentID,
 	)
 	require.NoError(err)
 	require.NotNil(hubSeal)
@@ -372,17 +229,22 @@ base_url = %q
 	require.Equal(http.StatusOK, status)
 	assert.True(retry.ReadyToActivate)
 	assert.Equal(first.PreparationSeal, retry.PreparationSeal)
-	assert.Equal(config.FleetRoleSpoke, spokeConfig.Fleet.Role)
+	// spokeConfig is the same pointer the config watcher rewrites.
+	spoke.cfgMu.Lock()
+	role := spoke.cfg.Fleet.Role
+	spoke.cfgMu.Unlock()
+	assert.Equal(config.FleetRoleSpoke, role)
 }
 
 func TestPersistPreparedSpokeRoleKeepsSealAndMembershipGuards(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	enrollments, credentials := openFederationPreparationStores(t, "persist-role")
 	local := federation.LocalEnrollment{
-		EnrollmentID: preparationEnrollmentID, NodeID: preparationLocalNodeID,
+		EnrollmentID: serverfake.PreparationEnrollmentID, NodeID: serverfake.PreparationLocalNodeID,
 		SpokeBaseURL: "https://spoke.example",
-		HubID:        preparationHubNodeID, HubURL: "https://hub.example",
+		HubID:        serverfake.PreparationHubNodeID, HubURL: "https://hub.example",
 		ProtocolVersion: federation.ProtocolVersion, State: federation.EnrollmentPending,
 		ExpiresAt: time.Now().Add(time.Minute), PreparationStarted: true,
 		PreparationRequired: true,
@@ -424,7 +286,7 @@ state = "active"
 		FederationEnrollments: enrollments, FederationCredentials: credentials,
 		FederationSpokeID: local.NodeID, DisableWorkspaceBackgroundMonitors: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, srv) })
 	sealRequest := db.SpokePreparationSealRequest{
 		EnrollmentID: local.EnrollmentID, NodeID: local.NodeID,
 		HubNodeID: local.HubID, ProtocolVersion: local.ProtocolVersion,
@@ -451,13 +313,14 @@ state = "active"
 }
 
 func TestPersistPreparedSpokeRoleKeepsEnrollmentHubBinding(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	enrollments, credentials := openFederationPreparationStores(t, "joined-spoke")
 	local := federation.LocalEnrollment{
-		EnrollmentID: preparationEnrollmentID, NodeID: preparationLocalNodeID,
+		EnrollmentID: serverfake.PreparationEnrollmentID, NodeID: serverfake.PreparationLocalNodeID,
 		SpokeBaseURL: "https://spoke.example",
-		HubID:        preparationHubNodeID, HubURL: "https://hub.example",
+		HubID:        serverfake.PreparationHubNodeID, HubURL: "https://hub.example",
 		ProtocolVersion: federation.ProtocolVersion, State: federation.EnrollmentPending,
 		ExpiresAt: time.Now().Add(time.Minute), PreparationStarted: true,
 		PreparationRequired: true,
@@ -490,9 +353,9 @@ base_url = "https://spoke.example"
 		FederationEnrollments: enrollments, FederationCredentials: credentials,
 		FederationSpokeID: local.NodeID, DisableWorkspaceBackgroundMonitors: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, srv) })
 	hub := config.FleetHub{NodeID: local.HubID, Name: "Hub", BaseURL: local.HubURL}
-	require.NoError(srv.persistHubBinding(t.Context(), hub))
+	require.NoError(srv.settingsapi.PersistHubBinding(t.Context(), hub))
 	seal := db.SpokePreparationSeal{
 		EnrollmentID: local.EnrollmentID, NodeID: local.NodeID,
 		HubNodeID: local.HubID, ProtocolVersion: local.ProtocolVersion,
@@ -508,15 +371,16 @@ base_url = "https://spoke.example"
 }
 
 func TestSpokePreparationRejectsFilesystemLaunchSpecBeforePersistence(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	database := dbtest.Open(t)
-	seedWorkspace(t, database, "invalid-launch-spec", "acme", "widget", db.WorkspaceItemTypePullRequest, 42)
+	serverfake.SeedWorkspace(t, database, "invalid-launch-spec", "acme", "widget", db.WorkspaceItemTypePullRequest, 42)
 	issuedAt := time.Now().UTC().Truncate(time.Second)
 	spec := db.WorkspaceLaunchSpec{
 		Version: db.WorkspaceLaunchSpecVersion,
 		Repository: db.WorkspaceLaunchRepository{
-			Provider: "github", PlatformHost: "github.com", PlatformRepoID: "repo-acme-widget",
+			Provider: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")),
 			Owner: "acme", Name: "widget", CloneURL: "file:///tmp/acme/widget.git",
 			DefaultBranch: "main",
 		},
@@ -540,10 +404,10 @@ func TestSpokePreparationRejectsFilesystemLaunchSpecBeforePersistence(t *testing
 			Body:       io.NopCloser(bytes.NewReader(encoded)),
 		}, nil
 	})
-	report := SpokePreparationReport{HandoffErrors: []string{}}
-	server := &Server{db: database, now: time.Now}
+	report := spokeapi.SpokePreparationReport{HandoffErrors: []string{}}
+	server := wiredServer(&Server{db: database, now: time.Now})
 
-	server.refreshSpokePreparationLaunchSpecs(t.Context(), client, &report)
+	server.spokeapi.RefreshSpokePreparationLaunchSpecs(t.Context(), client, &report)
 
 	require.Len(report.HandoffErrors, 1)
 	assert.Contains(report.HandoffErrors[0], "invalid hub launch specification")
@@ -553,15 +417,16 @@ func TestSpokePreparationRejectsFilesystemLaunchSpecBeforePersistence(t *testing
 }
 
 func TestSpokePreparationRequiresCredentialBeforePersistingLaunchSpec(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	database := dbtest.Open(t)
-	seedWorkspace(t, database, "missing-credential", "acme", "widget", db.WorkspaceItemTypePullRequest, 42)
+	serverfake.SeedWorkspace(t, database, "missing-credential", "acme", "widget", db.WorkspaceItemTypePullRequest, 42)
 	issuedAt := time.Now().UTC().Truncate(time.Second)
 	spec := db.WorkspaceLaunchSpec{
 		Version: db.WorkspaceLaunchSpecVersion,
 		Repository: db.WorkspaceLaunchRepository{
-			Provider: "github", PlatformHost: "github.com", PlatformRepoID: "repo-acme-widget",
+			Provider: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")),
 			Owner: "acme", Name: "widget", CloneURL: "https://github.com/acme/widget.git",
 			DefaultBranch: "main",
 		},
@@ -583,12 +448,12 @@ func TestSpokePreparationRequiresCredentialBeforePersistingLaunchSpec(t *testing
 			StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(encoded)),
 		}, nil
 	})
-	report := SpokePreparationReport{HandoffErrors: []string{}}
-	server := &Server{
+	report := spokeapi.SpokePreparationReport{HandoffErrors: []string{}}
+	server := wiredServer(&Server{
 		db: database, now: time.Now, clones: gitclone.New(t.TempDir(), nil),
-	}
+	})
 
-	server.refreshSpokePreparationLaunchSpecs(t.Context(), client, &report)
+	server.spokeapi.RefreshSpokePreparationLaunchSpecs(t.Context(), client, &report)
 
 	require.Len(report.HandoffErrors, 1)
 	assert.Contains(report.HandoffErrors[0], "git credential unavailable")
@@ -598,15 +463,16 @@ func TestSpokePreparationRequiresCredentialBeforePersistingLaunchSpec(t *testing
 }
 
 func TestSpokePreparationRequiresForkCredentialBeforePersistingLaunchSpec(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	database := dbtest.Open(t)
-	seedWorkspace(t, database, "missing-fork-credential", "acme", "widget", db.WorkspaceItemTypePullRequest, 42)
+	serverfake.SeedWorkspace(t, database, "missing-fork-credential", "acme", "widget", db.WorkspaceItemTypePullRequest, 42)
 	issuedAt := time.Now().UTC().Truncate(time.Second)
 	spec := db.WorkspaceLaunchSpec{
 		Version: db.WorkspaceLaunchSpecVersion,
 		Repository: db.WorkspaceLaunchRepository{
-			Provider: "github", PlatformHost: "github.com", PlatformRepoID: "repo-acme-widget",
+			Provider: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")),
 			Owner: "acme", Name: "widget", CloneURL: "https://github.com/acme/widget.git",
 			DefaultBranch: "main",
 		},
@@ -630,15 +496,15 @@ func TestSpokePreparationRequiresForkCredentialBeforePersistingLaunchSpec(t *tes
 			Body:       io.NopCloser(bytes.NewReader(encoded)),
 		}, nil
 	})
-	report := SpokePreparationReport{HandoffErrors: []string{}}
-	server := &Server{
+	report := spokeapi.SpokePreparationReport{HandoffErrors: []string{}}
+	server := wiredServer(&Server{
 		db: database, now: time.Now,
 		clones: gitclone.New(t.TempDir(), descriptorCloneRoutes{
-			source: testTokenSource("spoke-git-token"),
+			source: serverfake.TestTokenSource("spoke-git-token"),
 		}),
-	}
+	})
 
-	server.refreshSpokePreparationLaunchSpecs(t.Context(), client, &report)
+	server.spokeapi.RefreshSpokePreparationLaunchSpecs(t.Context(), client, &report)
 
 	require.Len(report.HandoffErrors, 1)
 	assert.Contains(report.HandoffErrors[0], "git credential unavailable")
@@ -648,17 +514,17 @@ func TestSpokePreparationRequiresForkCredentialBeforePersistingLaunchSpec(t *tes
 	assert.Nil(persisted)
 }
 
-func TestSpokePreparationRefreshFollowsStableRepositoryRename(t *testing.T) {
+func TestSpokePreparationRefreshFollowsStableRepositoryRename(t *testing.T) { //nolint:paralleltest // t.Setenv writes KENN_FORGE_TEST_PREPARATION_GIT_TOKEN
 	assert := assert.New(t)
 	require := require.New(t)
 	database := dbtest.Open(t)
 	const workspaceID = "renamed-launch-spec"
-	seedWorkspace(t, database, workspaceID, "acme", "widget", db.WorkspaceItemTypePullRequest, 42)
+	serverfake.SeedWorkspace(t, database, workspaceID, "acme", "widget", db.WorkspaceItemTypePullRequest, 42)
 	now := time.Now().UTC().Truncate(time.Second)
 	current := db.WorkspaceLaunchSpec{
 		Version: db.WorkspaceLaunchSpecVersion,
 		Repository: db.WorkspaceLaunchRepository{
-			Provider: "github", PlatformHost: "github.com", PlatformRepoID: "repo-acme-widget",
+			Provider: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")),
 			Owner: "acme", Name: "widget", CloneURL: "https://github.com/acme/widget.git",
 			DefaultBranch: "main",
 		},
@@ -680,15 +546,14 @@ func TestSpokePreparationRefreshFollowsStableRepositoryRename(t *testing.T) {
 	refreshed.Repository.CloneURL = "https://github.com/acme-renamed/widget-renamed.git"
 	refreshed.IssuedAt = now
 	refreshed.SourceVisibleUntil = now.Add(db.WorkspaceLaunchSpecVisibilityLease)
-	_, accepted, err := database.ReconcileRepositoryObservation(
+	_, err := database.ObserveRepository(
 		t.Context(), db.RepoIdentity{
 			Platform: "github", PlatformHost: "github.com",
-			PlatformRepoID: refreshed.Repository.PlatformRepoID,
-			Owner:          refreshed.Repository.Owner, Name: refreshed.Repository.Name,
-		}, time.Now().UTC().Add(time.Second),
+			Key:   refreshed.Repository.Key,
+			Owner: refreshed.Repository.Owner, Name: refreshed.Repository.Name,
+		},
 	)
 	require.NoError(err)
-	require.True(accepted)
 	encoded, err := json.Marshal(refreshed)
 	require.NoError(err)
 	client := providerPlaneClientFunc(func(
@@ -696,13 +561,13 @@ func TestSpokePreparationRefreshFollowsStableRepositoryRename(t *testing.T) {
 	) (*http.Response, error) {
 		var body providerplane.WorkspaceLaunchRequest
 		require.NoError(json.NewDecoder(request.Body).Decode(&body))
-		assert.Equal(current.Repository.PlatformRepoID, body.PlatformRepoID)
+		assert.Equal(current.Repository.Key, body.RepoKey)
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Body:       io.NopCloser(bytes.NewReader(encoded)),
 		}, nil
 	})
-	report := SpokePreparationReport{HandoffErrors: []string{}}
+	report := spokeapi.SpokePreparationReport{HandoffErrors: []string{}}
 	const tokenEnv = "KENN_FORGE_TEST_PREPARATION_GIT_TOKEN"
 	t.Setenv(tokenEnv, "token")
 	source := tokenauth.NewManagedSource(tokenauth.Descriptor{
@@ -711,12 +576,12 @@ func TestSpokePreparationRefreshFollowsStableRepositoryRename(t *testing.T) {
 			Kind: tokenauth.SourceKindEnv, EnvName: tokenEnv,
 		}},
 	}, tokenauth.Options{})
-	server := &Server{
+	server := wiredServer(&Server{
 		db: database, now: func() time.Time { return now },
 		clones: gitclone.New(t.TempDir(), gitclone.HostSources{"github.com": source}),
-	}
+	})
 
-	server.refreshSpokePreparationLaunchSpecs(t.Context(), client, &report)
+	server.spokeapi.RefreshSpokePreparationLaunchSpecs(t.Context(), client, &report)
 
 	assert.Empty(report.HandoffErrors)
 	workspace, err := database.GetWorkspace(t.Context(), workspaceID)
@@ -724,30 +589,4 @@ func TestSpokePreparationRefreshFollowsStableRepositoryRename(t *testing.T) {
 	require.NotNil(workspace)
 	assert.Equal("acme-renamed", workspace.RepoOwner)
 	assert.Equal("widget-renamed", workspace.RepoName)
-}
-
-func TestHubPreparationSealMustMatchRequestedBinding(t *testing.T) {
-	require := require.New(t)
-	request := db.SpokePreparationSealRequest{
-		EnrollmentID: preparationEnrollmentID, NodeID: preparationLocalNodeID,
-		HubNodeID:        preparationHubNodeID,
-		ProtocolVersion:  federation.ProtocolVersion,
-		MigrationVersion: db.WorkspaceLaunchSpecMigrationVersion,
-		ReceiptsDigest:   "receipts", DrainedAckGeneration: 1,
-	}
-	var err error
-	request.PreparationDigest, err = db.SpokePreparationSealDigest(request)
-	require.NoError(err)
-	valid := db.SpokePreparationSeal{
-		SpokePreparationSealRequest: request,
-		Seal:                        "opaque-seal", CreatedAt: time.Now().UTC(),
-	}
-	require.NoError(validateHubPreparationSeal(request, valid))
-
-	different := valid
-	different.ReceiptsDigest = "different"
-	require.Error(validateHubPreparationSeal(request, different))
-	incomplete := valid
-	incomplete.Seal = ""
-	require.Error(validateHubPreparationSeal(request, incomplete))
 }

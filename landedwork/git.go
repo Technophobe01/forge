@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 
 	gitcmd "go.kenn.io/kit/git/cmd"
@@ -16,9 +18,12 @@ import (
 )
 
 type objectView struct {
-	dir    string
-	runner gitcmd.Runner
-	meter  *meter
+	dir     string
+	runner  gitcmd.Runner
+	meter   *meter
+	objects *objectBatch
+	// Parents of physically verified commits; objects are immutable by ID.
+	verified map[string][]string
 }
 
 func (v *objectView) command(ctx context.Context, args ...string) *exec.Cmd {
@@ -77,7 +82,7 @@ func openView(ctx context.Context, path string, m *meter) (_ *objectView, err er
 	if err != nil {
 		return nil, err
 	}
-	v := &objectView{dir: dir, runner: runner, meter: m}
+	v := &objectView{dir: dir, runner: runner, meter: m, objects: &objectBatch{}, verified: map[string][]string{}}
 	defer func() {
 		if err != nil {
 			err = errors.Join(err, os.RemoveAll(dir))
@@ -94,7 +99,7 @@ func openView(ctx context.Context, path string, m *meter) (_ *objectView, err er
 		return nil, err
 	}
 	v.runner.Env = append(gitenv.StripAll(os.Environ()),
-		"GIT_OBJECT_DIRECTORY="+strings.TrimSpace(string(objects)), "GIT_NO_LAZY_FETCH=1",
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES="+strconv.Quote(strings.TrimSpace(string(objects))), "GIT_NO_LAZY_FETCH=1",
 		"GIT_NO_REPLACE_OBJECTS=1", "GIT_OPTIONAL_LOCKS=0")
 	v.runner.StripEnv = false
 	return v, nil
@@ -113,14 +118,22 @@ func (v *objectView) requireRepositoryRoot(ctx context.Context) error {
 	return err
 }
 
-func (v *objectView) close() error { return os.RemoveAll(v.dir) }
+func (v *objectView) close() error {
+	if v.objects != nil {
+		v.objects.close()
+	}
+	return os.RemoveAll(v.dir)
+}
 
 func (v *objectView) parents(ctx context.Context, id string) ([]string, error) {
 	if err := v.meter.node(); err != nil {
 		return nil, err
 	}
+	if parents, ok := v.verified[id]; ok {
+		return slices.Clone(parents), nil
+	}
 	// rev-list can serve cached ancestry even after the commit object disappears.
-	if _, err := v.run(ctx, "cat-file", "-e", id+"^{commit}"); err != nil {
+	if err := v.hasCommit(ctx, id); err != nil {
 		return nil, err
 	}
 	data, err := v.run(ctx, "rev-list", "--parents", "-n", "1", id, "--")
@@ -136,6 +149,7 @@ func (v *objectView) parents(ctx context.Context, id string) ([]string, error) {
 			return nil, errors.New("invalid parent object ID")
 		}
 	}
+	v.verified[id] = slices.Clone(ids[1:])
 	return ids[1:], nil
 }
 

@@ -52,7 +52,7 @@ func newSplitAuthTestClient(
 // installation token while user-facing writes (REST mutations and the
 // ready-for-review GraphQL mutation) must carry the user's PAT so
 // GitHub attributes them to the user, not "<app>[bot]".
-func TestMutationsUseUserPATWhileReadsUseAppToken(t *testing.T) {
+func TestMutationsUseUserPATWhileReadsUseAppToken(t *testing.T) { //nolint:paralleltest // t.Setenv writes TEST_SPLIT_AUTH_PAT
 	require := require.New(t)
 	assert := assert.New(t)
 	t.Setenv("TEST_SPLIT_AUTH_PAT", "user-pat")
@@ -89,12 +89,12 @@ func TestMutationsUseUserPATWhileReadsUseAppToken(t *testing.T) {
 			if r.Header.Get("Authorization") == "Bearer user-pat" {
 				record("repo:viewer-overlay", r)
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"id":1,"name":"widgets","permissions":{"push":true}}`))
+				_, _ = w.Write([]byte(`{"id":1,"name":"widgets","owner":{"login":"acme"},"permissions":{"push":true}}`))
 				return
 			}
 			record("repo:metadata", r)
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":1,"name":"widgets","permissions":{"push":false}}`))
+			_, _ = w.Write([]byte(`{"id":1,"name":"widgets","owner":{"login":"acme"},"permissions":{"push":false}}`))
 		})
 	mux.HandleFunc("PUT /api/v3/repos/acme/widgets/pulls/5/merge-async",
 		func(w http.ResponseWriter, r *http.Request) {
@@ -206,7 +206,7 @@ func TestMutationsUseUserPATWhileReadsUseAppToken(t *testing.T) {
 	assert.Equal(4321, userGraphQL.Remaining)
 }
 
-func TestNotificationAPIsUseUserAuthAndBackgroundBudget(t *testing.T) {
+func TestNotificationAPIsUseUserAuthAndBackgroundBudget(t *testing.T) { //nolint:paralleltest // t.Setenv writes TEST_NOTIFICATION_AUTH_PAT
 	require := require.New(t)
 	assert := assert.New(t)
 	t.Setenv("TEST_NOTIFICATION_AUTH_PAT", "user-pat")
@@ -342,7 +342,7 @@ func TestNotificationAPIsUseUserAuthAndBackgroundBudget(t *testing.T) {
 // accounting: the GetRepository viewer overlay runs on the write credential
 // during sync, so it must spend the write identity's sync budget, while
 // foreground mutations on the same transport stay uncharged.
-func TestViewerPermissionOverlayChargesWriteBudget(t *testing.T) {
+func TestViewerPermissionOverlayChargesWriteBudget(t *testing.T) { //nolint:paralleltest // t.Setenv writes TEST_OVERLAY_BUDGET_PAT
 	require := require.New(t)
 	assert := assert.New(t)
 	t.Setenv("TEST_OVERLAY_BUDGET_PAT", "user-pat")
@@ -352,10 +352,15 @@ func TestViewerPermissionOverlayChargesWriteBudget(t *testing.T) {
 		func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			if r.Header.Get("Authorization") == "Bearer user-pat" {
-				_, _ = w.Write([]byte(`{"id":1,"name":"widgets","permissions":{"push":true}}`))
+				if r.Header.Get("If-None-Match") == `W/"viewer"` {
+					w.WriteHeader(http.StatusNotModified)
+					return
+				}
+				w.Header().Set("ETag", `W/"viewer"`)
+				_, _ = w.Write([]byte(`{"id":1,"name":"widgets","owner":{"login":"acme"},"permissions":{"push":true}}`))
 				return
 			}
-			_, _ = w.Write([]byte(`{"id":1,"name":"widgets","permissions":{"push":false}}`))
+			_, _ = w.Write([]byte(`{"id":1,"name":"widgets","owner":{"login":"acme"},"permissions":{"push":false}}`))
 		})
 	mux.HandleFunc("POST /api/v3/repos/acme/widgets/issues/5/comments",
 		func(w http.ResponseWriter, _ *http.Request) {
@@ -399,10 +404,16 @@ func TestViewerPermissionOverlayChargesWriteBudget(t *testing.T) {
 	assert.Equal(1, writeBudget.Spent(),
 		"the background viewer overlay must spend the write identity's budget")
 
+	_, err = client.GetRepository(WithSyncBudget(t.Context()), "acme", "widgets")
+	require.NoError(err)
+	assert.Equal(2, readBudget.Spent())
+	assert.Equal(1, writeBudget.Spent(),
+		"an unchanged viewer overlay revalidates with a 304 that spends no budget")
+
 	_, err = client.CreateIssueComment(t.Context(), "acme", "widgets", 5, "lgtm")
 	require.NoError(err)
 	assert.Equal(1, writeBudget.Spent(), "foreground mutations stay uncharged")
-	assert.Equal(1, readBudget.Spent())
+	assert.Equal(2, readBudget.Spent())
 
 	// Archive requests hold leases for the read identity only: the viewer
 	// overlay is skipped so the write credential is never spent, and the
@@ -412,13 +423,15 @@ func TestViewerPermissionOverlayChargesWriteBudget(t *testing.T) {
 	assert.Nil(repo.Permissions)
 	assert.Equal(1, writeBudget.Spent(),
 		"archive repository reads must not spend the write identity")
-	assert.Equal(2, readBudget.Spent())
+	assert.Equal(3, readBudget.Spent())
 }
 
 // TestMutationAuthFallsBackToReadClientWhenUnsplit pins the hand-built
 // client shape used across this package's tests: without a dedicated
 // write client, mutations flow through the read client unchanged.
 func TestNewClientRejectsMutationsWithoutStartupWriteIdentity(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusCreated)
@@ -438,7 +451,7 @@ func TestNewClientRejectsMutationsWithoutStartupWriteIdentity(t *testing.T) {
 	require.ErrorIs(err, ErrMissingWriteIdentity)
 }
 
-func TestMutationAuthFallsBackToReadClientWhenUnsplit(t *testing.T) {
+func TestMutationAuthFallsBackToReadClientWhenUnsplit(t *testing.T) { //nolint:paralleltest // t.Setenv writes TEST_SPLIT_AUTH_PAT
 	require := require.New(t)
 	var gotAuth string
 	mux := http.NewServeMux()

@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const issueRoute = "/host/ghe.example.com/issues/github/acme/widget/7";
+// Each imported router wraps history.replaceState; restore it so a router from
+// an earlier test cannot record routes during a later one.
+const originalReplaceState = window.history.replaceState;
 
 async function importRouterAt(path: string) {
   vi.resetModules();
@@ -14,11 +17,37 @@ describe("router initialization", () => {
   });
 
   afterEach(() => {
+    window.history.replaceState = originalReplaceState;
     delete window.__BASE_PATH__;
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     window.sessionStorage.clear();
     window.history.replaceState(null, "", "/");
     vi.resetModules();
+  });
+
+  it("opens Workspaces for the native tablet desktop launch URL", async () => {
+    window.__BASE_PATH__ = "/forge/";
+    // mobile/connection.test.ts pins launchURL to this tablet desktop route.
+    const router = await importRouterAt("/forge/workspaces?desktop=1");
+    expect(router.getRoute()).toEqual({ page: "workspaces" });
+  });
+
+  it("restores a native workspace URL when Android Back reports the HTML document's initial URL", async () => {
+    vi.stubGlobal("ReactNativeWebView", { postMessage: vi.fn() });
+    window.__BASE_PATH__ = "/forge/";
+    const router = await importRouterAt("/forge/workspaces?desktop=1");
+    router.navigate("/terminal/workspace-a", { origin: "workspaces" });
+    const workspaceState = history.state;
+    router.navigate("/");
+
+    // loadDataWithBaseURL preserves entry state but returns its original URL.
+    originalReplaceState.call(history, workspaceState, "", "/forge/workspaces?desktop=1");
+    window.dispatchEvent(new PopStateEvent("popstate", { state: workspaceState }));
+
+    expect(router.getRoute()).toEqual({ page: "terminal", workspaceId: "workspace-a" });
+    expect(window.location.pathname).toBe("/forge/terminal/workspace-a");
+    expect(history.state.origin).toBe("workspaces");
   });
 
   it("withBasePath prefixes hrefs when mounted under a base path", async () => {
@@ -89,6 +118,26 @@ describe("router initialization", () => {
     expect(restoredURL.searchParams.get("hide_branch")).toBe("1");
     expect(restoredURL.searchParams.get("author")).toBe("Alice Smith");
     expect(new URL(router.getLastActivityRoute(), "https://example.com").searchParams.get("view")).toBe("threaded");
+  });
+
+  it("treats the base path without a trailing slash as the app root", async () => {
+    window.__BASE_PATH__ = "/kenn-forge/";
+    const router = await importRouterAt("/kenn-forge?view=threaded&notif=0");
+
+    expect(router.getRoute()).toEqual({ page: "activity" });
+    expect(router.getLastActivityRoute()).toBe("/?view=threaded&notif=0");
+  });
+
+  it("restores stored Activity filters when a bare base-path URL only sets the view", async () => {
+    window.__BASE_PATH__ = "/kenn-forge/";
+    window.sessionStorage.setItem("kenn-forge:last-activity-route", "/?item_types=pr&notif=0");
+
+    await importRouterAt("/kenn-forge?view=threaded");
+    const restoredURL = new URL(window.location.href);
+
+    expect(restoredURL.searchParams.get("view")).toBe("threaded");
+    expect(restoredURL.searchParams.get("item_types")).toBe("pr");
+    expect(restoredURL.searchParams.get("notif")).toBe("0");
   });
 
   it("restores stored Activity filters when SPA navigation enters from Settings", async () => {

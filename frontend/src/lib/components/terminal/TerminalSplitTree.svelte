@@ -490,7 +490,6 @@
       />
     </div>
     <SplitResizeHandle
-      class="split-divider"
       ariaLabel="Resize split"
       orientation={node.direction}
       ariaValueMin={Math.round(MIN_RATIO * splitSize)}
@@ -561,10 +560,6 @@
     flex: var(--second-ratio) 1 0;
   }
 
-  :global(.split-divider) {
-    flex: 0 0 var(--chrome-pane-divider-width);
-  }
-
   .terminal-leaf {
     display: flex;
     flex-direction: column;
@@ -588,6 +583,11 @@
 
   .terminal-leaf.trim-top {
     border-top: 0;
+  }
+
+  /* A workspace beside a sidebar's split handle: the handle is the divider. */
+  :global(.kit-split-resize-handle--horizontal + *) .terminal-leaf {
+    border-left: 0;
   }
 
   .leaf-header {

@@ -4,7 +4,7 @@
 // the non-data draggable attribute, neither expressible through kit's
 // extensions/codeFence/data-* hook surface. The fence primitives that DO
 // fit (escapeHtml, codeFenceLanguage, codeHighlightPlan and its budgets,
-// shikiStyleIsAllowed) are imported from kit-ui below, so highlighting
+// allowedShikiStyle) are imported from kit-ui below, so highlighting
 // budgets and the shiki style allowlist stay in parity by construction.
 // kit-ui-check-ignore: task-list renderer overrides exceed kit markdown hooks
 import { Marked } from "marked";
@@ -15,11 +15,29 @@ import type { RendererObject, TokenizerAndRendererExtension, Tokens } from "mark
 import DOMPurify from "dompurify";
 // kit-ui-check-ignore: sanitizer must run app-side around the custom renderer
 import type { UponSanitizeAttributeHook } from "dompurify";
-import { codeFenceLanguage, codeHighlightPlan, escapeHtml, shikiStyleIsAllowed } from "@kenn-io/kit-ui/utils/markdown";
+import { allowedShikiStyle, codeFenceLanguage, codeHighlightPlan, escapeHtml } from "@kenn-io/kit-ui/utils/markdown";
 import { mermaidCodeFence } from "@kenn-io/kit-ui/utils/markdown-mermaid";
 import { getSingletonHighlighter, type BundledLanguage, type Highlighter } from "shiki";
-import { canonicalProvider, providerRepoResourceURL } from "../api/provider-routes.js";
+import {
+  getGetMarkdownImageOnHostUrl,
+  getGetMarkdownImageUrl,
+  getGetMarkdownMediaOnHostUrl,
+  getGetMarkdownMediaUrl,
+} from "../api/generated/repositories/repositories.js";
+import {
+  canonicalProvider,
+  providerDefaultHost,
+  providerHostRouteParams,
+  providerRouteParams,
+  providerUsesHostRoute,
+} from "../api/provider-routes.js";
+import { configuredAPIPath } from "../api/runtime-base.js";
 import { itemReferenceAnchorAttributes, parseProviderItemURL } from "./item-reference.js";
+import {
+  resolveMarkdownMediaOutcomes,
+  settledMarkdownMediaOutcomes,
+  type MarkdownMediaCandidate,
+} from "./markdown-media.js";
 import type { ItemReferenceType } from "./item-reference.js";
 
 export interface RepoContext {
@@ -165,7 +183,14 @@ export interface RenderMarkdownOpts {
   // paragraphs. When false (the default), newlines render as hard <br>
   // breaks the way GitHub renders comments.
   collapseSingleLineBreaks?: boolean;
+  // Probe results for standalone GitHub attachment links, keyed by the
+  // attachment URL. Only "video" turns the link into a player.
+  mediaOutcomes?: ReadonlyMap<string, MarkdownMediaOutcome> | undefined;
 }
+
+// "link" is a confirmed non-video; "unknown" is a failed probe that says
+// nothing about the asset and must be probed again later.
+export type MarkdownMediaOutcome = "video" | "link" | "unknown";
 
 // Per-render state for the custom checkbox renderer. Marked is single-
 // threaded synchronous, so a module-level variable is safe.
@@ -192,6 +217,7 @@ let renderState: {
   // and clicks would mutate the wrong line.
   blockquoteDepth: number;
   repo?: RepoContext | undefined;
+  mediaOutcomes?: ReadonlyMap<string, MarkdownMediaOutcome> | undefined;
 } = {
   taskIndex: 0,
   interactiveTasks: false,
@@ -218,6 +244,7 @@ const MARKDOWN_ALLOWED_ATTRS = [
   "data-external-url",
   "data-task-index",
   "data-kenn-forge-shiki",
+  "data-kenn-forge-media",
   "draggable",
 ];
 
@@ -233,6 +260,19 @@ const DRAG_HANDLE_SVG =
   `<circle cx="9" cy="13" r="1.2"/>` +
   `</svg>`;
 
+// Lucide's video and chevron-down icons for the header above each player.
+const VIDEO_ICON_SVG =
+  `<svg class="markdown-video-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" ` +
+  `stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">` +
+  `<path d="m16 13 5.223 3.482a.5.5 0 0 0 .777-.416V7.87a.5.5 0 0 0-.752-.432L16 10.5"/>` +
+  `<rect x="2" y="6" width="14" height="12" rx="2"/>` +
+  `</svg>`;
+const CHEVRON_DOWN_SVG =
+  `<svg class="markdown-video-chevron" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" ` +
+  `stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">` +
+  `<path d="m6 9 6 6 6-6"/>` +
+  `</svg>`;
+
 const SHIKI_LIGHT_THEME = "github-light-default";
 const SHIKI_DARK_THEME = "github-dark-default";
 const SHIKI_THEMES = {
@@ -241,6 +281,10 @@ const SHIKI_THEMES = {
 } as const;
 const SHIKI_PLAINTEXT_LANG = "text";
 const SHIKI_GENERATED_ATTR = "data-kenn-forge-shiki";
+// Marks players this renderer generated, so the sanitizer can tell them from
+// raw <video> markup in the source. Stripped from the output.
+const MEDIA_GENERATED_ATTR = "data-kenn-forge-media";
+const GITLAB_VIDEO_EXTENSION = /\.(mp4|m4v|mov|webm|ogv)$/i;
 let shikiHighlighter: Highlighter | undefined;
 let shikiHighlighterPromise: Promise<Highlighter> | undefined;
 let shikiNonceFallbackCounter = 0;
@@ -295,6 +339,23 @@ const taskListRenderer: RendererObject = {
     if (!ref) return false;
     const text = this.parser.parseInline(token.tokens);
     return `<a ${itemReferenceAnchorAttributes(ref)}>${text}</a>`;
+  },
+  // GitHub plays an attachment link that is the whole paragraph, once the
+  // probe has confirmed the attachment is a video.
+  paragraph(token): string | false {
+    const repo = renderState.repo;
+    if (!repo || canonicalProvider(repo.provider) !== "github") return false;
+    const source = standaloneAttachmentLink(token, repo);
+    if (!source || renderState.mediaOutcomes?.get(source) !== "video") return false;
+    return generatedPlayer(source);
+  },
+  // GitLab plays image syntax that names a video file.
+  image(token): string | false {
+    const repo = renderState.repo;
+    if (!repo || canonicalProvider(repo.provider) !== "gitlab") return false;
+    const path = token.href.split(/[?#]/, 1)[0] ?? "";
+    if (!GITLAB_VIDEO_EXTENSION.test(path)) return false;
+    return generatedPlayer(gitLabUploadURL(token.href, repo)?.toString() ?? token.href);
   },
   blockquote(token): string {
     renderState.blockquoteDepth++;
@@ -394,17 +455,209 @@ function resetRenderState(
     itemStack: [],
     blockquoteDepth: 0,
     repo,
+    mediaOutcomes: opts.mediaOutcomes,
   };
+}
+
+function generatedPlayer(source: string): string {
+  return `<video ${MEDIA_GENERATED_ATTR}="${renderState.shikiNonce}" src="${escapeHtml(source)}"></video>\n`;
+}
+
+function standaloneAttachmentLink(token: Tokens.Paragraph, repo: RepoContext): string | null {
+  const [only, ...rest] = token.tokens;
+  if (rest.length > 0 || only?.type !== "link") return null;
+  const link = only as Tokens.Link;
+  // A bare autolink's source text is the URL itself; labelled links and
+  // angle-bracket links do not play on GitHub.
+  if (link.raw !== link.href) return null;
+  return isGitHubAttachment(link.href, repo) ? link.href : null;
+}
+
+// GitHub's two attachment link shapes on the platform host. The
+// repository-scoped shape only counts for this repository, matching the
+// server (platform/github/markdown_media.go).
+function isGitHubAttachment(source: string, repo: RepoContext): boolean {
+  let url: URL;
+  try {
+    url = new URL(source);
+  } catch {
+    return false;
+  }
+  const host = repo.platformHost?.trim() || "github.com";
+  if (url.protocol !== "https:" || url.host.toLowerCase() !== host.toLowerCase() || url.search) return false;
+  const segments = url.pathname.split("/").slice(1);
+  if (segments.length === 3 && segments[0] === "user-attachments" && segments[1] === "assets") return !!segments[2];
+  return (
+    segments.length === 5 &&
+    `${segments[0]}/${segments[1]}`.toLowerCase() === repo.repoPath.toLowerCase() &&
+    segments[2] === "assets" &&
+    /^\d+$/.test(segments[3] ?? "") &&
+    !!segments[4]
+  );
+}
+
+export function githubAttachmentParagraphSources(raw: string, repo: RepoContext): string[] {
+  if (!raw || canonicalProvider(repo.provider) !== "github") return [];
+  const sources: string[] = [];
+  getMarked(repo).walkTokens(getMarked(repo).lexer(raw), (token) => {
+    if (token.type !== "paragraph") return;
+    const source = standaloneAttachmentLink(token as Tokens.Paragraph, repo);
+    if (source && !sources.includes(source)) sources.push(source);
+  });
+  return sources;
+}
+
+// The media route for a provider-hosted video this repository's credential
+// can read: GitHub attachments and GitLab project uploads.
+export function proxiedMarkdownMediaSource(source: string, repo: RepoContext): string | null {
+  const path = markdownMediaRequestPath(source, repo);
+  return path === null ? null : configuredAPIPath(path);
+}
+
+// The same route relative to the API base, for generated-client requests.
+export function markdownMediaRequestPath(source: string, repo: RepoContext): string | null {
+  const provider = canonicalProvider(repo.provider);
+  let url: URL;
+  if (provider === "github") {
+    if (!isGitHubAttachment(source, repo)) return null;
+    url = new URL(source);
+  } else if (provider === "gitlab") {
+    const upload = gitLabUploadURL(source, repo);
+    if (!upload) return null;
+    url = upload;
+  } else {
+    return null;
+  }
+  const params = { source: url.toString() };
+  return providerUsesHostRoute(repo)
+    ? getGetMarkdownMediaOnHostUrl(providerHostRouteParams(repo), params)
+    : getGetMarkdownMediaUrl(providerRouteParams(repo), params);
+}
+
+// Applies each provider's rule for <video> markup. Generated players carry
+// this render's nonce; anything else came from the source text.
+function normalizeMarkdownVideos(root: HTMLElement): void {
+  const repo = renderState.repo;
+  const provider = repo ? canonicalProvider(repo.provider) : "";
+  for (const video of root.querySelectorAll("video")) {
+    const generated = video.getAttribute(MEDIA_GENERATED_ATTR) === renderState.shikiNonce;
+    video.removeAttribute(MEDIA_GENERATED_ATTR);
+    if (!repo) {
+      normalizePlayer(video, videoFileName(firstVideoSource(video)));
+      continue;
+    }
+    if (!generated && provider !== "github" && provider !== "gitea" && provider !== "forgejo") {
+      video.remove();
+      continue;
+    }
+    const sources = [video, ...video.querySelectorAll("source")];
+    // The header names the file from the source as written, before the
+    // media route replaces it.
+    let playableSource: string | null = null;
+    for (const element of sources) {
+      const src = element.getAttribute("src");
+      if (src === null) continue;
+      const resolved = resolvedMarkdownVideoSource(src, repo, provider, generated);
+      if (resolved === null) {
+        if (element === video) element.removeAttribute("src");
+        else element.remove();
+        continue;
+      }
+      element.setAttribute("src", resolved);
+      playableSource ??= src;
+    }
+    if (playableSource === null) {
+      video.remove();
+      continue;
+    }
+    normalizePlayer(video, videoFileName(playableSource));
+  }
+}
+
+function resolvedMarkdownVideoSource(
+  src: string,
+  repo: RepoContext,
+  provider: string,
+  generated: boolean,
+): string | null {
+  const proxied = proxiedMarkdownMediaSource(src, repo);
+  if (proxied) return proxied;
+  if (provider === "gitea" || provider === "forgejo") {
+    const host = repo.platformHost?.trim() || providerDefaultHost(provider) || "";
+    if (src.startsWith("attachments/")) return `https://${host}/${repo.repoPath}/${src}`;
+    if (src.startsWith("/attachments/")) return `https://${host}${src}`;
+    return src;
+  }
+  // GitLab plays image syntax that points anywhere; GitHub keeps raw
+  // players only for its own attachments.
+  return generated && provider === "gitlab" ? src : null;
+}
+
+function firstVideoSource(video: HTMLVideoElement): string | null {
+  return video.getAttribute("src") ?? video.querySelector("source[src]")?.getAttribute("src") ?? null;
+}
+
+// The last path segment when it reads as a file name. GitHub attachment
+// addresses end in an opaque id, so their header keeps the generic label.
+function videoFileName(source: string | null): string | null {
+  if (source === null) return null;
+  let segment: string;
+  try {
+    segment = new URL(source, "https://markdown.invalid/").pathname.split("/").pop() ?? "";
+    segment = decodeURIComponent(segment);
+  } catch {
+    return null;
+  }
+  return /^[^.].*\.[a-z0-9]{2,5}$/i.test(segment) ? segment : null;
+}
+
+function normalizePlayer(video: HTMLVideoElement, fileName: string | null): void {
+  video.removeAttribute("autoplay");
+  video.setAttribute("controls", "");
+  // An idle player must not fetch: Firefox keeps reading ahead on each one,
+  // and a few would hold every connection the browser allows to the daemon.
+  video.setAttribute("preload", "none");
+  video.classList.add("markdown-video");
+  // Names the kit-ui player that replaces this one (markdown-video-player.ts).
+  if (fileName) video.dataset["fileName"] = fileName;
+  // The frame gives the load-failure notice a stable parent to swap the
+  // player in (markdown-video-fallback.ts). A span stays valid inside a
+  // paragraph.
+  const doc = video.ownerDocument;
+  const frame = doc.createElement("span");
+  frame.className = "markdown-video-frame";
+  video.replaceWith(frame);
+  frame.append(markdownVideoHeader(doc, fileName), video);
+}
+
+// Collapses and expands the player; markdown-video-toggle.ts handles clicks.
+// A button rather than <details>: a block-level <details> would split the
+// paragraph a GitLab inline video sits in when the HTML is parsed again.
+function markdownVideoHeader(doc: Document, fileName: string | null): HTMLButtonElement {
+  const header = doc.createElement("button");
+  header.type = "button";
+  header.className = "markdown-video-header";
+  header.setAttribute("aria-expanded", "true");
+  const name = doc.createElement("span");
+  name.className = "markdown-video-name";
+  name.textContent = fileName ?? "Video";
+  header.innerHTML = VIDEO_ICON_SVG;
+  header.append(name);
+  header.insertAdjacentHTML("beforeend", CHEVRON_DOWN_SVG);
+  return header;
 }
 
 function sanitizeMarkdownHtml(html: string): string {
   DOMPurify.addHook("uponSanitizeAttribute", shikiStyleSanitizer);
   DOMPurify.addHook("uponSanitizeAttribute", markdownImageSourceSanitizer);
   try {
-    const sanitized = DOMPurify.sanitize(html, {
+    const body = DOMPurify.sanitize(html, {
       ADD_ATTR: MARKDOWN_ALLOWED_ATTRS,
+      RETURN_DOM: true,
     });
-    return sanitized.replaceAll(new RegExp(`\\s${SHIKI_GENERATED_ATTR}="[^"]*"`, "g"), "");
+    if (!(body instanceof HTMLElement)) throw new Error("DOMPurify returned a non-element document root");
+    normalizeMarkdownVideos(body);
+    return body.innerHTML.replaceAll(new RegExp(`\\s${SHIKI_GENERATED_ATTR}="[^"]*"`, "g"), "");
   } finally {
     DOMPurify.removeHook("uponSanitizeAttribute", shikiStyleSanitizer);
     DOMPurify.removeHook("uponSanitizeAttribute", markdownImageSourceSanitizer);
@@ -421,20 +674,22 @@ function proxiedMarkdownImageSource(source: string, repo: RepoContext): string |
   const provider = canonicalProvider(repo.provider);
   if (provider !== "github" && provider !== "gitlab") return null;
   try {
-    const host = repo.platformHost?.trim() || (provider === "github" ? "github.com" : "gitlab.com");
-    const normalizedSource =
-      provider === "gitlab" ? normalizedGitLabMarkdownImageSource(source, host, repo.repoPath) : source;
-    if (!normalizedSource) return null;
-    const url = new URL(normalizedSource);
-    if (url.protocol !== "https:") return null;
-    if (provider === "github" && !isProxiedGitHubImage(url, host, repo.repoPath)) return null;
-    if (
-      provider === "gitlab" &&
-      (url.host.toLowerCase() !== host.toLowerCase() ||
-        (!url.pathname.startsWith(`/${repo.repoPath}/uploads/`) && !/^\/-\/project\/\d+\/uploads\//.test(url.pathname)))
-    )
-      return null;
-    return providerRepoResourceURL(repo, "/markdown-image", { source: url.toString() });
+    let url: URL;
+    if (provider === "gitlab") {
+      const upload = gitLabUploadURL(source, repo);
+      if (!upload) return null;
+      url = upload;
+    } else {
+      url = new URL(source);
+      if (url.protocol !== "https:") return null;
+      if (!isProxiedGitHubImage(url, repo.platformHost?.trim() || "github.com", repo.repoPath)) return null;
+    }
+    const params = { source: url.toString() };
+    return configuredAPIPath(
+      providerUsesHostRoute(repo)
+        ? getGetMarkdownImageOnHostUrl(providerHostRouteParams(repo), params)
+        : getGetMarkdownImageUrl(providerRouteParams(repo), params),
+    );
   } catch {
     return null;
   }
@@ -460,11 +715,24 @@ function isProxiedGitHubImage(url: URL, host: string, repoPath: string): boolean
   return false;
 }
 
-function normalizedGitLabMarkdownImageSource(source: string, host: string, repoPath: string): string | null {
-  if (/^https:\/\//i.test(source)) return source;
-  const uploadPath = source.replace(/^\//, "");
-  if (uploadPath.startsWith("uploads/")) return `https://${host}/${repoPath}/${uploadPath}`;
-  if (uploadPath.startsWith(`${repoPath}/uploads/`)) return `https://${host}/${uploadPath}`;
+// A GitLab upload the repository credential can read, as an absolute URL on
+// the platform host. Images and videos share this rule, and so does the
+// server (platform/gitlab/markdown_images.go).
+function gitLabUploadURL(source: string, repo: RepoContext): URL | null {
+  const host = repo.platformHost?.trim() || "gitlab.com";
+  const path = source.replace(/^\//, "");
+  let absolute = source;
+  if (path.startsWith("uploads/")) absolute = `https://${host}/${repo.repoPath}/${path}`;
+  else if (!/^https:\/\//i.test(source)) absolute = `https://${host}/${path}`;
+  let url: URL;
+  try {
+    url = new URL(absolute);
+  } catch {
+    return null;
+  }
+  if (url.host.toLowerCase() !== host.toLowerCase()) return null;
+  if (url.pathname.startsWith(`/${repo.repoPath}/uploads/`) || /^\/-\/project\/\d+\/uploads\//.test(url.pathname))
+    return url;
   return null;
 }
 
@@ -486,9 +754,9 @@ const shikiStyleSanitizer: UponSanitizeAttributeHook = (node, data) => {
   const isStyledShikiNode =
     trustedShikiNode &&
     ((tagName === "pre" && node.classList.contains("shiki")) || (tagName === "span" && node.closest("pre.shiki")));
-  if (!isStyledShikiNode || !shikiStyleIsAllowed(data.attrValue)) {
-    data.keepAttr = false;
-  }
+  const allowed = isStyledShikiNode ? allowedShikiStyle(data.attrValue) : "";
+  if (allowed) data.attrValue = allowed;
+  else data.keepAttr = false;
 };
 
 function visibleTokenLineCount(raw: string): number {
@@ -611,7 +879,13 @@ export function renderMarkdown(raw: string, repo?: RepoContext, opts: RenderMark
   const interactiveTasks = !!opts.interactiveTasks;
   const collapse = !!opts.collapseSingleLineBreaks;
   const repoKey = repo ? `${repo.provider}/${repo.platformHost ?? ""}/${repo.repoPath}` : "";
-  const key = `${repoKey}\0${interactiveTasks ? 1 : 0}\0${collapse ? 1 : 0}\0${raw}`;
+  // A link rendered while a probe failed must not be reused after a later
+  // probe confirms the video.
+  const mediaKey = [...(opts.mediaOutcomes ?? [])]
+    .map(([source, outcome]) => `${source}=${outcome}`)
+    .sort()
+    .join("\u0001");
+  const key = `${repoKey}\0${interactiveTasks ? 1 : 0}\0${collapse ? 1 : 0}\0${mediaKey}\0${raw}`;
   const cached = htmlCache.get(key);
   if (cached !== undefined) return cached;
 
@@ -624,15 +898,33 @@ export function renderMarkdown(raw: string, repo?: RepoContext, opts: RenderMark
   return html;
 }
 
+const renderMarkdownAttempt = (raw: string, repo: RepoContext | undefined, opts: RenderMarkdownOpts) =>
+  Effect.tryPromise({
+    try: () => renderMarkdown(raw, repo, opts),
+    catch: (cause) => MarkdownRenderError.make({ cause }),
+  });
+
 export const renderMarkdownEffect = Effect.fn("Markdown.render")(function* (
   raw: string,
   repo?: RepoContext,
   opts: RenderMarkdownOpts = {},
 ) {
-  return yield* Effect.tryPromise({
-    try: () => renderMarkdown(raw, repo, opts),
-    catch: (cause) => MarkdownRenderError.make({ cause }),
-  });
+  // GitHub decides from upload metadata whether a bare attachment link is a
+  // video; Forge only has the URL, so it asks the media route first.
+  const candidates = markdownMediaCandidates(raw, repo);
+  const mediaOutcomes = candidates.length > 0 ? yield* resolveMarkdownMediaOutcomes(candidates) : opts.mediaOutcomes;
+  return yield* renderMarkdownAttempt(raw, repo, { ...opts, mediaOutcomes });
+});
+
+// Renders with only the attachment answers already known, so highlighting
+// never waits on a media probe that can take 30 seconds.
+export const renderMarkdownKnownMediaEffect = Effect.fn("Markdown.renderKnownMedia")(function* (
+  raw: string,
+  repo?: RepoContext,
+  opts: RenderMarkdownOpts = {},
+) {
+  const mediaOutcomes = opts.mediaOutcomes ?? settledMarkdownMediaOutcomes(markdownMediaCandidates(raw, repo));
+  return yield* renderMarkdownAttempt(raw, repo, { ...opts, mediaOutcomes });
 });
 
 async function renderMarkdownUncached(
@@ -649,11 +941,22 @@ async function renderMarkdownUncached(
   return renderMarkdownTokens(marked, tokens, opts, repo, true, highlightPlan.tokens);
 }
 
+function markdownMediaCandidates(raw: string, repo?: RepoContext): MarkdownMediaCandidate[] {
+  if (!repo) return [];
+  return githubAttachmentParagraphSources(raw, repo).flatMap((source) => {
+    const mediaURL = markdownMediaRequestPath(source, repo);
+    return mediaURL === null ? [] : [{ source, mediaURL }];
+  });
+}
+
 export function renderMarkdownSync(raw: string, repo?: RepoContext, opts: RenderMarkdownOpts = {}): string {
   if (!raw) return "";
   const marked = getMarked(repo, opts);
   const tokens = marked.lexer(raw) as Tokens.Generic[];
-  return renderMarkdownTokens(marked, tokens, opts, repo, false);
+  // Known answers apply at once, so a confirmed video mounts as a player
+  // instead of a link that the probe later swaps out.
+  const mediaOutcomes = opts.mediaOutcomes ?? settledMarkdownMediaOutcomes(markdownMediaCandidates(raw, repo));
+  return renderMarkdownTokens(marked, tokens, { ...opts, mediaOutcomes }, repo, false);
 }
 
 function renderMarkdownTokens(

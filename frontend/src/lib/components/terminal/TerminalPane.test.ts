@@ -376,7 +376,11 @@ describe("TerminalPane", () => {
     xtermInstances.length = 0;
     xtermCustomKeyEventHandlers.length = 0;
     xtermTerminalCtor.mockReset();
-    xtermOpen.mockReset();
+    xtermOpen.mockReset().mockImplementation((container: HTMLElement) => {
+      const screen = document.createElement("div");
+      screen.className = "xterm-screen";
+      container.appendChild(screen);
+    });
     xtermOnDataHandlers.length = 0;
     xtermOscHandlers.clear();
     mockSockets = [];
@@ -429,9 +433,12 @@ describe("TerminalPane", () => {
   });
 
   it("uses xterm.js", async () => {
-    render(TerminalPane, { props: { workspaceId: "ws-123" } });
+    const view = render(TerminalPane, { props: { workspaceId: "ws-123" } });
+    expect(view.getByRole("status").textContent).toBe("Loading terminal...");
 
+    await vi.dynamicImportSettled();
     await waitFor(() => expect(xtermTerminalCtor).toHaveBeenCalled());
+    expect(view.queryByRole("status")).toBeNull();
   });
 
   it("loads SIXEL and iTerm images without enabling Kitty graphics", async () => {
@@ -1026,10 +1033,10 @@ describe("TerminalPane", () => {
 
   it("releases terminal gesture resources when detached before the selected font is ready", async () => {
     const fontLoad = deferred<FontFace[]>();
-    stubFontLoad(fontLoad.promise);
+    const loadFont = stubFontLoad(fontLoad.promise);
 
     const { unmount } = render(TerminalPane, { props: { workspaceId: "ws-123" } });
-    await tick();
+    await waitFor(() => expect(loadFont).toHaveBeenCalled());
     unmount();
 
     await waitFor(() => expect(clipboardWriterDispose).toHaveBeenCalledTimes(1));
@@ -1130,10 +1137,8 @@ describe("TerminalPane", () => {
     await waitForSocketConnected(mockSockets[0]!);
     mockSockets[0]!.sent = [];
 
-    const screen = document.createElement("div");
-    screen.className = "xterm-screen";
+    const screen = container.querySelector<HTMLElement>(".xterm-screen")!;
     vi.spyOn(screen, "getBoundingClientRect").mockReturnValue(DOMRect.fromRect({ width: 875, height: 740 }));
-    container.querySelector(".terminal-container")?.append(screen);
 
     fitDimensions = { cols: 100, rows: 40 };
     resizeObserverCallbacks[0]!([], {} as ResizeObserver);
@@ -1157,6 +1162,7 @@ describe("TerminalPane", () => {
 
     await waitFor(() => expect(mockSockets).toHaveLength(1));
     await waitForSocketConnected(mockSockets[0]!);
+    await waitForInitialGeometry(mockSockets[0]!);
     mockSockets[0]!.sent = [];
 
     fitDimensions = undefined;

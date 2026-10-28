@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/platform"
@@ -129,12 +129,14 @@ func TestNormalizeCommitEventFallbacks(t *testing.T) {
 			commitAuthor:  signature("original-name", authoredAt),
 			wantAuthor:    "original-author",
 			wantCreatedAt: authoredAt,
+			wantMetadata:  `{"commit_author":"original-author"}`,
 		},
 		{
 			name:          "nested author name is used without associated users",
 			commitAuthor:  signature("original-author", authoredAt),
 			wantAuthor:    "original-author",
 			wantCreatedAt: authoredAt,
+			wantMetadata:  `{"commit_author":"original-author"}`,
 		},
 		{
 			name:            "author date is used when committer date is absent",
@@ -153,15 +155,17 @@ func TestNormalizeCommitEventFallbacks(t *testing.T) {
 			commitCommitter: &gh.CommitAuthor{Date: &gh.Timestamp{Time: committedAt}},
 			wantAuthor:      "original-author",
 			wantCreatedAt:   committedAt,
+			wantMetadata:    `{"commit_author":"original-author"}`,
 		},
 		{
-			name:            "same normalized identity omits redundant metadata",
-			author:          user("same-user"),
-			committer:       user("same-user"),
+			name:            "same normalized identity preserves known author",
+			author:          user("alice"),
+			committer:       user("alice"),
 			commitAuthor:    signature("original-name", authoredAt),
 			commitCommitter: signature("committer-name", committedAt),
-			wantAuthor:      "same-user",
+			wantAuthor:      "alice",
 			wantCreatedAt:   committedAt,
+			wantMetadata:    `{"commit_author":"alice"}`,
 		},
 		{
 			name: "all identity and date fields absent remain empty",
@@ -358,5 +362,22 @@ func TestNormalizePullRequestExtractsAssigneesAndRequestedReviewers(t *testing.T
 			assert.Equal(t, tc.wantAssignees, mr.Assignees)
 			assert.Equal(t, tc.wantReviewers, mr.RequestedReviewers)
 		})
+	}
+}
+
+func TestNormalizeAuthorAssociations(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	for _, association := range []*string{nil, new("MEMBER"), new("FIRST_TIMER"), new("FUTURE_VALUE")} {
+		pr, err := NormalizePullRequest(platform.RepoRef{}, &gh.PullRequest{AuthorAssociation: association}) //nolint:staticcheck // Removed from Events payloads only; this data comes from REST detail or GraphQL.
+		require.NoError(err)
+		assert.Equal(association, pr.AuthorAssociation)
+		issue, err := NormalizeIssue(platform.RepoRef{}, &gh.Issue{AuthorAssociation: association}) //nolint:staticcheck // Removed from Events payloads only; this data comes from REST detail or GraphQL.
+		require.NoError(err)
+		assert.Equal(association, issue.AuthorAssociation)
+		review := NormalizeReviewEvent(platform.RepoRef{}, 1, &gh.PullRequestReview{AuthorAssociation: association}) //nolint:staticcheck // Removed from Events payloads only; this data comes from REST detail or GraphQL.
+		assert.Equal(association, review.AuthorAssociation)
+		comment := NormalizeReviewCommentEvent(platform.RepoRef{}, 1, &gh.PullRequestComment{AuthorAssociation: association}) //nolint:staticcheck // Removed from Events payloads only; this data comes from REST detail or GraphQL.
+		assert.Equal(association, comment.AuthorAssociation)
 	}
 }

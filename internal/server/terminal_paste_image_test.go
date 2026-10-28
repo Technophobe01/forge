@@ -15,31 +15,33 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/federationauth"
+	"go.kenn.io/forge/internal/server/authapi"
 	"go.kenn.io/forge/internal/terminalpaste"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 )
 
 func TestTerminalPasteImageStoresBrowserImageForRemoteTerminal(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	dataDir := t.TempDir()
 	srv := New(
-		openTestDB(t), nil, nil, "/",
+		serverfake.OpenTestDB(t), nil, nil, "/",
 		&config.Config{DataDir: dataDir},
-		ServerOptions{HostCheck: HostCheckOptions{
+		ServerOptions{HostCheck: authapi.HostCheckOptions{
 			Bind: config.HostKey{Host: "127.0.0.1", Port: "8091"},
 		}},
 	)
-	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, srv) })
 
 	var imageBytes bytes.Buffer
 	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
 	img.Set(0, 0, color.RGBA{R: 0x44, G: 0x88, B: 0xcc, A: 0xff})
 	require.NoError(png.Encode(&imageBytes, img))
 
-	req := httptest.NewRequest(
+	req := httptest.NewRequestWithContext(t.Context(),
 		http.MethodPost,
 		"/api/v1/terminal/paste-image",
 		bytes.NewReader(imageBytes.Bytes()),
@@ -76,23 +78,26 @@ func TestTerminalPasteImageStoresBrowserImageForRemoteTerminal(t *testing.T) {
 }
 
 func TestTerminalPasteImageAcceptsFleetPeerRelay(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	dataDir := t.TempDir()
 	store, err := federationauth.Open(filepath.Join(t.TempDir(), "credentials.json"))
 	require.NoError(t, err)
 	token, err := store.MintInbound("fedcba9876543210fedcba9876543210", []federationauth.Scope{federationauth.ScopeTerminalAttach})
 	require.NoError(t, err)
 	srv := New(
-		openTestDB(t), nil, nil, "/",
+		serverfake.OpenTestDB(t), nil, nil, "/",
 		&config.Config{DataDir: dataDir},
-		ServerOptions{FederationCredentials: store,
-			DaemonAccess: DaemonAccessOptions{Token: "local-secret", RequireAPIAuth: true},
-			HostCheck: HostCheckOptions{
+		ServerOptions{
+			FederationCredentials: store,
+			DaemonAccess:          authapi.DaemonAccessOptions{Token: "local-secret", RequireAPIAuth: true},
+			HostCheck: authapi.HostCheckOptions{
 				Bind: config.HostKey{Host: "127.0.0.1", Port: "8091"},
-			}},
+			},
+		},
 	)
-	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, srv) })
 
-	req := httptest.NewRequest(
+	req := httptest.NewRequestWithContext(t.Context(),
 		http.MethodPost,
 		"/api/v1/terminal/paste-image",
 		strings.NewReader("\x89PNG\r\n\x1a\n"),
@@ -109,14 +114,15 @@ func TestTerminalPasteImageAcceptsFleetPeerRelay(t *testing.T) {
 }
 
 func TestTerminalPasteImageRejectsUnsupportedAndOversizedPayloads(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	srv := New(
-		openTestDB(t), nil, nil, "/",
+		serverfake.OpenTestDB(t), nil, nil, "/",
 		&config.Config{DataDir: t.TempDir()},
-		ServerOptions{HostCheck: HostCheckOptions{
+		ServerOptions{HostCheck: authapi.HostCheckOptions{
 			Bind: config.HostKey{Host: "127.0.0.1", Port: "8091"},
 		}},
 	)
-	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, srv) })
 	oversized := make([]byte, terminalpaste.MaxImageBytes+1)
 	copy(oversized, []byte("\x89PNG\r\n\x1a\n"))
 
@@ -129,7 +135,7 @@ func TestTerminalPasteImageRejectsUnsupportedAndOversizedPayloads(t *testing.T) 
 		{name: "oversized", body: oversized, want: http.StatusRequestEntityTooLarge},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(
+			req := httptest.NewRequestWithContext(t.Context(),
 				http.MethodPost,
 				"/api/v1/terminal/paste-image",
 				bytes.NewReader(tt.body),
@@ -148,8 +154,9 @@ func TestTerminalPasteImageRejectsUnsupportedAndOversizedPayloads(t *testing.T) 
 }
 
 func TestTerminalPasteImageFleetRouteAcceptsBrowserBinaryContentType(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	srv := newTestServer(t)
-	req := httptest.NewRequest(
+	req := httptest.NewRequestWithContext(t.Context(),
 		http.MethodPost,
 		"/api/v1/fleet/hosts/missing/terminal/paste-image",
 		strings.NewReader("\x89PNG\r\n\x1a\n"),
@@ -166,15 +173,16 @@ func TestTerminalPasteImageFleetRouteAcceptsBrowserBinaryContentType(t *testing.
 }
 
 func TestTerminalPasteImageAcceptsAuthenticatedCLIRelay(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	srv := New(
-		openTestDB(t), nil, nil, "/",
+		serverfake.OpenTestDB(t), nil, nil, "/",
 		&config.Config{DataDir: t.TempDir()},
-		ServerOptions{HostCheck: HostCheckOptions{
+		ServerOptions{HostCheck: authapi.HostCheckOptions{
 			Bind: config.HostKey{Host: "127.0.0.1", Port: "8091"},
 		}},
 	)
-	t.Cleanup(func() { gracefulShutdown(t, srv) })
-	req := httptest.NewRequest(
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, srv) })
+	req := httptest.NewRequestWithContext(t.Context(),
 		http.MethodPost,
 		"/api/v1/terminal/paste-image",
 		strings.NewReader("\x89PNG\r\n\x1a\n"),
@@ -191,8 +199,9 @@ func TestTerminalPasteImageAcceptsAuthenticatedCLIRelay(t *testing.T) {
 }
 
 func TestTerminalPasteImageRejectsSimpleRequestContentType(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	srv := newTestServer(t)
-	req := httptest.NewRequest(
+	req := httptest.NewRequestWithContext(t.Context(),
 		http.MethodPost,
 		"/api/v1/terminal/paste-image",
 		strings.NewReader("image bytes"),

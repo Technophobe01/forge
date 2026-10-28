@@ -72,6 +72,7 @@ func Handlers(broadcaster *Broadcaster, sources map[string]Source) (http.Handler
 		}},
 	}, func(context.Context, *struct{}) (*huma.StreamResponse, error) {
 		return &huma.StreamResponse{Body: func(ctx huma.Context) {
+			ctx.SetHeader(protocolHeader, protocolVersion)
 			ctx.SetHeader("Content-Type", "text/event-stream")
 			ctx.SetHeader("Cache-Control", "no-cache")
 			_, w := humago.Unwrap(ctx)
@@ -161,14 +162,13 @@ type pullReference struct {
 func reduce(event string, body []byte, allowed []int64) ([]Hint, error) {
 	switch event {
 	case "pull_request", "pull_request_review", "pull_request_review_comment", "pull_request_review_thread",
-		"issues", "issue_comment", "push", "create", "delete", "repository", "workflow_run":
+		"issues", "issue_comment", "push", "create", "delete", "repository", "workflow_run", "check_run":
 	default:
 		return nil, nil
 	}
 	var payload struct {
 		Repository struct {
-			ID     int64  `json:"id"`
-			NodeID string `json:"node_id"`
+			ID int64 `json:"id"`
 		} `json:"repository"`
 		PullRequest *pullReference `json:"pull_request"`
 		Issue       *struct {
@@ -178,11 +178,14 @@ func reduce(event string, body []byte, allowed []int64) ([]Hint, error) {
 		WorkflowRun *struct {
 			PullRequests []pullReference `json:"pull_requests"`
 		} `json:"workflow_run"`
+		CheckRun *struct {
+			PullRequests []pullReference `json:"pull_requests"`
+		} `json:"check_run"`
 	}
 	if json.Unmarshal(body, &payload) != nil || payload.Repository.ID <= 0 || !slices.Contains(allowed, payload.Repository.ID) {
 		return nil, errors.New("invalid webhook repository")
 	}
-	hint := Hint{Provider: "github", Host: "github.com", RepositoryID: payload.Repository.NodeID}
+	hint := Hint{Provider: "github", Host: "github.com", RepositoryID: payload.Repository.ID}
 	switch event {
 	case "pull_request", "pull_request_review", "pull_request_review_comment", "pull_request_review_thread":
 		if payload.PullRequest == nil {
@@ -201,12 +204,26 @@ func reduce(event string, body []byte, allowed []int64) ([]Hint, error) {
 		hint.Target = RepositoryRefs
 	case "repository":
 		hint.Target = Repository
-	case "workflow_run":
-		if payload.WorkflowRun == nil {
-			return nil, errors.New("missing workflow run")
-		}
+	case "workflow_run", "check_run":
 		var hints []Hint
-		for _, pr := range payload.WorkflowRun.PullRequests {
+		var pulls []pullReference
+		if event == "workflow_run" {
+			if payload.WorkflowRun == nil {
+				return nil, errors.New("missing workflow run")
+			}
+			pulls = payload.WorkflowRun.PullRequests
+			hint.Target = WorkflowRuns
+			if err := hint.Validate(); err != nil {
+				return nil, err
+			}
+			hints = append(hints, hint)
+		} else {
+			if payload.CheckRun == nil {
+				return nil, errors.New("missing check run")
+			}
+			pulls = payload.CheckRun.PullRequests
+		}
+		for _, pr := range pulls {
 			hint.Target, hint.Number = PullRequestChecks, pr.Number
 			if err := hint.Validate(); err != nil {
 				return nil, err

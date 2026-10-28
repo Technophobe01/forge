@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
+	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/gitclone"
 	ghclient "go.kenn.io/forge/internal/github"
@@ -23,6 +24,7 @@ type Event struct {
 }
 
 type ConfigSnapshot struct {
+	Repositories                   []config.Repo
 	AllowMidStackMerges            bool
 	UseWorkspaceActivityForRecency bool
 }
@@ -90,7 +92,10 @@ type Handler struct {
 
 	deferredMergeMu       sync.Mutex
 	deferredMergeInFlight map[string]*deferredMergeHandle
+	mergeLocks            httpapi.KeyedLocks
 	deferredMergeMaxWait  time.Duration
+
+	mergeWorkspaceCleanupWake chan struct{}
 }
 
 func New(deps Deps) *Handler {
@@ -125,6 +130,7 @@ func New(deps Deps) *Handler {
 		bgCtx:                         bgCtx,
 		bgCancel:                      bgCancel,
 		shutdownDone:                  make(chan struct{}),
+		mergeWorkspaceCleanupWake:     make(chan struct{}, 1),
 		deferredMergeInFlight:         make(map[string]*deferredMergeHandle),
 		deferredMergeMaxWait:          maxWait,
 	}
@@ -224,6 +230,7 @@ func (s *Handler) Shutdown(ctx context.Context) error {
 }
 
 func (s *Handler) Register(api huma.API) {
+	huma.Post(api, "/gh/query", s.ghShim, httpapi.DocumentOperation("query-gh", "Query GitHub CLI cached data", "Pull Requests"))
 	pullRepoPath := "/pulls/{provider}/{owner}/{name}"
 	hostPullRepoPath := "/host/{platform_host}/pulls/{provider}/{owner}/{name}"
 	pullPath := pullRepoPath + "/{number}"
@@ -285,6 +292,12 @@ func registerPullMutationRoutes(api huma.API, pullPath, hostPullPath string, s *
 	register(api, "set-pr-labels-on-host", http.MethodPut, hostPullPath+"/labels", "Set pull request labels", s.setPullLabelsOnHost)
 	register(api, "set-pr-assignees", http.MethodPut, pullPath+"/assignees", "Set pull request assignees", s.setPullAssignees)
 	register(api, "set-pr-assignees-on-host", http.MethodPut, hostPullPath+"/assignees", "Set pull request assignees", s.setPullAssigneesOnHost)
+	register(api, "update-pr-labels", http.MethodPatch, pullPath+"/labels", "Add and remove pull request labels", s.updatePullLabels)
+	register(api, "update-pr-labels-on-host", http.MethodPatch, hostPullPath+"/labels", "Add and remove pull request labels", s.updatePullLabelsOnHost)
+	register(api, "update-pr-assignees", http.MethodPatch, pullPath+"/assignees", "Add and remove pull request assignees", s.updatePullAssignees)
+	register(api, "update-pr-assignees-on-host", http.MethodPatch, hostPullPath+"/assignees", "Add and remove pull request assignees", s.updatePullAssigneesOnHost)
+	register(api, "get-pr-reviewer-accounts", http.MethodGet, pullPath+"/reviewer-accounts", "List pull request reviewer accounts", s.getReviewerAccounts)
+	register(api, "get-pr-reviewer-accounts-on-host", http.MethodGet, hostPullPath+"/reviewer-accounts", "List pull request reviewer accounts", s.getReviewerAccountsOnHost)
 	register(api, "set-pr-reviewers", http.MethodPut, pullPath+"/reviewers", "Set pull request reviewers", s.setPullReviewers)
 	register(api, "set-pr-reviewers-on-host", http.MethodPut, hostPullPath+"/reviewers", "Set pull request reviewers", s.setPullReviewersOnHost)
 	register(api, "approve-pull", http.MethodPost, pullPath+"/approve", "Approve pull request", s.approvePR)

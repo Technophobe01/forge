@@ -26,6 +26,8 @@ import (
 	"go.kenn.io/forge/internal/procutil"
 	"go.kenn.io/forge/internal/server"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	"go.kenn.io/forge/platform"
 	_ "modernc.org/sqlite"
 )
 
@@ -69,80 +71,78 @@ func TestPrepareEphemeralConfigOverridesPortAndDataDir(t *testing.T) {
 	assert.Equal(sourceDataDir, source.DataDir)
 }
 
-func TestPrepareEphemeralConfigMovesEnabledMCPListenerOffTheSourcePort(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	dir := t.TempDir()
-	sourcePath := filepath.Join(dir, "source.toml")
-	workDir := filepath.Join(dir, "run")
-	require.NoError(os.MkdirAll(workDir, 0o700))
+func TestPrepareEphemeralConfigSharesDefaultMCPListener(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		mcp           config.MCP
+		mcpPortSet    bool
+		requestedPort int
+		expectedPort  int
+	}{
+		{name: "shared default", expectedPort: 39101},
+		{name: "explicit flag", mcpPortSet: true, requestedPort: 39103, expectedPort: 39103},
+		{name: "explicit zero flag", mcpPortSet: true},
+		{name: "source port free port", mcp: config.MCP{Enabled: new(true), Port: 6661}},
+		{name: "disabled", mcp: config.MCP{Enabled: new(false)}, mcpPortSet: true, requestedPort: 39103},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			dir := t.TempDir()
+			sourcePath := filepath.Join(dir, "source.toml")
+			workDir := filepath.Join(dir, "run")
+			require.NoError(os.MkdirAll(workDir, 0o700))
 
-	source := config.Config{
-		SyncInterval:        "5m",
-		GitHubTokenEnv:      "KENN_FORGE_GITHUB_TOKEN",
-		DefaultPlatformHost: "github.com",
-		Host:                "127.0.0.1",
-		Port:                8091,
-		DataDir:             filepath.Join(dir, "source-data"),
-		Activity:            config.Activity{ViewMode: "threaded", TimeRange: "7d"},
-		MCP:                 config.MCP{Enabled: true, Port: 6661},
+			source := config.Config{
+				SyncInterval:        "5m",
+				GitHubTokenEnv:      "KENN_FORGE_GITHUB_TOKEN",
+				DefaultPlatformHost: "github.com",
+				Host:                "127.0.0.1",
+				Port:                8091,
+				DataDir:             filepath.Join(dir, "source-data"),
+				Activity:            config.Activity{ViewMode: "threaded", TimeRange: "7d"},
+				MCP:                 tc.mcp,
+			}
+			require.NoError(source.Save(sourcePath))
+
+			prepared, err := prepareEphemeralConfig(ephemeralOptions{
+				sourceConfigPath: sourcePath,
+				workDir:          workDir,
+				backendPort:      39101,
+				frontendPort:     39102,
+				mcpPort:          tc.requestedPort,
+				mcpPortSet:       tc.mcpPortSet,
+				freshDB:          true,
+			})
+			require.NoError(err)
+
+			reloaded, err := config.Load(prepared.configPath)
+			require.NoError(err)
+			switch {
+			case tc.mcp.Enabled != nil && !*tc.mcp.Enabled:
+				assert.Equal(new(false), reloaded.MCP.Enabled)
+				assert.Zero(reloaded.MCP.Port)
+				assert.Zero(prepared.mcpPort)
+				assert.Empty(prepared.mcpURL)
+			case tc.mcp.Enabled == nil && !tc.mcpPortSet:
+				assert.Nil(reloaded.MCP.Enabled)
+				assert.Zero(reloaded.MCP.Port)
+				assert.Equal(tc.expectedPort, prepared.mcpPort)
+			default:
+				assert.Equal(new(true), reloaded.MCP.Enabled)
+				if tc.expectedPort != 0 {
+					assert.Equal(tc.expectedPort, reloaded.MCP.Port)
+				} else {
+					assert.Positive(reloaded.MCP.Port)
+					assert.NotEqual(tc.mcp.Port, reloaded.MCP.Port)
+					assert.NotEqual(39101, reloaded.MCP.Port)
+					assert.NotEqual(39102, reloaded.MCP.Port)
+				}
+				assert.Equal(reloaded.MCP.Port, prepared.mcpPort)
+			}
+			assert.Equal(reloaded.MCPURL(), prepared.mcpURL)
+		})
 	}
-	require.NoError(source.Save(sourcePath))
-
-	prepared, err := prepareEphemeralConfig(ephemeralOptions{
-		sourceConfigPath: sourcePath,
-		workDir:          workDir,
-		backendPort:      39101,
-		frontendPort:     39102,
-		mcpPort:          39103,
-		freshDB:          true,
-	})
-	require.NoError(err)
-
-	reloaded, err := config.Load(prepared.configPath)
-	require.NoError(err)
-	assert.True(reloaded.MCP.Enabled)
-	assert.Equal(39103, reloaded.MCP.Port)
-	assert.Equal("127.0.0.1:39103", reloaded.MCPListenAddr())
-	assert.Equal(39103, prepared.mcpPort)
-	assert.Equal("http://127.0.0.1:39103", prepared.mcpURL)
-}
-
-func TestPrepareEphemeralConfigLeavesDisabledMCPAlone(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	dir := t.TempDir()
-	sourcePath := filepath.Join(dir, "source.toml")
-	workDir := filepath.Join(dir, "run")
-	require.NoError(os.MkdirAll(workDir, 0o700))
-
-	source := config.Config{
-		SyncInterval:        "5m",
-		GitHubTokenEnv:      "KENN_FORGE_GITHUB_TOKEN",
-		DefaultPlatformHost: "github.com",
-		Host:                "127.0.0.1",
-		Port:                8091,
-		DataDir:             filepath.Join(dir, "source-data"),
-		Activity:            config.Activity{ViewMode: "threaded", TimeRange: "7d"},
-	}
-	require.NoError(source.Save(sourcePath))
-
-	prepared, err := prepareEphemeralConfig(ephemeralOptions{
-		sourceConfigPath: sourcePath,
-		workDir:          workDir,
-		backendPort:      39101,
-		frontendPort:     39102,
-		mcpPort:          39103,
-		freshDB:          true,
-	})
-	require.NoError(err)
-
-	reloaded, err := config.Load(prepared.configPath)
-	require.NoError(err)
-	assert.False(reloaded.MCP.Enabled)
-	assert.Empty(reloaded.MCPListenAddr())
-	assert.Equal(0, prepared.mcpPort)
-	assert.Empty(prepared.mcpURL)
 }
 
 func TestRequireDistinctPortsRejectsAnyCollision(t *testing.T) {
@@ -221,7 +221,7 @@ func TestPrepareEphemeralConfigDisablesReverseProxyTrustForDirectBackend(t *test
 	srv := server.NewWithConfig(
 		dbtest.Open(t), nil, nil, nil, reloaded, prepared.configPath, server.ServerOptions{},
 	)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/version", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/version", nil)
 	req.Host = "127.0.0.1:39141"
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
@@ -461,8 +461,8 @@ func TestDevEphemeralDefaultStartsWithoutProviderAccess(t *testing.T) {
 	}
 	require.NoError(sourceConfig.Save(sourcePath))
 	database := dbtest.OpenAt(t, filepath.Join(sourceDataDir, "forge.db"))
-	_, err = database.UpsertRepoByProviderID(t.Context(), db.RepoIdentity{
-		Platform: "github", PlatformHost: providerHost, PlatformRepoID: "42",
+	_, err = reposeed.Seed(t.Context(), database, db.RepoIdentity{
+		Platform: "github", PlatformHost: providerHost, Key: platform.RepositoryIDKey(42),
 		Owner: "acme", Name: "widget", RepoPath: "acme/widget",
 	})
 	require.NoError(err)
@@ -485,12 +485,10 @@ exec "$FORGE_TEST_BIN" "$@"
 	t.Setenv("KENN_FORGE_HOME", filepath.Join(root, "runtime"))
 	t.Setenv("BACKEND_ARGS", "")
 
-	oldDir, err := os.Getwd()
-	require.NoError(err)
-	require.NoError(os.Chdir(commandDir))
-	defer func() { require.NoError(os.Chdir(oldDir)) }()
+	stackScriptDir = commandDir
+	t.Cleanup(func() { stackScriptDir = "" })
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	errCh := make(chan error, 1)
 	go func() {
@@ -502,7 +500,13 @@ exec "$FORGE_TEST_BIN" "$@"
 	}()
 	status := waitForStatusFile(t, filepath.Join(root, "run", "dev-ephemeral.json"))
 	require.Eventually(func() bool {
-		resp, requestErr := http.Get(status.BackendURL + "/api/v1/repos")
+		req, requestErr := http.NewRequestWithContext(
+			t.Context(), http.MethodGet, status.BackendURL+"/api/v1/repos", nil,
+		)
+		if requestErr != nil {
+			return false
+		}
+		resp, requestErr := (&http.Client{Timeout: 5 * time.Second}).Do(req)
 		if requestErr != nil {
 			return false
 		}
@@ -658,12 +662,18 @@ func TestRunWaitsForWorkDirLockBeforeReusingLiveStatus(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- run(context.Background(), []string{"-work-dir", dir})
+		// Reusing live status binds no ports; keep allocation out of this lock test.
+		errCh <- run(t.Context(), []string{
+			"-work-dir", dir,
+			"-backend-port", "39411",
+			"-frontend-port", "39412",
+			"-mcp-port", "39413",
+		})
 	}()
 	select {
 	case err := <-errCh:
 		require.Failf("run returned while the workdir lock was held", "err: %v", err)
-	case <-time.After(150 * time.Millisecond):
+	case <-time.After(150 * time.Millisecond): //nolint:kennlint // shows the event does not happen; the held workdir lock blocks run until release
 	}
 
 	require.NoError(release())
@@ -732,16 +742,12 @@ func TestRunWaitsForStopLockBeforeStartingReplacementStack(t *testing.T) {
 		}
 	})
 
-	oldDir, err := os.Getwd()
-	require.NoError(err)
-	require.NoError(os.Chdir(commandDir))
-	t.Cleanup(func() {
-		require.NoError(os.Chdir(oldDir))
-	})
+	stackScriptDir = commandDir
+	t.Cleanup(func() { stackScriptDir = "" })
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- run(context.Background(), []string{
+		errCh <- run(t.Context(), []string{
 			"-config", sourcePath,
 			"-work-dir", workDir,
 			"-backend-port", "39511",
@@ -751,7 +757,7 @@ func TestRunWaitsForStopLockBeforeStartingReplacementStack(t *testing.T) {
 	select {
 	case err := <-errCh:
 		require.Failf("run returned while stop held the workdir lock", "err: %v", err)
-	case <-time.After(150 * time.Millisecond):
+	case <-time.After(150 * time.Millisecond): //nolint:kennlint // shows the event does not happen; stop holds the workdir lock until release
 	}
 
 	require.NoError(stopEphemeralStack(statusPath))
@@ -925,16 +931,16 @@ func TestWaitForCommandsEscalatesIgnoredInterrupt(t *testing.T) {
 	frontendScript := filepath.Join(dir, "frontend.sh")
 	writeInterruptIgnoringScript(t, backendScript)
 	writeBlockingScript(t, frontendScript)
-	backend, err := startCommand(context.Background(), commandSpec{name: backendScript})
+	backend, err := startCommand(t.Context(), commandSpec{name: backendScript})
 	require.NoError(err)
-	frontend, err := startCommand(context.Background(), commandSpec{name: frontendScript})
+	frontend, err := startCommand(t.Context(), commandSpec{name: frontendScript})
 	require.NoError(err)
 	t.Cleanup(func() {
 		stopProcess(backend.Process)
 		stopProcess(frontend.Process)
 	})
 
-	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancelCtx, cancel := context.WithCancel(t.Context())
 	cancel()
 	err = waitForCommands(cancelCtx, backend, frontend)
 	require.NoError(err)
@@ -952,7 +958,7 @@ func TestStopStartedCommandsEscalatesAndWaits(t *testing.T) {
 	dir := t.TempDir()
 	scriptPath := filepath.Join(dir, "ignore-int.sh")
 	writeInterruptIgnoringScript(t, scriptPath)
-	cmd, err := startCommand(context.Background(), commandSpec{name: scriptPath})
+	cmd, err := startCommand(t.Context(), commandSpec{name: scriptPath})
 	require.NoError(err)
 	t.Cleanup(func() { stopProcess(cmd.Process) })
 
@@ -989,12 +995,8 @@ func TestRunWritesStatusAndReusesLiveDefaultStack(t *testing.T) {
 	writeBlockingScript(t, filepath.Join(commandDir, "scripts", "dev-stack-backend.sh"))
 	writeBlockingScript(t, filepath.Join(commandDir, "scripts", "frontend-dev.sh"))
 
-	oldDir, err := os.Getwd()
-	require.NoError(err)
-	require.NoError(os.Chdir(commandDir))
-	t.Cleanup(func() {
-		require.NoError(os.Chdir(oldDir))
-	})
+	stackScriptDir = commandDir
+	t.Cleanup(func() { stackScriptDir = "" })
 
 	ctx := t.Context()
 	errCh := make(chan error, 1)
@@ -1020,7 +1022,7 @@ func TestRunWritesStatusAndReusesLiveDefaultStack(t *testing.T) {
 
 	var reuseErr error
 	require.Eventually(func() bool {
-		reuseErr = run(context.Background(), []string{
+		reuseErr = run(t.Context(), []string{
 			"-config", sourcePath,
 			"-work-dir", workDir,
 			"-backend-port", "39503",
@@ -1066,7 +1068,7 @@ func writeInterruptIgnoringScript(t *testing.T, path string) {
 
 func startTestCommand(t *testing.T, spec commandSpec) (*exec.Cmd, <-chan error) {
 	t.Helper()
-	cmd, err := startCommand(context.Background(), spec)
+	cmd, err := startCommand(t.Context(), spec)
 	require.NoError(t, err)
 	waitCh := make(chan error, 1)
 	go func() {
@@ -1100,15 +1102,20 @@ func waitForCommandExit(t *testing.T, cmd *exec.Cmd, waitCh <-chan error) {
 
 func waitForStatusFile(t *testing.T, path string) ephemeralStatus {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+	deadline := time.After(5 * time.Second)
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
 		if status, ok := tryReadStatusFile(t, path); ok {
 			return status
 		}
-		time.Sleep(25 * time.Millisecond)
+		select {
+		case <-deadline:
+			require.Failf(t, "timed out waiting for status file", "path: %s", path)
+			return ephemeralStatus{}
+		case <-ticker.C:
+		}
 	}
-	require.Failf(t, "timed out waiting for status file", "path: %s", path)
-	return ephemeralStatus{}
 }
 
 func readStatusFile(t *testing.T, path string) ephemeralStatus {
@@ -1138,9 +1145,9 @@ func writeSQLiteMarker(t *testing.T, path, value string) {
 	db, err := sql.Open("sqlite", path)
 	require.NoError(err)
 	defer db.Close()
-	_, err = db.Exec("CREATE TABLE marker (value TEXT NOT NULL)")
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE marker (value TEXT NOT NULL)")
 	require.NoError(err)
-	_, err = db.Exec("INSERT INTO marker (value) VALUES (?)", value)
+	_, err = db.ExecContext(t.Context(), "INSERT INTO marker (value) VALUES (?)", value)
 	require.NoError(err)
 }
 
@@ -1151,6 +1158,6 @@ func readSQLiteMarker(t *testing.T, path string) string {
 	require.NoError(err)
 	defer db.Close()
 	var value string
-	require.NoError(db.QueryRow("SELECT value FROM marker").Scan(&value))
+	require.NoError(db.QueryRowContext(t.Context(), "SELECT value FROM marker").Scan(&value))
 	return value
 }

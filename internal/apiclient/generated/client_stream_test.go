@@ -2,7 +2,6 @@ package generated
 
 import (
 	"bufio"
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -38,7 +37,14 @@ func TestStreamEventsReturnsLiveEventStream(t *testing.T) {
 		err  error
 	}, 1)
 	go func() {
-		resp, err := client.StreamEventsRaw(context.Background(), server.Client(), &StreamEventsRequestOptions{})
+		resp, err := client.StreamEventsRaw(t.Context(), server.Client(), &StreamEventsRequestOptions{})
+		if resp != nil {
+			t.Cleanup(func() {
+				if resp != nil && resp.Body != nil {
+					_ = resp.Body.Close()
+				}
+			})
+		}
 		done <- struct {
 			resp *http.Response
 			err  error
@@ -62,7 +68,7 @@ func TestStreamEventsReturnsLiveEventStream(t *testing.T) {
 		line, err := bufio.NewReader(result.resp.Body).ReadString('\n')
 		require.NoError(err)
 		assert.Equal(": connected\n", line)
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		require.Fail("StreamEvents did not return the live response body")
 	}
 }

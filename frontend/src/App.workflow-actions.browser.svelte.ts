@@ -8,7 +8,7 @@ import {
   resetKeyboardModuleState,
   type MountedBrowserApp,
 } from "./test/browserAppHarness.js";
-import { jsonResponse, mockSettings, type MockRouteOverride } from "./test/mockApiFetch.js";
+import { createMockApiHandler, jsonResponse, mockSettings, type MockRouteOverride } from "./test/mockApiFetch.js";
 
 const WAIT = 10_000;
 
@@ -27,6 +27,7 @@ const capable = {
   workflow_dispatch: true,
   read_labels: true,
   read_markdown_images: true,
+  read_markdown_media: true,
   read_authenticated_user: true,
   comment_mutation: true,
   state_mutation: true,
@@ -52,6 +53,8 @@ const capable = {
 
 const workflowOperation = { available: true };
 
+const repoIds: Record<string, number> = { widgets: 1005, legacy: 1020 };
+
 function summary(name: string, supportsActions: boolean) {
   return {
     owner: "acme",
@@ -64,7 +67,7 @@ function summary(name: string, supportsActions: boolean) {
       owner: "acme",
       name,
       repo_path: `acme/${name}`,
-      platform_repo_id: `${name}-repo-id`,
+      platform_repo_id: repoIds[name] ?? 0,
       capabilities: supportsActions
         ? capable
         : {
@@ -176,6 +179,56 @@ describe("opt-in workflow Actions route", () => {
       .toBeVisible();
   });
 
+  it("keeps a pull workflow dialog and its draft open when the list refreshes", async () => {
+    const fixtures = createMockApiHandler();
+    const detailPath = "/api/v1/pulls/github/acme/widgets/42";
+    const detail = await fixtures
+      .handle({
+        method: "GET",
+        url: new URL(detailPath, "http://localhost"),
+        bodyText: "",
+      })
+      .json();
+    detail.repo = summary("widgets", true).repo;
+    let refreshed = false;
+    const pullFixtures: MockRouteOverride = (request) => {
+      if (request.method === "GET" && request.url.pathname === "/api/v1/pulls") {
+        return jsonResponse([
+          {
+            ...detail.merge_request,
+            Title: refreshed ? "Refreshed pull list title" : detail.merge_request.Title,
+            repo: detail.repo,
+          },
+        ]);
+      }
+      if (request.url.pathname === detailPath || request.url.pathname === `${detailPath}/sync`) {
+        return jsonResponse(detail);
+      }
+      return null;
+    };
+    mounted = await mountBrowserApp("/pulls/github/acme/widgets/42", {
+      overrides: [pullFixtures, actionsFixtures()],
+    });
+    await page
+      .getByRole("region", { name: "Pull request conversation" })
+      .getByRole("button", { name: "Run workflow", exact: true })
+      .click();
+    await page
+      .getByRole("region", { name: "GitHub Actions" })
+      .getByRole("button", { name: "Deploy", exact: true })
+      .click();
+    const dialog = page.getByRole("dialog", { name: "Run workflow" });
+    await expect.element(dialog).toBeVisible();
+    await dialog.getByRole("textbox", { name: "Git ref" }).fill("feature/keep-this-draft");
+
+    refreshed = true;
+    emitBrowserEventSource("data_changed", {});
+
+    await expect.element(page.getByText("Refreshed pull list title", { exact: true })).toBeVisible();
+    await expect.element(dialog).toBeVisible();
+    await expect.element(dialog.getByRole("textbox", { name: "Git ref" })).toHaveValue("feature/keep-this-draft");
+  });
+
   it("releases the mounted workspace and redirects when a settings update disables Actions", async () => {
     mounted = await mountBrowserApp("/actions", { overrides: [actionsFixtures()] });
     await expect.element(page.getByRole("heading", { name: "Actions" })).toBeVisible();
@@ -204,7 +257,7 @@ describe("opt-in workflow Actions route", () => {
       expect(getComputedStyle(layout!).flexDirection).toBe("column");
       expect(
         Array.from(document.querySelectorAll(".actions-layout h2"), (heading) => heading.textContent?.trim()),
-      ).toEqual(["Workflows", "Dispatch", "Recent runs"]);
+      ).toEqual(["Repos", "Workflows", "Dispatch", "Recent runs"]);
       expect(document.querySelector<HTMLElement>(".actions-page")!.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
     }, WAIT);
   });
@@ -244,14 +297,23 @@ describe("opt-in workflow Actions route", () => {
       const row = document.querySelector<HTMLElement>(".run-row")!;
       const disclosure = document.querySelector<HTMLElement>(".run-disclosure")!;
       const providerLink = row.querySelector<HTMLAnchorElement>("a")!;
-      const metadata = row.querySelectorAll<HTMLElement>(".run-ref, .run-actor, .run-time, .run-status");
-      expect(metadata).toHaveLength(4);
       expect(pageElement.scrollWidth).toBeLessThanOrEqual(pageElement.clientWidth);
       expect(row.scrollWidth).toBeLessThanOrEqual(row.clientWidth);
       expect(disclosure.scrollWidth).toBeLessThanOrEqual(disclosure.clientWidth);
       expect(providerLink.getBoundingClientRect().right).toBeLessThanOrEqual(row.getBoundingClientRect().right);
-      for (const item of metadata) {
-        expect(item.getBoundingClientRect().right).toBeLessThanOrEqual(disclosure.getBoundingClientRect().right);
+    }, WAIT);
+
+    // Narrow panes collapse table columns, so the expanded detail must carry the same fields.
+    await page.getByRole("button", { name: /Run 99/ }).click();
+    await vi.waitFor(() => {
+      const pageElement = document.querySelector<HTMLElement>(".actions-page")!;
+      const detail = document.querySelector<HTMLElement>(".run-detail")!;
+      expect(detail.textContent).toContain("feature/an-intentionally-long-reference-that-must-not-expand-the-page");
+      expect(detail.textContent).toContain("maintainer-with-an-intentionally-long-provider-identity");
+      expect(detail.textContent).toContain("0123456");
+      expect(pageElement.scrollWidth).toBeLessThanOrEqual(pageElement.clientWidth);
+      for (const item of detail.querySelectorAll<HTMLElement>("dd")) {
+        expect(item.getBoundingClientRect().right).toBeLessThanOrEqual(detail.getBoundingClientRect().right);
       }
     }, WAIT);
   });

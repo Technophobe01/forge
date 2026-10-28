@@ -33,8 +33,7 @@ func canonicalRepoRef(repo RepoRef) RepoRef {
 		Name:               strings.TrimSpace(repo.Name),
 		PlatformHost:       canonicalRepoHost(repo.PlatformHost),
 		RepoPath:           strings.TrimSpace(repo.RepoPath),
-		PlatformRepoID:     repo.PlatformRepoID,
-		PlatformExternalID: strings.TrimSpace(repo.PlatformExternalID),
+		Key:                repo.Key,
 		WebURL:             strings.TrimSpace(repo.WebURL),
 		CloneURL:           strings.TrimSpace(repo.CloneURL),
 		DefaultBranch:      strings.TrimSpace(repo.DefaultBranch),
@@ -58,13 +57,15 @@ func canonicalRepoPattern(pattern string) string {
 	return strings.ToLower(pattern)
 }
 
+// ConfiguredRepoStatus reports one configured repository entry. Its JSON
+// encoding is ConfiguredRepoStatusJSON.
 type ConfiguredRepoStatus struct {
-	Provider       string `json:"provider"`
-	PlatformHost   string `json:"platform_host"`
-	PlatformRepoID string `json:"platform_repo_id,omitempty"`
-	Owner          string `json:"owner"`
-	Name           string `json:"name"`
-	RepoPath       string `json:"repo_path"`
+	Provider     string                 `json:"provider"`
+	PlatformHost string                 `json:"platform_host"`
+	Key          platform.RepositoryKey `json:"-" repokey:"platform_repo_id,bitbucket_repository_uuid,omitempty"`
+	Owner        string                 `json:"owner"`
+	Name         string                 `json:"name"`
+	RepoPath     string                 `json:"repo_path"`
 	// TrackedRepoPath is the provider-verified current route of the tracked
 	// repository backing an exact entry. After a provider-side rename it
 	// differs from the configured RepoPath, and clients need it to release
@@ -76,6 +77,16 @@ type ConfiguredRepoStatus struct {
 	MatchedRepoCount  int    `json:"matched_repo_count"`
 	HiddenFromUI      bool   `json:"hidden_from_ui"`
 	IssuePRReferences bool   `json:"issue_pr_references"`
+}
+
+func (r ConfiguredRepoStatus) MarshalJSON() ([]byte, error) {
+	type plain ConfiguredRepoStatus
+	return platform.MarshalKeyedJSON(plain(r))
+}
+
+func (r *ConfiguredRepoStatus) UnmarshalJSON(data []byte) error {
+	type plain ConfiguredRepoStatus
+	return platform.UnmarshalKeyedJSON(data, (*plain)(r))
 }
 
 type ResolveConfiguredReposResult struct {
@@ -92,6 +103,17 @@ func FallbackConfiguredRepoRefs(
 	host := raw.PlatformHostOrDefault()
 	repoPath := configuredRepoPath(raw)
 	if !raw.HasNameGlob() {
+		if pinned := raw.RepositoryKey(); !pinned.IsZero() {
+			for _, repo := range previous {
+				if repoPlatform(repo) == kind &&
+					sameConfiguredRepoHost(repoHost(repo), host) &&
+					repo.Key == pinned {
+					repo.ConfiguredRepoPath = repoPath
+					return []RepoRef{repo}
+				}
+			}
+			return nil
+		}
 		// Provenance first: a provider-side rename moves the tracked route
 		// away from the configured path, but the tracked ref still records
 		// which config entry it was resolved from. Falling back to it keeps
@@ -248,16 +270,14 @@ func resolveConfiguredRepo(
 			)
 		}
 		resolved := repoRefFromRepository(raw, kind, host, repo)
-		configuredProviderID := strings.TrimSpace(raw.PlatformRepoID)
-		if configuredProviderID != "" &&
-			resolved.PlatformExternalID != configuredProviderID {
+		if pinned := raw.RepositoryKey(); !pinned.IsZero() && resolved.Key != pinned {
 			return status, nil, fmt.Errorf(
 				"resolve configured repo %s/%s: provider repository ID changed",
 				raw.Owner, raw.Name,
 			)
 		}
 		status.MatchedRepoCount = 1
-		status.PlatformRepoID = resolved.PlatformExternalID
+		status.Key = resolved.Key
 		return status, []RepoRef{resolved}, nil
 	}
 
@@ -341,19 +361,12 @@ func repoRefFromRepository(
 		Name:               strings.TrimSpace(name),
 		PlatformHost:       canonicalRepoHost(host),
 		RepoPath:           strings.TrimSpace(repo.Ref.RepoPath),
-		PlatformRepoID:     repo.PlatformID,
-		PlatformExternalID: repo.PlatformExternalID,
+		Key:                repo.Ref.Key,
 		WebURL:             repo.WebURL,
 		CloneURL:           repo.CloneURL,
 		DefaultBranch:      repo.DefaultBranch,
 		Archived:           repo.Archived,
 		ConfiguredRepoPath: exactConfiguredRepoPath(raw),
-	}
-	if ref.PlatformRepoID == 0 {
-		ref.PlatformRepoID = repo.Ref.PlatformID
-	}
-	if ref.PlatformExternalID == "" {
-		ref.PlatformExternalID = repo.Ref.PlatformExternalID
 	}
 	if ref.WebURL == "" {
 		ref.WebURL = repo.Ref.WebURL
@@ -418,12 +431,13 @@ func expandedRepoRouteKey(repo RepoRef) string {
 }
 
 func expandedRepoIdentityKey(repo RepoRef) string {
-	if strings.TrimSpace(repo.PlatformExternalID) == "" {
+	key := repo.Key
+	if key.IsZero() {
 		return ""
 	}
 	canonical := canonicalRepoRef(repo)
 	return string(repoPlatform(canonical)) + "\x00" + canonical.PlatformHost +
-		"\x00" + canonical.PlatformExternalID
+		"\x00" + key.String()
 }
 
 func (s *ExpandedRepoSet) Add(repo RepoRef, providerResolved bool) {
@@ -524,7 +538,7 @@ func RegisterConfiguredRepoCredentialAliases(
 			continue
 		}
 		router.RegisterRepoCredentialAlias(
-			repo.Owner, repo.Name, configured, repo.PlatformExternalID,
+			repo.Owner, repo.Name, configured, repo.Key,
 		)
 	}
 }

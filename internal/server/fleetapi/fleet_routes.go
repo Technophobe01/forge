@@ -48,6 +48,7 @@ func (s *Handler) Register(api huma.API) {
 			"Refresh all worktree git stats", "Fleet"))
 	s.registerFleetOperationRoutes(api)
 	s.registerFleetProjectRoutes(api)
+	s.registerBrowserLoginRoute(api)
 }
 
 func (s *Handler) getSnapshotAggregate(
@@ -139,4 +140,10 @@ func (s *Handler) RegisterWorkspaceCleanup(api huma.API, hidden bool) {
 		DefaultStatus: http.StatusAccepted,
 		Hidden:        hidden,
 	}, s.queueFederationWorkspaceCleanup)
+}
+
+// LocalSnapshot returns only this process's inventory; it never fans out.
+func (s *Handler) LocalSnapshot(ctx context.Context) (fleet.RawSnapshot, error) {
+	s.noteSnapshotDemand()
+	return s.buildLocalRaw(ctx)
 }

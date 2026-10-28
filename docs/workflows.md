@@ -45,11 +45,37 @@ merge when the provider and credential allow it.
 
 Unsupported actions remain visible but unavailable.
 
+To merge several pull requests at once, Shift- or Cmd/Ctrl-click them in the
+list, right-click, and choose **Merge**. Ready pull requests merge right away;
+those with pending CI merge once their checks pass. Drafts, conflicts, and
+failed CI are skipped.
+
+The same selection works in the pull request and issue lists for other
+actions. Right-click to copy links, star, edit labels or assignees, close,
+reopen, or run a quick action on each item. Pull requests also offer **Mark
+ready for review** and **Convert to draft**. Label and assignee edits change
+only the values you change.
+
 Detected stacks show member order. Mid-stack merges stay blocked by default
 until earlier members land.
 
+On GitHub.com repositories whose default branch uses a merge queue, **Add to
+merge queue** replaces the merge action. Pull rows and the detail view show
+queue position and state. When the queue removes a pull request without
+merging it, the detail view keeps the reason until you queue it again.
+**Delete workspace after merge** waits for the queue: the workspace is
+deleted once the pull request merges, and kept if it is closed or leaves the
+queue unmerged.
+
 The conversation, files, and workspace can share a pane layout. Reorder,
 split, resize, hide, or maximize panes as the task changes.
+
+## Work through a worklist
+
+Ask an agent connected through the [MCP companion](kenn-forge-mcp.md) for a
+ranked list of pull requests and issues. Open **Worklists** to step through
+the items, see what changed since the agent wrote the list, and mark items
+handled. See [Work through a worklist](workflows/worklists.md).
 
 ## Run manual provider workflows
 
@@ -104,8 +130,9 @@ kenn-forge agent-hook install
 ```
 
 Use `--agent NAME` to limit installation. Active work, approval requests, and
-input requests update while the sidebar is open. Hook reports expire after 30
-minutes without another event, then fall back to tmux activity.
+input requests update while the sidebar is open. Hook reports stay active until
+the agent session ends or its terminal runtime is removed. Terminal-based activity
+detection resumes when the report clears.
 
 See [Work in local sessions](workflows/workspaces.md) for workspace types,
 session layouts, tmux attachment, phone use, deletion, and recovery.
@@ -123,12 +150,14 @@ to pull requests, issues, and workspaces. There is no separate Kata mode.
 
 ## Review Roborev jobs
 
-Start the Roborev daemon, then open **Reviews**. Filter the queue by repository,
-branch, status, or Git ref. Select a job to read the review, inspect its log and
-prompt, add a comment, or use the actions available for its current state.
+Start the Roborev daemon, then open **Reviews** in a pull request's workspace
+panel or a local workspace. Jobs load for that workspace's repository and
+branch when you display the panel. Select a job to read the review, inspect its
+log and prompt, add a comment, or use the actions available for its current
+state.
 
 See [Integrations](integrations.md#review-roborev-jobs) for endpoint setup and a
-walkthrough of the Reviews page.
+walkthrough of the Reviews panel.
 
 ## Browse and edit Docs
 

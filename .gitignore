@@ -1,5 +1,7 @@
 /kenn-forge
 /kenn-forge.exe
+/custom-gcl
+/.golangci-cache/
 /kenn-forge-github-app
 /kenn-forge-github-app.exe
 dist/
@@ -17,7 +19,7 @@ frontend/playwright-report/
 frontend/test-results/
 /test-results/
 frontend/tests/demo/screenshots/
-frontend/.vitest-attachments/
+frontend/.vitest/
 frontend/src/**/__screenshots__/
 .idea/
 .vscode/
@@ -53,3 +55,6 @@ __pycache__/
 # ptyowner test artifacts
 .sessions
 .env.local
+
+# svelte-check --tsgo transpile cache
+.svelte-check/

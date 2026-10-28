@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,7 +17,7 @@ import (
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/gitclone"
 	"go.kenn.io/forge/internal/github"
-	"go.kenn.io/forge/internal/server"
+	"go.kenn.io/forge/internal/server/syncevents"
 	"go.kenn.io/forge/internal/testutil/dbtest"
 	"go.kenn.io/forge/internal/tokenauth"
 	"go.kenn.io/forge/platform"
@@ -29,7 +30,7 @@ func TestWireSyncStatusDoesNotReloadDataForRelayConnectionChanges(t *testing.T) 
 	ctx, cancel := context.WithCancel(t.Context())
 	syncer := github.NewSyncer(nil, dbtest.Open(t), nil, nil, time.Minute, nil, nil)
 	t.Cleanup(syncer.Stop)
-	hub := server.NewEventHub()
+	hub := syncevents.NewEventHub()
 	t.Cleanup(hub.Close)
 	events, _ := hub.Subscribe(ctx, false)
 	wireSyncStatus(syncer, hub)
@@ -43,14 +44,14 @@ func TestWireSyncStatusDoesNotReloadDataForRelayConnectionChanges(t *testing.T) 
 		syncer.RunRelay(ctx, github.RelayOptions{URL: relay.URL, Client: relay.Client()})
 	}()
 	t.Cleanup(func() { cancel(); <-stopped })
-	nextEvent := func() server.RecordedEvent {
+	nextEvent := func() syncevents.RecordedEvent {
 		t.Helper()
 		select {
 		case event := <-events:
 			return event
 		case <-time.After(10 * time.Second):
 			require.FailNow("hub event did not arrive")
-			return server.RecordedEvent{}
+			return syncevents.RecordedEvent{}
 		}
 	}
 	initial := nextEvent()
@@ -174,6 +175,11 @@ func TestGitStartupAllowsAnonymousReadsButRequiredRoutesFailClosed(t *testing.T)
 	require.ErrorIs(manager.RequireCredentialRoute(
 		t.Context(), string(platform.KindGitHub), "github.com", "acme", "public",
 	), gitclone.ErrCredentialUnavailable)
+	readToken, err := optional.ReadSourceForRepo(
+		string(platform.KindGitHub), "github.com", "acme", "public",
+	).Token(t.Context())
+	require.NoError(err)
+	assert.Empty(t, readToken, "optional clone reads must preserve anonymous Git")
 
 	requiredRoutes, err := buildGitStartup(&config.Config{
 		Repos: []config.Repo{{Owner: "acme", Name: "private"}},
@@ -184,6 +190,10 @@ func TestGitStartupAllowsAnonymousReadsButRequiredRoutesFailClosed(t *testing.T)
 	)
 	require.NotNil(requiredSource)
 	_, err = requiredSource.Token(t.Context())
+	require.ErrorIs(err, tokenauth.ErrMissingToken)
+	_, err = requiredRoutes.ReadSourceForRepo(
+		string(platform.KindGitHub), "github.com", "acme", "private",
+	).Token(t.Context())
 	require.ErrorIs(err, tokenauth.ErrMissingToken)
 }
 
@@ -217,7 +227,7 @@ func TestDefaultProviderFactoryPassesGitLabSharedSyncBudget(t *testing.T) {
 
 	_, err = reader.GetRepository(github.WithSyncBudget(t.Context()), platform.RepoRef{
 		Platform: platform.KindGitLab, Host: host,
-		Owner: "group", Name: "project", RepoPath: "group/project", PlatformID: 42,
+		Owner: "group", Name: "project", RepoPath: "group/project", Key: platform.RepositoryIDKey(42),
 	})
 	require.NoError(err)
 	assert.Equal(1, budget.Spent())
@@ -262,4 +272,38 @@ func TestDefaultProviderFactoryUsesGiteaExplicitBaseURL(t *testing.T) {
 	})
 	require.NoError(err)
 	assert.Equal("http://gitea.test/owner/repo.git", repo.CloneURL)
+}
+
+func TestBitbucketFactorySelectsCloudAndDataCenterAPI(t *testing.T) {
+	for _, host := range []string{"bitbucket.org", "bitbucket.example.com"} {
+		t.Run(host, func(t *testing.T) {
+			assert := assert.New(t)
+			original := http.DefaultTransport
+			http.DefaultTransport = platform.RoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				var body string
+				if host == "bitbucket.org" {
+					assert.Equal("api.bitbucket.org", r.URL.Host)
+					assert.Equal("/2.0/repositories/PROJECT/widgets", r.URL.Path)
+					body = `{"uuid":"{11111111-1111-4111-8111-111111111111}","full_name":"PROJECT/widgets"}`
+				} else {
+					assert.Equal(host, r.URL.Host)
+					if strings.HasSuffix(r.URL.Path, "/default-branch") {
+						body = `{"displayId":"main"}`
+					} else {
+						assert.Equal("/rest/api/latest/projects/PROJECT/repos/widgets", r.URL.Path)
+						body = `{"id":42,"slug":"widgets","project":{"key":"PROJECT"}}`
+					}
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+			})
+			t.Cleanup(func() { http.DefaultTransport = original })
+			built, err := defaultProviderFactories()["bitbucket"](t.Context(), providerFactoryInput{host: host, tokenSource: mainTestTokenSource(t, "bitbucket", host, "BITBUCKET_FACTORY_TOKEN", "token")})
+			require.NoError(t, err)
+			reader, ok := built.provider.(platform.RepositoryReader)
+			require.True(t, ok)
+			repo, err := reader.GetRepository(t.Context(), platform.RepoRef{Platform: platform.KindBitbucket, Host: host, Owner: "PROJECT", Name: "widgets"})
+			require.NoError(t, err)
+			assert.Equal(host, repo.Ref.Host)
+		})
+	}
 }

@@ -13,7 +13,9 @@ import (
 	"go.kenn.io/forge/internal/db"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
+	"go.kenn.io/forge/internal/server/authapi"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/testutil/servertest"
 )
 
@@ -32,7 +34,7 @@ func setupNotificationsAPIServer(t *testing.T) (*server.Server, *db.DB) {
 	// (which short-circuits config-derived host options) keeps the apitest
 	// "forge.test" base URL accepted.
 	srv := servertest.New(t, database, syncer, nil, "/", &config.Config{}, server.ServerOptions{
-		HostCheck: server.HostCheckOptions{
+		HostCheck: authapi.HostCheckOptions{
 			Bind: config.HostKey{Host: "127.0.0.1", Port: "8091"},
 			Allowed: []config.HostKey{
 				{Host: "forge.test", Port: ""},
@@ -41,7 +43,7 @@ func setupNotificationsAPIServer(t *testing.T) (*server.Server, *db.DB) {
 		},
 	})
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
 		defer cancel()
 		require.NoError(t, srv.Shutdown(ctx))
 	})
@@ -84,6 +86,7 @@ func activityItemKey(it generated.ActivityItemResponse) string {
 // serialization -> generated client) that the DB-unit and Svelte-component
 // tests cannot give on their own.
 func TestActivityNotificationsFullStack(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 

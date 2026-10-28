@@ -37,6 +37,15 @@ const (
 	// is larger than a single in-memory collection supports; unbounded
 	// datasets belong on the durable-cursor archive path.
 	ErrCodePageLimit PlatformErrorCode = "page_limit"
+	// ErrCodeUnsupportedMediaType marks a fetched source whose type is not an
+	// allowed video type. It is the only media failure that proves the asset
+	// is not a video, so callers may remember it.
+	ErrCodeUnsupportedMediaType PlatformErrorCode = "unsupported_media_type"
+	// ErrCodeRangeNotSatisfiable marks an upstream 416 for a media Range.
+	ErrCodeRangeNotSatisfiable PlatformErrorCode = "range_not_satisfiable"
+	// ErrCodeMergeQueueRequired marks a direct merge the provider refused
+	// because the target branch only accepts merges through its merge queue.
+	ErrCodeMergeQueueRequired PlatformErrorCode = "merge_queue_required"
 )
 
 var (
@@ -52,6 +61,7 @@ var (
 	ErrRateLimited               = &Error{Code: ErrCodeRateLimited}
 	ErrStaleState                = &Error{Code: ErrCodeStaleState}
 	ErrPageLimit                 = &Error{Code: ErrCodePageLimit}
+	ErrMergeQueueRequired        = &Error{Code: ErrCodeMergeQueueRequired}
 )
 
 // ErrArchiveAttemptBudget is returned by budget-counting transports when an
@@ -131,8 +141,8 @@ func (e *Error) Unwrap() error {
 }
 
 func (e *Error) Is(target error) bool {
-	var targetErr *Error
-	if !errors.As(target, &targetErr) {
+	targetErr, ok := errors.AsType[*Error](target)
+	if !ok {
 		return false
 	}
 	return e != nil && e.Code == targetErr.Code

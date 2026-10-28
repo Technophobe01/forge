@@ -13,6 +13,7 @@ import (
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/testutil/servertest"
 )
 
@@ -23,6 +24,7 @@ import (
 // RunOnce — the scheduled entry point — because the explicit API sync
 // trigger deliberately bypasses cadence gates.
 func TestScheduledSyncFetchesArchivedMetadataOncePerCadenceE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -30,7 +32,7 @@ func TestScheduledSyncFetchesArchivedMetadataOncePerCadenceE2E(t *testing.T) {
 	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/api/v3/repos/corp/frozen":
+		case "/api/v3/repos/corp/frozen", "/api/v3/repositories/1":
 			repoFetches.Add(1)
 			_, _ = w.Write([]byte(`{"id":1,"node_id":"R_frozen","name":"frozen","full_name":"corp/frozen","owner":{"login":"corp"},"archived":true}`))
 		case "/api/v3/rate_limit":

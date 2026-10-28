@@ -3,11 +3,12 @@ package workspaceapi
 import (
 	"context"
 	"log/slog"
-	"maps"
 	"strings"
 	"time"
 
 	"go.kenn.io/forge/internal/db"
+	"go.kenn.io/forge/internal/workspace"
+	"go.kenn.io/forge/internal/workspace/localruntime"
 )
 
 const (
@@ -102,6 +103,7 @@ func (s *Handler) toCachedWorkspaceResponse(
 	defer s.applyAgentActivity(&resp, summary)
 	resp.Repo = s.repoRefFromParts(
 		summary.Platform, summary.PlatformHost, summary.RepoOwner, summary.RepoName,
+		summary.RepoKey,
 	)
 	if s.workspaceEnrichmentDisabled {
 		return
@@ -134,6 +136,7 @@ func (s *Handler) workspaceResponseFromEnrichmentCacheEntry(
 	resp := toWorkspaceResponse(summary)
 	resp.Repo = s.repoRefFromParts(
 		summary.Platform, summary.PlatformHost, summary.RepoOwner, summary.RepoName,
+		summary.RepoKey,
 	)
 	resp.EnrichmentStatus = workspaceEnrichmentPending
 	if entry == nil {
@@ -272,12 +275,12 @@ func (s *Handler) cachedWorkspaceEnrichment(
 	if !ok {
 		return nil, true
 	}
-	copy := entry
+	entryCopy := entry
 	tmuxDue, divergenceDue := entry.componentsDue(s.now())
 	if kind == workspaceEnrichmentTmux {
-		return &copy, tmuxDue
+		return &entryCopy, tmuxDue
 	}
-	return &copy, tmuxDue || divergenceDue
+	return &entryCopy, tmuxDue || divergenceDue
 }
 
 // componentsDue reports which enrichment components have aged past their
@@ -684,6 +687,49 @@ func (s *Handler) scheduleWorkspaceTmuxPrune() {
 	s.workspaceEnrichmentMu.Unlock()
 }
 
+// restoringBaseTerminals reports whether base terminals lost with a tmux
+// server are still being restored, so the prune must not error their
+// workspaces.
+func (s *Handler) restoringBaseTerminals() bool {
+	s.runtimeRecoveryMu.Lock()
+	defer s.runtimeRecoveryMu.Unlock()
+	return len(s.baseRestoreRemaining) > 0 || s.baseRestoreListPending
+}
+
+// retainMissingRuntime reports whether the missing-tmux prune must keep a
+// runtime row whose tmux session is gone. It is asked after tmux was listed,
+// so a runtime lost during the pass is judged on current evidence: a runtime
+// pending recovery is kept; a runtime whose exit this process has not yet
+// seen waits for its exit handler, and its missing session may mean a lost
+// server, so base terminals are restored before any workspace is errored; a
+// seen exit gets the exit handler's decision.
+func (s *Handler) retainMissingRuntime(stored db.WorkspaceRuntimeSession) bool {
+	s.runtimeRecoveryMu.Lock()
+	pending := s.runtimeRecoveryPending[stored.SessionKey]
+	s.runtimeRecoveryMu.Unlock()
+	if pending || s.runtime == nil {
+		return pending
+	}
+	// The runtime moves a session from running to exited in one step, so
+	// checking running first never misses an exit in between.
+	for _, live := range s.runtime.ListSessions(stored.WorkspaceID) {
+		if live.Key == stored.SessionKey {
+			s.runtimeRecoveryMu.Lock()
+			s.baseRestoreListPending = true
+			s.runtimeRecoveryMu.Unlock()
+			return true
+		}
+	}
+	exited, ok := s.runtime.ExitedSession(stored.SessionKey)
+	if !ok || !exited.CreatedAt.Equal(stored.CreatedAt) {
+		return false
+	}
+	if exited.Kind == localruntime.LaunchTargetACP {
+		return s.keepsExitedChat(exited)
+	}
+	return s.keepAgentAfterTmuxServerLoss(exited)
+}
+
 func (s *Handler) runWorkspaceTmuxPrune(ctx context.Context) {
 	defer func() {
 		s.workspaceEnrichmentMu.Lock()
@@ -697,14 +743,18 @@ func (s *Handler) runWorkspaceTmuxPrune(ctx context.Context) {
 		slog.Debug("retry workspace runtime recovery", "err", err)
 	}
 	cancelRecovery()
+	if s.restoringBaseTerminals() {
+		slog.Debug("skip missing tmux prune while base terminals are restored")
+		return
+	}
 	pruneCtx, cancel := context.WithTimeout(
 		ctx, workspaceEnrichmentRefreshTimeout,
 	)
 	defer cancel()
-	s.runtimeRecoveryMu.Lock()
-	pendingRecovery := maps.Clone(s.runtimeRecoveryPending)
-	s.runtimeRecoveryMu.Unlock()
-	pruned, err := s.workspaces.PruneMissingTmuxSessions(pruneCtx, pendingRecovery)
+	pruned, err := s.workspaces.PruneMissingTmuxSessions(pruneCtx, workspace.TmuxPruneHooks{
+		RetainRuntime:       s.retainMissingRuntime,
+		HoldWorkspaceStatus: s.restoringBaseTerminals,
+	})
 	if err != nil {
 		slog.Debug("prune missing tmux sessions", "err", err)
 	}

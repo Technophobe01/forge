@@ -1,9 +1,29 @@
-/* Shared design tokens (palette, typography, spacing, radii, shadows,
-   breakpoints rationale) come from kit-ui; app.css only defines
-   kenn-forge-specific tokens on top. */
+/* Shared design tokens come from kit-ui; Forge adds app-specific tokens
+   and increases the quiet dark palette's surface contrast below. */
 @import "@kenn-io/kit-ui/theme.css";
-/* Mermaid viewer chrome plus the --mermaid- and --viewer-scrim tokens (opt-in kit module). */
+/* The quiet identity (system type, AA muted text, sentence-case labels);
+   index.html and initTheme select it with data-kit-theme="quiet". */
+@import "@kenn-io/kit-ui/themes.css";
+/* Mermaid viewer chrome plus the --mermaid- tokens (opt-in kit module). */
 @import "@kenn-io/kit-ui/mermaid.css";
+/* Expand buttons on markdown images; the expanded view is kit MediaViewer. */
+@import "@kenn-io/kit-ui/markdown-images.css";
+@import "./e-reader.css";
+
+/* kit's themes.css tints scrollbars under every named theme; Forge's scroll
+   panes keep browser-native scrollbars (tests/e2e/viewport-fit.spec.ts). */
+:root[data-kit-theme] {
+  scrollbar-color: auto;
+}
+
+/* kit's SplitResizeHandle sits at z-index 1, below xterm's canvas and
+   scrollbar layers (up to 11), which would swallow the handle's grab margin
+   beside a terminal. Lift it above them and below kit popovers. :root and
+   the attribute outrank kit's scoped rule. Placement only: kit owns the
+   handle's thickness and look. */
+:root .kit-split-resize-handle[role="separator"] {
+  z-index: 12;
+}
 
 /* Reset */
 *,
@@ -18,13 +38,7 @@
 :root {
   --chrome-border-width: 1px;
   --chrome-active-accent-width: 2px;
-  --chrome-pane-divider-width: 3px;
-  --chrome-dock-resize-hit-size: 7px;
-  --chrome-dock-resize-hit-outset: 4px;
-  --chrome-dock-resize-stripe-offset: 2px;
   --z-flash: 1050;
-  --actions-repository-rail-width: 190px;
-  --actions-workflow-list-width: 220px;
   --budget-green: var(--accent-green);
   --budget-yellow: var(--accent-amber);
   --budget-red: var(--accent-red);
@@ -73,26 +87,62 @@
   --diff-stale-text: #9a6700; /* kit-ui-check-ignore: darker warning ink for AA contrast on the light stale surface */
   --diff-stale-border: color-mix(in srgb, var(--accent-amber) 55%, var(--border-default));
 
-  /* Media-viewer chrome uses shared tokens so it remains theme-aware. */
-  --viewer-control-bg: color-mix(in srgb, var(--bg-inset) 92%, transparent);
-  --viewer-control-hover: color-mix(in srgb, var(--bg-surface-hover) 96%, transparent);
-  --viewer-control-border: color-mix(in srgb, var(--border-default) 48%, transparent);
-  --viewer-control-text: var(--text-primary);
-  --viewer-control-shadow: var(--shadow-sm);
-  --viewer-panel-shadow: var(--shadow-lg);
-
   --text-on-accent: var(--bg-surface);
-  --terminal-bg: #0d1117; /* kit-ui-check-ignore: xterm surface stays dark in both themes */
+  --terminal-bg: #d9d7d3; /* kit-ui-check-ignore: matches the light xterm theme */
   --bubble-ink: #0a0d14; /* kit-ui-check-ignore: dark ink for light accent bubble fills in both themes */
 }
 
 /* App-specific tokens — dark theme */
 :root.dark {
+  --terminal-bg: #0d1117; /* kit-ui-check-ignore: matches the dark xterm theme */
   --budget-bar-bg: var(--border-muted);
   --kanban-new: var(--text-muted);
   --diff-stale-text: var(--accent-amber);
   --sidebar-row-hover-bg: color-mix(in srgb, var(--bg-surface-hover) 82%, var(--text-muted) 18%);
   --bg-row-selected: color-mix(in srgb, var(--sidebar-row-hover-bg) 38%, var(--bg-surface));
+}
+
+/* Silver quiet light palette: dimmed, nearly neutral gray chrome and
+   reading surface with a trace of warmth and soft warm-black ink around 10:1
+   instead of near-black on near-white, so long reading sessions have no
+   glare and no blue or yellow cast. Steps match dark:
+   inset and hover sit just below the surface. Muted text stays AA on the
+   hover step. Accent text also sits on its own color-mix tint (up to 16%),
+   so each accent darkens until it stays AA on that tint over the inset
+   step. Keep kit's high-contrast palette authoritative when
+   enabled. */
+:root[data-kit-theme="quiet"]:not(.dark):not(.high-contrast) {
+  --bg-primary: #cbc9c5; /* kit-ui-check-ignore: silver chrome canvas */
+  --bg-surface: #d9d7d3; /* kit-ui-check-ignore: silver reading surface without glare */
+  --bg-inset: #d2d0cc; /* kit-ui-check-ignore: one step below the surface */
+  --bg-surface-hover: #c9c7c2; /* kit-ui-check-ignore: two steps below the surface */
+  --border-default: #aaa7a1; /* kit-ui-check-ignore: control edges on the silver surface */
+  --border-muted: #bdbab5; /* kit-ui-check-ignore: dividers on the silver surface */
+  --text-primary: #2a2927; /* kit-ui-check-ignore: soft warm-black ink, about 10:1 on the surface */
+  --text-secondary: #3c3a37; /* kit-ui-check-ignore: secondary ink */
+  --text-muted: #4f4c48; /* kit-ui-check-ignore: AA on the hover step */
+  --accent-blue: #1d4580; /* kit-ui-check-ignore: AA on its 16% tint */
+  --accent-amber: #733307; /* kit-ui-check-ignore: AA on its 16% tint */
+  --accent-purple: #55309a; /* kit-ui-check-ignore: AA on its 16% tint */
+  --accent-green: #184d2d; /* kit-ui-check-ignore: AA on its 16% tint */
+  --accent-red: #851f18; /* kit-ui-check-ignore: AA on its 16% tint */
+  --accent-teal: #0d4d57; /* kit-ui-check-ignore: AA on its 16% tint */
+  --status-waiting: #5a4728; /* kit-ui-check-ignore: AA on its 16% tint */
+  --diff-stale-text: var(--accent-amber);
+}
+
+/* Darker quiet reading surfaces with small, even elevation steps: inset
+   and hover sit just above the surface so tabs, group headers, and chips
+   read as structure, not gray blocks. Kit's muted text stays AA on every
+   step. Keep kit's high-contrast palette authoritative when enabled. */
+:root.dark[data-kit-theme="quiet"]:not(.high-contrast) {
+  --bg-primary: #0f1012; /* kit-ui-check-ignore: quiet dark canvas */
+  --bg-surface: #141518; /* kit-ui-check-ignore: quiet dark reading surface */
+  --bg-inset: #1c1e22; /* kit-ui-check-ignore: one step above the surface */
+  --bg-surface-hover: #24272c; /* kit-ui-check-ignore: two steps above the surface */
+  --border-default: #33363c; /* kit-ui-check-ignore: control edges on the darker surface */
+  --border-muted: #26292e; /* kit-ui-check-ignore: dividers on the darker surface */
+  --sidebar-row-hover-bg: var(--bg-surface-hover);
 }
 
 /* Base. The root stays at the browser default (no html font-size) so the
@@ -116,6 +166,44 @@ body {
 
 body {
   font-size: var(--font-size-root);
+}
+
+/* Phone type scale. kit-ui's touch scale (16px body, 20px titles) costs
+   too many rows on triage screens, so phones get a denser scale here:
+   15px body, 13px metadata, 17px titles. Text fields stay at 1rem because
+   iOS zooms the page when a focused field renders below 16px. */
+:root {
+  --font-size-touch-field: 1rem;
+  --font-size-phone-prose: 0.875rem;
+  --mobile-chrome-hit-target: 2.5rem;
+}
+
+@media (hover: none) and (pointer: coarse) {
+  :root {
+    --font-size-2xs: 0.6875rem;
+    --font-size-xs: 0.75rem;
+    --font-size-sm: 0.8125rem;
+    --font-size-md: 0.9375rem;
+    --font-size-lg: 1rem;
+    --font-size-xl: 1.0625rem;
+    --font-size-2xl: 1.375rem;
+  }
+  #app :is(input:not([type="checkbox"], [type="radio"], [type="range"]), textarea, select) {
+    font-size: max(var(--font-size-touch-field), var(--font-size-acp, var(--font-size-touch-field)));
+  }
+}
+
+:root.kit-type-touch {
+  --font-size-2xs: 0.6875rem;
+  --font-size-xs: 0.75rem;
+  --font-size-sm: 0.8125rem;
+  --font-size-md: 0.9375rem;
+  --font-size-lg: 1rem;
+  --font-size-xl: 1.0625rem;
+  --font-size-2xl: 1.375rem;
+}
+.kit-type-touch #app :is(input:not([type="checkbox"], [type="radio"], [type="range"]), textarea, select) {
+  font-size: max(var(--font-size-touch-field), var(--font-size-acp, var(--font-size-touch-field)));
 }
 
 #app {
@@ -253,202 +341,93 @@ a:hover {
   font-weight: 600;
   margin: 8px 0 4px;
 }
+.markdown-body .markdown-video-frame {
+  display: block;
+  margin: 8px 0;
+  overflow: hidden;
+  border: var(--border-width) solid var(--border-muted);
+  border-radius: var(--radius-md);
+}
+.markdown-body .markdown-video-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  min-width: 0;
+  padding: var(--space-2) var(--space-4);
+  color: var(--text-secondary);
+  background: var(--bg-surface);
+  border: 0;
+  font: inherit;
+  font-size: var(--font-size-sm);
+  text-align: left;
+  cursor: pointer;
+}
+.markdown-body .markdown-video-header:hover {
+  color: var(--text-primary);
+  background: var(--bg-surface-hover);
+}
+.markdown-body .markdown-video-header:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: -2px;
+}
+.markdown-body .markdown-video-header svg {
+  flex: none;
+}
+.markdown-body .markdown-video-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.markdown-body .markdown-video-chevron {
+  transition: transform var(--transition-fast) var(--transition-ease, ease);
+}
+.markdown-body .markdown-video-header[aria-expanded="false"] .markdown-video-chevron {
+  transform: rotate(180deg);
+}
+.markdown-body .markdown-video-header[aria-expanded="false"] ~ * {
+  display: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .markdown-body .markdown-video-chevron {
+    transition: none;
+  }
+}
+.markdown-body .markdown-video-error {
+  display: block;
+  padding: var(--space-4);
+  color: var(--text-muted);
+  border-top: var(--border-width) solid var(--border-muted);
+}
+/* An idle player does not preload, so it has no intrinsic size; a fixed
+   frame keeps it from resizing on first play. */
+.markdown-body video.markdown-video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  max-height: 640px;
+  height: auto;
+  object-fit: contain;
+  border-top: var(--border-width) solid var(--border-muted);
+  background: var(--bg-inset);
+}
+/* The kit-ui player that replaces the <video> (markdown-video-player.ts)
+   keeps the same fixed frame. */
+.markdown-body .markdown-video-player {
+  border-top: var(--border-width) solid var(--border-muted);
+  border-radius: 0;
+}
+.markdown-body .markdown-video-player video {
+  aspect-ratio: 16 / 9;
+  max-height: 640px;
+  height: auto;
+}
 .markdown-body img {
   max-width: 100%;
   height: auto;
   border-radius: var(--radius-sm);
-}
-.markdown-image-expander {
-  position: relative;
-  display: inline-block;
-  max-width: 100%;
-  vertical-align: top;
-  line-height: 0;
-}
-.markdown-image-expander > a {
-  display: inline-block;
-  max-width: 100%;
-  line-height: 0;
-}
-.markdown-image-expander img {
-  display: block;
-  min-width: 1px;
-  min-height: 1px;
-}
-.markdown-image-expander__button {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  z-index: 2;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 30px;
-  height: 30px;
-  border: 1px solid var(--viewer-control-border);
-  border-radius: var(--radius-md);
-  background: var(--viewer-control-bg);
-  color: var(--viewer-control-text);
-  box-shadow: var(--viewer-control-shadow);
-  opacity: 0;
-  pointer-events: none;
-  transition:
-    background-color 120ms ease-out,
-    opacity 120ms ease-out;
-}
-.markdown-image-expander:hover .markdown-image-expander__button,
-.markdown-image-expander:focus-within .markdown-image-expander__button {
-  opacity: 1;
-  pointer-events: auto;
-}
-.markdown-image-expander__button:hover {
-  background: var(--viewer-control-hover);
-}
-.markdown-image-expander__button:focus-visible {
-  outline: 2px solid var(--accent-blue);
-  outline-offset: 2px;
-}
-.markdown-image-expander__icon {
-  position: relative;
-  display: block;
-  width: 15px;
-  height: 15px;
-}
-.markdown-image-expander__icon::before,
-.markdown-image-expander__icon::after {
-  position: absolute;
-  display: block;
-  content: "";
-}
-.markdown-image-expander__icon::before {
-  top: 1px;
-  left: 1px;
-  width: 10px;
-  height: 10px;
-  border: 2px solid currentColor;
-  border-radius: 50%;
-}
-.markdown-image-expander__icon::after {
-  right: 1px;
-  bottom: 1px;
-  width: 6px;
-  height: 2px;
-  background: currentColor;
-  border-radius: 999px;
-  transform: rotate(45deg);
-  transform-origin: center;
-}
-.markdown-image-lightbox {
-  position: fixed;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  z-index: var(--z-overlay);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 28px;
-  background: var(--viewer-scrim);
-}
-.markdown-image-lightbox__panel {
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: fit-content;
-  height: fit-content;
-  max-width: calc(100vw - 56px);
-  max-height: calc(100vh - 56px);
-  overflow: visible;
-  background: transparent;
-  border: none;
-  border-radius: 0;
-  box-shadow: var(--viewer-panel-shadow);
-}
-.markdown-image-lightbox__panel img {
-  display: block;
-  width: auto;
-  height: auto;
-  max-width: calc(100vw - 56px);
-  max-height: calc(100vh - 56px);
-  object-fit: contain;
-}
-.markdown-image-lightbox__close {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  z-index: 3;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 34px;
-  height: 34px;
-  border: 1px solid transparent;
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: var(--text-secondary);
-  font-family: var(--font-sans);
-  font-size: var(--font-size-xl);
-  line-height: 1;
-  opacity: 0;
-  pointer-events: none;
-  transition:
-    background-color 120ms ease-out,
-    border-color 120ms ease-out,
-    color 120ms ease-out,
-    opacity 120ms ease-out;
-}
-.markdown-image-lightbox__panel:hover .markdown-image-lightbox__close,
-.markdown-image-lightbox__panel:focus-within .markdown-image-lightbox__close {
-  background: var(--viewer-control-bg);
-  border-color: var(--viewer-control-border);
-  color: var(--viewer-control-text);
-  box-shadow: var(--viewer-control-shadow);
-  opacity: 1;
-  pointer-events: auto;
-}
-.markdown-image-lightbox__close:hover {
-  background: var(--viewer-control-hover);
-  color: var(--viewer-control-text);
-}
-.markdown-image-lightbox__close:focus-visible {
-  outline: 2px solid var(--accent-blue);
-  outline-offset: 2px;
-}
-@media (hover: none), (pointer: coarse) {
-  .markdown-image-expander__button,
-  .markdown-image-lightbox__close {
-    opacity: 1;
-    pointer-events: auto;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .markdown-image-expander__button {
-    transition: none;
-  }
-  .markdown-image-lightbox__close {
-    transition: none;
-  }
-}
-@media (max-width: 640px) {
-  .markdown-image-expander__button {
-    top: 6px;
-    right: 6px;
-    width: 32px;
-    height: 32px;
-  }
-  .markdown-image-lightbox {
-    padding: 10px;
-  }
-  .markdown-image-lightbox__panel {
-    max-width: calc(100vw - 20px);
-    max-height: calc(100vh - 20px);
-  }
-  .markdown-image-lightbox__panel img {
-    max-width: calc(100vw - 20px);
-    max-height: calc(100vh - 20px);
-  }
 }
 /* GitHub's (Primer) table layout model: shrink-wrap to content, cap at
    the container, scroll on overflow. Auto table layout then gives compact

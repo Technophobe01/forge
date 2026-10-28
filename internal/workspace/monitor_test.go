@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	"go.kenn.io/forge/platform"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -73,7 +76,7 @@ func insertMonitorWorkspace(
 		TmuxSession:        "kenn-forge-ws-issue",
 		Status:             "ready",
 	}
-	require.NoError(t, d.InsertWorkspace(context.Background(), &ws))
+	require.NoError(t, d.InsertWorkspace(t.Context(), &ws))
 	return ws.ID
 }
 
@@ -83,7 +86,7 @@ func insertMonitorWorkspaceWithIdentity(
 	id, provider, host, owner, name, worktreePath string,
 ) string {
 	t.Helper()
-	require.NoError(t, d.InsertWorkspace(context.Background(), &db.Workspace{
+	require.NoError(t, d.InsertWorkspace(t.Context(), &db.Workspace{
 		ID:           id,
 		Platform:     provider,
 		PlatformHost: host,
@@ -105,7 +108,7 @@ func seedIssue(
 ) {
 	t.Helper()
 	now := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
-	_, err := d.UpsertIssue(context.Background(), &db.Issue{
+	_, err := d.UpsertIssue(t.Context(), &db.Issue{
 		RepoID:         repoID,
 		PlatformID:     repoID*10000 + int64(number),
 		Number:         number,
@@ -123,9 +126,9 @@ func seedIssue(
 func replaceMonitorRepoRoute(t *testing.T, d *db.DB) int64 {
 	t.Helper()
 	identity := db.GitHubRepoIdentity("github.com", "acme", "widget")
-	identity.PlatformRepoID = "repo-acme-widget-replacement"
-	replacement, _, err := d.ReconcileRepositoryObservation(
-		t.Context(), identity, time.Now().UTC().Add(time.Hour),
+	identity.Key = platform.RepositoryIDKey(1012)
+	replacement, err := d.ObserveRepository(
+		t.Context(), identity,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, replacement)
@@ -152,41 +155,6 @@ func TestPRMonitorRunOnceSkipsWorkspaceForInactiveRepository(t *testing.T) {
 	workspace, err := d.GetWorkspace(t.Context(), "ws-issue")
 	require.NoError(err)
 	require.Nil(workspace.AssociatedPRNumber)
-}
-
-func TestPRMonitorLegacyWorkspaceSkipsHistoricallyReusedRoute(t *testing.T) {
-	require := require.New(t)
-	database := openTestDB(t)
-	insertMonitorWorkspace(t, database, t.TempDir(), nil)
-	workspace, err := database.GetWorkspace(t.Context(), "ws-issue")
-	require.NoError(err)
-	require.Zero(workspace.RepoID)
-
-	observedAt := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
-	_, _, err = database.ReconcileRepositoryObservation(t.Context(), db.RepoIdentity{
-		Platform: "github", PlatformHost: "github.com", PlatformRepoID: "repo-original",
-		Owner: "acme", Name: "widget",
-	}, observedAt)
-	require.NoError(err)
-	_, _, err = database.ReconcileRepositoryObservation(t.Context(), db.RepoIdentity{
-		Platform: "github", PlatformHost: "github.com", PlatformRepoID: "repo-original",
-		Owner: "acme", Name: "moved-away",
-	}, observedAt.Add(time.Minute))
-	require.NoError(err)
-	replacement, _, err := database.ReconcileRepositoryObservation(t.Context(), db.RepoIdentity{
-		Platform: "github", PlatformHost: "github.com", PlatformRepoID: "repo-replacement",
-		Owner: "acme", Name: "widget",
-	}, observedAt.Add(2*time.Minute))
-	require.NoError(err)
-	require.NotNil(replacement)
-	seedMRWithHeadRepo(
-		t, database, replacement.Repository.ID, 42,
-		"feature/replacement", "https://github.com/acme/widget.git",
-	)
-
-	candidates, err := NewPRMonitor(database).listOpenPullCandidates(t.Context(), workspace)
-	require.NoError(err)
-	require.Empty(candidates)
 }
 
 func TestPRMonitorRetiresWorkspaceWithoutRepositoryIdentity(t *testing.T) {
@@ -224,7 +192,7 @@ func TestPRMonitorRunOnceUsesUpstreamBranchMatch(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	repoID := seedRepo(t, d, "github.com", "acme", "widget")
 	seedIssue(t, d, repoID, 7, "Track workspace association")
@@ -288,7 +256,7 @@ func TestLaunchSpecMonitorUsesHubCandidatesWithoutProviderItemRows(t *testing.T)
 			Version: WorkspaceLaunchSpecVersion,
 			Repository: WorkspaceLaunchRepository{
 				Provider: "github", PlatformHost: "github.com",
-				PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget",
+				Key: platform.RepositoryIDKey(testRepoID("acme", "widget")), Owner: "acme", Name: "widget",
 				CloneURL: "https://github.com/acme/widget.git", DefaultBranch: "main",
 			},
 			ItemType: db.WorkspaceItemTypeIssue, ItemNumber: 7,
@@ -297,7 +265,7 @@ func TestLaunchSpecMonitorUsesHubCandidatesWithoutProviderItemRows(t *testing.T)
 			SourceVisibleUntil: issuedAt.Add(WorkspaceLaunchSpecVisibilityLease),
 		},
 	))
-	manager := NewManager(database, t.TempDir())
+	manager := newWorkspaceTestManager(t, database, t.TempDir())
 	source := &staticPullCandidateSource{candidates: []db.MergeRequest{{
 		Number: 42, State: db.MergeRequestStateOpen,
 		HeadBranch:       "feature/issue-7",
@@ -319,7 +287,7 @@ func TestPRMonitorRunOnceFallsBackToLocalBranchNameAndHeadSHA(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	repoID := seedRepo(t, d, "github.com", "acme", "widget")
 	seedIssue(t, d, repoID, 7, "Track workspace association")
@@ -363,7 +331,7 @@ func TestPRMonitorRefreshWorkspaceAssociationAssociatesKataTask(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	repoID := seedRepo(t, d, "github.com", "acme", "widget")
 	worktreePath := setupMonitorRepo(t)
@@ -408,15 +376,15 @@ func TestPRMonitorRunOnceFallsBackToLocalHeadSHAWhenUpstreamRepoMetadataMissing(
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
-	repoID, err := d.UpsertRepo(ctx, db.RepoIdentity{
-		Platform:       "gitlab",
-		PlatformHost:   "gitlab.com",
-		PlatformRepoID: "gid://gitlab/Project/42",
-		Owner:          "Group/SubGroup",
-		Name:           "Project",
-		RepoPath:       "Group/SubGroup/Project",
+	repoID, err := reposeed.Seed(ctx, d, db.RepoIdentity{
+		Platform:     "gitlab",
+		PlatformHost: "gitlab.com",
+		Key:          platform.RepositoryIDKey(1002),
+		Owner:        "Group/SubGroup",
+		Name:         "Project",
+		RepoPath:     "Group/SubGroup/Project",
 	})
 	require.NoError(err)
 	seedIssue(t, d, repoID, 7, "Track workspace association")
@@ -460,7 +428,7 @@ func TestPRMonitorRunOnceRejectsLocalBranchWithMismatchedHeadSHA(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	repoID := seedRepo(t, d, "github.com", "acme", "widget")
 	seedIssue(t, d, repoID, 7, "Track workspace association")
@@ -500,7 +468,7 @@ func TestPRMonitorRunOnceRejectsLocalBranchWithMismatchedUpstreamRemote(t *testi
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	repoID := seedRepo(t, d, "github.com", "acme", "widget")
 	seedIssue(t, d, repoID, 7, "Track workspace association")
@@ -559,7 +527,7 @@ func TestPRMonitorRunOnceSkipsSyntheticIssueBranch(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	repoID := seedRepo(t, d, "github.com", "acme", "widget")
 	seedIssue(t, d, repoID, 7, "Track workspace association")
@@ -584,7 +552,7 @@ func TestPRMonitorRunOnceAssociatesPRFromManagedIssueBranch(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	repoID := seedRepo(t, d, "github.com", "acme", "widget")
 	seedIssue(t, d, repoID, 7, "Track workspace association")
@@ -630,7 +598,7 @@ func TestPRMonitorRunOnceAssociatesPRWhenSlugWorkspaceCheckedOutToBareBranch(t *
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	repoID := seedRepo(t, d, "github.com", "acme", "widget")
 	seedIssue(t, d, repoID, 7, "Track workspace association")
@@ -693,7 +661,7 @@ func TestPRMonitorRunOnceUsesUpstreamRemoteIdentity(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	repoID := seedRepo(t, d, "github.com", "acme", "widget")
 	seedIssue(t, d, repoID, 7, "Track workspace association")
@@ -734,22 +702,22 @@ func TestPRMonitorRunOnceScopesCandidatesByWorkspaceProvider(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
-	githubRepoID, err := d.UpsertRepo(ctx, db.RepoIdentity{
-		Platform:       "github",
-		PlatformHost:   "git.example.com",
-		PlatformRepoID: "repo-github-widget",
-		Owner:          "acme",
-		Name:           "widget",
+	githubRepoID, err := reposeed.Seed(ctx, d, db.RepoIdentity{
+		Platform:     "github",
+		PlatformHost: "git.example.com",
+		Key:          platform.RepositoryIDKey(1015),
+		Owner:        "acme",
+		Name:         "widget",
 	})
 	require.NoError(err)
-	gitlabRepoID, err := d.UpsertRepo(ctx, db.RepoIdentity{
-		Platform:       "gitlab",
-		PlatformHost:   "git.example.com",
-		PlatformRepoID: "repo-gitlab-widget",
-		Owner:          "acme",
-		Name:           "widget",
+	gitlabRepoID, err := reposeed.Seed(ctx, d, db.RepoIdentity{
+		Platform:     "gitlab",
+		PlatformHost: "git.example.com",
+		Key:          platform.RepositoryIDKey(1017),
+		Owner:        "acme",
+		Name:         "widget",
 	})
 	require.NoError(err)
 	seedIssue(t, d, gitlabRepoID, 7, "Track workspace association")
@@ -786,7 +754,7 @@ func TestPRMonitorRefreshWorkspaceAssociationReturnsInspectionError(t *testing.T
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	repoID := seedRepo(t, d, "github.com", "acme", "widget")
 	seedIssue(t, d, repoID, 7, "Track workspace association")
@@ -826,14 +794,14 @@ func TestSelectPRByUpstream(t *testing.T) {
 		},
 	}
 
-	number, ok := selectPRByUpstream("github", candidates, upstreamState{
+	number, ok := selectPRByUpstream("github", "", candidates, upstreamState{
 		branchName: "shared-branch",
 		remoteURL:  "git@github.com:Fork-Two/Widget.git",
 	})
 	assert.True(ok)
 	assert.Equal(42, number)
 
-	number, ok = selectPRByUpstream("github", []db.MergeRequest{{
+	number, ok = selectPRByUpstream("github", "", []db.MergeRequest{{
 		Number:           44,
 		HeadBranch:       "shared-branch",
 		HeadRepoCloneURL: "https://ghe.example.com/fork-two/widget.git",
@@ -849,7 +817,7 @@ func TestSelectPRByUpstream(t *testing.T) {
 		{branchName: "missing", remoteURL: "git@github.com:Fork-Two/Widget.git"},
 		{branchName: ""},
 	} {
-		number, ok = selectPRByUpstream("github", candidates, upstream)
+		number, ok = selectPRByUpstream("github", "", candidates, upstream)
 		assert.False(ok)
 		assert.Zero(number)
 	}
@@ -865,19 +833,19 @@ func TestSelectPRByBranchRejectsAmbiguousMatches(t *testing.T) {
 	}
 
 	number, ok := selectPRByLocalBranch(
-		"github", candidates, "single-local", "abc123", upstreamState{},
+		"github", "", candidates, "single-local", "abc123", upstreamState{},
 	)
 	assert.True(ok)
 	assert.Equal(43, number)
 
 	number, ok = selectPRByLocalBranch(
-		"github", candidates, "shared-local", "abc123", upstreamState{},
+		"github", "", candidates, "shared-local", "abc123", upstreamState{},
 	)
 	assert.False(ok)
 	assert.Zero(number)
 
 	number, ok = selectPRByLocalBranch(
-		"github", candidates, "wrong-head", "abc123", upstreamState{},
+		"github", "", candidates, "wrong-head", "abc123", upstreamState{},
 	)
 	assert.False(ok)
 	assert.Zero(number)
@@ -947,34 +915,34 @@ func TestNormalizeCloneRepoIdentity(t *testing.T) {
 
 	assert.Equal(
 		"github/github.com/fork/widget",
-		normalizeCloneRepoIdentity("github", " git@GitHub.com:Fork/Widget.git "),
+		normalizeCloneRepoIdentity("github", "", " git@GitHub.com:Fork/Widget.git "),
 	)
 	assert.Equal(
 		"github/github.com/fork/widget",
-		normalizeCloneRepoIdentity("github", "https://token@github.com/Fork/Widget/"),
+		normalizeCloneRepoIdentity("github", "", "https://token@github.com/Fork/Widget/"),
 	)
 	assert.Equal(
 		"github/github.com/fork/widget",
-		normalizeCloneRepoIdentity("github", "ssh://git@github.com:22/Fork/Widget.git"),
+		normalizeCloneRepoIdentity("github", "", "ssh://git@github.com:22/Fork/Widget.git"),
 	)
 	assert.Equal(
 		"github/ghe.example.com:8443/fork/widget",
-		normalizeCloneRepoIdentity("github", "https://ghe.example.com:8443/Fork/Widget.git"),
+		normalizeCloneRepoIdentity("github", "", "https://ghe.example.com:8443/Fork/Widget.git"),
 	)
 	assert.Equal(
 		"gitlab/gitlab.com/group/subgroup/project",
-		normalizeCloneRepoIdentity("gitlab", "https://gitlab.com/Group/Subgroup/Project.git"),
+		normalizeCloneRepoIdentity("gitlab", "", "https://gitlab.com/Group/Subgroup/Project.git"),
 	)
 	assert.Equal(
 		"gitlab/gitlab.com/group/subgroup/project",
-		normalizeCloneRepoIdentity("gitlab", "git@gitlab.com:Group/Subgroup/Project.git"),
+		normalizeCloneRepoIdentity("gitlab", "", "git@gitlab.com:Group/Subgroup/Project.git"),
 	)
 	assert.NotEqual(
-		normalizeCloneRepoIdentity("github", "https://forge.example/acme/widget.git"),
-		normalizeCloneRepoIdentity("gitlab", "https://forge.example/acme/widget.git"),
+		normalizeCloneRepoIdentity("github", "", "https://forge.example/acme/widget.git"),
+		normalizeCloneRepoIdentity("gitlab", "", "https://forge.example/acme/widget.git"),
 	)
-	assert.Empty(normalizeCloneRepoIdentity("github", "/tmp/workspace/remote.git"))
-	assert.Empty(normalizeCloneRepoIdentity("github", "not a clone url"))
+	assert.Empty(normalizeCloneRepoIdentity("github", "", "/tmp/workspace/remote.git"))
+	assert.Empty(normalizeCloneRepoIdentity("github", "", "not a clone url"))
 }
 
 func TestNormalizePlatformHostIdentity(t *testing.T) {
@@ -983,4 +951,12 @@ func TestNormalizePlatformHostIdentity(t *testing.T) {
 	assert.Equal("ghe.example.com:8443", normalizePlatformHostIdentity("GHE.example.com:8443"))
 	assert.Equal("ghe.example.com", normalizePlatformHostIdentity("ghe.example.com:443"))
 	assert.Equal("ghe.example.com", normalizePlatformHostIdentity("ghe.example.com"))
+}
+
+func TestBitbucketDataCenterHeadAndUpstreamIdentity(t *testing.T) {
+	require.Nil(t, WorkspaceHeadRepo("bitbucket", "code.example.test:8443", "PROJECT", "repo", "https://code.example.test:8443/scm/PROJECT/repo.git"))
+	require.Nil(t, WorkspaceHeadRepo("bitbucket", "code.example.test:8443", "PROJECT", "repo", "ssh://git@code.example.test:7999/PROJECT/repo.git"))
+	number, ok := selectPRByUpstream("bitbucket", "code.example.test:8443", []db.MergeRequest{{Number: 7, HeadBranch: "topic", HeadRepoCloneURL: "https://code.example.test:8443/scm/PROJECT/repo.git"}}, upstreamState{branchName: "topic", remoteURL: "ssh://git@code.example.test:7999/PROJECT/repo.git"})
+	require.True(t, ok)
+	require.Equal(t, 7, number)
 }

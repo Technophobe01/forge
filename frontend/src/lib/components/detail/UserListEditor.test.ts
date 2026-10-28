@@ -35,6 +35,109 @@ describe("UserListEditor", () => {
     await Effect.runPromise(runtime.disposeEffect);
   });
 
+  it("shows account names while submitting stable IDs and disallowing free-text identities", async () => {
+    const onchange = vi.fn((_next, callbacks) => callbacks.onSettled?.());
+    renderEditor({
+      label: "Reviewers",
+      users: ["{22222222-2222-4222-8222-222222222222}"],
+      canEdit: true,
+      loadCandidates: candidateLoader([]),
+      loadAccounts: () =>
+        Effect.succeed({
+          accounts: [
+            {
+              id: "{22222222-2222-4222-8222-222222222222}",
+              display_name: "Alex Example",
+              nickname: "alex",
+              avatar_url: "",
+            },
+            {
+              id: "{33333333-3333-4333-8333-333333333333}",
+              display_name: "Alex Other",
+              nickname: "alex",
+              avatar_url: "",
+            },
+          ],
+          candidate_error: "",
+        }),
+      onchange,
+    });
+    await waitFor(() => expect(screen.getByText("Alex Example (@alex)")).toBeTruthy());
+    await fireEvent.click(screen.getByRole("button", { name: "Edit reviewers" }));
+    await fireEvent.click(await screen.findByRole("menuitemcheckbox", { name: /Alex Other/ }));
+    expect(onchange.mock.calls[0]?.[0]).toEqual([
+      "{22222222-2222-4222-8222-222222222222}",
+      "{33333333-3333-4333-8333-333333333333}",
+    ]);
+    await fireEvent.input(screen.getByLabelText("Filter users"), { target: { value: "unknown person" } });
+    expect(screen.queryByRole("menuitemcheckbox")).toBeNull();
+    expect(screen.queryByText(/Add “/)).toBeNull();
+  });
+
+  it("filters partial reviewer accounts without reloading and retries discovery explicitly", async () => {
+    const existing = {
+      id: "{22222222-2222-4222-8222-222222222222}",
+      display_name: "Alex Example",
+      nickname: "alex",
+      avatar_url: "",
+    };
+    const loadAccounts = vi
+      .fn()
+      .mockReturnValueOnce(
+        Effect.succeed({
+          accounts: [existing],
+          candidate_error: "Workspace members could not be loaded.",
+        }),
+      )
+      .mockReturnValue(
+        Effect.succeed({
+          accounts: [
+            existing,
+            {
+              id: "{33333333-3333-4333-8333-333333333333}",
+              display_name: "Alex Other",
+              nickname: "other",
+              avatar_url: "",
+            },
+          ],
+          candidate_error: "",
+        }),
+      );
+    renderEditor({
+      label: "Reviewers",
+      users: [existing.id],
+      canEdit: true,
+      loadCandidates: candidateLoader([]),
+      loadAccounts,
+      onchange: vi.fn(),
+    });
+
+    await waitFor(() => expect(screen.getByText("Alex Example (@alex)")).toBeTruthy());
+    await fireEvent.click(screen.getByRole("button", { name: "Edit reviewers" }));
+    expect(screen.getByRole("alert").textContent).toContain("Workspace members could not be loaded.");
+    vi.useFakeTimers();
+    try {
+      await fireEvent.input(screen.getByLabelText("Filter users"), { target: { value: "nobody" } });
+      await vi.advanceTimersByTimeAsync(250);
+      expect(screen.queryByRole("menuitemcheckbox")).toBeNull();
+      await fireEvent.input(screen.getByLabelText("Filter users"), { target: { value: "Alex" } });
+      await vi.advanceTimersByTimeAsync(250);
+      expect(screen.getByRole("menuitemcheckbox", { name: /Alex Example/ })).toBeTruthy();
+      expect(loadAccounts).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    await fireEvent.click(screen.getByRole("button", { name: "Close user picker" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Edit reviewers" }));
+    expect(screen.getByRole("alert").textContent).toContain("Workspace members could not be loaded.");
+    expect(loadAccounts).toHaveBeenCalledTimes(1);
+    await fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(screen.getByRole("menuitemcheckbox", { name: /Alex Other/ })).toBeTruthy());
+    expect(loadAccounts).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("keeps a mutation flash visible when a later candidate fetch succeeds", async () => {
     const loadCandidates = candidateLoader(["alice", "bob"]);
     const onchange = vi.fn((_next, callbacks) => {

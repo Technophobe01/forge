@@ -7,13 +7,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/db"
-	"go.kenn.io/forge/internal/procutil"
 	"go.kenn.io/forge/internal/testutil/gitfixture"
 )
 
@@ -38,6 +38,11 @@ func TestCloneProject(t *testing.T) {
 		"path": dest,
 	})
 	resp := httpDo(t, ts, http.MethodPost, "/api/v1/projects/clone", body)
+	t.Cleanup(func() {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	})
 	require.Equal(http.StatusCreated, resp.StatusCode)
 	var created struct {
 		ID        string `json:"id"`
@@ -67,7 +72,7 @@ func TestCloneProject(t *testing.T) {
 // TestCloneProjectBranchAndHomePath covers the branch option and
 // home-relative destination expansion: fleet clients send "~/..." paths
 // because only the executing host knows its home.
-func TestCloneProjectBranchAndHomePath(t *testing.T) {
+func TestCloneProjectBranchAndHomePath(t *testing.T) { //nolint:paralleltest // t.Setenv writes HOME
 	acquireWorkspaceGitSlot(t)
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
@@ -91,6 +96,11 @@ func TestCloneProjectBranchAndHomePath(t *testing.T) {
 		"branch": "feat/clone",
 	})
 	resp := httpDo(t, ts, http.MethodPost, "/api/v1/projects/clone", body)
+	t.Cleanup(func() {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	})
 	require.Equal(http.StatusCreated, resp.StatusCode)
 	var created struct {
 		LocalPath string `json:"local_path"`
@@ -99,12 +109,8 @@ func TestCloneProjectBranchAndHomePath(t *testing.T) {
 	resp.Body.Close()
 	assert.Equal(filepath.Join(fakeHome, "clones", "widget"), created.LocalPath)
 
-	out, err := procutil.Command(
-		"git", "-C", created.LocalPath,
-		"rev-parse", "--abbrev-ref", "HEAD",
-	).Output()
-	require.NoError(err)
-	assert.Equal("feat/clone", string(out[:len(out)-1]))
+	out := gitfixture.Run(t, created.LocalPath, "rev-parse", "--abbrev-ref", "HEAD")
+	assert.Equal("feat/clone", strings.TrimSpace(string(out)))
 }
 
 // TestCloneProjectFailureCleansOwnedDestination pins the rollback
@@ -133,6 +139,11 @@ func TestCloneProjectFailureCleansOwnedDestination(t *testing.T) {
 
 	for attempt := 1; attempt <= 2; attempt++ {
 		resp := httpDo(t, ts, http.MethodPost, "/api/v1/projects/clone", body)
+		t.Cleanup(func() {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+		})
 		var problem struct {
 			Code string `json:"code"`
 		}
@@ -167,6 +178,11 @@ func TestListProjectBranches(t *testing.T) {
 
 	resp := httpDo(t, ts, http.MethodGet,
 		"/api/v1/projects/"+projectID+"/branches", nil)
+	t.Cleanup(func() {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	})
 	require.Equal(http.StatusOK, resp.StatusCode)
 	var body struct {
 		Branches []string `json:"branches"`
@@ -227,6 +243,11 @@ func TestInspectProjectWorktree(t *testing.T) {
 		resp := httpDo(t, ts, http.MethodGet,
 			"/api/v1/projects/"+projectID+"/worktrees/"+
 				worktreeID+"/inspect", nil)
+		t.Cleanup(func() {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+		})
 		require.Equal(http.StatusOK, resp.StatusCode)
 		var got inspection
 		require.NoError(json.NewDecoder(resp.Body).Decode(&got))
@@ -292,6 +313,11 @@ func TestInspectProjectWorktreeCountsStoredTmuxSessions(t *testing.T) {
 
 	resp := httpDo(t, ts, http.MethodGet,
 		"/api/v1/projects/"+projectID+"/worktrees/"+worktreeID+"/inspect", nil)
+	t.Cleanup(func() {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	})
 	require.Equal(http.StatusOK, resp.StatusCode)
 	var got struct {
 		AliveSessionCount int `json:"alive_session_count"`

@@ -8,6 +8,7 @@ import (
 	"go.kenn.io/forge/internal/providerplane"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/server/workspaceapi"
+	"go.kenn.io/forge/platform"
 )
 
 // ProviderSource supplies hub-owned pull data without spoke-local
@@ -19,6 +20,7 @@ type ProviderSource interface {
 }
 
 type ListQuery struct {
+	Attributes string
 	Label      string
 	Repo       string
 	State      string
@@ -45,6 +47,7 @@ type StackContext struct {
 	Position int
 	Size     int
 	Health   string
+	Native   bool
 	Members  []StackMember
 }
 
@@ -79,7 +82,7 @@ func (s *Handler) ListService(ctx context.Context, req ListQuery) ([]MergeReques
 	if err != nil {
 		return nil, err
 	}
-	return s.overlayLocalPullWorkspaces(ctx, rows)
+	return s.OverlayLocalWorkspaces(ctx, rows)
 }
 
 // ListProviderService returns provider-owned rows in hub order. It
@@ -90,8 +93,29 @@ func (s *Handler) ListProviderService(
 	output, err := s.listPullsRouteCore(ctx, &listPullsInput{
 		Repo: req.Repo, State: req.State, Kanban: req.Kanban,
 		Starred: req.Starred, InvolvesMe: req.InvolvesMe, Unassigned: req.Unassigned,
-		Q: req.Text, Label: req.Label, Limit: req.Limit, Offset: req.Offset,
-	})
+		Q: req.Text, Label: req.Label, Attributes: req.Attributes, Limit: req.Limit, Offset: req.Offset,
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	rows := output.Body
+	for i := range rows {
+		rows[i].Workspace = nil
+		rows[i].LastWorkspaceActivityAt = ""
+	}
+	return rows, nil
+}
+
+// RowsForItems returns list-pulls rows for the named visible pull requests in
+// any state, without workspace references. Rows for repositories the list
+// hides are omitted.
+func (s *Handler) RowsForItems(
+	ctx context.Context, items []db.RepoItemNumber,
+) ([]MergeRequestResponse, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	output, err := s.listPullsRouteCore(ctx, &listPullsInput{State: "all"}, items)
 	if err != nil {
 		return nil, err
 	}
@@ -134,7 +158,10 @@ func (s *Handler) GetProviderService(
 	return detail, nil
 }
 
-func (s *Handler) overlayLocalPullWorkspaces(
+// OverlayLocalWorkspaces replaces workspace references on provider rows
+// with this machine's own, since a reference from another node names a
+// workspace this machine cannot open. It returns a copy.
+func (s *Handler) OverlayLocalWorkspaces(
 	ctx context.Context, rows []MergeRequestResponse,
 ) ([]MergeRequestResponse, error) {
 	rows = append(make([]MergeRequestResponse, 0, len(rows)), rows...)
@@ -177,9 +204,9 @@ func (s *Handler) overlayLocalPullDetail(
 		return detail
 	}
 	identity := providerplane.ItemIdentity{
-		Repository: providerplane.RepositoryIdentity{
+		Repository: platform.RepositoryIdentity{
 			Provider: detail.Repo.Provider, PlatformHost: detail.Repo.PlatformHost,
-			PlatformRepoID: detail.Repo.PlatformRepoID,
+			Key: detail.Repo.Key,
 		},
 		ItemType: "pr", ItemNumber: detail.MergeRequest.Number,
 	}.Canonical()
@@ -199,10 +226,10 @@ func pullWorkspaceOverlays(
 			continue
 		}
 		identity := providerplane.ItemIdentity{
-			Repository: providerplane.RepositoryIdentity{
-				Provider:       activity.Subject.Platform,
-				PlatformHost:   activity.Subject.PlatformHost,
-				PlatformRepoID: activity.Subject.PlatformRepoID,
+			Repository: platform.RepositoryIdentity{
+				Provider:     activity.Subject.Platform,
+				PlatformHost: activity.Subject.PlatformHost,
+				Key:          activity.Subject.RepoKey,
 			},
 			ItemType: "pr", ItemNumber: key.ItemNumber,
 		}.Canonical()
@@ -215,9 +242,9 @@ func pullWorkspaceOverlays(
 
 func pullResponseIdentity(row MergeRequestResponse) providerplane.ItemIdentity {
 	return providerplane.ItemIdentity{
-		Repository: providerplane.RepositoryIdentity{
+		Repository: platform.RepositoryIdentity{
 			Provider: row.Repo.Provider, PlatformHost: row.Repo.PlatformHost,
-			PlatformRepoID: row.Repo.PlatformRepoID,
+			Key: row.Repo.Key,
 		},
 		ItemType: "pr", ItemNumber: row.Number,
 	}.Canonical()
@@ -260,6 +287,7 @@ func (s *Handler) GetStackService(
 	stack := StackContext{
 		ID: output.Body.StackID, Name: output.Body.StackName,
 		Position: output.Body.Position, Size: output.Body.Size, Health: output.Body.Health,
+		Native:  output.Body.Native,
 		Members: make([]StackMember, 0, len(output.Body.Members)),
 	}
 	for _, member := range output.Body.Members {
@@ -271,7 +299,7 @@ func (s *Handler) GetStackService(
 func (stack StackContext) routeResponse() stackContextResponse {
 	response := stackContextResponse{
 		StackID: stack.ID, StackName: stack.Name, Position: stack.Position,
-		Size: stack.Size, Health: stack.Health,
+		Size: stack.Size, Health: stack.Health, Native: stack.Native,
 		Members: make([]stackMemberResponse, 0, len(stack.Members)),
 	}
 	for _, member := range stack.Members {

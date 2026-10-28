@@ -14,14 +14,15 @@ embedder protocol for arbitrary host state.
 - Materialize that entry as a local Git worktree plus tmux session.
 - Let the UI reopen the same workspace from `/workspaces` or `/terminal/:id`.
 - Carry enough item metadata to render the correct sidebar behavior.
+- Workspace response enrichment must preserve `repo.platform_repo_id` from the catalog summary;
+  frontend detail caches require that permanent identity (`internal/server/workspaceapi/helpers.go::repoRefFromParts`).
 - Persist provider workspaces by the internal repository catalog ID. Route
   requests resolve their current occupant before lookup or creation; a rename
   follows the same repository, while route reuse creates a separate workspace
-  identity. Migration backfills every unambiguous catalog route, including
-  route-only repositories. Provider lifecycle code retires legacy rows through
-  dirty-aware deletion and leaves failures stable for explicit user action; it
-  must neither discard uncommitted work nor resolve them through the current
-  occupant
+  identity. Workspaces whose repository row was deleted keep a null `repo_id`;
+  provider lifecycle code retires them through dirty-aware deletion and leaves
+  failures stable for explicit user action; it must neither discard uncommitted
+  work nor resolve them through the current occupant
   (`internal/server/workspaceapi/handler.go::New`,
   `internal/workspace/launch_spec.go::Manager.RequireWorkspaceLaunchSpec`).
 - A repository referenced by a workspace is a durable identity tombstone.
@@ -33,19 +34,21 @@ embedder protocol for arbitrary host state.
   and its owned state instead of adding another legacy path (`internal/db/migrations/000055_workspace_repository_identity.up.sql:15`).
 - Setup verifies the stable repository ID independently of its mutable route.
   Managed clones partition storage by that ID, and configured bases must match
-  it; route reuse must not share checkout state. Network Git work also captures
-  the route generation and fails closed if that route changes before setup
-  completes, restoring refs and retargeted origins after a rejected fetch.
-  Recovery and cleanup discover identity-scoped clones across every route
-  owned by that repository; network reuse retargets a historical origin to the
-  fenced current route
+  it; route reuse must not share checkout state. Setup re-verifies the
+  repository after cloning. Recovery and cleanup accept every bare clone in the
+  repository's identity namespace, whatever route it was cloned under; network
+  reuse retargets an earlier origin to the current route
   (`internal/workspace/manager.go::Manager.workspaceSetupGitDir`,
   `internal/gitclone/clone.go::Manager.EnsureCloneValidated`,
-  `internal/server/settings_handlers.go::Server.worktreeBasePathForRepo`,
+  `internal/server/settingsapi/settings_handlers.go::Handlers.WorktreeBasePathForRepo`,
   `internal/workspace/manager.go::Manager.workspaceManagedCloneCandidates`).
 - A backfilled workspace may keep a route-keyed managed clone from any current
   or historical route that has one stable owner; route reuse excludes that path
   (`internal/workspace/manager.go::Manager.workspaceManagedClonePaths`).
+- Execution workers may set `execution_worker.worktree_dir` for new worktrees;
+  GitHub.com uses `<root>/<owner>/<repo>/<item>` there. Keep runtime metadata and
+  clones under `data_dir`; existing workspace paths remain authoritative
+  (`internal/workspace/manager.go::workspaceRepoDir`).
 - New worktrees live at the plain `<platform>/<host>/<owner>/<name>/<item>`
   path so people can find them by repository name. Only when the catalog shows
   another stable repository has owned that route does the repository directory
@@ -66,7 +69,7 @@ embedder protocol for arbitrary host state.
   (`internal/server/workspaceapi/fleet_snapshot.go::FleetSnapshot`).
 - Managed clones keep `core.bare=true` in shared config and override it per
   linked worktree; repository tools use the shared value to identify this layout
-  (`internal/workspace/manager.go::configureBareLinkedWorktree`).
+  (`internal/workspace/repository_hooks.go::ensureManagedCloneExclude`).
 - Managed clones and existing local base checkouts use the same exact
   provider-host cleartext acknowledgement when validating their canonical remote; local
   bases do not silently weaken or ignore the configured transport policy
@@ -93,6 +96,12 @@ embedder protocol for arbitrary host state.
   - Pending recovery uses a Git-invalid branch marker and must adopt that
     directory without create/cleanup fallback; retry/delete preserve it until setup
     publishes the real branch and ready status (`internal/workspace/manager.go::workspaceRequiresExistingDirectory`).
+- Repository selections and loaded PR/issue details carry the provider's stable ID through local, fleet,
+  and devbox creation; validate it before workspace reuse or creation so a reused route cannot redirect the choice
+  (`internal/server/workspaceapi/routes_handlers.go::createIssueWorkspaceRouteCore`).
+- Repository choices use their stable ID after a rename; creation rejects a different active repository
+  at the supplied route and rejects unknown or inactive repository IDs. Route-only callers keep current-route semantics
+  (`internal/server/httpapi/repository_resolver.go::RepositoryResolver.LookupSelection`).
 - `POST /repo/{provider}/{owner}/{name}/workspaces`: create or reuse an ad-hoc
   workspace for new work with no source item. Its branch is its identity: the
   item key is `adhoc:<branch>` and `item_number` stays 0, so item-key fallbacks
@@ -107,6 +116,9 @@ embedder protocol for arbitrary host state.
   (`internal/workspace/monitor.go::workspacePRMonitorEligible`); that number is
   the workspace's item identity for display, links, and search, so surfaces must
   never gate PR affordances on `item_type == "pull_request"` alone.
+  Local summaries and hub enrichment both take PR state and title from it, but
+  it is not the source item, so `Source*` fields stay empty
+  (`internal/db/queries.go::scanWorkspaceSummary`, `internal/fleet/provider_enrichment.go::EnrichProviderState`).
   A hub may route this creation to itself or a writable spoke; a spoke offers
   only itself as an execution target (`internal/server/fleetapi/fleet_proxy.go::Handler.registerFleetOperationRoutes`).
 - `GET /kata/daemons/{daemon_id}/references`: search canonical Kata issue references on an explicitly pinned daemon for link and workspace creation.
@@ -123,6 +135,36 @@ embedder protocol for arbitrary host state.
     (`internal/server/kata/workspace.go::Handler.createKataWorkspace`).
 - `GET /workspaces`: list kenn-forge's persisted workspaces for the workspaces
   page and terminal picker.
+- `GET`, `POST .../commands`, and `POST .../restore` under
+  `/workspaces/{id}/runtime/sessions/{session_key}/chat` let a coordinator drive a chat over
+  HTTP. The daemon serves them under its normal API auth; execution workers accept only their
+  bearer token. An attached chat answers at once; a chat that is not attached first reconnects
+  the workspace's chats as opening it does (`internal/server/workspaceapi/acp_http.go`).
+  - The snapshot is the published state with transcript messages `[after, after+limit)`, each
+    with its transcript `index`, plus `messageCount` (`limit` 1–500, default 100). A stored chat
+    returns only `exited: true` when its owner is known to be gone: the daemon saw it exit, or
+    a relaunch failed with `cannot_reload`. A chat that could not be attached for another
+    reason, such as workspace setup, is `503`. An `index` can shift by one: a prompt start or
+    a steer inserts its user message before output that arrived while it was being sent, so the
+    agent's reply follows it. A reader paging with `after` can then see a message again; the
+    inserted message carries its `submissionId`.
+  - Commands take the chat command body for input types only. A refusal with an owner error
+    code is `409 conflict` with that code as `details.reason` (`supervised`,
+    `stale_generation`, `uncertain`, `stale_request`, `not_owned`, `person_only`, `withdrawn`, `sending`,
+    `already_answered`, `not_pending`); a disconnected agent or a chat that is not running is
+    `503`, and any other refusal is `400`
+    (`internal/server/workspaceapi/acp_http.go::chatCommandProblem`). A command whose change
+    took effect, such as a sent, steered, queued, moved, or unqueued prompt or a delivered answer, is
+    accepted even if the save after it fails; the chat's `error` reports that
+    (`internal/workspace/localruntime/acp_owner.go::ACP.saveTakenEffectLocked`).
+  - Restore applies only to chats a coordinator holds and uses the stored record. It refuses
+    an unsupervised or taken-over chat with reason `not_supervised`, an agent without
+    `loadSession` with reason `cannot_reload`, and a workspace that setup or deletion owns
+    with `workspaceSetupInProgress` and reason `setup_in_progress`.
+  - After a `cannot_reload` failure, ordinary reads, commands, and workspace opens skip the
+    chat instead of starting an agent each time. An explicit restore tries again, and a
+    successful restore or a stop clears the mark
+    (`internal/server/workspaceapi/acp.go::Handler.setChatCannotReload`).
 - Terminal and mobile pickers read inline workspaces from the projected snapshot;
   they never fan out per-host list reads, and remote actions require advertised
   availability (`frontend/src/lib/components/terminal/WorkspaceListSidebar.svelte::loadWorkspaces`).
@@ -161,7 +203,7 @@ embedder protocol for arbitrary host state.
   work fail with `hubUnavailable`; the spoke must not fall back to stale
   provider replicas. Existing local execution plus ad-hoc and Kata creation
   remain available because their authority is spoke-local
-  (`internal/server/provider_sources.go`, `internal/workspace/launch_spec.go`).
+  (`internal/server/spokeapi/provider_sources.go`, `internal/workspace/launch_spec.go`).
 - Workspace creation is event-confirmed rather than response-owned. After accepting a purpose payload, the backend emits
   `workspace_created` with the persisted ID and a `created` boolean that distinguishes a new workspace from task-scoped
   reuse; clients load that ID through the generated workspace API to recover canonical identity.
@@ -181,7 +223,7 @@ embedder protocol for arbitrary host state.
   (`internal/server/pullapi/services.go::Handler.overlayLocalPullWorkspaces`).
 - Assignment-dependent filters on spoke workspace overlays must use hub state;
   spoke provider rows are optional and cannot decide filter membership
-  (`internal/server/provider_activity_subjects.go::Server.federationFilterUnassignedActivitySubjects`).
+  (`internal/server/providerapi/provider_activity_subjects.go::Handlers.federationFilterUnassignedActivitySubjects`).
 - Workspace enrichment is best-effort on Issue/PR detail: snapshot failures log
   and omit optional workspace metadata rather than hiding a valid item; list and
   Activity reads stay fail-fast because the snapshot affects ordering and identity (`internal/server/pullapi/routes.go::Handler.buildPullDetailResponse`, `internal/server/issueapi/routes.go::Handler.BuildDetail`).
@@ -191,21 +233,16 @@ embedder protocol for arbitrary host state.
   (`frontend/src/lib/views/MobileActivityView.svelte::visibleWorkspaceActivity`).
 - In enabled mode, Activity number search uses the same `#number` shape for provider events,
   notifications, and eventless workspace subjects; matching provider events keep
-  workspace recency across incremental polls (`internal/server/huma_routes.go::Server.workspaceActivityResponse`).
+  workspace recency across incremental polls (`internal/server/itemapi/huma_routes.go::Handlers.WorkspaceActivityResponse`).
 - Enabled workspace recency lets Activity author filters and candidates match
   eventless workspace subjects in the same repository and time scope; disabled
   mode returns provider authors unchanged
-  (`internal/server/huma_routes.go::Server.activityAuthorsWithWorkspace`).
+  (`internal/server/activityapi/huma_routes.go::Handlers.ActivityAuthorsWithWorkspace`).
 - Activity events and parent summaries key that snapshot by stable repo ID and
   canonical item type; normalize wire `"pr"` to workspace `"pull_request"`
-  before lookup so route reuse stays fail-closed (`internal/server/helpers.go::workspaceItemTypeFromActivity`).
-- The shared subject snapshot holds the repository-reconciliation read barrier
-  across both its workspace-summary and subject-metadata reads, so a route move
-  cannot split one response across repository identities
-  (`internal/server/workspaceapi/subject_activity.go::Handler.WorkspaceSubjectSnapshot`).
-- Hub and standalone Activity reads hold one reconciliation barrier
-  across events and workspace subjects; spokes overlay a separate local snapshot
-  by stable identity (`internal/server/huma_routes.go::Server.listActivity`).
+  before lookup so route reuse stays fail-closed (`internal/server/itemapi/helpers.go::WorkspaceItemTypeFromActivity`).
+- Spokes overlay their local workspace subject snapshot on hub Activity by
+  stable identity (`internal/server/activityapi/huma_routes.go::Handlers.ListActivity`).
 - Subject metadata and opt-in Issue/PR activity ordering use JSON-backed SQLite
   relations, so retained workspaces cannot exhaust bind variables. Lists always
   expose `last_workspace_activity_at`; provider activity is authoritative by default
@@ -235,9 +272,15 @@ embedder protocol for arbitrary host state.
 - Failed enrichment retains last-known-good values and component-owned errors;
   one component's success clears only its own error
   (`internal/server/workspaceapi/workspace_enrichment.go::recordWorkspaceEnrichmentResult`).
+- A partial tmux probe replaces last-known-good only when an answering session shows
+  the agent working; idle partials and failed sessions' fallback samples cannot, since
+  the failed session may be the working one (`internal/server/workspaceapi/routes_handlers.go::Handler.applyWorkspaceTmuxEnrichment`).
 - Each workspace admits one background enrichment flight at a time; a full
   refresh upgrade waits behind active tmux work, and only the matching unique
   flight may release ownership (`internal/server/workspaceapi/workspace_enrichment.go::nextWorkspaceEnrichmentJob`).
+- Do not rely on cached earlier tmux sessions to rescue later probes under load;
+  samples expire before the next enrichment refresh, so each pass needs sibling progress
+  (`internal/server/workspaceapi/routes_handlers.go::probeWorkspaceTmuxActivity`).
 - Overlapping tmux probes wait for the active sample within the caller budget;
   fallback carries an error only when waiting or sample production fails
   (`internal/server/workspaceapi/routes_handlers.go::probeOneTmuxSession`).
@@ -273,30 +316,45 @@ embedder protocol for arbitrary host state.
     the authoritative lifecycle state for setup/deletion races
     (`internal/server/workspaceapi/routes_handlers.go::Handler.DeleteWorkspace`).
   - Setup rejects occupied destinations before clone/fetch and again under the
-    repo lock before mutation. Branch creation and failed-add cleanup use ref
-    compare-and-swap so changed branches survive (`internal/workspace/manager.go::createBranchAndAddWorktree`).
-  - New registrations receive their workspace-ID marker before fallible post-add
-    configuration; marker failure rolls back the exact registration and any unchanged
-    created branch under the repo lock (`internal/workspace/manager.go::Manager.runOwnedGitWorktreeAdd`).
+    repo lock before mutation. Shared creation retains acquisition evidence so failed
+    setup cannot remove replacement artifacts (`internal/workspace/manager.go::createWorkspaceCheckout`).
+  - Publish the workspace-ID marker before fallible post-add configuration; a failed
+    required marker write preserves the checkout without granting rollback authority
+    (`internal/workspace/manager.go::createWorkspaceCheckout`).
   - Existing-worktree reuse accepts only a non-symlink worktree root and revalidates
     its repository and provenance under the repo lock before refresh or ownership
     marking (`internal/workspace/manager.go::Manager.reuseExistingWorkspaceWorktree`).
-  - Destructive worktree removal, including setup rollback, requires a matching
-    persisted workspace-ID marker under the repo lock; preserve unmarked or mismatched
-    roots (`internal/workspace/manager.go::Manager.rollbackWorktree`).
-  - An unmarked live registration is ambiguous after upgrade: delete and retry return
-    conflict and retain the workspace row; only registrations without a live worktree
-    may be cleared as stale (`internal/workspace/manager.go::gitDirOwnsCleanupWorktree`).
-  - Only exact Git roots whose `.git` matches their registration are live; symlinked
-    roots may be live but are never owned, so they conflict instead of entering stale
-    cleanup (`internal/workspace/manager.go::gitDirHasLiveWorktree`).
-  - Pre-lock cleanup resolution is advisory. Revalidate marker identity and current
-    live/stale state as the first locked action (`internal/workspace/manager.go::currentWorkspaceCleanupState`).
+  - Setup rollback requires a matching persisted workspace-ID marker under the repo
+    lock; preserve unmarked or mismatched roots
+    (`internal/workspace/manager.go::Manager.rollbackWorktree`).
+  - Explicit deletion accepts a live same-repository registration at the recorded
+    path even without a matching marker; this authority does not extend to rollback
+    (`internal/workspace/manager.go::Manager.gitDirOwnsCleanupWorktree`).
+  - Only exact, non-symlink Git roots whose `.git` matches their registration qualify
+    as live; preserve unrelated paths
+    (`internal/workspace/manager.go::Manager.observeWorkspaceRegistration`).
+  - After successful preflight and runtime teardown, a recorded symlink to another
+    same-repository worktree permits row deletion while preserving the link and target
+    (`internal/workspace/manager.go::Manager.cleanupWorkspaceArtifactsForDelete`).
+  - Pre-lock cleanup resolution is advisory. Revalidate cleanup authority and current
+    live/stale state as the first locked action (`internal/workspace/manager.go::Manager.cleanupWorkspaceArtifactsForDeleteLocked`).
   - A force delete retains the workspace row when Git cannot remove a live owned
     worktree; only errors proving the worktree is already absent or corrupt may
     continue to branch and row cleanup (`internal/workspace/manager.go::Manager.cleanupWorkspaceArtifactsForDeleteLocked`).
 
 ## Data Model Intent
+
+- Tracking targets never change workspace ownership, branch association, push routing, or cleanup eligibility; merged targets do not close workspaces
+  (`internal/server/workspaceapi/targets.go::Handler.AddWorkspaceTargetService`).
+- Target lists combine explicit links with implicit owner/branch links; UI removal dismisses either until a deliberate revisit, without removing ownership or branch associations. Unavailable metadata retains undismissed links
+  (`internal/server/workspaceapi/targets.go::Handler.ListWorkspaceTargetsService`).
+- Devbox target links and dismissals belong to the worker; provider identity and display metadata come from the controller. Tracking needs no Git admission or worker provider replicas
+  (`internal/server/devbox_targets.go::Server.updateDevboxWorkspaceTarget`).
+- Removing a devbox target needs only its stable identity; missing controller metadata must not prevent dismissal
+  (`internal/server/devbox_targets.go::Server.updateDevboxWorkspaceTarget`).
+- A spoke's sparse, stale, or inactive catalog and repository picker visibility must not limit target visits; refresh the hub descriptor by stable identity before every visit
+  (`internal/server/spokeapi/provider_sources.go::HubProviderSource.ObserveWorkspaceTargetRepository`).
+
 
 - `item_type`: whether the workspace belongs to a `pull_request`, provider
   `issue`, or `kata_task`.
@@ -318,7 +376,7 @@ embedder protocol for arbitrary host state.
   (`internal/db/queries.go::DB.GetWorkspaceLinkedToMRForProvider`).
 - Merge-request sync limits head-repo trust writes to direct PR workspaces;
   association-only rows are presentation links, not sync write targets
-  (`internal/github/sync.go::Syncer.reclassifyWorkspaceHeadRepoTrustUnderRepositoryReconciliationRead`).
+  (`internal/github/sync.go::Syncer.reclassifyWorkspaceHeadRepoTrust`).
 
 These fields exist so PR-backed workspaces show PR/Reviews sidebars, while
 issue-backed workspaces show the issue sidebar and disable the PR/reviews path.
@@ -377,21 +435,44 @@ through new and reused worktrees; never infer ownership from paths or run them f
 After branch persistence, `repository_hooks` holds a fresh repository lock while
 requiring Roborev to use common-directory hooks, resolving the trusted default only
 from fetched remote refs, and configuring a worktree-specific snapshot exclude
-without replacing explicit or implicit user exclusion rules. A custom effective
-hooks directory is a setup error; shared hook changes roll back unless
+without replacing explicit or implicit user exclusion rules. That exclude copies
+the user's rules, so each agent launch rebuilds it from the current rules; the
+refresh is best-effort and never blocks the launch
+(`internal/workspace/repository_hooks.go::refreshManagedCloneExclude`). A custom effective
+hooks directory prevents hook initialization; shared hook changes roll back unless
 registration succeeds.
 Only regular root config files on that commit are trusted; a workspace Roborev
 snapshot path must match it or use `.roborev`. Registration confirmation, final
 route validation, and rollback stay under the repository lock; cache invalidation
 follows lock release
 (`internal/workspace/repository_hooks.go::Manager.setupManagedRepositoryHooks`).
+Roborev initialization is optional: failures warn without blocking workspace,
+terminal, or agent access. Repository identity validation remains mandatory
+(`internal/workspace/manager.go::Manager.SetupWithOptions`).
 
-Keep Git worktree and merge-request lifecycle semantics in
-`go.kenn.io/kit/git/managed`; kenn-forge supplies application policy instead of
-maintaining a local lifecycle fork (`internal/server/projects_handlers.go::createWorktreeOnDisk`).
+Consolidate reusable worktree lifecycle in the public `kwt` library, reusing Kit
+underneath. Add needed customization in `kwt` while preserving existing Forge
+workspaces and behavior; Forge owns provider policy, persistence, and runtimes.
+Keep registration scans, orphan preservation, and branch deletion in the shared
+library. Forge selects recovery names and cleanup authority; advisory observations
+never authorize a later mutation (`internal/workspace/manager.go::Manager.cleanupWorkspaceArtifactsForDeleteLocked`).
+Projects and item workspaces use that library and share repository coordination.
+The coordinator must exist without the optional item manager; unconfigured Projects
+locks in the Git common directory (`internal/workspace/repository_worktrees.go::NewRepositoryCoordinator`).
+Item Git disables native hooks. Execution-worker identity and credential config
+share the repository lock and precede fork-upstream clearing
+(`internal/workspace/manager.go::Manager.SetupWithOptions`).
+Projects native Git hooks run under the repository lock; synchronous reentry into
+Forge mutation is unsupported. Explicit setup/teardown scripts run outside the lock,
+with removal revalidated afterward (`internal/server/workspaceapi/projects_handlers.go::Handler.removeProjectWorktreeOnDisk`).
+After registration failure, preserve changed checkouts and report retained artifacts;
+never discard rollback errors or imply the destination is clear for retry
+(`internal/server/workspaceapi/projects_handlers.go::rollbackProjectCreation`). The
+problem keeps the cause's status and code and sets `details.cleanupIncomplete`
+(`internal/server/workspaceapi/projects_handlers.go::withRetainedArtifacts`).
 Classify same-repository merge requests with the provider-hosted project
 identity, not the effective origin URL: the origin may be a local mirror
-(`internal/server/projects_handlers.go::createProjectWorktreeFromMergeRequest`).
+(`internal/server/workspaceapi/projects_handlers.go::Handler.createProjectWorktreeFromMergeRequest`).
 
 All workspace API timestamps are emitted as UTC RFC3339 strings. Keep timestamp
 normalization in the DB/server boundary; the Svelte UI can present local time
@@ -433,18 +514,18 @@ workspace rows from the post-upsert snapshot; an unknown-head snapshot cannot
 downgrade an already-known fork classification. This cache projection is
 best-effort, while the launch-specification lifecycle path is fail-closed
 (`internal/github/sync.go::CommitMergeRequestParentSnapshot`,
-`internal/github/sync.go::reclassifyWorkspaceHeadRepoTrustUnderRepositoryReconciliationRead`,
+`internal/github/sync.go::reclassifyWorkspaceHeadRepoTrust`,
 `internal/workspace/manager.go::WorkspaceHeadRepo`).
 
 Head-repo classification reads and writes stay on the workspace repository ID;
 persisted provider workspaces without one fail unresolved. Parent snapshot
-commits use the per-MR snapshot lock; repository-ID reconciliation holds the
-exclusive side of the stable barrier that every snapshot lock holds shared, so
-moving an MR cannot change its lock identity during a snapshot commit
+commits use the per-MR snapshot lock
 (`internal/workspace/manager.go::Manager.RefreshWorkspaceHeadRepoSnapshot`,
 `internal/db/queries.go::UpdateWorkspaceMRHeadRepoForSnapshot`).
 Launch-spec refresh preserves the workspace's stable repository and branch
-identity while renewing hub-owned head and visibility facts. A changed
+identity while renewing hub-owned head and visibility facts, even when another
+repository occupies its old route. Creation admission must not constrain existing
+workspace refresh or spoke preparation. A changed
 repository identity conflicts; an expired lease followed by a hub
 outage is retryable, while removed or inaccessible PRs fail closed before generated
 context can expose a branch or push target
@@ -471,9 +552,14 @@ shares the ordinary manual Launch-menu trust boundary
 (`frontend/src/lib/stores/workspace-create-pending.svelte.ts::queueWorkspaceLaunch`).
 Quick actions are the one exception to frontend-owned launches: after ordinary
 creation, the detail header posts the configured agent and prompt to
-`POST /workspaces/{id}/runtime/agent-handoffs`, which waits for the workspace to
-become ready, launches the agent in the workflow region, and delivers the prompt
-through the initial-message path, retrying only the typed input-mode-not-ready
+`POST /workspaces/{id}/runtime/agent-handoffs`; the workspace launch surface
+offers the same actions for an existing local or devbox workspace, but not for a
+fleet peer, which has no handoff route
+(`frontend/src/lib/components/terminal/WorkspaceTerminalView.svelte::workspaceQuickActions`).
+The endpoint waits for the workspace to
+become ready and launches the agent in the workflow region. Native Claude prompt
+arguments are recorded as delivered so retries never type them a second time;
+other agents use the terminal initial-message path, retrying only the typed input-mode-not-ready
 signal. The readiness wait, the retry-while-input-not-ready loop, and the
 cancellation-aware poll live in one shared package that the MCP spawn tool also
 drives; add handoff pacing or retry rules there, not in either caller
@@ -527,6 +613,9 @@ Workspace create endpoints may return 202 with a pre-existing workspace
   workspace is persisted; run it independently of creation/setup under handler
   shutdown ownership. Preserve assignees and never roll back on upstream failure
   (`internal/server/workspaceapi/auto_assign.go::Handler.runWorkspaceAutoAssignment`).
+- Background assignment must retain the launch repository's stable ID locally and
+  through federation; a reused route must never change the assignment target
+  (`internal/server/workspaceapi/auto_assign.go::Handler.AutoAssignProviderWorkspaceItem`).
 - Inspect warm clones locally for branch conflicts; setup owns the fresh fetch
   before checkout. Cold admission still creates the clone so its existing branches
   participate in conflict handling (`internal/workspace/manager.go::Manager.branchInspectionDir`).
@@ -538,7 +627,10 @@ Workspace create endpoints may return 202 with a pre-existing workspace
   (`internal/workspace/hot_worktree.go::Manager.prepareHotWorktree`).
 - Claim only clean, owned spares at the freshly fetched requested revision; preserve
   branch and ownership rules, and leave changed or foreign spares untouched
-  (`internal/workspace/hot_worktree.go::tryHotWorktree`).
+  (`internal/workspace/manager.go::createWorkspaceCheckout`).
+- Compare warm claims and cold creation against `main` with benchstat when changing them or
+  kwt/Kit lifecycle; Git subprocess count dominates warm-claim cost
+  (`internal/workspace/hot_worktree_test.go::BenchmarkHotWorktree`).
 
 ## Agent Activity Hooks
 
@@ -550,6 +642,14 @@ Workspace create endpoints may return 202 with a pre-existing workspace
 - User-level install and uninstall target all kit profiles by default or one
   profile with `--agent`; kit preserves unrelated handlers and never enables
   agent consent or auto-approval (`cmd/kenn-forge/agent_hook.go::installAgentHooks`).
+- Reuse Codex approvals only for identical hook hashes in sibling Git worktrees;
+  preserve disabled hooks and existing per-worktree decisions
+  (`internal/codexhooks/trust.go::ReuseApprovals`).
+- Run approval reuse through configured `sh -c`/`bash -c` exec launchers too;
+  their worktree trust settings must reach Codex's app-server
+  (`internal/codexhooks/trust.go::approvalCommand`).
+- Named Codex profiles retain native hook review because the app-server API
+  cannot select or edit profile configuration (`internal/codexhooks/trust.go::configOptions`).
 - Matching live runtime/worktree reports prioritize approval, input, working, done, then idle.
   Agent status row activation preserves completion, its hook timestamp, and sort position. Outside that sort, activation acknowledges a versioned completion for the browser-tab session, while a new timestamp resurfaces (`internal/agentactivity/store.go::statePriority`, `frontend/src/lib/components/terminal/WorkspaceListSidebar.svelte::openWorkspace`).
 - Hook installs require absolute data roots; kit preserves config symlinks, while
@@ -562,12 +662,22 @@ Workspace create endpoints may return 202 with a pre-existing workspace
 Workspace diffs compare against local `HEAD`, the pushed branch, or a merge
 target. The merge-target scope exists only when the server can resolve a real
 merge target branch, not merely when the workspace carries a PR identity.
-Resolution requires all of: a positive PR number (PR-backed workspaces use their
-own `item_number`; issue-backed, Kata-backed, and ad-hoc workspaces use
+For locally synced or associated PRs, resolution requires a positive PR number
+(PR-backed workspaces use their own `item_number`; issue-backed, Kata-backed, and ad-hoc workspaces use
 `associated_pr_number`), a synced repo row, a synced merge request row, and a
 non-empty base branch on that row. When any of those is missing the API returns
 "workspace merge target branch not available" and treats it as the
 non-actionable state.
+
+Spoke PR targets use launch specifications and renew expired visibility through the hub.
+Never require spoke-local PR cache rows for those targets
+(`internal/server/workspaceapi/routes_handlers.go::Handler.workspaceMergeTargetBranch`).
+
+The Diff panel opens on `HEAD` for a dirty worktree, the pushed branch for
+unpushed commits with an upstream, and otherwise the merge target when shown;
+a never-pushed branch reports no ahead count and opens on the target. An unknown
+dirty state keeps `HEAD`; a user's pick overrides the default for the panel's
+lifetime (`frontend/src/lib/components/workspace/workspace-diff-default.ts::defaultWorkspaceDiffBase`).
 
 The server is authoritative for availability. The sidebar hides the
 merge-target-dependent controls (both the Target scope control and the commit
@@ -581,6 +691,8 @@ server check exactly.
 
 ## Diff Snapshot Coherence
 
+- Repeat workspace visits restore bounded browser snapshots by host and complete diff query; retain files and patches only as a matching revision pair, and revalidate without blanking that pair
+  (`frontend/src/lib/stores/diff.svelte.ts::startWorkspaceDiff`).
 - Files and patches project from one immutable snapshot. Preview membership is
   revision-pinned too, but new-side bytes remain live and may move afterward
   (`internal/server/workspaceapi/workspace_diff_cache.go::workspaceDiffCache`).
@@ -590,13 +702,13 @@ server check exactly.
   wrapper owns snapshot coherence, bounded validation, selection leases, and
   publication. Only selected workspaces
   receive proactive refresh leases; ordinary entries validate on demand
-  (`internal/server/server.go::streamEvents`).
+  (`internal/server/streamapi/server.go::Handlers.StreamEvents`).
 - A workspace response is user-visibly stale only when a bounded, coalesced
   head-only probe confirms cached/current Git HEAD mismatch and queues refresh;
   cache age, probe timeout, and resolution failure do not warn (`internal/server/workspaceapi/workspace_diff_cache.go::workspaceDiffCache.Get`).
-- Local workspace selection reuses the singleton provider SSE connection;
-  workspace subscribers attach before `workspace_id` selection and release
-  with it (`frontend/src/lib/stores/events.svelte.ts::createEventsStore`).
+- Local diff selection reuses the singleton provider SSE connection. Local selection
+  leases and fleet diff watches run only while the Diff pane is visible; workspace
+  and provider updates remain subscribed independently (`frontend/src/lib/components/terminal/WorkspaceTerminalView.svelte::watchFleetWorkspaceDiff`).
 - Late workspace subscribers receive current connected state, so route mount
   does not depend on a future reconnect (`frontend/src/lib/stores/events.svelte.ts::subscribeWorkspaceEvents`).
 - Workspace event fan-out is lossless while subscribed; an event burst must not
@@ -617,7 +729,7 @@ server check exactly.
   retries it with the normal watch backoff; unsupported watch responses remain
   terminal and fall back to request-driven diff loading.
 - Workspace switching keeps runtime and shell reads on their own critical path.
-  The previous sidebar is replaced immediately by a neutral placeholder. The
+  A repeat visit restores its cached sidebar; a cold visit shows a neutral placeholder. The
   new diff panel mounts after matching workspace metadata and either matching
   runtime state or a terminal runtime error, so a runtime API failure cannot
   leave workspace details hidden forever. Panel cancellation uses a per-load
@@ -626,10 +738,12 @@ server check exactly.
 - Manual workspace refresh schedules asynchronous validation for every cached
   key belonging to that workspace, whether or not the workspace currently has
   a local selection lease, even when provider refresh later fails. Workspace
-  responses and runtime readiness never wait on Git. Failure preserves the
-  last-known-good snapshot; preserving browser refreshes retry with capped,
-  cancelable backoff only when retained files and diff share a snapshot version,
-  while cold loads expose blocking errors
+  responses and runtime readiness never wait on Git. Failed refreshes preserve
+  the last-known-good snapshot, including repeat visits, except when a missing
+  or rejected scope invalidates both visible and retained data. Temporary
+  commit-list errors stay in the commit picker and do not block diff refresh. Preserving
+  browser refreshes retry with capped, cancelable backoff only when retained
+  files and diff share a snapshot version; cold loads expose blocking errors
   (`frontend/src/lib/stores/diff.svelte.ts::loadWorkspaceDiff`).
   A changed fingerprint publishes through `workspace_diff_changed` when ready.
   Watcher hints validate selected keys even inside the freshness interval;
@@ -699,10 +813,13 @@ synthetic name and its numbered variants and may delete them during cleanup;
 any other pre-existing branch is user-owned and must keep pointing where it did.
 Ad-hoc workspaces instead reserve their final hashed branch identity before
 setup; a later external Git ref collision is an explicit setup error.
-PR worktree creation and reuse fast-forward the fetched local base branch while
-holding repository route identity stable; checked-out, diverged, or ref-namespace-
-blocked base branches stay untouched and emit a warning
-(`internal/workspace/manager.go::syncLocalBaseBranch`).
+PR worktree creation and reuse sync the fetched local base branch while holding
+repository route identity stable. Managed clones follow rewritten upstream bases
+after preserving the old tip under `refs/kenn-forge/base-backups/<sha>`; those refs
+also retain local-only commits and can be used to create a recovery branch.
+Checked-out branches, diverged bases in configured user checkouts, and
+ref-namespace-blocked bases stay untouched
+(`internal/workspace/manager.go::Manager.syncWorkspaceBaseBranch`).
 
 ## Branch Upstream
 
@@ -719,13 +836,15 @@ offer the push that verifies or creates its remote branch. Every path that creat
 PR-owned branch should configure its upstream when repository identity is known.
 Configured local bases may use a remote other than `origin`; new preferred and synthetic
 PR branches must track the same identity-selected remote used for checkout
-(`internal/workspace/manager.go::configureFallbackBranchUpstream`).
+(`internal/workspace/manager.go::Manager.addFallbackCandidate`). Any fallback
+failure other than an ownership-marker error moves on to the numbered name, then
+to a detached checkout (`internal/workspace/manager.go::Manager.addFallbackWorktree`).
 Passive workspace enrichment never contacts remotes, so the UI offers Push only for a
 missing local tracking ref or commits ahead. A zero-ahead branch deleted remotely remains
 in-sync until local Git state changes (`internal/server/workspaceapi/routes_handlers.go::applyWorktreeDivergence`).
 Issue, Kata, and ad-hoc workspaces create new untracked branches; a
 same-named remote ref is not authority to adopt an upstream
-(`internal/workspace/manager.go::configureFallbackBranchUpstream`). PR upstream
+(`internal/workspace/manager.go::createWorkspaceCheckout`). PR upstream
 wiring requires a non-empty head-repository identity whose
 provider, host, and full repository path match the base repository; matching
 commit SHAs are not identity evidence because forks preserve commit IDs. Fork
@@ -733,7 +852,10 @@ heads stay untracked, while unknown heads fail closed before Git access. The
 pushed-head observer may repair a missing upstream only when a current
 hub candidate proves the head is in the base repository, the
 checked-out branch is the PR head or synthetic branch, and the remote-tracking
-ref exists.
+ref exists. Recheck the branch and absence of upstream configuration under the
+shared repository lock before repair;
+ordinary observer reads remain lock-free
+(`internal/workspace/pushed_head_gitdir.go::gitdirRemoteHeadReader.SetBranchUpstream`).
 
 Test fixtures exercising a provider-backed lifecycle must seed the matching
 launch specification even when they also seed hub PR rows. A same-repo

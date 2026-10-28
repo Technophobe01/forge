@@ -1,0 +1,1061 @@
+package spokeapi
+
+import (
+	"context"
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+
+	"go.kenn.io/forge/internal/apiclient/generated"
+	"go.kenn.io/forge/internal/db"
+	"go.kenn.io/forge/internal/federationauth"
+	"go.kenn.io/forge/internal/fleet"
+	"go.kenn.io/forge/internal/gitclone"
+	"go.kenn.io/forge/internal/mcpserver"
+	"go.kenn.io/forge/internal/providerplane"
+	"go.kenn.io/forge/internal/server/httpapi"
+	"go.kenn.io/forge/internal/server/issueapi"
+	"go.kenn.io/forge/internal/server/itemapi"
+	"go.kenn.io/forge/internal/server/pullapi"
+	"go.kenn.io/forge/internal/server/worklistapi"
+	"go.kenn.io/forge/internal/server/workspaceapi"
+	"go.kenn.io/forge/internal/workspace"
+	"go.kenn.io/forge/platform"
+)
+
+type HubProviderSource struct {
+	Client  providerplane.Client
+	Db      *db.DB
+	Clones  *gitclone.Manager
+	Enabled func() bool
+}
+
+func (s *HubProviderSource) ResolveWorkspaceLaunchSpec(
+	ctx context.Context, request providerplane.WorkspaceLaunchRequest,
+) (db.WorkspaceLaunchSpec, error) {
+	return s.resolveWorkspaceLaunchSpec(
+		ctx, request, false,
+		federationauth.ScopeProviderRead,
+	)
+}
+
+func (s *HubProviderSource) resolveWorkspaceLaunchSpec(
+	ctx context.Context, request providerplane.WorkspaceLaunchRequest,
+	refresh bool, scope federationauth.Scope,
+) (db.WorkspaceLaunchSpec, error) {
+	canonicalRoute, err := providerplane.CanonicalRepositoryRoute(request.Repository)
+	if err != nil {
+		return db.WorkspaceLaunchSpec{}, httpapi.BadRequest(
+			httpapi.CodeValidationError, err.Error(), nil,
+		)
+	}
+	request.Repository = canonicalRoute
+	body := providerLaunchRequestBody(request)
+	var httpRequest *http.Request
+	if refresh {
+		httpRequest, err = generated.NewFederationRefreshWorkspaceLaunchSpecRequest(ctx, "/api/v1", &generated.FederationRefreshWorkspaceLaunchSpecRequestOptions{Body: body})
+	} else {
+		httpRequest, err = generated.NewFederationResolveWorkspaceLaunchSpecRequest(ctx, "/api/v1", &generated.FederationResolveWorkspaceLaunchSpecRequestOptions{Body: body})
+	}
+	if err != nil {
+		return db.WorkspaceLaunchSpec{}, err
+	}
+	var spec db.WorkspaceLaunchSpec
+	if err := s.exchange(ctx, scope, httpRequest, &spec); err != nil {
+		return db.WorkspaceLaunchSpec{}, err
+	}
+	if err := providerplane.ValidateFederationWorkspaceLaunchSpecResponse(request, spec); err != nil {
+		return db.WorkspaceLaunchSpec{}, InvalidHubDescriptor(err)
+	}
+	credentialRoute, err := requireWorkspaceLaunchSpecCredentials(ctx, s.Clones, spec)
+	if err != nil {
+		if errors.Is(err, gitclone.ErrCredentialUnavailable) {
+			return db.WorkspaceLaunchSpec{}, httpapi.GitCredentialUnavailable(
+				credentialRoute.Provider, credentialRoute.PlatformHost,
+				credentialRoute.Owner+"/"+credentialRoute.Name,
+			)
+		}
+		return db.WorkspaceLaunchSpec{}, err
+	}
+	if err := s.observeWorkspaceLaunchSpec(ctx, spec); err != nil {
+		return db.WorkspaceLaunchSpec{}, err
+	}
+	return spec, nil
+}
+
+func requireWorkspaceLaunchSpecCredentials(
+	ctx context.Context,
+	clones *gitclone.Manager,
+	spec db.WorkspaceLaunchSpec,
+) (providerplane.RepositoryRoute, error) {
+	base := providerplane.RepositoryRoute{
+		Provider: spec.Repository.Provider, PlatformHost: spec.Repository.PlatformHost,
+		Owner: spec.Repository.Owner, Name: spec.Repository.Name,
+	}
+	if clones == nil {
+		return base, gitclone.ErrCredentialUnavailable
+	}
+	if err := clones.RequireCredentialRoute(
+		ctx, base.Provider, base.PlatformHost, base.Owner, base.Name,
+	); err != nil {
+		return base, err
+	}
+	if spec.Pull == nil || spec.Pull.HeadRepoKind != "fork" {
+		return providerplane.RepositoryRoute{}, nil
+	}
+	fork, err := providerplane.FederationRemoteRepositoryRoute(
+		spec.Repository.Provider, spec.Repository.PlatformHost,
+		spec.Pull.HeadRepoCloneURL,
+	)
+	if err != nil {
+		return fork, err
+	}
+	if err := clones.RequireCredentialRoute(
+		ctx, fork.Provider, fork.PlatformHost, fork.Owner, fork.Name,
+	); err != nil {
+		return fork, err
+	}
+	return providerplane.RepositoryRoute{}, nil
+}
+
+func (s *HubProviderSource) observeWorkspaceLaunchSpec(
+	ctx context.Context, spec db.WorkspaceLaunchSpec,
+) error {
+	if s.Db == nil {
+		return httpapi.Internal("repository catalog is unavailable")
+	}
+	entry, err := s.Db.ObserveRepository(ctx, db.RepoIdentity{
+		Platform: spec.Repository.Provider, PlatformHost: spec.Repository.PlatformHost,
+		Key:   spec.Repository.Key,
+		Owner: spec.Repository.Owner, Name: spec.Repository.Name,
+		RepoPath: spec.Repository.Owner + "/" + spec.Repository.Name,
+	})
+	if err != nil {
+		return InvalidHubDescriptor(err)
+	}
+	if err := s.Db.UpdateRepoProviderObservation(
+		ctx, entry.Repository.ID,
+		db.RepoProviderMetadata{
+			CloneURL:      spec.Repository.CloneURL,
+			DefaultBranch: spec.Repository.DefaultBranch,
+		}, nil, nil,
+	); err != nil {
+		return InvalidHubDescriptor(err)
+	}
+	return nil
+}
+
+func (s *HubProviderSource) RefreshWorkspaceLaunchSpec(
+	ctx context.Context, current db.WorkspaceLaunchSpec,
+) (db.WorkspaceLaunchSpec, error) {
+	refreshed, err := s.resolveWorkspaceLaunchSpec(
+		ctx, providerplane.WorkspaceLaunchRequest{
+			Repository: providerplane.RepositoryRoute{
+				Provider:     current.Repository.Provider,
+				PlatformHost: current.Repository.PlatformHost,
+				Owner:        current.Repository.Owner,
+				Name:         current.Repository.Name,
+			},
+			RepoKey:  current.Repository.Key,
+			ItemType: current.ItemType, ItemNumber: current.ItemNumber,
+			ItemKey: current.ItemKey, GitHeadRef: current.GitHeadRef,
+		}, true,
+		federationauth.ScopeProviderWrite)
+	if err != nil {
+		return db.WorkspaceLaunchSpec{}, err
+	}
+	if refreshed.Repository.Key != current.Repository.Key ||
+		refreshed.GitHeadRef != current.GitHeadRef {
+		return db.WorkspaceLaunchSpec{}, InvalidHubDescriptor(
+			errors.New("refreshed workspace launch specification changed durable identity"),
+		)
+	}
+	return refreshed, nil
+}
+
+func (s *HubProviderSource) ListOpenPullCandidates(
+	ctx context.Context, local workspace.Workspace,
+) ([]db.MergeRequest, error) {
+	rows, err := s.ListPulls(ctx, pullapi.ListQuery{
+		Repo: fmt.Sprintf(
+			"%s|%s/%s/%s",
+			workspaceProviderName(local), local.PlatformHost, local.RepoOwner, local.RepoName,
+		),
+		State: string(db.MergeRequestStateOpen), Limit: 1000,
+	})
+	if err != nil {
+		return nil, err
+	}
+	candidates := make([]db.MergeRequest, 0, len(rows))
+	for _, row := range rows {
+		if !strings.EqualFold(row.Repo.Provider, workspaceProviderName(local)) ||
+			!strings.EqualFold(row.PlatformHost, local.PlatformHost) ||
+			!strings.EqualFold(row.RepoOwner, local.RepoOwner) ||
+			!strings.EqualFold(row.RepoName, local.RepoName) {
+			continue
+		}
+		candidates = append(candidates, row.MergeRequest)
+	}
+	return candidates, nil
+}
+
+func workspaceProviderName(local workspace.Workspace) string {
+	provider := strings.TrimSpace(local.Platform)
+	if provider == "" {
+		return "github"
+	}
+	return provider
+}
+
+func (s *HubProviderSource) GetRepositoryDescriptor(
+	ctx context.Context, route providerplane.RepositoryRoute,
+) (providerplane.RepositoryDescriptor, error) {
+	return s.getRepositoryDescriptor(ctx, route, platform.RepositoryKey{})
+}
+
+func (s *HubProviderSource) getRepositoryDescriptor(
+	ctx context.Context, route providerplane.RepositoryRoute, repoKey platform.RepositoryKey,
+) (providerplane.RepositoryDescriptor, error) {
+	route, err := providerplane.CanonicalRepositoryRoute(route)
+	if err != nil {
+		return providerplane.RepositoryDescriptor{}, httpapi.BadRequest(
+			httpapi.CodeValidationError, err.Error(), nil,
+		)
+	}
+	var descriptor providerplane.RepositoryDescriptor
+	httpRequest, err := generated.NewFederationGetRepositoryDescriptorRequest(ctx, "/api/v1", &generated.FederationGetRepositoryDescriptorRequestOptions{Body: &generated.RepositoryDescriptorRequest{Provider: route.Provider, PlatformHost: route.PlatformHost, Owner: optionalProviderQuery(route.Owner), Name: optionalProviderQuery(route.Name), PlatformRepoID: optionalProviderQuery(wireRepoID(repoKey)), BitbucketRepositoryUUID: wireRepoUUID(repoKey)}})
+	if err != nil {
+		return providerplane.RepositoryDescriptor{}, err
+	}
+	if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &descriptor); err != nil {
+		return providerplane.RepositoryDescriptor{}, err
+	}
+	if repoKey.IsZero() {
+		err = descriptor.ValidateRoute(route)
+	} else if err = descriptor.Validate(); err == nil && descriptor.Identity() != (platform.RepositoryIdentity{
+		Provider: route.Provider, PlatformHost: route.PlatformHost, Key: repoKey,
+	}).Canonical() {
+		err = errors.New("repository descriptor does not match selected repository")
+	}
+	if err != nil {
+		return providerplane.RepositoryDescriptor{}, InvalidHubDescriptor(err)
+	}
+	if err := s.ObserveRepositoryDescriptor(ctx, descriptor); err != nil {
+		return providerplane.RepositoryDescriptor{}, err
+	}
+	return descriptor, nil
+}
+
+func (s *HubProviderSource) ResolveRepositoryRoute(
+	ctx context.Context, route providerplane.RepositoryRoute, repoKey platform.RepositoryKey,
+) (*db.Repo, error) {
+	descriptor, err := s.getRepositoryDescriptor(ctx, route, repoKey)
+	if err != nil {
+		return nil, err
+	}
+	entry, err := s.Db.GetRepositoryByProviderID(ctx, descriptor.Identity())
+	if err != nil {
+		return nil, httpapi.Internal("read reconciled repository identity failed")
+	}
+	if entry == nil {
+		return nil, httpapi.Internal("reconciled repository identity is unavailable")
+	}
+	return &entry.Repository, nil
+}
+
+func (s *HubProviderSource) GetDiffDescriptor(
+	ctx context.Context, item pullapi.ItemIdentity,
+) (providerplane.DiffDescriptor, error) {
+	route, err := providerplane.CanonicalRepositoryRoute(providerplane.RepositoryRoute{
+		Provider: item.Provider, PlatformHost: item.PlatformHost,
+		Owner: item.Owner, Name: item.Name,
+	})
+	if err != nil {
+		return providerplane.DiffDescriptor{}, httpapi.BadRequest(
+			httpapi.CodeValidationError, err.Error(), nil,
+		)
+	}
+	var descriptor providerplane.DiffDescriptor
+	httpRequest, err := generated.NewFederationGetDiffDescriptorRequest(ctx, "/api/v1", &generated.FederationGetDiffDescriptorRequestOptions{Body: &generated.FederationGetDiffDescriptorBody{Repository: generated.RepositoryRoute{Provider: route.Provider, PlatformHost: route.PlatformHost, Owner: route.Owner, Name: route.Name}, PullNumber: int64(item.Number)}})
+	if err != nil {
+		return providerplane.DiffDescriptor{}, err
+	}
+	if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &descriptor); err != nil {
+		return providerplane.DiffDescriptor{}, err
+	}
+	if err := descriptor.Validate(); err != nil {
+		return providerplane.DiffDescriptor{}, InvalidHubDescriptor(err)
+	}
+	if err := descriptor.Repository.ValidateRoute(route); err != nil {
+		return providerplane.DiffDescriptor{}, InvalidHubDescriptor(err)
+	}
+	if descriptor.PullNumber != item.Number {
+		return providerplane.DiffDescriptor{}, InvalidHubDescriptor(
+			fmt.Errorf("diff descriptor does not match requested pull number"),
+		)
+	}
+	if err := s.ObserveRepositoryDescriptor(ctx, descriptor.Repository); err != nil {
+		return providerplane.DiffDescriptor{}, err
+	}
+	return descriptor, nil
+}
+
+func (s *HubProviderSource) ObserveRepositoryDescriptor(
+	ctx context.Context, descriptor providerplane.RepositoryDescriptor,
+) error {
+	return observeRepositoryDescriptor(ctx, s.Db, descriptor)
+}
+
+func observeRepositoryDescriptor(
+	ctx context.Context, database *db.DB,
+	descriptor providerplane.RepositoryDescriptor,
+) error {
+	if database == nil {
+		return httpapi.Internal("repository catalog is unavailable")
+	}
+	entry, err := database.ObserveRepository(ctx, db.RepoIdentity{
+		Platform: descriptor.Provider, PlatformHost: descriptor.PlatformHost,
+		Key:   descriptor.Key,
+		Owner: descriptor.Owner, Name: descriptor.Name,
+		RepoPath: descriptor.Owner + "/" + descriptor.Name,
+	})
+	if err != nil {
+		return InvalidHubDescriptor(err)
+	}
+	if err := database.UpdateRepoProviderObservation(
+		ctx, entry.Repository.ID,
+		db.RepoProviderMetadata{
+			CloneURL:      descriptor.CloneURL,
+			DefaultBranch: descriptor.DefaultBranch,
+		}, nil, nil,
+	); err != nil {
+		return InvalidHubDescriptor(err)
+	}
+	return nil
+}
+
+func InvalidHubDescriptor(error) error {
+	return httpapi.NewProblem(
+		http.StatusBadGateway,
+		httpapi.CodeUpstreamError,
+		"hub returned an invalid repository descriptor",
+		map[string]any{"reason": "invalidDescriptor"},
+	)
+}
+
+func (s *HubProviderSource) GetSettings(
+	ctx context.Context,
+) (ProviderSettingsProjection, error) {
+	var response ProviderSettingsResponse
+	httpRequest, err := generated.NewFederationGetProviderSettingsRequest(ctx, "/api/v1")
+	if err != nil {
+		return ProviderSettingsProjection{}, err
+	}
+	if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &response); err != nil {
+		return ProviderSettingsProjection{}, err
+	}
+	return response.projection(), nil
+}
+
+func (s *HubProviderSource) UpdateSettings(
+	ctx context.Context, update UpdateSettingsRequest,
+) (SettingsResponse, error) {
+	var response ProviderSettingsResponse
+	httpRequest, err := generated.NewFederationUpdateProviderSettingsRequest(ctx, "/api/v1", &generated.FederationUpdateProviderSettingsRequestOptions{Body: providerSettingsRequestBody(update)})
+	if err != nil {
+		return SettingsResponse{}, err
+	}
+	if err := s.exchange(ctx, federationauth.ScopeProviderWrite, httpRequest, &response); err != nil {
+		return SettingsResponse{}, err
+	}
+	return response.projection().Settings, nil
+}
+
+func (s *HubProviderSource) AutoAssignWorkspaceItem(
+	ctx context.Context, request workspaceapi.ProviderWorkspaceItemRequest,
+) error {
+	var response struct{}
+	httpRequest, err := generated.NewFederationAutoAssignWorkspaceItemRequest(ctx, "/api/v1", &generated.FederationAutoAssignWorkspaceItemRequestOptions{Body: &generated.FederationAutoAssignWorkspaceItemBody{Repository: generated.RepositoryRoute{Provider: request.Repository.Provider, PlatformHost: request.Repository.PlatformHost, Owner: request.Repository.Owner, Name: request.Repository.Name}, PlatformRepoID: wireRepoID(request.RepoKey), BitbucketRepositoryUUID: wireRepoUUID(request.RepoKey), ItemType: request.ItemType, ItemNumber: int64(request.ItemNumber)}})
+	if err != nil {
+		return err
+	}
+	return s.exchangeMutation(ctx, federationauth.ScopeProviderWrite, httpRequest, &response)
+}
+
+func (s *HubProviderSource) ListWorkflowStates(
+	ctx context.Context, query mcpserver.WorkflowQuery,
+) (mcpserver.WorkflowPage, error) {
+	var response FederationWorkflowPage
+	httpRequest, err := generated.NewFederationListWorkflowStatesRequest(ctx, "/api/v1", &generated.FederationListWorkflowStatesRequestOptions{Body: &generated.FederationListWorkflowStatesBody{Repository: generated.FederationWorkflowRepositoryIdentity{Provider: query.Repository.Provider, PlatformHost: query.Repository.PlatformHost, PlatformRepoID: wireRepoID(query.Repository.Key), BitbucketRepositoryUUID: wireRepoUUID(query.Repository.Key), RepoPath: query.Repository.RepoPath, Owner: query.Repository.Owner, Name: query.Repository.Name}, ItemTypes: append([]string{}, query.ItemTypes...), States: append([]string{}, query.States...), IncludeClosed: query.IncludeClosed, Limit: int64(query.Limit), Cursor: query.Cursor}})
+	if err != nil {
+		return mcpserver.WorkflowPage{}, err
+	}
+	if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &response); err != nil {
+		return mcpserver.WorkflowPage{}, err
+	}
+	return response.mcp(), nil
+}
+
+func (s *HubProviderSource) SetWorkflowState(
+	ctx context.Context,
+	item mcpserver.ItemIdentity,
+	update mcpserver.WorkflowUpdate,
+) (mcpserver.WorkflowMutation, error) {
+	var response FederationWorkflowMutation
+	httpRequest, err := generated.NewFederationSetWorkflowStateRequest(ctx, "/api/v1", &generated.FederationSetWorkflowStateRequestOptions{Body: &generated.FederationSetWorkflowStateBody{Item: generated.FederationWorkflowItemIdentity{Type: item.Type, Provider: item.Provider, PlatformHost: item.PlatformHost, PlatformRepoID: wireRepoID(item.RepoKey), BitbucketRepositoryUUID: wireRepoUUID(item.RepoKey), Owner: item.Owner, Name: item.Name, Number: int64(item.Number)}, Update: generated.FederationWorkflowUpdate{Status: update.Status, ExpectedStatus: update.ExpectedStatus, Force: update.Force, Source: update.Source, Actor: update.Actor, Reason: update.Reason}}})
+	if err != nil {
+		return mcpserver.WorkflowMutation{}, err
+	}
+	if err := s.exchangeMutation(ctx, federationauth.ScopeProviderWrite, httpRequest, &response); err != nil {
+		return mcpserver.WorkflowMutation{}, err
+	}
+	return response.mcp(), nil
+}
+
+func (s *HubProviderSource) ListRepositorySummaries(
+	ctx context.Context,
+) ([]itemapi.RepoSummaryResponse, error) {
+	var rows []itemapi.RepoSummaryResponse
+	httpRequest, err := generated.NewListRepoSummariesRequest(ctx, "/api/v1")
+	if err != nil {
+		return nil, err
+	}
+	if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (s *HubProviderSource) ResolveRepository(
+	ctx context.Context, identity mcpserver.RepositoryIdentity,
+) (*db.Repo, error) {
+	var httpRequest *http.Request
+	var err error
+	if strings.TrimSpace(identity.PlatformHost) != "" {
+		httpRequest, err = generated.NewGetRepoOnHostRequest(ctx, "/api/v1", &generated.GetRepoOnHostRequestOptions{PathParams: &generated.GetRepoOnHostPath{Provider: identity.Provider, Owner: identity.Owner, Name: identity.Name, PlatformHost: identity.PlatformHost}})
+	} else {
+		httpRequest, err = generated.NewGetRepoRequest(ctx, "/api/v1", &generated.GetRepoRequestOptions{PathParams: &generated.GetRepoPath{Provider: identity.Provider, Owner: identity.Owner, Name: identity.Name}})
+	}
+	if err != nil {
+		return nil, err
+	}
+	var response itemapi.RepoResponse
+	if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &response); err != nil {
+		return nil, err
+	}
+	key, err := platform.RepositoryKeyFromWire(response.PlatformRepoID, response.BitbucketRepositoryUUID)
+	if err != nil {
+		return nil, InvalidHubDescriptor(err)
+	}
+	return &db.Repo{
+		Platform: response.Platform, PlatformHost: response.PlatformHost,
+		Key:   key,
+		Owner: response.Owner, Name: response.Name,
+		RepoPath: response.Owner + "/" + response.Name,
+	}, nil
+}
+
+func (s *HubProviderSource) GetPullStack(
+	ctx context.Context, item mcpserver.ItemIdentity,
+) (pullapi.StackContext, error) {
+	var httpRequest *http.Request
+	var err error
+	if strings.TrimSpace(item.PlatformHost) != "" {
+		httpRequest, err = generated.NewGetPullStackOnHostRequest(ctx, "/api/v1", &generated.GetPullStackOnHostRequestOptions{PathParams: &generated.GetPullStackOnHostPath{Provider: item.Provider, Owner: item.Owner, Name: item.Name, Number: int64(item.Number), PlatformHost: item.PlatformHost}})
+	} else {
+		httpRequest, err = generated.NewGetPullStackRequest(ctx, "/api/v1", &generated.GetPullStackRequestOptions{PathParams: &generated.GetPullStackPath{Provider: item.Provider, Owner: item.Owner, Name: item.Name, Number: int64(item.Number)}})
+	}
+	if err != nil {
+		return pullapi.StackContext{}, err
+	}
+	var response hubStackResponse
+	if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &response); err != nil {
+		return pullapi.StackContext{}, err
+	}
+	members := make([]pullapi.StackMember, 0, len(response.Members))
+	for _, member := range response.Members {
+		members = append(members, pullapi.StackMember{
+			Number: member.Number, Title: member.Title, State: member.State,
+			CIStatus: member.CIStatus, ReviewDecision: member.ReviewDecision,
+			MergeableState: member.MergeableState, Position: member.Position,
+			IsDraft: member.IsDraft, BaseBranch: member.BaseBranch,
+			BlockedBy: member.BlockedBy,
+		})
+	}
+	return pullapi.StackContext{
+		ID: response.StackID, Name: response.StackName,
+		Position: response.Position, Size: response.Size,
+		Health: response.Health, Native: response.Native, Members: members,
+	}, nil
+}
+
+type hubStackResponse struct {
+	StackID   int64                    `json:"stack_id"`
+	StackName string                   `json:"stack_name"`
+	Position  int                      `json:"position"`
+	Size      int                      `json:"size"`
+	Health    string                   `json:"health"`
+	Native    bool                     `json:"native"`
+	Members   []hubStackMemberResponse `json:"members"`
+}
+
+type hubStackMemberResponse struct {
+	Number         int    `json:"number"`
+	Title          string `json:"title"`
+	State          string `json:"state"`
+	CIStatus       string `json:"ci_status"`
+	ReviewDecision string `json:"review_decision"`
+	MergeableState string `json:"mergeable_state"`
+	Position       int    `json:"position"`
+	IsDraft        bool   `json:"is_draft"`
+	BaseBranch     string `json:"base_branch"`
+	BlockedBy      *int   `json:"blocked_by"`
+}
+
+func (s *HubProviderSource) ListPulls(
+	ctx context.Context, query pullapi.ListQuery,
+) ([]pullapi.MergeRequestResponse, error) {
+	var rows []pullapi.MergeRequestResponse
+	httpRequest, err := generated.NewListPullsRequest(ctx, "/api/v1", &generated.ListPullsRequestOptions{Query: &generated.ListPullsQuery{Attributes: optionalProviderQuery(query.Attributes), Repo: optionalProviderQuery(query.Repo), State: optionalProviderQuery(query.State), Kanban: optionalProviderQuery(query.Kanban), Starred: optionalProviderQuery(query.Starred), InvolvesMe: optionalProviderQuery(query.InvolvesMe), Unassigned: optionalProviderQuery(query.Unassigned), Q: optionalProviderQuery(query.Text), Label: optionalProviderQuery(query.Label), Limit: optionalProviderQuery(int64(query.Limit)), Offset: optionalProviderQuery(int64(query.Offset))}})
+	if err != nil {
+		return nil, err
+	}
+	if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (s *HubProviderSource) GetPull(
+	ctx context.Context, item pullapi.ItemIdentity,
+) (pullapi.MergeRequestDetailResponse, error) {
+	var detail pullapi.MergeRequestDetailResponse
+	var httpRequest *http.Request
+	var err error
+	if strings.TrimSpace(item.PlatformHost) != "" {
+		httpRequest, err = generated.NewGetPullOnHostRequest(ctx, "/api/v1", &generated.GetPullOnHostRequestOptions{PathParams: &generated.GetPullOnHostPath{Provider: item.Provider, Owner: item.Owner, Name: item.Name, Number: int64(item.Number), PlatformHost: item.PlatformHost}})
+	} else {
+		httpRequest, err = generated.NewGetPullRequest(ctx, "/api/v1", &generated.GetPullRequestOptions{PathParams: &generated.GetPullPath{Provider: item.Provider, Owner: item.Owner, Name: item.Name, Number: int64(item.Number)}})
+	}
+	if err != nil {
+		return pullapi.MergeRequestDetailResponse{}, err
+	}
+	if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &detail); err != nil {
+		return pullapi.MergeRequestDetailResponse{}, err
+	}
+	return detail, nil
+}
+
+func (s *HubProviderSource) ResolveMergeRequestWorktreeFacts(
+	ctx context.Context, route providerplane.RepositoryRoute, number int,
+) (workspaceapi.MergeRequestWorktreeFacts, error) {
+	detail, err := s.GetPull(ctx, pullapi.ItemIdentity{
+		Provider: route.Provider, PlatformHost: route.PlatformHost,
+		Owner: route.Owner, Name: route.Name, Number: number,
+	})
+	if err != nil {
+		return workspaceapi.MergeRequestWorktreeFacts{}, err
+	}
+	if detail.MergeRequest == nil || detail.MergeRequest.Number != number ||
+		!strings.EqualFold(detail.Repo.Provider, route.Provider) ||
+		!strings.EqualFold(detail.PlatformHost, route.PlatformHost) ||
+		!strings.EqualFold(detail.RepoOwner, route.Owner) ||
+		!strings.EqualFold(detail.RepoName, route.Name) {
+		return workspaceapi.MergeRequestWorktreeFacts{}, InvalidHubDescriptor(
+			errors.New("merge request worktree facts do not match the requested item"),
+		)
+	}
+	mr := detail.MergeRequest
+	return workspaceapi.MergeRequestWorktreeFacts{
+		Number: mr.Number, URL: mr.URL, State: string(mr.State),
+		Title: mr.Title, IsDraft: mr.IsDraft, HeadBranch: mr.HeadBranch,
+		HeadRepoCloneURL: mr.HeadRepoCloneURL,
+		ExpectedHeadSHA:  detail.PlatformHeadSHA,
+	}, nil
+}
+
+func (s *HubProviderSource) ListIssues(
+	ctx context.Context, query issueapi.ListQuery,
+) ([]issueapi.IssueResponse, error) {
+	var rows []issueapi.IssueResponse
+	httpRequest, err := generated.NewListIssuesRequest(ctx, "/api/v1", &generated.ListIssuesRequestOptions{Query: &generated.ListIssuesQuery{Repo: optionalProviderQuery(query.Repo), State: optionalProviderQuery(query.State), Starred: optionalProviderQuery(query.Starred), InvolvesMe: optionalProviderQuery(query.InvolvesMe), Unassigned: optionalProviderQuery(query.Unassigned), ReferencedByPr: optionalProviderQuery(query.ReferencedByPR), Q: optionalProviderQuery(query.Text), Assignee: optionalProviderQuery(query.Assignee), Limit: optionalProviderQuery(int64(query.Limit)), Offset: optionalProviderQuery(int64(query.Offset))}})
+	if err != nil {
+		return nil, err
+	}
+	if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (s *HubProviderSource) GetIssue(
+	ctx context.Context, item issueapi.ItemIdentity,
+) (issueapi.IssueDetailResponse, error) {
+	var detail issueapi.IssueDetailResponse
+	var httpRequest *http.Request
+	var err error
+	if strings.TrimSpace(item.PlatformHost) != "" {
+		httpRequest, err = generated.NewGetIssueOnHostRequest(ctx, "/api/v1", &generated.GetIssueOnHostRequestOptions{PathParams: &generated.GetIssueOnHostPath{Provider: item.Provider, Owner: item.Owner, Name: item.Name, Number: int64(item.Number), PlatformHost: item.PlatformHost}})
+	} else {
+		httpRequest, err = generated.NewGetIssueRequest(ctx, "/api/v1", &generated.GetIssueRequestOptions{PathParams: &generated.GetIssuePath{Provider: item.Provider, Owner: item.Owner, Name: item.Name, Number: int64(item.Number)}})
+	}
+	if err != nil {
+		return issueapi.IssueDetailResponse{}, err
+	}
+	if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &detail); err != nil {
+		return issueapi.IssueDetailResponse{}, err
+	}
+	return detail, nil
+}
+
+func (s *HubProviderSource) ListActivity(
+	ctx context.Context, input *itemapi.ListActivityInput,
+) (itemapi.ActivityResponse, error) {
+	var response itemapi.ActivityResponse
+	httpRequest, err := generated.NewListActivityRequest(ctx, "/api/v1", &generated.ListActivityRequestOptions{Query: &generated.ListActivityQuery{Repo: optionalProviderQuery(input.Repo), Search: optionalProviderQuery(input.Search), Author: optionalProviderQuery(input.Author), InvolvesMe: optionalProviderQuery(input.InvolvesMe), Unassigned: optionalProviderQuery(input.Unassigned), After: optionalProviderQuery(input.After), Before: optionalProviderQuery(input.Before), AtOrBefore: optionalProviderQuery(input.AtOrBefore), Since: optionalProviderQuery(input.Since), Projection: optionalProviderQuery(generated.ListActivityQueryProjection(input.Projection)), Limit: optionalProviderQuery(int64(input.Limit)), HideClosedMerged: optionalProviderQuery(input.HideClosedMerged), HideBots: optionalProviderQuery(input.HideBots), HideDrafts: optionalProviderQuery(input.HideDrafts), HideDefaultBranch: optionalProviderQuery(input.HideDefaultBranch), Types: input.Types, ItemTypes: input.ItemTypes}})
+	if err != nil {
+		return itemapi.ActivityResponse{}, err
+	}
+	if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &response); err != nil {
+		return itemapi.ActivityResponse{}, err
+	}
+	return response, nil
+}
+
+func (s *HubProviderSource) FilterUnassignedActivitySubjects(
+	ctx context.Context, subjects []providerplane.ItemIdentity,
+) ([]providerplane.ItemIdentity, error) {
+	const batchSize = 500
+	result := make([]providerplane.ItemIdentity, 0, len(subjects))
+	for start := 0; start < len(subjects); start += batchSize {
+		end := min(start+batchSize, len(subjects))
+		requestSubjects := make([]generated.FederationActivitySubjectIdentity, 0, end-start)
+		for _, subject := range subjects[start:end] {
+			requestSubjects = append(
+				requestSubjects, generated.FederationActivitySubjectIdentity{Repository: generated.FederationActivityRepositoryIdentity{Provider: subject.Repository.Provider, PlatformHost: subject.Repository.PlatformHost, PlatformRepoID: wireRepoID(subject.Repository.Key), BitbucketRepositoryUUID: wireRepoUUID(subject.Repository.Key)}, ItemType: subject.ItemType, ItemNumber: int64(subject.ItemNumber)},
+			)
+		}
+		body := &generated.FederationFilterUnassignedActivitySubjectsBody{Subjects: requestSubjects}
+		var response FederationUnassignedActivitySubjectsResponse
+		httpRequest, err := generated.NewFederationFilterUnassignedActivitySubjectsRequest(ctx, "/api/v1", &generated.FederationFilterUnassignedActivitySubjectsRequestOptions{Body: body})
+		if err != nil {
+			return nil, err
+		}
+		if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &response); err != nil {
+			return nil, err
+		}
+		for _, subject := range response.Subjects {
+			result = append(result, subject.Provider())
+		}
+	}
+	return result, nil
+}
+
+func (s *HubProviderSource) ListActivityAuthors(
+	ctx context.Context, input *itemapi.ListActivityAuthorsInput,
+) (itemapi.ActivityAuthorsResponse, error) {
+	var response itemapi.ActivityAuthorsResponse
+	httpRequest, err := generated.NewListActivityAuthorsRequest(ctx, "/api/v1", &generated.ListActivityAuthorsRequestOptions{Query: &generated.ListActivityAuthorsQuery{Repo: optionalProviderQuery(input.Repo), Since: optionalProviderQuery(input.Since)}})
+	if err != nil {
+		return itemapi.ActivityAuthorsResponse{}, err
+	}
+	if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &response); err != nil {
+		return itemapi.ActivityAuthorsResponse{}, err
+	}
+	return response, nil
+}
+
+type workspaceProviderStateResponse struct {
+	Workspaces []workspaceProviderState `json:"workspaces"`
+}
+
+type workspaceProviderState struct {
+	ID                 string  `json:"id"`
+	ItemAuthor         *string `json:"item_author,omitempty"`
+	ItemLastActivityAt *string `json:"item_last_activity_at,omitempty"`
+	MRTitle            *string `json:"mr_title,omitempty"`
+	MRState            *string `json:"mr_state,omitempty"`
+	MRIsDraft          *bool   `json:"mr_is_draft,omitempty"`
+	MRCIStatus         *string `json:"mr_ci_status,omitempty"`
+	MRReviewDecision   *string `json:"mr_review_decision,omitempty"`
+	MRAdditions        *int    `json:"mr_additions,omitempty"`
+	MRDeletions        *int    `json:"mr_deletions,omitempty"`
+}
+
+// WorkspaceProviderState returns a copy of workspaces with the hub's provider
+// state applied. Workspaces without a stable repository identity have no
+// provider item the hub can resolve, so they are returned unchanged.
+func (s *HubProviderSource) WorkspaceProviderState(
+	ctx context.Context, workspaces []fleet.RawWorkspace,
+) ([]fleet.RawWorkspace, error) {
+	out := append([]fleet.RawWorkspace(nil), workspaces...)
+	subjects := make([]generated.FederationWorkspaceProviderSubject, 0, len(workspaces))
+	for _, workspace := range workspaces {
+		if workspace.Repository.Key.IsZero() {
+			continue
+		}
+		subject := generated.FederationWorkspaceProviderSubject{
+			ID: workspace.ID,
+			Repository: generated.FederationActivityRepositoryIdentity{
+				Provider:                workspace.Repository.Provider,
+				PlatformHost:            workspace.Repository.PlatformHost,
+				PlatformRepoID:          wireRepoID(workspace.Repository.Key),
+				BitbucketRepositoryUUID: wireRepoUUID(workspace.Repository.Key),
+			},
+			ItemType: workspace.ItemType, ItemNumber: int64(workspace.ItemNumber),
+		}
+		if workspace.AssociatedPRNumber != nil {
+			subject.AssociatedPrNumber = new(int64(*workspace.AssociatedPRNumber))
+		}
+		subjects = append(subjects, subject)
+	}
+	states := make(map[string]workspaceProviderState, len(subjects))
+	for start := 0; start < len(subjects); start += 500 {
+		end := min(start+500, len(subjects))
+		body := &generated.FederationWorkspaceProviderStateRequest{Workspaces: subjects[start:end]}
+		httpRequest, err := generated.NewFederationQueryWorkspaceProviderStateRequest(ctx, "/api/v1", &generated.FederationQueryWorkspaceProviderStateRequestOptions{Body: body})
+		if err != nil {
+			return nil, err
+		}
+		var response workspaceProviderStateResponse
+		if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &response); err != nil {
+			return nil, err
+		}
+		for _, state := range response.Workspaces {
+			states[state.ID] = state
+		}
+	}
+	for index := range out {
+		state, ok := states[out[index].ID]
+		if !ok {
+			continue
+		}
+		workspace := &out[index]
+		workspace.ItemAuthor = state.ItemAuthor
+		workspace.ItemLastActivityAt = state.ItemLastActivityAt
+		workspace.MRTitle, workspace.MRState = state.MRTitle, state.MRState
+		workspace.MRIsDraft, workspace.MRCIStatus = state.MRIsDraft, state.MRCIStatus
+		workspace.MRReviewDecision = state.MRReviewDecision
+		workspace.MRAdditions, workspace.MRDeletions = state.MRAdditions, state.MRDeletions
+	}
+	return out, nil
+}
+
+// ConvertPendingGitHubRepositories finishes the integer repository-ID
+// conversion for GitHub rows this spoke stored under node IDs. A spoke has no
+// GitHub credentials, so the hub asks GitHub on its behalf. Until a host
+// converts, the catalog refuses the hub's descriptors for it. A failed lookup
+// leaves the row pending for the next hub connection.
+func (s *HubProviderSource) ConvertPendingGitHubRepositories(ctx context.Context) {
+	pending, err := s.Db.ListPendingGitHubRepositories(ctx)
+	if err != nil {
+		slog.Warn("list pending github repository conversions", "err", err)
+		return
+	}
+	for _, repo := range pending {
+		if ctx.Err() != nil {
+			return
+		}
+		httpRequest, err := generated.NewFederationResolveGithubRepositoryIDRequest(ctx, "/api/v1", &generated.FederationResolveGithubRepositoryIDRequestOptions{Body: &generated.GitHubRepositoryIDRequest{PlatformHost: repo.PlatformHost, Owner: repo.Owner, Name: repo.Name, NodeID: repo.NodeID}})
+		if err != nil {
+			slog.Warn("build github repository id request", "err", err)
+			return
+		}
+		var resolved generated.GitHubRepositoryIDResponse
+		if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &resolved); err != nil {
+			slog.Warn("resolve github repository id through hub",
+				"repo", repo.Owner+"/"+repo.Name, "host", repo.PlatformHost, "err", err,
+			)
+			continue
+		}
+		id := resolved.PlatformRepoID
+		if !resolved.Found {
+			id = 0
+			slog.Warn("github no longer resolves stored repository; keeping it inactive",
+				"repo", repo.Owner+"/"+repo.Name, "host", repo.PlatformHost,
+			)
+		}
+		if err := s.Db.CompleteGitHubRepositoryConversion(ctx, repo.RepoID, id); err != nil {
+			slog.Warn("record github repository id",
+				"repo", repo.Owner+"/"+repo.Name, "host", repo.PlatformHost, "err", err,
+			)
+		}
+	}
+}
+
+func (s *HubProviderSource) exchange(ctx context.Context, scope federationauth.Scope, request *http.Request, target any) error {
+	return s.exchangeWithProblem(ctx, scope, request, target, hubProviderProblem)
+}
+
+func (s *HubProviderSource) exchangeMutation(ctx context.Context, scope federationauth.Scope, request *http.Request, target any) error {
+	return s.exchangeWithProblem(ctx, scope, request, target, hubProviderMutationProblem)
+}
+
+func (s *HubProviderSource) exchangeWithProblem(ctx context.Context, scope federationauth.Scope, request *http.Request, target any, problem func(error) error) error {
+	if s.Client == nil || (s.Enabled != nil && !s.Enabled()) {
+		return httpapi.HubUnavailable("provider data is unavailable because fleet federation is disabled or inactive")
+	}
+	if err := providerplane.ReadJSON(ctx, s.Client, scope, request, target); err != nil {
+		return problem(err)
+	}
+	return nil
+}
+
+func hubProviderMutationProblem(err error) error {
+	if _, ok := errors.AsType[*providerplane.ResponseError](err); ok ||
+		errors.Is(err, providerplane.ErrCredentialUnavailable) ||
+		errors.Is(err, providerplane.ErrRequestBodyTooLarge) ||
+		errors.Is(err, providerplane.ErrInvalidScope) {
+		return hubProviderProblem(err)
+	}
+	return httpapi.MutationOutcomeUnknown(
+		"The federation hub could not confirm whether the provider mutation was applied.",
+		"", "",
+	)
+}
+
+func hubProviderProblem(err error) error {
+	if responseErr, ok := errors.AsType[*providerplane.ResponseError](err); ok {
+		var problem httpapi.ProblemError
+		if json.Unmarshal(responseErr.Body, &problem) == nil && problem.Code != "" {
+			problem.Status = responseErr.Status
+			return &problem
+		}
+		return httpapi.NewProblem(
+			http.StatusBadGateway,
+			httpapi.CodeUpstreamError,
+			fmt.Sprintf("hub returned HTTP %d without a valid problem", responseErr.Status),
+			nil,
+		)
+	}
+	if errors.Is(err, providerplane.ErrHubUnavailable) ||
+		errors.Is(err, providerplane.ErrCredentialUnavailable) {
+		return httpapi.HubUnavailable(
+			"provider data is unavailable because the federation hub cannot be reached",
+		)
+	}
+	return httpapi.NewProblem(
+		http.StatusBadGateway,
+		httpapi.CodeUpstreamError,
+		"hub returned an invalid provider response",
+		nil,
+	)
+}
+
+// wireRepoID and wireRepoUUID are a key's flat encoding for generated
+// federation request bodies.
+func wireRepoID(key platform.RepositoryKey) int64 {
+	id, _ := key.Wire()
+	return id
+}
+
+func wireRepoUUID(key platform.RepositoryKey) *string {
+	repositoryUUID, ok := key.UUID()
+	if !ok {
+		return nil
+	}
+	return new(repositoryUUID.String())
+}
+
+func optionalProviderQuery[T comparable](value T) *T {
+	var zero T
+	if value == zero {
+		return nil
+	}
+	return &value
+}
+
+func providerLaunchRequestBody(request providerplane.WorkspaceLaunchRequest) *generated.WorkspaceLaunchRequest {
+	return &generated.WorkspaceLaunchRequest{
+		Repository: generated.RepositoryRoute{Provider: request.Repository.Provider, PlatformHost: request.Repository.PlatformHost, Owner: request.Repository.Owner, Name: request.Repository.Name}, ItemType: request.ItemType, ItemNumber: int64(request.ItemNumber),
+		ItemKey: optionalProviderQuery(request.ItemKey), GitHeadRef: optionalProviderQuery(request.GitHeadRef),
+		PlatformRepoID: optionalProviderQuery(wireRepoID(request.RepoKey)), BitbucketRepositoryUUID: wireRepoUUID(request.RepoKey), IssueBranchSlug: optionalProviderQuery(request.IssueBranchSlug),
+		ForCreation: optionalProviderQuery(request.ForCreation),
+	}
+}
+
+func providerSettingsRequestBody(update UpdateSettingsRequest) *generated.ProviderSettingsUpdate {
+	body := &generated.ProviderSettingsUpdate{}
+	if value := update.Activity; value != nil {
+		body.Activity = &generated.Activity{
+			CollapseThreads: value.CollapseThreads, DefaultBranchMaxCommits: int64(value.DefaultBranchMaxCommits),
+			DefaultBranchRetentionDays: int64(value.DefaultBranchRetentionDays), HideBots: value.HideBots, HideClosed: value.HideClosed,
+			ItemTypes: value.ItemTypes, EventTypes: value.EventTypes, HideDrafts: value.HideDrafts,
+			HideNotifications: value.HideNotifications, HideDefaultBranch: value.HideDefaultBranch, RollUpCommits: value.RollUpCommits,
+			TimeRange: generated.ActivityTimeRange(value.TimeRange), ViewMode: generated.ActivityViewMode(value.ViewMode),
+			UseWorkspaceActivityForRecency: value.UseWorkspaceActivityForRecency,
+		}
+	}
+	if value := update.Detail; value != nil {
+		body.Detail = &generated.Detail{CollapseSingleLineBreaks: value.CollapseSingleLineBreaks, InitialTimelineEntryLimit: int64(value.InitialTimelineEntryLimit), RenderCommitMessagesAsMarkdown: value.RenderCommitMessagesAsMarkdown}
+	}
+	if value := update.PullRequests; value != nil {
+		body.PullRequests = &generated.PullRequests{AllowMidStackMerges: value.AllowMidStackMerges, PreferGithubNativeStacks: value.PreferGitHubNativeStacks}
+	}
+	if value := update.Issues; value != nil {
+		body.Issues = new(generated.Issues(*value))
+	}
+	if value := update.Sync; value != nil && value.BudgetPerHour != nil {
+		body.Sync = &generated.SyncSettingsUpdate{BudgetPerHour: new(int64(*value.BudgetPerHour))}
+	}
+	return body
+}
+
+// ObserveWorkspaceTargetRepository imports only the selected hub repository into
+// the spoke's sparse catalog, retaining the caller's stable provider identity.
+func (s *HubProviderSource) ObserveWorkspaceTargetRepository(ctx context.Context, identity platform.RepositoryIdentity) error {
+	request, err := generated.NewFederationGetRepositoryDescriptorRequest(ctx, "/api/v1", &generated.FederationGetRepositoryDescriptorRequestOptions{Body: &generated.RepositoryDescriptorRequest{
+		Provider: identity.Provider, PlatformHost: identity.PlatformHost,
+		PlatformRepoID: optionalProviderQuery(wireRepoID(identity.Key)), BitbucketRepositoryUUID: wireRepoUUID(identity.Key),
+	}})
+	if err != nil {
+		return err
+	}
+	var descriptor providerplane.RepositoryDescriptor
+	if err := s.exchange(ctx, federationauth.ScopeProviderRead, request, &descriptor); err != nil {
+		return err
+	}
+	if err := descriptor.Validate(); err != nil {
+		return InvalidHubDescriptor(err)
+	}
+	if descriptor.Identity() != identity.Canonical() {
+		return InvalidHubDescriptor(errors.New("repository descriptor does not match selected repository"))
+	}
+	return s.ObserveRepositoryDescriptor(ctx, descriptor)
+}
+
+func (s *HubProviderSource) ReadWorkspaceTarget(ctx context.Context, repo db.Repo, kind string, number int) (workspaceapi.WorkspaceTargetMetadata, error) {
+	if kind == db.WorkspaceItemTypePullRequest {
+		detail, err := s.GetPull(ctx, pullapi.ItemIdentity{Provider: repo.Platform, PlatformHost: repo.PlatformHost, Owner: repo.Owner, Name: repo.Name, Number: number})
+		if err != nil {
+			return workspaceapi.WorkspaceTargetMetadata{}, err
+		}
+		if detail.MergeRequest == nil || detail.Repo.Identity() != (platform.RepositoryIdentity{Provider: repo.Platform, PlatformHost: repo.PlatformHost, Key: repo.Key}).Canonical() {
+			return workspaceapi.WorkspaceTargetMetadata{}, InvalidHubDescriptor(errors.New("workspace target repository identity changed"))
+		}
+		return workspaceapi.WorkspaceTargetMetadata{URL: detail.MergeRequest.URL, Title: detail.MergeRequest.Title, State: string(detail.MergeRequest.State)}, nil
+	}
+	detail, err := s.GetIssue(ctx, issueapi.ItemIdentity{Provider: repo.Platform, PlatformHost: repo.PlatformHost, Owner: repo.Owner, Name: repo.Name, Number: number})
+	if err != nil {
+		return workspaceapi.WorkspaceTargetMetadata{}, err
+	}
+	if detail.Issue == nil || detail.Repo.Identity() != (platform.RepositoryIdentity{Provider: repo.Platform, PlatformHost: repo.PlatformHost, Key: repo.Key}).Canonical() {
+		return workspaceapi.WorkspaceTargetMetadata{}, InvalidHubDescriptor(errors.New("workspace target repository identity changed"))
+	}
+	return workspaceapi.WorkspaceTargetMetadata{URL: detail.Issue.URL, Title: detail.Issue.Title, State: detail.Issue.State}, nil
+}
+
+func (s *HubProviderSource) PutWorklist(
+	ctx context.Context, put mcpserver.WorklistPut,
+) (mcpserver.WorklistPutResult, error) {
+	items := make([]generated.FederationWorklistPutItem, 0, len(put.Items))
+	for _, item := range put.Items {
+		var score *int64
+		if item.Score != nil {
+			score = new(int64(*item.Score))
+		}
+		wire := generated.FederationWorklistPutItem{
+			Item: generated.FederationWorkflowItemIdentity{
+				Type: item.Item.Type, Provider: item.Item.Provider, PlatformHost: item.Item.PlatformHost,
+				PlatformRepoID: wireRepoID(item.Item.RepoKey), BitbucketRepositoryUUID: wireRepoUUID(item.Item.RepoKey),
+				Owner: item.Item.Owner, Name: item.Item.Name, Number: int64(item.Item.Number),
+			},
+			Score: score, Section: item.Section, Note: item.Note, Caveat: item.Caveat,
+		}
+		if item.CaveatLevel != "" {
+			wire.CaveatLevel = new(generated.FederationWorklistPutItemCaveatLevel(item.CaveatLevel))
+		}
+		items = append(items, wire)
+	}
+	body := generated.FederationPutWorklistBody{
+		Title: put.Title, Recipe: put.Recipe, CreatedBy: put.CreatedBy,
+		WorkspaceID: put.WorkspaceID, Items: items,
+	}
+	if put.WorklistID != 0 {
+		body.WorklistID = new(put.WorklistID)
+	}
+	httpRequest, err := generated.NewFederationPutWorklistRequest(ctx, "/api/v1", &generated.FederationPutWorklistRequestOptions{Body: &body})
+	if err != nil {
+		return mcpserver.WorklistPutResult{}, err
+	}
+	var response mcpserver.WorklistPutResult
+	if err := s.exchangeMutation(ctx, federationauth.ScopeProviderWrite, httpRequest, &response); err != nil {
+		return mcpserver.WorklistPutResult{}, err
+	}
+	return response, nil
+}
+
+// ImportWorklist imports a worklist link on the hub, as the hub's import
+// page does.
+func (s *HubProviderSource) ImportWorklist(
+	ctx context.Context, fragment string,
+) (worklistapi.WorklistImportResponse, error) {
+	httpRequest, err := generated.NewImportWorklistRequest(ctx, "/api/v1", &generated.ImportWorklistRequestOptions{Body: &generated.ImportWorklistBody{Fragment: fragment}})
+	if err != nil {
+		return worklistapi.WorklistImportResponse{}, err
+	}
+	var response worklistapi.WorklistImportResponse
+	if err := s.exchangeMutation(ctx, federationauth.ScopeProviderWrite, httpRequest, &response); err != nil {
+		return worklistapi.WorklistImportResponse{}, err
+	}
+	return response, nil
+}
+
+func (s *HubProviderSource) GetWorklist(
+	ctx context.Context, id int64,
+) (worklistapi.WorklistResponse, error) {
+	httpRequest, err := generated.NewGetWorklistRequest(ctx, "/api/v1", &generated.GetWorklistRequestOptions{PathParams: &generated.GetWorklistPath{ID: id}})
+	if err != nil {
+		return worklistapi.WorklistResponse{}, err
+	}
+	var response worklistapi.WorklistResponse
+	if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &response); err != nil {
+		return worklistapi.WorklistResponse{}, err
+	}
+	return response, nil
+}
+
+func (s *HubProviderSource) ListWorklists(
+	ctx context.Context, includeDismissed bool,
+) ([]worklistapi.WorklistSummaryResponse, error) {
+	httpRequest, err := generated.NewListWorklistsRequest(ctx, "/api/v1", &generated.ListWorklistsRequestOptions{Query: &generated.ListWorklistsQuery{IncludeDismissed: new(includeDismissed)}})
+	if err != nil {
+		return nil, err
+	}
+	var response worklistapi.ListWorklistsResponse
+	if err := s.exchange(ctx, federationauth.ScopeProviderRead, httpRequest, &response); err != nil {
+		return nil, err
+	}
+	return response.Worklists, nil
+}
+
+func (s *HubProviderSource) DismissWorklist(
+	ctx context.Context, id int64,
+) (worklistapi.WorklistSummaryResponse, error) {
+	httpRequest, err := generated.NewDismissWorklistRequest(ctx, "/api/v1", &generated.DismissWorklistRequestOptions{PathParams: &generated.DismissWorklistPath{ID: id}})
+	if err != nil {
+		return worklistapi.WorklistSummaryResponse{}, err
+	}
+	var response worklistapi.WorklistSummaryResponse
+	if err := s.exchangeMutation(ctx, federationauth.ScopeProviderWrite, httpRequest, &response); err != nil {
+		return worklistapi.WorklistSummaryResponse{}, err
+	}
+	return response, nil
+}
+
+func (s *HubProviderSource) ClearWorklistMarks(
+	ctx context.Context, id int64,
+) (mcpserver.WorklistMarksCleared, error) {
+	httpRequest, err := generated.NewFederationClearWorklistMarksRequest(ctx, "/api/v1", &generated.FederationClearWorklistMarksRequestOptions{PathParams: &generated.FederationClearWorklistMarksPath{ID: id}})
+	if err != nil {
+		return mcpserver.WorklistMarksCleared{}, err
+	}
+	var response mcpserver.WorklistMarksCleared
+	if err := s.exchangeMutation(ctx, federationauth.ScopeProviderWrite, httpRequest, &response); err != nil {
+		return mcpserver.WorklistMarksCleared{}, err
+	}
+	return response, nil
+}

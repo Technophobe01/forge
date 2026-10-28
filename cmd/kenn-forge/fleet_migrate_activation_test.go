@@ -18,6 +18,7 @@ import (
 	"go.kenn.io/forge/internal/federation"
 	"go.kenn.io/forge/internal/federationauth"
 	"go.kenn.io/forge/internal/server"
+	"go.kenn.io/forge/internal/server/authapi"
 	"go.kenn.io/forge/internal/testutil/dbtest"
 	"go.kenn.io/forge/internal/testutil/servertest"
 )
@@ -41,12 +42,18 @@ func TestFleetMigrateProtocolRestoresAuthenticatedActivation(t *testing.T) {
 			t.Cleanup(hub.Close)
 			hubURL := "https://" + hub.Listener.Addr().String()
 			hubDir, spokeDir := t.TempDir(), t.TempDir()
-			hubConfig := &config.Config{DataDir: hubDir, BasePath: "/", Host: "127.0.0.1", Port: 8091,
-				Fleet: config.Fleet{Enabled: true, Role: config.FleetRoleHub, BaseURL: hubURL}}
+			hubConfig := &config.Config{
+				DataDir: hubDir, BasePath: "/", Host: "127.0.0.1", Port: 8091,
+				Fleet: config.Fleet{Enabled: true, Role: config.FleetRoleHub, BaseURL: hubURL},
+			}
 			hubConfig.Tmux.Command = []string{"kenn-forge-no-such-tmux"}
-			spokeConfig := &config.Config{DataDir: spokeDir, BasePath: "/", Host: "127.0.0.1", Port: 8091,
-				Fleet: config.Fleet{Enabled: true, Role: config.FleetRoleSpoke, BaseURL: "https://spoke.example",
-					Hub: &config.FleetHub{NodeID: startupHubID, BaseURL: hubURL}}}
+			spokeConfig := &config.Config{
+				DataDir: spokeDir, BasePath: "/", Host: "127.0.0.1", Port: 8091,
+				Fleet: config.Fleet{
+					Enabled: true, Role: config.FleetRoleSpoke, BaseURL: "https://spoke.example",
+					Hub: &config.FleetHub{NodeID: startupHubID, BaseURL: hubURL},
+				},
+			}
 			hubConfig.API.RequireAuth = true
 			spokeConfig.API.RequireAuth = true
 			member := config.FleetMember{NodeID: startupNodeID, Name: "Spoke", BaseURL: spokeConfig.Fleet.BaseURL, State: federation.EnrollmentActive}
@@ -67,9 +74,11 @@ func TestFleetMigrateProtocolRestoresAuthenticatedActivation(t *testing.T) {
 			generation, err := spokeDB.FreezeSpokePreparationAckGeneration(t.Context())
 			require.NoError(err)
 			emptyReceipts := sha256.Sum256([]byte("[]"))
-			sealRequest := db.SpokePreparationSealRequest{EnrollmentID: startupEnrollmentID, NodeID: startupNodeID,
+			sealRequest := db.SpokePreparationSealRequest{
+				EnrollmentID: startupEnrollmentID, NodeID: startupNodeID,
 				HubNodeID: startupHubID, ProtocolVersion: 3, MigrationVersion: db.WorkspaceLaunchSpecMigrationVersion,
-				ReceiptsDigest: hex.EncodeToString(emptyReceipts[:]), DrainedAckGeneration: generation}
+				ReceiptsDigest: hex.EncodeToString(emptyReceipts[:]), DrainedAckGeneration: generation,
+			}
 			sealRequest.PreparationDigest, err = db.SpokePreparationSealDigest(sealRequest)
 			require.NoError(err)
 			seal, err := hubDB.IssueSpokePreparationSeal(t.Context(), sealRequest)
@@ -86,16 +95,22 @@ func TestFleetMigrateProtocolRestoresAuthenticatedActivation(t *testing.T) {
 			}
 			require.NoError(spokeDB.StoreLocalSpokePreparationSeal(t.Context(), seal.PreparationDigest, seal.Seal))
 			now := time.Now().UTC()
-			enrollment := federation.Enrollment{ID: startupEnrollmentID, NodeID: startupNodeID,
+			enrollment := federation.Enrollment{
+				ID: startupEnrollmentID, NodeID: startupNodeID,
 				SpokeName: "Spoke", SpokePlatform: "linux", SpokeBaseURL: spokeConfig.Fleet.BaseURL,
 				HubID: startupHubID, HubURL: hubURL, ProtocolVersion: 3, State: state,
-				ExpiresAt: now.Add(time.Hour), CreatedAt: now, UpdatedAt: now, PreparationStarted: true}
-			local := federation.LocalEnrollment{EnrollmentID: enrollment.ID, NodeID: enrollment.NodeID,
+				ExpiresAt: now.Add(time.Hour), CreatedAt: now, UpdatedAt: now, PreparationStarted: true,
+			}
+			local := federation.LocalEnrollment{
+				EnrollmentID: enrollment.ID, NodeID: enrollment.NodeID,
 				SpokeName: enrollment.SpokeName, SpokePlatform: enrollment.SpokePlatform, SpokeBaseURL: enrollment.SpokeBaseURL,
 				HubID: enrollment.HubID, HubURL: hubURL, ProtocolVersion: 3, State: state,
 				ExpiresAt: enrollment.ExpiresAt, PreparationStarted: true, PreparationRequired: state == federation.EnrollmentPending,
-				Preparation: &federation.LocalPreparationSeal{EnrollmentID: enrollment.ID, NodeID: enrollment.NodeID,
-					HubID: enrollment.HubID, ProtocolVersion: 3, PreparationDigest: seal.PreparationDigest, Seal: seal.Seal}}
+				Preparation: &federation.LocalPreparationSeal{
+					EnrollmentID: enrollment.ID, NodeID: enrollment.NodeID,
+					HubID: enrollment.HubID, ProtocolVersion: 3, PreparationDigest: seal.PreparationDigest, Seal: seal.Seal,
+				},
+			}
 			for dir, record := range map[string]any{
 				hubDir:   map[string]any{"version": 1, "tokens": []any{}, "enrollments": []federation.Enrollment{enrollment}},
 				spokeDir: map[string]any{"version": 1, "tokens": []any{}, "enrollments": []any{}, "local": local},
@@ -134,7 +149,7 @@ func TestFleetMigrateProtocolRestoresAuthenticatedActivation(t *testing.T) {
 			spokeEnrollments, err := federation.Open(federation.DefaultStorePath(spokeDir), federation.StoreOptions{})
 			require.NoError(err)
 			hub.Config.Handler = servertest.NewWithConfig(t, hubDB, nil, nil, nil, hubConfig, hubPath, server.ServerOptions{
-				DaemonAccess:          server.DaemonAccessOptions{Token: "local-secret", RequireAPIAuth: true},
+				DaemonAccess:          authapi.DaemonAccessOptions{Token: "local-secret", RequireAPIAuth: true},
 				FederationCredentials: hubCredentials, FederationEnrollments: hubEnrollments, FederationSpokeID: startupHubID,
 				WorktreeDir: t.TempDir(), DisableWorkspaceBackgroundMonitors: true, HostCheckAllowLoopbackAnyPort: true,
 			})

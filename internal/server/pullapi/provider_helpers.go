@@ -14,6 +14,7 @@ const (
 	capabilityCommentMutation             = "comment_mutation"
 	capabilityStateMutation               = "state_mutation"
 	capabilityMergeMutation               = "merge_mutation"
+	capabilityMergeQueueMutation          = "merge_queue_mutation"
 	capabilityReviewMutation              = "review_mutation"
 	capabilityWorkflowApproval            = "workflow_approval"
 	capabilityReadyForReview              = "ready_for_review"
@@ -38,14 +39,14 @@ func providerRouteLookupError(err error) error {
 func (s *Handler) lookupRepoByProviderRoute(
 	ctx context.Context,
 	provider, platformHost, owner, name string,
-) (*db.Repo, error) {
+) (*db.ActiveRepo, error) {
 	return s.resolver.LookupRoute(ctx, provider, platformHost, owner, name)
 }
 
 func (s *Handler) requireRepoRouteCapability(
 	ctx context.Context,
 	provider, platformHost, owner, name, capability string,
-) (*db.Repo, error) {
+) (*db.ActiveRepo, error) {
 	return s.resolver.RequireRouteCapability(
 		ctx, provider, platformHost, owner, name, capability,
 	)

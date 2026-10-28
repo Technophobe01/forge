@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-import { page } from "vite-plus/test/browser";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { page, userEvent } from "vite-plus/test/browser";
 import { cleanup, render } from "vitest-browser-svelte";
 import "./app.css";
 
@@ -23,12 +23,12 @@ const launchTargets: LaunchTarget[] = [
 ];
 
 function resolvedColor(value: string): string {
-  const probe = document.createElement("span");
-  probe.style.color = value;
-  document.body.append(probe);
-  const color = getComputedStyle(probe).color;
-  probe.remove();
-  return color;
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  if (context === null) throw new Error("Canvas rendering is unavailable");
+  context.fillStyle = value;
+  context.fillRect(0, 0, 1, 1);
+  return Array.from(context.getImageData(0, 0, 1, 1).data).join(",");
 }
 
 describe("workspace create split button control height", () => {
@@ -62,6 +62,10 @@ describe("workspace create split button control height", () => {
 describe("workspace create split button in the New workspace dialog", () => {
   const originalFetch = globalThis.fetch;
 
+  beforeEach(() => {
+    localStorage.removeItem("kenn-forge:workspace:new_repo");
+  });
+
   afterEach(async () => {
     cleanup();
     globalThis.fetch = originalFetch;
@@ -82,7 +86,10 @@ describe("workspace create split button in the New workspace dialog", () => {
         [
           STORES_KEY,
           {
-            settings: { getLaunchTargets: () => launchTargets },
+            settings: {
+              getLaunchTargets: () => [...launchTargets, { ...launchTargets[0], key: "custom", label: "review_agent" }],
+              getWorkspaceSettings: () => ({ default_execution_target: "" }),
+            },
           },
         ],
       ]),
@@ -109,9 +116,93 @@ describe("workspace create split button in the New workspace dialog", () => {
     const hit = document.elementFromPoint(itemRect.left + itemRect.width / 2, itemRect.top + itemRect.height / 2);
     expect(item.element() === hit || item.element().contains(hit)).toBe(true);
 
-    await item.click();
+    const custom = page.getByRole("menuitem", { name: "review_agent" });
+    await expect.element(custom).toBeVisible();
+    const labelPositions = [item.element(), custom.element()].map((element) => {
+      const text = [...element.childNodes].find((node) => node.nodeType === Node.TEXT_NODE && node.textContent?.trim());
+      if (!text) throw new Error("Missing agent label");
+      const range = document.createRange();
+      range.selectNodeContents(text);
+      return range.getBoundingClientRect().left;
+    });
+    expect(labelPositions[1]).toBe(labelPositions[0]);
+    item.element().focus();
+    await userEvent.keyboard("{Enter}");
     await vi.waitFor(() => expect(onCreated).toHaveBeenCalledWith("ws-new", undefined));
   });
+
+  it.each([
+    ["github.com", false, "Devbox is in maintenance"],
+    ["github.example.com", true, "Devboxes currently support only github.com"],
+  ])(
+    "explains an unavailable devbox and allows choosing this machine (%s)",
+    async (platformHost, available, reason) => {
+      const api = createMockApiFetch([
+        ({ method, url }) => {
+          if (method === "POST" && url.pathname.endsWith("/workspaces")) return jsonResponse({ id: "ws-local" }, 202);
+          if (method !== "GET") return undefined;
+          if (url.pathname === "/api/v1/repos")
+            return jsonResponse([
+              {
+                ID: 1,
+                PlatformRepoID: 1001,
+                Owner: "acme",
+                Name: "widget",
+                Platform: "github",
+                PlatformHost: platformHost,
+                Host: platformHost,
+                DefaultBranch: "main",
+                IsArchived: false,
+              },
+            ]);
+          if (url.pathname === "/api/v1/snapshot")
+            return jsonResponse({
+              hosts: [
+                {
+                  configKey: "local",
+                  kind: "self",
+                  name: "Laptop",
+                  federationRole: "hub",
+                  operationAvailability: { workspaceWrite: { available: true } },
+                },
+                {
+                  configKey: "devbox:compute-a",
+                  kind: "devbox",
+                  name: "Compute A",
+                  federationRole: "devbox",
+                  operationAvailability: { workspaceWrite: { available, unavailableReason: reason } },
+                },
+              ],
+            });
+          return undefined;
+        },
+      ]);
+      globalThis.fetch = api.fetch;
+      const onCreated = vi.fn();
+      await render(NewWorkspaceDialogRuntimeHarness, {
+        props: { open: true, onClose: vi.fn(), onCreated },
+        context: new Map([
+          [
+            STORES_KEY,
+            {
+              settings: {
+                getLaunchTargets: () => launchTargets,
+                getWorkspaceSettings: () => ({ default_execution_target: "devbox:compute-a" }),
+              },
+            },
+          ],
+        ]),
+      });
+      const dialog = page.getByRole("dialog", { name: "New workspace" });
+      await expect.element(dialog.getByText(reason, { exact: false })).toBeVisible();
+      await expect.element(dialog.getByRole("button", { name: "Create workspace", exact: true })).toBeDisabled();
+      await dialog.getByRole("combobox", { name: "Workspace machine: Compute A (devbox)", exact: false }).click();
+      await expect.element(page.getByRole("option", { name: "Compute A (devbox)", exact: false })).toBeDisabled();
+      await page.getByRole("option", { name: "Laptop (this machine)" }).click();
+      await dialog.getByRole("button", { name: "Create workspace", exact: true }).click();
+      await vi.waitFor(() => expect(onCreated).toHaveBeenCalledWith("ws-local", undefined));
+    },
+  );
 
   it("uses kit-ui primary colors for both solid segments", async () => {
     globalThis.fetch = createMockApiFetch().fetch;
@@ -123,7 +214,10 @@ describe("workspace create split button in the New workspace dialog", () => {
         [
           STORES_KEY,
           {
-            settings: { getLaunchTargets: () => launchTargets },
+            settings: {
+              getLaunchTargets: () => launchTargets,
+              getWorkspaceSettings: () => ({ default_execution_target: "" }),
+            },
           },
         ],
       ]),
@@ -146,10 +240,10 @@ describe("workspace create split button in the New workspace dialog", () => {
     const accent = resolvedColor(rootStyle.getPropertyValue("--accent-blue").trim());
     const foreground = resolvedColor(rootStyle.getPropertyValue("--bg-surface").trim());
 
-    expect(primaryStyle.backgroundColor).toBe(accent);
-    expect(optionsStyle.backgroundColor).toBe(accent);
-    expect(primaryStyle.color).toBe(foreground);
-    expect(optionsStyle.color).toBe(foreground);
+    expect(resolvedColor(primaryStyle.backgroundColor)).toBe(accent);
+    expect(resolvedColor(optionsStyle.backgroundColor)).toBe(accent);
+    expect(resolvedColor(primaryStyle.color)).toBe(foreground);
+    expect(resolvedColor(optionsStyle.color)).toBe(foreground);
   });
 
   it("keeps the launch split button usable for the Kata issue source", async () => {
@@ -199,7 +293,10 @@ describe("workspace create split button in the New workspace dialog", () => {
         [
           STORES_KEY,
           {
-            settings: { getLaunchTargets: () => launchTargets },
+            settings: {
+              getLaunchTargets: () => launchTargets,
+              getWorkspaceSettings: () => ({ default_execution_target: "" }),
+            },
           },
         ],
       ]),

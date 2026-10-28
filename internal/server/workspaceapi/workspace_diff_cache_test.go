@@ -16,6 +16,7 @@ import (
 )
 
 func TestWorkspaceDiffCacheMissThenHitPreparesOnce(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	now := time.Unix(100, 0)
@@ -137,7 +138,7 @@ func TestWorkspaceDiffCacheHeadMismatchQueuesImmediateValidation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		require := require.New(t)
 		assert := assert.New(t)
-		root, cancel := context.WithCancel(context.Background())
+		root, cancel := context.WithCancel(t.Context())
 		now := time.Unix(100, 0)
 		resolved := workspaceDiffTestResolved()
 		key := workspaceDiffTestKey()
@@ -247,7 +248,7 @@ func TestWorkspaceDiffCacheReconnectRetainsActiveScopes(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		require := require.New(t)
 		assert := assert.New(t)
-		root, cancel := context.WithCancel(context.Background())
+		root, cancel := context.WithCancel(t.Context())
 		now := time.Unix(100, 0)
 		var fingerprintCalls atomic.Int64
 		cache := newWorkspaceDiffCache(root, workspaceDiffCacheDeps{
@@ -295,6 +296,7 @@ func TestWorkspaceDiffCacheReconnectRetainsActiveScopes(t *testing.T) {
 }
 
 func TestWorkspaceDiffCacheChangedValidationReplacesStableSnapshot(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	now := time.Unix(100, 0)
@@ -332,6 +334,7 @@ func TestWorkspaceDiffCacheChangedValidationReplacesStableSnapshot(t *testing.T)
 }
 
 func TestWorkspaceDiffCacheConcurrentMissesCoalesce(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	key := workspaceDiffTestKey()
 	started := make(chan struct{})
@@ -418,6 +421,7 @@ func TestWorkspaceDiffCacheExpiredActiveEntryCanBeEvicted(t *testing.T) {
 }
 
 func TestWorkspaceDiffCacheSelectionRetriesFailedPrewarm(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	retry := make(chan time.Time)
@@ -457,6 +461,7 @@ func TestWorkspaceDiffCacheSelectionRetriesFailedPrewarm(t *testing.T) {
 }
 
 func TestWorkspaceDiffCacheSelectedColdFailureWaitsForPrewarmBackoff(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	retry := make(chan time.Time)
@@ -499,7 +504,7 @@ func TestWorkspaceDiffCacheSelectedColdFailureWaitsForPrewarmBackoff(t *testing.
 	case attempt := <-attempts:
 		earlyAttempt = true
 		assert.Fail("periodic validation bypassed cold retry backoff", "attempt=%d", attempt)
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // shows the event does not happen; the cold retry backoff holds the next attempt until retry fires
 	}
 
 	retry <- time.Now()
@@ -647,7 +652,7 @@ func TestWorkspaceDiffCacheValidationTimeoutDoesNotPoisonForegroundWaiter(t *tes
 		},
 	})
 
-	validationCtx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	validationCtx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond) //nolint:kennlint // the deadline is the expected result; prepare blocks on releasePrepare until it fires
 	defer cancel()
 	validationDone := make(chan error, 1)
 	go func() { validationDone <- cache.validate(validationCtx, key) }()
@@ -665,7 +670,7 @@ func TestWorkspaceDiffCacheValidationTimeoutDoesNotPoisonForegroundWaiter(t *tes
 	select {
 	case result := <-getDone:
 		require.Fail("foreground waiter inherited validation cancellation", "error=%v", result.err)
-	case <-time.After(25 * time.Millisecond):
+	case <-time.After(25 * time.Millisecond): //nolint:kennlint // shows the event does not happen; prepare blocks the foreground waiter until releasePrepare
 	}
 	close(releasePrepare)
 	require.NoError((<-getDone).err)
@@ -706,7 +711,7 @@ func TestWorkspaceDiffCacheSelectedValidationMeetsMaxAge(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		require := require.New(t)
 		assert := assert.New(t)
-		root, cancel := context.WithCancel(context.Background())
+		root, cancel := context.WithCancel(t.Context())
 		now := time.Unix(100, 0)
 		key := workspaceDiffTestKey()
 		var fingerprint atomic.Value

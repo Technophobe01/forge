@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
+	"go.kenn.io/forge/internal/apiclient/paramcodec"
 )
 
 // ListReposRequestOptions is the options needed to make a request to ListRepos.
@@ -23,7 +24,7 @@ func (o *ListReposRequestOptions) GetPathParams() (map[string]any, error) {
 
 // GetQuery returns the query params as a map.
 func (o *ListReposRequestOptions) GetQuery() (map[string]any, error) {
-	return runtime.AsMap[any](o.Query)
+	return paramcodec.Map(o.Query)
 }
 
 // GetBody returns the payload in any type that can be marshalled to JSON by the client.
@@ -115,10 +116,22 @@ func (c *Client) ListReposWithResponse(ctx context.Context, options *ListReposRe
 			}
 		}
 		return out, nil
-	case 500:
-		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
 	default:
-		return out, runtime.NewClientAPIError(fmt.Errorf("unexpected status code: %d", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+		out.ApplicationProblemPlusJSONDefault = new(ListReposErrorResponse)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.ApplicationProblemPlusJSONDefault); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "ListReposErrorResponse",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
 	}
 }
 
@@ -178,11 +191,12 @@ type ListReposResponse = ListReposOutputBody
 type ListReposErrorResponse = ErrorModel
 
 type ListReposResp struct {
-	HTTPResponse *http.Response
-	Body         []byte
-	StatusCode   int
-	Error        *ListReposErrorResponse
-	JSON200      *ListReposResponse
+	HTTPResponse                      *http.Response
+	Body                              []byte
+	StatusCode                        int
+	Error                             *ListReposErrorResponse
+	JSON200                           *ListReposResponse
+	ApplicationProblemPlusJSONDefault *ListReposErrorResponse
 }
 
 type ErrorDetail struct {
@@ -226,7 +240,7 @@ func (s ErrorModel) Error() string {
 type ListReposOutputBody struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema     *string         `json:"$schema,omitempty"`
-	Repos      []RepoWithCount `json:"repos,omitempty"`
+	Repos      []RepoWithCount `json:"repos"`
 	TotalCount int64           `json:"total_count"`
 }
 

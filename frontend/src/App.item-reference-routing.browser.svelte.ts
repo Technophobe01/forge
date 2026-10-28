@@ -1,15 +1,6 @@
-// Browser-tier reimplementation of frontend/tests/e2e-full/item-reference-routing.spec.ts.
-// A cross-repository timeline reference is an item-ref link: clicking it POSTs to
-// the repo resolve endpoint and then either navigates internally (when the target
-// repo is tracked) or opens the provider URL via window.open (when it is not).
-// The app is mounted for real with the PR detail, the resolve responses, and the
-// target detail mocked at the fetch boundary, so the navigation and the
-// window.open call are the genuine outputs of the resolve handler.
-//
-// A real Chromium page provides matchMedia/ResizeObserver/IntersectionObserver/
-// canvas natively, so the jsdom installAppDomGlobals() shim is gone; the browser
-// harness stubs only EventSource. The untracked case spies window.open with
-// vi.spyOn instead of intercepting a Playwright popup.
+// Timeline references resolve tracked repositories inside Forge. Untracked
+// references retain native browser navigation to the provider. The browser-tier
+// test observes that uncancelled click; the ACP e2e checks the actual new tab.
 //
 // Seed parity (internal/testutil/fixtures.go): acme/widgets#1 carries
 // cross_referenced events to the tracked acme/tools#1 and the untracked
@@ -123,6 +114,27 @@ const widgetsEvents = [
 
 function overrides(): MockRouteOverride[] {
   return [
+    (req) =>
+      req.url.pathname === "/api/v1/repos"
+        ? jsonResponse(
+            ["widgets", "tools"].map((Name, index) => ({
+              ID: index + 1,
+              PlatformRepoID: 1001 + index,
+              Owner: "acme",
+              Name,
+              Platform: "github",
+              PlatformHost: "github.com",
+              AllowSquashMerge: true,
+              AllowMergeCommit: true,
+              AllowRebaseMerge: true,
+              ViewerCanMerge: true,
+              LastSyncStartedAt: null,
+              LastSyncCompletedAt: null,
+              LastSyncError: "",
+              CreatedAt: "2026-03-01T00:00:00Z",
+            })),
+          )
+        : null,
     // Match the detail GET and the background /sync/async POST so the sync does
     // not 404 against the default fixtures and clobber the loaded detail.
     (req) =>
@@ -169,7 +181,7 @@ describe("item references through the timeline", () => {
     mounted = await mountBrowserApp("/pulls/github/acme/widgets/1", { overrides: overrides() });
     await vi.waitFor(() => expect(detailTitle()).toContain("Add widget caching layer"), WAIT);
 
-    await page.getByRole("link", { name: "Add CLI flag parser" }).click();
+    await page.getByRole("link", { name: "Add CLI flag parser", exact: false }).click();
 
     await vi.waitFor(() => expect(window.location.pathname).toBe("/pulls/github/acme/tools/1"), WAIT);
     await vi.waitFor(() => expect(detailTitle()).toContain("Add CLI flag parser"), WAIT);
@@ -180,11 +192,77 @@ describe("item references through the timeline", () => {
     mounted = await mountBrowserApp("/pulls/github/acme/widgets/1", { overrides: overrides() });
     await vi.waitFor(() => expect(detailTitle()).toContain("Add widget caching layer"), WAIT);
 
-    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
-    await page.getByRole("link", { name: "External follow-up PR" }).click();
+    const link = document.querySelector<HTMLAnchorElement>('a.item-ref[data-owner="other"]')!;
+    let captured = true;
+    document.addEventListener(
+      "click",
+      (event) => {
+        captured = event.defaultPrevented;
+        // Keep the test runner iframe in place after observing Forge's handler.
+        event.preventDefault();
+      },
+      { once: true },
+    );
+    await page.getByRole("link", { name: "External follow-up PR", exact: false }).click();
 
-    await vi.waitFor(() => expect(openSpy).toHaveBeenCalled(), WAIT);
-    expect(String(openSpy.mock.calls[0]![0])).toBe("https://github.com/other/repo/pull/77");
+    expect(captured).toBe(false);
+    expect(link.href).toBe("https://github.com/other/repo/pull/77");
+    expect(link.target).toBe("_blank");
+    expect(mounted.api.requests.some((r) => r.url.pathname === "/api/v1/repo/github/other/repo/resolve/77")).toBe(
+      false,
+    );
     expect(window.location.pathname).toBe("/pulls/github/acme/widgets/1");
+  });
+
+  it.each([
+    ["pr", "https://github.com/acme/tools/pull/1", "Add CLI flag parser"],
+    ["issue", "https://github.com/acme/widgets/issues/7", "Theme toggle does not stick"],
+  ] as const)("keeps a linked %s inside the current workspace", async (itemType, url, title) => {
+    const workspace = {
+      id: "ws-1",
+      repo: repoRef("acme", "widgets"),
+      platform_host: "github.com",
+      repo_owner: "acme",
+      repo_name: "widgets",
+      item_type: "pull_request",
+      item_number: 1,
+      source_item_visible: true,
+      git_head_ref: "feature/x",
+      worktree_path: "/tmp/worktrees/ws-1",
+      tmux_session: "kenn-forge-ws-1",
+      status: "ready",
+      enrichment_status: "fresh",
+      created_at: "2026-03-30T14:00:00Z",
+    };
+    const initial = pullDetail("acme", "widgets", 1, "Add widget caching layer", widgetsEvents);
+    initial.merge_request.Body = `See [linked item](${url}).`;
+    localStorage.setItem("kenn-forge-workspace-sidebar-open", "true");
+    localStorage.setItem("kenn-forge-workspace-sidebar-tab:ws-1", "pr");
+    mounted = await mountBrowserApp("/terminal/ws-1", {
+      overrides: [
+        (req) => {
+          const path = req.url.pathname;
+          if (path === "/api/v1/workspaces") return jsonResponse({ workspaces: [workspace] });
+          if (path === "/api/v1/workspaces/ws-1") return jsonResponse(workspace);
+          if (path === "/api/v1/workspaces/ws-1/runtime") return jsonResponse({ launch_targets: [], sessions: [] });
+          if (/^\/api\/v1\/pulls\/github\/acme\/widgets\/1(\/sync(?:\/async)?)?$/.test(path))
+            return jsonResponse(initial);
+          if (path === "/api/v1/repo/github/acme/widgets/resolve/7") {
+            return jsonResponse({ number: 7, item_type: "issue", repo_tracked: true });
+          }
+          return null;
+        },
+        ...overrides(),
+      ],
+    });
+
+    const sidebar = page.getByRole("region", { name: "Workspace details pane" });
+    await sidebar.getByRole("link", { name: itemType === "pr" ? title : "linked item", exact: false }).click();
+
+    await expect.element(sidebar.getByRole("heading", { name: title, exact: true })).toBeVisible();
+    expect(window.location.pathname).toBe("/terminal/ws-1");
+    expect(
+      JSON.parse(localStorage.getItem('kenn-forge-workspace-viewed-items:["self","ws-1"]')!)[itemType].number,
+    ).toBe(itemType === "pr" ? 1 : 7);
   });
 });

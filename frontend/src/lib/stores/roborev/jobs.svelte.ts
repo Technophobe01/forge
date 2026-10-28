@@ -22,7 +22,6 @@ export interface JobsStoreOptions {
   client: RoborevClient;
   runtime: AppRuntime;
   owner: string;
-  navigate: (path: string) => void;
   onError?: (msg: string) => void;
 }
 
@@ -42,7 +41,7 @@ interface JobsAuthority {
   readonly queryScope: string;
 }
 
-type SortColumn = "id" | "status" | "verdict" | "agent" | "elapsed" | "cost" | "job_type" | "enqueued_at";
+type SortColumn = "id" | "repo" | "status" | "verdict" | "agent" | "elapsed" | "cost" | "job_type" | "enqueued_at";
 type SortDirection = "asc" | "desc";
 type StringFilterKey = "repo" | "branch" | "status" | "search" | "jobType";
 type BooleanFilterKey = "hideClosed" | "showAutoDesign";
@@ -211,6 +210,10 @@ export function createJobsStore(opts: JobsStoreOptions) {
     switch (col) {
       case "id":
         return job.id;
+      case "repo":
+        // The column reads repo, then branch, then ref; NUL keeps each field
+        // comparing whole before the next one breaks the tie.
+        return [job.repo_name ?? "", job.branch ?? "", job.git_ref].join("\u0000");
       case "status":
         return job.status;
       case "verdict":
@@ -354,6 +357,7 @@ export function createJobsStore(opts: JobsStoreOptions) {
     );
 
   function loadJobs(): void {
+    if (disposed) return;
     opts.runtime.runCommand(loadJobsEffect(), {
       operation: "load Roborev jobs",
       safeContext: { owner: opts.owner },
@@ -456,7 +460,6 @@ export function createJobsStore(opts: JobsStoreOptions) {
   function setRepoBranchFilter(repo: string | undefined, branch: string | undefined): void {
     filterRepo = repo;
     filterBranch = branch;
-    loadJobs();
   }
 
   function setSortColumn(col: SortColumn): void {
@@ -739,14 +742,10 @@ export function createJobsStore(opts: JobsStoreOptions) {
   function selectJob(id: number): void {
     selectedJobId = id;
     highlightedJobId = id;
-    if (!window.location.pathname.endsWith(`/reviews/${id}`)) {
-      opts.navigate(`/reviews/${id}`);
-    }
   }
 
   function deselectJob(): void {
     selectedJobId = undefined;
-    opts.navigate("/reviews");
   }
 
   const connectEventStreamEffect = (baseUrl: string, eventOwner: string) =>

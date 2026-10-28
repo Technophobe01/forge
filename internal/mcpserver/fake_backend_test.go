@@ -6,9 +6,15 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/forge/platform"
 )
 
 type fakeBackend struct {
+	kataTargetsAvailableFn       func() bool
+	addWorkspaceTargetFn         func(context.Context, string, WorkspaceTargetRequest) (WorkspaceTarget, error)
+	listWorkspaceTargetsFn       func(context.Context, string) (WorkspaceTargets, error)
+	removeWorkspaceTargetFn      func(context.Context, string, string, int64) error
 	listRepositoriesFn           func(context.Context) ([]RepositorySummary, error)
 	listActivityFn               func(context.Context, ActivityQuery) (ActivityPage, error)
 	listPullsFn                  func(context.Context, ItemListQuery) ([]Pull, error)
@@ -19,6 +25,12 @@ type fakeBackend struct {
 	getPullStackFn               func(context.Context, ItemIdentity) (Stack, error)
 	listWorkflowStatesFn         func(context.Context, WorkflowQuery) (WorkflowPage, error)
 	setWorkflowStateFn           func(context.Context, ItemIdentity, WorkflowUpdate) (WorkflowMutation, error)
+	putWorklistFn                func(context.Context, WorklistPut) (WorklistPutResult, error)
+	getWorklistFn                func(context.Context, int64) (Worklist, error)
+	listWorklistsFn              func(context.Context, bool) ([]WorklistSummary, error)
+	dismissWorklistFn            func(context.Context, int64) (WorklistDismissal, error)
+	clearWorklistMarksFn         func(context.Context, int64) (WorklistMarksCleared, error)
+	importWorklistFn             func(context.Context, string) (WorklistImportResult, error)
 	listLaunchTargetsFn          func(context.Context) ([]LaunchTarget, error)
 	preferredWorkspaceAgentFn    func(context.Context, time.Time, []string) (string, bool, error)
 	listWorkspaceAgentSessionsFn func(context.Context, string) ([]WorkspaceAgentSession, error)
@@ -26,11 +38,53 @@ type fakeBackend struct {
 	createPullWorkspaceFn        func(context.Context, ItemIdentity, bool) (Workspace, error)
 	createIssueWorkspaceFn       func(context.Context, ItemIdentity, bool) (Workspace, error)
 	createAdHocWorkspaceFn       func(context.Context, RepositoryIdentity, string) (Workspace, error)
-	launchWorkspaceRuntimeFn     func(context.Context, string, string) (RuntimeSession, error)
+	launchWorkspaceRuntimeFn     func(context.Context, string, string, string) (RuntimeSession, error)
 	getWorkspaceRuntimeFn        func(context.Context, string) (WorkspaceRuntime, error)
 	submitAgentMessageFn         func(context.Context, AgentMessageRequest) (AgentMessageResult, error)
 	submitInitialMessageFn       func(context.Context, InitialMessageRequest) (InitialMessageStatus, error)
 	getInitialMessageFn          func(context.Context, string, string) (InitialMessageStatus, error)
+}
+
+func (b *fakeBackend) PutWorklist(ctx context.Context, put WorklistPut) (WorklistPutResult, error) {
+	if b.putWorklistFn != nil {
+		return b.putWorklistFn(ctx, put)
+	}
+	return WorklistPutResult{}, nil
+}
+
+func (b *fakeBackend) GetWorklist(ctx context.Context, id int64) (Worklist, error) {
+	if b.getWorklistFn != nil {
+		return b.getWorklistFn(ctx, id)
+	}
+	return Worklist{}, nil
+}
+
+func (b *fakeBackend) ListWorklists(ctx context.Context, includeDismissed bool) ([]WorklistSummary, error) {
+	if b.listWorklistsFn != nil {
+		return b.listWorklistsFn(ctx, includeDismissed)
+	}
+	return nil, nil
+}
+
+func (b *fakeBackend) DismissWorklist(ctx context.Context, id int64) (WorklistDismissal, error) {
+	if b.dismissWorklistFn != nil {
+		return b.dismissWorklistFn(ctx, id)
+	}
+	return WorklistDismissal{}, nil
+}
+
+func (b *fakeBackend) ClearWorklistMarks(ctx context.Context, id int64) (WorklistMarksCleared, error) {
+	if b.clearWorklistMarksFn != nil {
+		return b.clearWorklistMarksFn(ctx, id)
+	}
+	return WorklistMarksCleared{}, nil
+}
+
+func (b *fakeBackend) ImportWorklist(ctx context.Context, fragment string) (WorklistImportResult, error) {
+	if b.importWorklistFn != nil {
+		return b.importWorklistFn(ctx, fragment)
+	}
+	return WorklistImportResult{}, nil
 }
 
 func (b *fakeBackend) ListRepositories(ctx context.Context) ([]RepositorySummary, error) {
@@ -154,9 +208,9 @@ func (b *fakeBackend) CreateAdHocWorkspace(ctx context.Context, repo RepositoryI
 	return Workspace{}, nil
 }
 
-func (b *fakeBackend) LaunchWorkspaceRuntime(ctx context.Context, workspaceID, targetKey string) (RuntimeSession, error) {
+func (b *fakeBackend) LaunchWorkspaceRuntime(ctx context.Context, workspaceID, targetKey, initialMessage string) (RuntimeSession, error) {
 	if b.launchWorkspaceRuntimeFn != nil {
-		return b.launchWorkspaceRuntimeFn(ctx, workspaceID, targetKey)
+		return b.launchWorkspaceRuntimeFn(ctx, workspaceID, targetKey, initialMessage)
 	}
 	return RuntimeSession{}, nil
 }
@@ -201,15 +255,40 @@ func newMCPTestServer(t *testing.T, backend Backend) *Server {
 func testRepository() RepositoryIdentity {
 	return RepositoryIdentity{
 		Provider: "github", PlatformHost: "github.com",
-		PlatformRepoID: "repo-acme-widget",
-		RepoPath:       "acme/widget", Owner: "acme", Name: "widget",
+		Key:      platform.RepositoryIDKey(1001),
+		RepoPath: "acme/widget", Owner: "acme", Name: "widget",
 	}
 }
 
 func testItemIdentity(itemType string, number int) ItemIdentity {
 	return ItemIdentity{
 		Type: itemType, Provider: "github", PlatformHost: "github.com",
-		PlatformRepoID: "repo-acme-widget",
-		Owner:          "acme", Name: "widget", Number: number,
+		RepoKey: platform.RepositoryIDKey(1001),
+		Owner:   "acme", Name: "widget", Number: number,
 	}
+}
+
+func (b *fakeBackend) KataTargetsAvailable() bool {
+	return b.kataTargetsAvailableFn != nil && b.kataTargetsAvailableFn()
+}
+
+func (b *fakeBackend) AddWorkspaceTarget(ctx context.Context, id string, in WorkspaceTargetRequest) (WorkspaceTarget, error) {
+	if b.addWorkspaceTargetFn != nil {
+		return b.addWorkspaceTargetFn(ctx, id, in)
+	}
+	return WorkspaceTarget{}, nil
+}
+
+func (b *fakeBackend) ListWorkspaceTargets(ctx context.Context, id string) (WorkspaceTargets, error) {
+	if b.listWorkspaceTargetsFn != nil {
+		return b.listWorkspaceTargetsFn(ctx, id)
+	}
+	return WorkspaceTargets{Targets: []WorkspaceTarget{}}, nil
+}
+
+func (b *fakeBackend) RemoveWorkspaceTarget(ctx context.Context, id, kind string, targetID int64) error {
+	if b.removeWorkspaceTargetFn != nil {
+		return b.removeWorkspaceTargetFn(ctx, id, kind, targetID)
+	}
+	return nil
 }

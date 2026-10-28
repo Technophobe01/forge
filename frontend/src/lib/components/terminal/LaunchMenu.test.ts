@@ -1,10 +1,77 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/svelte";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import LaunchMenu from "./LaunchMenu.svelte";
 
 describe("LaunchMenu", () => {
   afterEach(() => cleanup());
+
+  it("offers sorted quick actions beside Launch and disables unavailable agents", async () => {
+    const onQuickAction = vi.fn();
+    const { rerender } = render(LaunchMenu, {
+      props: {
+        launchTargets: [
+          { key: "codex", label: "Codex", kind: "agent", source: "builtin", available: true },
+          { key: "claude", label: "Claude", kind: "agent", source: "builtin", available: false },
+        ],
+        quickActions: [
+          { label: "Review", agent: "codex", prompt: "Review this change" },
+          { label: "audit", agent: "claude", prompt: "Audit this change" },
+          { label: "Missing", agent: "missing", prompt: "Check this change" },
+        ],
+        onQuickAction,
+      },
+    });
+    await fireEvent.click(screen.getByRole("button", { name: "Launch", exact: true }));
+    await fireEvent.click(screen.getByRole("button", { name: "Quick actions", exact: true }));
+    expect(screen.queryByRole("dialog", { name: "Run configurations" })).toBeNull();
+    const menu = screen.getByRole("dialog", { name: "Quick actions" });
+    expect(
+      within(menu)
+        .getAllByRole("button")
+        .map((button) => button.textContent?.trim()),
+    ).toEqual(["audit", "Missing", "Review"]);
+    expect((within(menu).getByRole("button", { name: "audit" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((within(menu).getByRole("button", { name: "Missing" }) as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.click(within(menu).getByRole("button", { name: "Review" }));
+    expect(onQuickAction).toHaveBeenCalledExactlyOnceWith({
+      label: "Review",
+      agent: "codex",
+      prompt: "Review this change",
+    });
+    expect(screen.queryByRole("dialog", { name: "Quick actions" })).toBeNull();
+    await fireEvent.click(screen.getByRole("button", { name: "Quick actions", exact: true }));
+    await rerender({ hostVisible: false });
+    expect(screen.queryByRole("dialog", { name: "Quick actions" })).toBeNull();
+  });
+
+  it("enables quick actions that target available ACP agents", async () => {
+    const onQuickAction = vi.fn();
+    const { rerender } = render(LaunchMenu, {
+      props: {
+        launchTargets: [{ key: "claude-acp", label: "Claude (ACP)", kind: "acp", source: "builtin", available: true }],
+        quickActions: [{ label: "triage", agent: "claude-acp", prompt: "Triage this change" }],
+        onQuickAction,
+      },
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Quick actions", exact: true }));
+    const triage = within(screen.getByRole("dialog", { name: "Quick actions" })).getByRole("button", {
+      name: "triage",
+    }) as HTMLButtonElement;
+    expect(triage.disabled).toBe(false);
+    await fireEvent.click(triage);
+    expect(onQuickAction).toHaveBeenCalledExactlyOnceWith({
+      label: "triage",
+      agent: "claude-acp",
+      prompt: "Triage this change",
+    });
+    await rerender({ quickActionBusy: true });
+    expect(screen.getByRole("button", { name: "Quick actions", exact: true }).hasAttribute("disabled")).toBe(true);
+    expect(screen.getByRole("button", { name: "Launch", exact: true }).hasAttribute("disabled")).toBe(false);
+    await rerender({ quickActionBusy: false });
+    expect(screen.getByRole("button", { name: "Quick actions", exact: true }).hasAttribute("disabled")).toBe(false);
+  });
 
   it("hides disabled configured targets but keeps unavailable detected targets visible", async () => {
     const onLaunch = vi.fn();
@@ -49,6 +116,8 @@ describe("LaunchMenu", () => {
 
     await fireEvent.click(screen.getByRole("button", { name: "Launch" }));
 
+    expect(screen.queryByRole("button", { name: "Quick actions" })).toBeNull();
+
     const codexOption = screen.getByRole("button", { name: /Codex/ });
     expect(codexOption.textContent?.trim()).toBe("Codex");
     expect((screen.getByRole("button", { name: /Missing/ }) as HTMLButtonElement).disabled).toBe(true);
@@ -57,6 +126,31 @@ describe("LaunchMenu", () => {
 
     await fireEvent.click(codexOption);
     expect(onLaunch).toHaveBeenCalledWith("codex");
+  });
+
+  it("lists configured and builtin agents alphabetically with the shell last", async () => {
+    render(LaunchMenu, {
+      props: {
+        launchTargets: [
+          { key: "claude", label: "Claude", kind: "agent", source: "config", available: true },
+          { key: "pi", label: "pi", kind: "agent", source: "config", available: true },
+          { key: "claude-acp", label: "claude-acp", kind: "acp", source: "config", available: true },
+          { key: "gemini", label: "Gemini", kind: "agent", source: "builtin", available: true },
+          { key: "aider", label: "aider", kind: "agent", source: "builtin", available: false },
+          { key: "plain_shell", label: "Shell", kind: "plain_shell", source: "system", available: true },
+        ],
+        onLaunch: vi.fn(),
+      },
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Launch" }));
+
+    const menu = screen.getByRole("dialog", { name: "Run configurations" });
+    expect(
+      within(menu)
+        .getAllByRole("button")
+        .map((button) => button.textContent?.trim()),
+    ).toEqual(["aider", "Claude", "claude-acp", "Gemini", "pi", "Shell"]);
   });
 
   it("draws a harness glyph for agents whose key matches one and keeps the generic icon otherwise", async () => {

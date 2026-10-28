@@ -99,7 +99,7 @@ func (s *Handler) LaunchWorkspaceAgentHandoffService(
 			"body.target_key", "target_key is not an available agent launch target",
 		)
 	}
-	message, _, err := normalizeInitialAgentMessage(req.Message)
+	message, _, err := normalizeAgentMessage(req.Message, workspaceRuntimeTargetKind(s.runtime, targetKey))
 	if err != nil {
 		return WorkspaceAgentHandoffResult{}, httpapi.Validation("body.message", err.Error())
 	}
@@ -113,7 +113,7 @@ func (s *Handler) LaunchWorkspaceAgentHandoffService(
 	if err := s.waitForWorkspaceReady(handoffCtx, req.WorkspaceID); err != nil {
 		return WorkspaceAgentHandoffResult{}, err
 	}
-	session, err := s.launchWorkspaceRuntimeService(handoffCtx, req.WorkspaceID, targetKey, "workflow")
+	session, err := s.launchWorkspaceRuntimeService(handoffCtx, req.WorkspaceID, targetKey, "workflow", message)
 	if err != nil {
 		// A launch that failed because the handoff context ended is a
 		// timeout or shutdown, not an internal error.
@@ -142,8 +142,8 @@ func (s *Handler) LaunchWorkspaceAgentHandoffService(
 func postLaunchHandoffProblem(
 	err error, session localruntime.SessionInfo, status InitialMessageResult,
 ) error {
-	var problem *httpapi.ProblemError
-	if !errors.As(err, &problem) {
+	problem, ok := errors.AsType[*httpapi.ProblemError](err)
+	if !ok {
 		problem = httpapi.NewProblem(
 			http.StatusInternalServerError, httpapi.CodeInternalError, "submit initial message failed", nil,
 		)
@@ -203,6 +203,9 @@ func (s *Handler) waitForWorkspaceReady(ctx context.Context, workspaceID string)
 				return agenthandoff.WorkspaceState{}, cause
 			}
 			return agenthandoff.WorkspaceState{}, err
+		}
+		if summary.Status != "ready" && summary.Status != "error" && s.onAgentHandoffPending != nil {
+			s.onAgentHandoffPending()
 		}
 		state := agenthandoff.WorkspaceState{Status: summary.Status}
 		if summary.ErrorMessage != nil {

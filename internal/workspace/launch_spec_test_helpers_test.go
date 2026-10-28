@@ -10,6 +10,7 @@ import (
 
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/providerplane"
+	"go.kenn.io/forge/platform"
 )
 
 type databaseLaunchSpecResolver struct {
@@ -22,10 +23,13 @@ func (r databaseLaunchSpecResolver) ResolveWorkspaceLaunchSpec(
 ) (db.WorkspaceLaunchSpec, error) {
 	var repo *db.Repo
 	var err error
-	if strings.TrimSpace(request.PlatformRepoID) != "" {
+	if !request.RepoKey.IsZero() {
 		entry, lookupErr := r.db.GetRepositoryByProviderID(
-			ctx, request.Repository.Provider, request.Repository.PlatformHost,
-			request.PlatformRepoID,
+			ctx, platform.RepositoryIdentity{
+				Provider:     request.Repository.Provider,
+				PlatformHost: request.Repository.PlatformHost,
+				Key:          request.RepoKey,
+			},
 		)
 		err = lookupErr
 		if entry != nil {
@@ -33,10 +37,14 @@ func (r databaseLaunchSpecResolver) ResolveWorkspaceLaunchSpec(
 			repo = &resolved
 		}
 	} else {
-		repo, err = r.db.GetRepoByIdentity(ctx, db.RepoIdentity{
+		active, lookupErr := r.db.GetRepoByIdentity(ctx, db.RepoIdentity{
 			Platform: request.Repository.Provider, PlatformHost: request.Repository.PlatformHost,
 			Owner: request.Repository.Owner, Name: request.Repository.Name,
 		})
+		err = lookupErr
+		if active != nil {
+			repo = active.Row()
+		}
 	}
 	if err != nil {
 		return db.WorkspaceLaunchSpec{}, err
@@ -60,7 +68,7 @@ func (r databaseLaunchSpecResolver) ResolveWorkspaceLaunchSpec(
 		Version: db.WorkspaceLaunchSpecVersion,
 		Repository: db.WorkspaceLaunchRepository{
 			Provider: repo.Platform, PlatformHost: repo.PlatformHost,
-			PlatformRepoID: repo.PlatformRepoID, Owner: repo.Owner, Name: repo.Name,
+			Key: repo.Key, Owner: repo.Owner, Name: repo.Name,
 			CloneURL: cloneURL, DefaultBranch: defaultBranch,
 		},
 		ItemType: request.ItemType, ItemNumber: request.ItemNumber,
@@ -135,15 +143,15 @@ func (r databaseLaunchSpecResolver) RefreshWorkspaceLaunchSpec(
 			Provider: current.Repository.Provider, PlatformHost: current.Repository.PlatformHost,
 			Owner: current.Repository.Owner, Name: current.Repository.Name,
 		},
-		PlatformRepoID: current.Repository.PlatformRepoID,
-		ItemType:       current.ItemType, ItemNumber: current.ItemNumber,
+		RepoKey:  current.Repository.Key,
+		ItemType: current.ItemType, ItemNumber: current.ItemNumber,
 		ItemKey: current.ItemKey, GitHeadRef: current.GitHeadRef,
 	})
 }
 
-func newTestManager(t testing.TB, database *db.DB, worktreeDir string) *Manager {
-	t.Helper()
-	manager := NewManager(database, worktreeDir)
+func newTestManager(tb testing.TB, database *db.DB, worktreeDir string) *Manager {
+	tb.Helper()
+	manager := newWorkspaceTestManager(tb, database, worktreeDir)
 	if database != nil {
 		manager.SetLaunchSpecResolver(databaseLaunchSpecResolver{db: database})
 	}

@@ -1,5 +1,7 @@
 import { Deferred, Effect } from "effect";
 import type { AppRuntime, AppServices } from "../app/runtime.js";
+import { getStreamEventsUrl } from "../api/generated/system/system.js";
+import { configuredAPIPath } from "../api/runtime-base.js";
 import type { SyncStatus } from "../api/types.js";
 import {
   providerEventsProgram,
@@ -20,11 +22,13 @@ import {
   type WorkspaceDeletedEvent,
   type WorkspaceStatusEvent,
   type WorkflowDispatchProgressEvent,
+  type WorklistsChangedEvent,
 } from "./provider-events-workflow.js";
 
 export interface EventsStoreOptions {
   readonly runtime: AppRuntime;
   readonly getBasePath?: () => string;
+  readonly onConnectionStateChange?: (state: ProviderEventsConnectionState) => void;
   readonly onDataChanged?: () => Effect.Effect<void, ProviderEventsError, AppServices>;
   readonly onSyncStatus?: (status: SyncStatus) => Effect.Effect<void, ProviderEventsError, AppServices>;
   readonly onHubConnectionChanged?: (
@@ -54,6 +58,7 @@ export interface EventsStoreOptions {
   readonly onDeferredMergeCompleted?: (
     event: DeferredMergeCompletedEvent,
   ) => Effect.Effect<void, ProviderEventsError, AppServices>;
+  readonly onWorklistsChanged?: (event: WorklistsChangedEvent) => Effect.Effect<void, ProviderEventsError, AppServices>;
   readonly onWorkflowDispatchProgress?: (
     event: WorkflowDispatchProgressEvent,
   ) => Effect.Effect<void, ProviderEventsError, AppServices>;
@@ -73,6 +78,11 @@ export function createEventsStore(opts: EventsStoreOptions) {
   const workspaceSelections = new Map<number, string>();
   const workspaceEventSubscribers = new Set<(event: WorkspaceEventsNotification) => void>();
 
+  function setConnectionState(state: ProviderEventsConnectionState): void {
+    connectionState = state;
+    opts.onConnectionStateChange?.(state);
+  }
+
   function notifyWorkspaceEventSubscribers(event: WorkspaceEventsNotification): void {
     for (const subscriber of workspaceEventSubscribers) subscriber(event);
   }
@@ -82,10 +92,11 @@ export function createEventsStore(opts: EventsStoreOptions) {
   }
 
   function buildURL(): string {
-    const base = getBasePath().replace(/\/$/, "");
-    const url = `${base}/api/v1/events`;
     const workspaceId = selectedWorkspaceId();
-    return workspaceId === undefined ? url : `${url}?workspace_id=${encodeURIComponent(workspaceId)}`;
+    return configuredAPIPath(
+      getStreamEventsUrl(workspaceId === undefined ? {} : { workspace_id: workspaceId }),
+      getBasePath(),
+    );
   }
 
   function dispatch(event: ProviderEvent): Effect.Effect<void, ProviderEventsError, AppServices> {
@@ -123,8 +134,11 @@ export function createEventsStore(opts: EventsStoreOptions) {
           return opts.onDeferredMergeCompleted?.(event.payload) ?? Effect.void;
         case "workflow_dispatch_progress":
           return opts.onWorkflowDispatchProgress?.(event.payload) ?? Effect.void;
+        case "worklists_changed":
+          return opts.onWorklistsChanged?.(event.payload) ?? Effect.void;
         case "workspace_diff_ready":
         case "workspace_diff_changed":
+        case "workflow_runs_changed":
           return Effect.void;
       }
     })();
@@ -142,7 +156,7 @@ export function createEventsStore(opts: EventsStoreOptions) {
       providerEventsProgram({
         url,
         onState: (state) => {
-          connectionState = state;
+          setConnectionState(state);
           if (state === "connected") notifyWorkspaceEventSubscribers({ type: "open" });
         },
         onEvent: dispatch,
@@ -177,7 +191,7 @@ export function createEventsStore(opts: EventsStoreOptions) {
     streamAttempt.pipe(
       Effect.catch((failure) =>
         Effect.sync(() => {
-          connectionState = "disconnected";
+          setConnectionState("disconnected");
           lastError = `Live updates stopped: ${failure.operation}`;
           opts.onTerminalFailure?.(lastError);
         }).pipe(Effect.andThen(waitForReconnect)),
@@ -187,7 +201,7 @@ export function createEventsStore(opts: EventsStoreOptions) {
     Effect.ensuring(
       Effect.sync(() => {
         reconnectSignal = null;
-        connectionState = "disconnected";
+        setConnectionState("disconnected");
       }),
     ),
   );

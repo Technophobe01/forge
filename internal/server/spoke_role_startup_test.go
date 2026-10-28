@@ -5,14 +5,15 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/gitclone"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/platform"
 )
 
@@ -26,6 +27,7 @@ func (t *countingNodeRoleTransport) RoundTrip(*http.Request) (*http.Response, er
 }
 
 func TestInactiveFleetNodeKeepsLocalServicesWithoutProviderPlane(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	transport := &countingNodeRoleTransport{}
@@ -45,13 +47,12 @@ func TestInactiveFleetNodeKeepsLocalServicesWithoutProviderPlane(t *testing.T) {
 		HostCheckAllowLoopbackAnyPort:      true,
 		DisableWorkspaceBackgroundMonitors: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, srv) })
 
-	assert.Nil(srv.syncer)
 	assert.Nil(srv.archive)
 	assert.Same(clones, srv.clones)
 	require.NotNil(srv.providerSource)
-	assert.Nil(srv.providerSource.client)
+	assert.Nil(srv.providerSource.Client)
 	assert.Nil(srv.providerProxy)
 	assert.Nil(srv.hubEvents)
 	assert.Equal(httpapi.ProviderCapabilitiesResponse{}, srv.repoResolver.Capabilities(
@@ -65,12 +66,20 @@ func TestInactiveFleetNodeKeepsLocalServicesWithoutProviderPlane(t *testing.T) {
 		"/api/v1/workspaces",
 		"/api/v1/snapshot?include_peers=true",
 	} {
-		response, err := httpServer.Client().Get(httpServer.URL + path)
+		responseReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, httpServer.URL+path, nil)
+		require.NoError(err)
+		httpClient := httpServer.Client()
+		httpClient.Timeout = 5 * time.Second
+		response, err := httpClient.Do(responseReq)
 		require.NoError(err)
 		response.Body.Close()
 		assert.Equal(http.StatusOK, response.StatusCode, path)
 	}
-	providerResponse, err := httpServer.Client().Get(httpServer.URL + "/api/v1/pulls")
+	providerResponseReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, httpServer.URL+"/api/v1/pulls", nil)
+	require.NoError(err)
+	httpClient := httpServer.Client()
+	httpClient.Timeout = 5 * time.Second
+	providerResponse, err := httpClient.Do(providerResponseReq)
 	require.NoError(err)
 	providerResponse.Body.Close()
 	assert.Equal(http.StatusServiceUnavailable, providerResponse.StatusCode)

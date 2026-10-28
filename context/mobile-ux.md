@@ -4,6 +4,30 @@ Use this document as the intent-level guide for mobile UI work in `kenn-forge`. 
 
 ## Core stance
 
+- Bundle the shared web UI in the native app; use the selected server only for
+  APIs, event streams, and WebSockets. Do not duplicate ACP or terminal UI in
+  React Native (`mobile/embedded-page.ts`).
+- After rebuilding `mobile/assets/web.bundle`, force Gradle's
+  `:app:createBundleReleaseJsAndAssets --rerun-tasks` before assembling the APK;
+  React Native's task inputs track JS/TS, not this asset. Build release APKs
+  through `mobile/scripts/release-android.mjs`, which does both.
+- Desktop layout is opt-in for tablets (`mobile/connection.ts::launchURL`).
+- Frontend tests must not import from `mobile/`: its tsconfig extends
+  `expo/tsconfig.base`, which frontend CI does not install. Pin shared
+  route literals on each side instead (`mobile/tsconfig.json`).
+- The native shell owns system-bar and cutout spacing. Android WebView must pass
+  zeroes for those CSS safe-area insets while preserving keyboard insets
+  (`mobile/patches/react-native-webview@14.0.1.patch`).
+- Connected native views use the web UI's header without a native server bar.
+  Connection settings live in the phone menu and desktop Settings page; Android
+  Back also returns there after page history (`mobile/App.tsx`).
+- Top-frame links on the server's origin and under its base path stay in the
+  bundled SPA and preserve WebView history so Android Back returns to the
+  previous page; other same-host paths open externally
+  (`mobile/connection.ts::isForgePageURL`).
+- Native history entries carry their URL in state: Android's HTML loader
+  restores state but loses changed URLs on Back (`frontend/src/lib/stores/router.svelte.ts::nativeHistoryState`).
+
 Mobile is not the desktop app squeezed into a smaller viewport. It is a separate phone-first workflow for maintainers who need to triage, inspect, and act while holding a phone.
 
 `kenn-forge` can stay dense and information-rich, but phone density must come from hierarchy and summarization, not from tiny desktop controls, compressed split panes, or table layouts.
@@ -35,16 +59,30 @@ Think about mobile work in this order:
 ## Design rules
 
 - Build dedicated phone routes/components when the desktop interaction model does not fit. A `/m` route must not simply mount the desktop view inside a narrow wrapper.
-- The phone top bar may expose the same direct Forge selector as desktop. Keep
-  it within the phone viewport, retain the product name when only one Forge is
-  available, and navigate with ordinary origin links so other tabs are not
+- The phone shell has no top bar. Each phone screen's own first row (the list
+  search bar, the workspace list actions, the terminal toolbar, and the detail
+  headers) ends with one Menu button that opens a bottom sheet with the phone
+  modes, the Forge selector when the fleet has another Forge, and Open desktop
+  view. Only screens mounted inside the phone shell receive the menu context, so
+  desktop and desktop-narrow views that reuse those rows render no menu. A new
+  phone screen must put the menu in its first row or the user has no way to
+  switch modes (`frontend/src/lib/components/mobile/MobileNavMenu.svelte`,
+  `frontend/src/lib/components/mobile/mobile-nav-menu.ts`).
+- The Forge selector navigates with ordinary origin links so other tabs are not
   retargeted (`frontend/src/lib/components/layout/ForgeSelector.svelte`).
 - Preserve human-facing product copy. Remove text that sounds like an implementation note or model instruction.
+- The phone launch menu must omit unavailable agents and shells; disabled choices waste phone space
+  (`frontend/src/lib/components/mobile/MobileWorkspaceTerminal.svelte::availableLaunchTargets`).
 - Keep repository/provider identity visible enough to disambiguate similarly named repos, especially on activity cards and detail headers.
-- Give focused PR/issue detail pages their own phone shell treatment even when they reuse desktop detail components internally. Phone-like focus presentation, whether reached from `/m` lists, the activity feed, `/focus/...`, or a narrow canonical URL, renders inside the same `.mobile-shell` top bar as every other phone view, and detail routes add a header with the item badge and a Back control. Desktop-narrow focus presentation stays chrome-free (`frontend/src/App.svelte::phoneDetailItem`).
+- Give focused PR/issue detail pages their own phone shell treatment even when they reuse desktop detail components internally. Phone-like focus presentation, whether reached from `/m` lists, the activity feed, `/focus/...`, or a narrow canonical URL, renders inside the same `.mobile-shell` as every other phone view, and detail routes add a header with the item badge, a Back control, and the shell menu. Desktop-narrow focus presentation stays chrome-free (`frontend/src/App.svelte::phoneDetailItem`).
 - The phone PR header status row is one control family: state, CI, diff stat, review decision, labels, assignees, and reviewers all render at the action-grid height with the same corner radius, one size, one weight, and plain case. Tone tints still carry status; pills and uppercase labels are desktop density devices. Branch names keep the app mono face at the inline-code ratio so the mono line reads the same size as the sans repository line (`frontend/src/App.svelte` phone `.chips-row` rules).
 - Phone-like PR and issue detail branches in `App.svelte` all receive the phone workspace callbacks (`phoneDetailProps` / `phoneIssueDetailProps`), and both detail components open a freshly created workspace through `onOpenWorkspace` when the host provides it; the desktop `/terminal` route is only the fallback for hosts without a callback (`frontend/src/lib/components/detail/IssueDetail.svelte`, `frontend/src/lib/components/detail/PullDetail.svelte`).
-- Back on a phone detail returns to the list that opened it, at the same rows. Phone lists record their origin in history state when they open an item (through the navigate callback's `state` option, never as a bare second argument) and park their scroll offset and loaded chunk size before every path that leaves the list, timeline events included. Parking stamps the list's own history entry, so only a remount on that entry (header Back or browser Back) restores the offset; a fresh visit from the mode picker or a deep link discards it and starts at the top. A deep link with no origin falls back to the matching `/m` list. A detail that navigates again (a tab switch, a stack member) carries the origin onto the new entry with a back depth, so the header Back pops straight to the list while browser back still steps through the tabs (`frontend/src/lib/stores/mobile-list-return.ts::carryMobileListOrigin`, `frontend/src/lib/views/FocusListView.svelte::parkListPosition`, `frontend/src/App.svelte::leavePhoneDetail`).
+- Back on a phone detail returns to the list that opened it, at the same rows. Phone lists record their origin in history state when they open an item (through the navigate callback's `state` option, never as a bare second argument) and park their scroll offset and loaded chunk size before every path that leaves the list, timeline events included. Parking stamps the list's own history entry, so only a remount on that entry (header Back or browser Back) restores the offset; a fresh visit from the shell menu or a deep link discards it and starts at the top. A deep link with no origin falls back to the matching `/m` list. A detail that navigates again (a tab switch, a stack member) carries the origin onto the new entry with a back depth, so the header Back pops straight to the list while browser back still steps through the tabs (`frontend/src/lib/stores/mobile-list-return.ts::carryMobileListOrigin`, `frontend/src/lib/views/FocusListView.svelte::parkListPosition`, `frontend/src/App.svelte::leavePhoneDetail`).
+- Phone Files views keep diff controls on one row and start with the file tree hidden; secondary
+  controls belong in the overflow menu, not new rows. The workspace item header holds its own
+  Conversation/Files tabs (`frontend/src/lib/components/diff/DiffToolbar.svelte::phone`).
+- Diff toolbar menus must be fixed-positioned and clamped to the viewport; the Files view hides
+  overflow, so a trigger-anchored absolute menu is clipped on phones (`frontend/src/lib/components/diff/DiffScopePicker.svelte::positionMenu`).
 - Mobile escape hatches to desktop views are allowed, but they must be intentional and not the default path.
 
 ## Responsive route and presentation model
@@ -68,8 +106,12 @@ In code and tests, name predicates so this distinction is visible. Avoid generic
 
 ## Typography and sizing
 
-- `frontend/src/app.css` owns the shared design tokens, including `--font-size-mobile-*`.
-- Mobile typography, spacing, radii, and hit targets should be mostly `rem`-based and expressed through scoped tokens.
+- Phone type comes from the `--font-size-*` scale. `frontend/src/app.css` overrides kit-ui's touch scale (under `kit-type-touch` and the `(hover: none) and (pointer: coarse)` query) with a denser phone scale: 15px body, 13px metadata, 17px titles. The larger kit scale cost too many rows on triage screens.
+- Phone text fields stay at least `1rem`; ACP can use a larger configured size. iOS zooms the page when a focused field renders below 16px, so the denser scale must not reach `input`, `textarea`, or `select` (`frontend/src/app.css`, `frontend/tests/e2e-full/mobile-routes.spec.ts::expectReadableFocusList`).
+- Phone detail prose (descriptions, comments, markdown insets) renders at 14px (`--font-size-phone-prose`) with markdown headings on the 15px body step, so long text does not dwarf the 13px detail chrome (`frontend/src/App.svelte::.focus-layout--phone`).
+- Phone controls stay compact next to the denser type: 40px for chrome and list controls (shell menu, search, filters), 38px for detail buttons, and 32px for the header status chips (`frontend/src/app.css::--mobile-chrome-hit-target`, `frontend/src/App.svelte::--focus-detail-hit-target`, `--focus-detail-chip-height`). Larger 44-49px targets made the buttons feel clunky.
+- Phone list rows size to their content with only the hit-target floor as a minimum; fixed multi-line minimum heights waste rows (`frontend/src/lib/components/sidebar/PullItem.svelte`).
+- Mobile typography, spacing, radii, and hit targets should be mostly `rem`-based. Reuse shared phone tokens directly; components must not define private aliases or fallback sizes. Phone prose, input type, and chrome targets live in `frontend/src/app.css`, shared by detail and ACP views.
 - The app intentionally keeps the global root font size small for desktop/terminal stability. Do not change the global `html` root just to make mobile readable.
 - Compensate inside mobile shells with mobile-scoped tokens such as `--mobile-type-*`, pointing back to the app-level mobile font-size tokens where possible.
 - Do not apply mobile-scoped tokens to every narrow desktop viewport. A desktop-narrow focus presentation should remain compact and desktop-scaled unless the environment is phone-like.
@@ -98,7 +140,7 @@ Avoid by default:
 
 - Mobile Activity starts with 30 collapsed parents and autoloads one 30-parent chunk per
   end-of-list scroll gesture. The response limit counts distinct parents after event
-  matching, while event scans remain separately bounded (`internal/server/huma_routes.go::Server.listActivityRouteCore`).
+  matching, while event scans remain separately bounded (`internal/server/activityapi/huma_routes.go::Handlers.listActivityRouteCore`).
 - Phone PR and issue lists start with 30 items and autoload one 30-item chunk per
   end-of-list scroll gesture. Mutation reloads retain the active chunk size
   (`frontend/src/lib/stores/pulls.svelte.ts::createPullsStore`, `frontend/src/lib/stores/issues.svelte.ts::createIssuesStore`).
@@ -123,24 +165,34 @@ Avoid by default:
 
 ## Mobile workspace workflow
 
-- Workspaces is a first-class phone mode selected from the shared mobile mode picker; `/m/workspaces` uses a dedicated card list and never mounts the desktop workspace layout.
+- Workspaces is a first-class phone mode selected from the shell menu; `/m/workspaces` uses a dedicated card list and never mounts the desktop workspace layout.
 - Keep search and workspace creation inline. Put the existing sort, grouping, organization-name, and diff-stat controls in a touch-sized View sheet backed by the same persisted settings as desktop.
-- Phone workspace rows show hook-reported Working, Approval, Input, and Done states as visible compact badges; color-only status dots are insufficient for agent state (`frontend/src/lib/components/mobile/MobileWorkspaceList.svelte::agentStatePresentation`).
-- Phone PR detail must not reflow while a background sync runs: the inline "Syncing" meta item wraps to its own row on a phone and pushes the page down, so phone presentation renders a 2px absolutely positioned progress bar at the top of `.pull-detail` instead (`role="status"`, reduced-motion safe). Desktop keeps the inline indicator.
+- Phone workspace rows show hook- or ACP-reported Working, Approval, Input, and Done states as visible compact badges; color-only status dots are insufficient for agent state (`frontend/src/lib/components/mobile/MobileWorkspaceList.svelte::agentStatePresentation`).
+- PR background sync must not reflow phone or desktop detail; use the shared progress treatment in `context/ui-design-system.md`.
 - Phone PR detail hides the kanban/review-status `SelectDropdown` (header and below-chips instances); its purpose is not self-evident on a phone and it competes with the primary actions. Desktop-narrow presentation keeps it (`frontend/src/lib/components/detail/PullDetail.svelte`, gated on `phonePresentation`).
-- Phone detail headers turn the title actions (edit, star, provider link) into bordered, equal hit-target squares; the inline `#123` copy button stays text-sized with only the WCAG 24px target floor and must not receive the 49px hit-target minimums, or the meta row grows to button height (`frontend/tests/e2e-full/mobile-routes.spec.ts::expectReadableDetail` pins the floor) (`frontend/src/App.svelte::.focus-layout--phone`).
+- Phone detail headers turn the title actions (edit, star, provider link) into bordered, equal hit-target squares; the inline `#123` copy button stays text-sized with only the WCAG 24px target floor and must not receive the phone hit-target minimums, or the meta row grows to button height (`frontend/tests/e2e-full/mobile-routes.spec.ts::expectReadableDetail` pins the floor) (`frontend/src/App.svelte::.focus-layout--phone`).
 - Phone-like PR detail routes have no inline workspace controller; creating or opening a workspace from them must land in the `/m/workspaces` shell, never the desktop `/terminal/{id}` route. The same phone signal renders the PR primary actions as one kit `AdaptiveActionGrid` in `layout="fill"` (rows packed by natural width and stretched edge to edge, labels never truncated) instead of the desktop fit stages and actions menu. Desktop-narrow focus presentation keeps desktop destinations and layout (`frontend/src/App.svelte::phoneDetailProps`, `tests/e2e/mobile-pr-actions.spec.ts`).
 - Opening a workspace shows exactly one terminal. Repository, branch, and Fleet host identity get a full-width context row above the controls; the switcher selects base, agent, or shell sessions without destroying background sessions (`frontend/src/lib/components/mobile/MobileWorkspaceTerminal.svelte`).
 - Phone terminals keep direct xterm interaction available for hardware keyboards and terminal-native controls, but touching xterm must not summon the software keyboard. The optional auto-growing composer owns software-keyboard input, stays above the keyboard, routes text through xterm's sanitized paste path, and exposes Escape, Tab, arrow, Enter, and Space keys through xterm's mode-aware keyboard path. Each special-key tap claims the visible pane's resize authority before sending input (`frontend/src/lib/components/mobile/MobileWorkspaceTerminal.svelte::sendComposedInput`, `frontend/src/lib/components/mobile/MobileWorkspaceTerminal.svelte::sendSpecialKey`, `frontend/src/lib/components/terminal/XtermTerminalPane.svelte::sendKey`).
+- Resize Android's layout viewport with the software keyboard; visual-only resizing leaves unused browser-toolbar space below the composer in Brave (`frontend/index.html:6`). Verify keyboard spacing with native Android and iOS keyboards; desktop phone emulation does not exercise their viewport changes.
 - Keep xterm's built-in renderer on Android and Firefox; Android WebGL can accept terminal output while presenting a blank surface (`frontend/src/lib/components/terminal/XtermTerminalPane.svelte::shouldUseBuiltinRenderer`).
 - Remember the selected session per workspace. A ready local workspace always offers its base terminal, even while runtime-session discovery is pending or unavailable; Fleet exposes only runtime-reported sessions. When a runtime session exits, fall back to another live session or the local base terminal (`frontend/src/lib/components/mobile/MobileWorkspaceTerminal.svelte`).
+- Create-and-launch and quick actions show worktree preparation and agent startup before opening the chosen session; the base terminal remains an explicit choice during startup. Present acknowledged quick-action sessions immediately once the loaded workspace and Fleet host match the route, then reconcile runtime. An older request must not clear a newer request's launch state (`frontend/src/lib/components/mobile/MobileWorkspaceTerminal.svelte`, `frontend/src/lib/stores/workspace-quick-actions.ts::runWorkspaceQuickAction`).
 - An accepted queued launch reconciles the exact workspace, Fleet host, session key, and acceptance time for 15 seconds. Transient reads retry; the matching session completes the claim, while only that exact claim may expire and report a danger flash (`frontend/src/lib/components/terminal/workspace-runtime-workflow.ts::reconcileAcceptedLaunch`).
 - A local linked item opened from the workspace list returns to the list without mounting terminal runtime work; one opened from a terminal keeps that exact workspace and selected session mounted. Direct item tabs replace their direct-origin history entry before Back falls through to the terminal. Fleet linked-item numbers stay passive until detail routing can retain Fleet host identity (`frontend/src/App.svelte::leaveMobileWorkspaceItem`).
-- The phone shell has one linked-item slot per workspace. A visible associated PR wins over the issue or ad-hoc branch the workspace was created from, so the list badge, terminal pill, item route, and provider link all name the same PR (`frontend/src/lib/components/mobile/mobile-workspace-detail.ts::mobileWorkspaceLinkedItem`, `frontend/src/lib/components/mobile/mobile-workspace-list.ts::mobileWorkspaceLinkedItem`).
+- Keep opaque session identifiers out of the linked-item header; they offer no user action and waste phone screen space.
+- The phone shell has one linked-item slot per workspace. A visible associated PR wins over the issue or ad-hoc branch the workspace was created from, so the list badge, terminal pill, item route, and provider link all name the same PR (`frontend/src/lib/components/mobile/mobile-workspace-detail.ts::mobileWorkspaceLinkedItem`, `frontend/src/lib/components/mobile/mobile-workspace-list.ts::mobileWorkspaceLinkedItem`). On issue workspaces, `mr_state` and `mr_is_draft` describe the issue, so the associated PR badge uses a neutral color instead of a lifecycle color. The phone list badge, phone terminal pill, and desktop sidebar bubble share one color rule (`frontend/src/lib/components/terminal/workspace-item-state.ts::workspaceItemState`). Once ready, the terminal poll reloads only runtime, so a shown terminal reloads workspace detail on synced item-data and PR-association events and when it becomes visible again. These background reloads keep the loaded terminal on transient failure (`frontend/src/lib/components/mobile/MobileWorkspaceTerminal.svelte::loadWorkspace`). Test `visible` changes through a harness that owns that state: testing-library `rerender` replaces every prop and reruns effects the app never reruns (`frontend/src/lib/components/mobile/MobileWorkspaceTerminalTestHarness.svelte`).
 - Keep launch and Stop out of the phone terminal header. Its touch-sized ellipsis opens a bottom Terminal options tray backed by the existing persisted terminal settings; New terminal opens the launcher, while Stop remains immediately discoverable in the tray and requires explicit confirmation before the runtime mutation begins (`frontend/src/lib/components/mobile/MobileWorkspaceTerminal.svelte::stopSelectedSession`).
 - Routes retain local or Fleet identity. Only authoritative deletion events invalidate shared workspace state. A `workspaceNotFound` response replaces matching phone routes with the list without publishing deletion or invalidating shared state. Unavailable Fleet hosts and generic connection failures remain in context with Retry or reconnect affordances (`frontend/src/lib/stores/workspace-host.svelte.ts::notifyWorkspaceDeleted`).
 - Mobile workspace screens may share data, persistence, runtime, and focused-item primitives with desktop, but must not depend on its pane tree, dock, sidebar, or resize hub.
 - Verify phone routing, overflow, filters, touch input, session switching and exit, Fleet failures, item round trips, retained workspace actions, and desktop workspace regressions.
+
+- ACP sessions use their own chat composer and permission controls inside the phone
+  session picker; never overlay terminal input controls on a chat session
+  (`frontend/src/lib/components/mobile/MobileWorkspaceTerminal.svelte`).
+- Workspace layouts own the bottom device safe area. ACP composers add only
+  their normal gutter; a chat pane can also sit above other toolbars
+  (`frontend/src/lib/components/acp/ACPWorkspace.svelte`).
 
 ## Verification expectations
 

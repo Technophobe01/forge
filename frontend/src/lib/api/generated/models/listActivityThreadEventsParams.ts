@@ -6,7 +6,8 @@ import type { ListActivityThreadEventsItemType } from "./listActivityThreadEvent
 export type ListActivityThreadEventsParams = {
   provider?: string;
   platform_host?: string;
-  platform_repo_id?: string;
+  platform_repo_id?: number;
+  bitbucket_repository_uuid?: string;
   item_type?: ListActivityThreadEventsItemType;
   /**
    * @minimum 1
@@ -28,5 +29,9 @@ export type ListActivityThreadEventsParams = {
   limit?: number;
   hide_closed_merged?: boolean;
   hide_bots?: boolean;
+  /**
+   * Exclude activity for draft pull requests.
+   */
+  hide_drafts?: boolean;
   hide_default_branch?: boolean;
 };

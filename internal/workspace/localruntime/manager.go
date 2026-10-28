@@ -17,10 +17,12 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
 	"go.kenn.io/forge/internal/agentactivity"
+	"go.kenn.io/forge/internal/codexhooks"
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/procutil"
 	ptyownerruntime "go.kenn.io/forge/internal/ptyowner/runtime"
@@ -34,6 +36,9 @@ const (
 	SessionStatusRunning  SessionStatus = "running"
 	SessionStatusExited   SessionStatus = "exited"
 	SessionStatusError    SessionStatus = "error"
+	// SessionStatusParked marks a stored runtime idle stop parked; it resumes
+	// when its workspace shows.
+	SessionStatusParked SessionStatus = "parked"
 )
 
 const initialMessageWriteTimeout = 30 * time.Second
@@ -42,8 +47,8 @@ const initialMessageWriteTimeout = 30 * time.Second
 // keystroke that submits it. Terminal UIs that collapse a multi-line paste
 // treat bytes arriving in the same chunk as the paste-end marker as part of
 // the paste, so a carriage return in that chunk never submits the prompt.
-// Allow startup to settle too: tmux enables paste mode before the agent is
-// reading input, so a 150 ms gap can still leave both writes queued together.
+// Keep a settle gap after the agent enters raw mode: its input loop may
+// still be starting, leaving both writes queued together with a shorter gap.
 const initialMessageEnterDelay = time.Second
 
 var (
@@ -73,6 +78,9 @@ type SessionInfo struct {
 	ExitedAt      *time.Time       `json:"exited_at,omitempty"`
 	ExitCode      *int             `json:"exit_code,omitempty"`
 	TmuxSession   string           `json:"-"`
+	// InitialMessageProvided means the opening prompt was passed as a CLI
+	// argument. The caller must not also type it into the terminal.
+	InitialMessageProvided bool `json:"-"`
 	// tmuxLaunchID identifies the concrete tmux backend generation created for
 	// this launch. It is empty when the manager reattached to a pre-existing
 	// backend instead of creating one.
@@ -106,6 +114,23 @@ type RestoredRuntimeSession struct {
 }
 
 type Options struct {
+	// TmuxEnvironmentDir holds the short-lived terminal handoff files.
+	TmuxEnvironmentDir string
+	AgentMCPURL        string
+	AgentMCPToken      string
+	ACPPreferencesPath string
+	ACPSessionsDir     string
+	// ParkedDir holds a marker per runtime session idle stop parked.
+	ParkedDir string
+	// AgentExitDir holds how each tmux-backed agent exited, so a clean tmux
+	// exit caused by a killed agent can be told apart from the agent
+	// finishing. Empty disables the record.
+	AgentExitDir string
+	// AgentActivityDir is where ACP owners report turn state for the
+	// workspace activity views, alongside hook-reported agents.
+	AgentActivityDir string
+	ACPOwnerCommand  []string
+
 	Targets      []LaunchTarget
 	ShellCommand []string
 	TmuxCommand  []string
@@ -143,10 +168,32 @@ type Options struct {
 }
 
 type Manager struct {
-	mu                sync.Mutex
-	targets           map[string]LaunchTarget
-	targetsList       []LaunchTarget
-	sessions          map[string]*session
+	tmuxEnvironmentDir string
+	agentMCPURL        string
+	agentMCPToken      string
+	acpPreferencesMu   sync.Mutex
+	acpPreferencesPath string
+	acpSessionsDir     string
+	parkedDir          string
+	inputObserver      atomic.Pointer[func(workspaceID string)]
+	agentActivityDir   string
+	agentExitDir       string
+	acpOwnerCommand    []string
+	acpPreferences     map[string]map[string]string
+
+	// exitCallbacks counts running OnSessionExit calls. A session gains one
+	// when it leaves sessions, under mu, so every call Shutdown must wait for
+	// is counted before Shutdown clears sessions.
+	exitCallbacks sync.WaitGroup
+
+	mu          sync.Mutex
+	targets     map[string]LaunchTarget
+	targetsList []LaunchTarget
+	sessions    map[string]*session
+	// exited holds the keys of sessions this manager saw exit on their own.
+	// Their stored records are forgotten in the background, and a restore in
+	// the meantime must not relaunch an agent that already finished.
+	exited            map[string]SessionInfo
 	labelReservations map[string]map[string]int
 	shellCommand      []string
 	tmuxCommand       []string
@@ -201,7 +248,8 @@ var (
 )
 
 type session struct {
-	mu sync.Mutex
+	acp ACPChat
+	mu  sync.Mutex
 	// inputMu serializes terminal input so an initial-message handoff owns
 	// the PTY from its paste through its Enter keystroke.
 	inputMu                   sync.Mutex
@@ -287,9 +335,21 @@ func NewManager(options Options) *Manager {
 		targetsList = append(targetsList, cloneTarget(cloned))
 	}
 	return &Manager{
+		tmuxEnvironmentDir: options.TmuxEnvironmentDir,
+		agentMCPURL:        options.AgentMCPURL,
+		agentMCPToken:      options.AgentMCPToken,
+		acpPreferencesPath: options.ACPPreferencesPath,
+		acpSessionsDir:     options.ACPSessionsDir,
+		parkedDir:          options.ParkedDir,
+		agentActivityDir:   options.AgentActivityDir,
+		agentExitDir:       options.AgentExitDir,
+		acpOwnerCommand:    slices.Clone(options.ACPOwnerCommand),
+		acpPreferences:     make(map[string]map[string]string),
+
 		targets:           targets,
 		targetsList:       targetsList,
 		sessions:          make(map[string]*session),
+		exited:            make(map[string]SessionInfo),
 		labelReservations: make(map[string]map[string]int),
 		shellCommand:      slices.Clone(options.ShellCommand),
 		tmuxCommand:       slices.Clone(options.TmuxCommand),
@@ -345,16 +405,25 @@ func (m *Manager) Launch(
 	cwd string,
 	targetKey string,
 ) (SessionInfo, error) {
-	return m.launch(ctx, workspaceID, cwd, targetKey, nil, "", "")
+	return m.launch(ctx, workspaceID, cwd, targetKey, nil, "", "", "")
+}
+
+// LaunchWithInitialMessage uses Claude's native prompt argument so startup
+// dialogs cannot consume the prompt or its submit keystroke. Other targets
+// still need their prompt delivered through SubmitInitialMessage.
+func (m *Manager) LaunchWithInitialMessage(
+	ctx context.Context, workspaceID, cwd, targetKey, message string,
+) (SessionInfo, error) {
+	return m.launch(ctx, workspaceID, cwd, targetKey, nil, "", "", message)
 }
 
 // Resume launches the saved conversation under its original runtime key.
 // It never submits an opening prompt or falls back to a new conversation.
 func (m *Manager) Resume(ctx context.Context, restored RestoredRuntimeSession, agent, sessionID string) (SessionInfo, error) {
-	return m.launch(ctx, restored.WorkspaceID, restored.CWD, restored.TargetKey, &restored, agent, sessionID)
+	return m.launch(ctx, restored.WorkspaceID, restored.CWD, restored.TargetKey, &restored, agent, sessionID, "")
 }
 
-func (m *Manager) launch(ctx context.Context, workspaceID, cwd, targetKey string, restored *RestoredRuntimeSession, agent, sessionID string) (SessionInfo, error) {
+func (m *Manager) launch(ctx context.Context, workspaceID, cwd, targetKey string, restored *RestoredRuntimeSession, agent, sessionID, initialMessage string) (SessionInfo, error) {
 	slog.Debug(
 		"runtime launch requested",
 		"workspace_id", workspaceID,
@@ -390,14 +459,20 @@ func (m *Manager) launch(ctx context.Context, workspaceID, cwd, targetKey string
 		)
 	}
 
-	if restored != nil {
-		if target.Kind != LaunchTargetAgent {
-			return SessionInfo{}, fmt.Errorf("target %q is not an agent", targetKey)
-		}
+	switch {
+	case restored == nil:
+	case target.Kind == LaunchTargetAgent:
 		target.Command, err = agentResumeCommand(target.Command, agent, sessionID)
 		if err != nil {
 			return SessionInfo{}, err
 		}
+	case target.Kind != LaunchTargetPlainShell:
+		return SessionInfo{}, fmt.Errorf("target %q is not an agent or shell", targetKey)
+	}
+	initialMessageProvided := initialMessage != "" && target.Kind == LaunchTargetAgent &&
+		strings.TrimSuffix(filepath.Base(target.Command[0]), ".exe") == "claude"
+	if initialMessageProvided {
+		target.Command = append(target.Command, "--", initialMessage)
 	}
 
 	if err := m.ensureOpen(); err != nil {
@@ -434,7 +509,15 @@ func (m *Manager) launch(ctx context.Context, workspaceID, cwd, targetKey string
 	if restored != nil && restored.Label != "" {
 		label = restored.Label
 	}
+	if target.Kind == LaunchTargetAgent {
+		if err := codexhooks.ReuseApprovals(ctx, target.Command, cwd); err != nil {
+			slog.Warn("reuse Codex hook approvals", "workspace_id", workspaceID, "err", err)
+		}
+	}
 
+	// The runtime starts before its pane does, so even the agent's first hook
+	// is never older than the runtime it reports for.
+	createdAt := time.Now().UTC()
 	launch, err := m.launchCommand(ctx, target, workspaceID, key, cwd)
 	if err != nil {
 		slog.Debug(
@@ -456,16 +539,17 @@ func (m *Manager) launch(ctx context.Context, workspaceID, cwd, targetKey string
 	)
 
 	started, err := m.startOwnedSession(ctx, SessionInfo{
-		Key:          key,
-		WorkspaceID:  workspaceID,
-		TargetKey:    targetKey,
-		Label:        label,
-		Kind:         target.Kind,
-		Status:       SessionStatusStarting,
-		CreatedAt:    time.Now().UTC(),
-		TmuxSession:  launch.TmuxSession,
-		tmuxLaunchID: launch.TmuxLaunchID,
-		Reused:       launch.TmuxSession != "" && !launch.TmuxCreated,
+		InitialMessageProvided: initialMessageProvided,
+		Key:                    key,
+		WorkspaceID:            workspaceID,
+		TargetKey:              targetKey,
+		Label:                  label,
+		Kind:                   target.Kind,
+		Status:                 SessionStatusStarting,
+		CreatedAt:              createdAt,
+		TmuxSession:            launch.TmuxSession,
+		tmuxLaunchID:           launch.TmuxLaunchID,
+		Reused:                 launch.TmuxSession != "" && !launch.TmuxCreated,
 	}, launch.Command, cwd, m.currentStripEnvVars())
 	if err != nil {
 		if launch.TmuxCreated {
@@ -500,6 +584,7 @@ func (m *Manager) launch(ctx context.Context, workspaceID, cwd, targetKey string
 		return SessionInfo{}, errManagerShutdown
 	}
 	m.sessions[key] = started
+	delete(m.exited, key)
 	m.mu.Unlock()
 	go m.watchSession(started)
 	slog.Debug(
@@ -592,19 +677,34 @@ func (m *Manager) restoreRuntimeSession(
 		)
 		return nil
 	}
-	if tmuxSession != "" {
+	if m.Exited(key) {
+		return fmt.Errorf("%w: %q already exited", ErrSessionUnavailable, key)
+	}
+	restored.WorkspaceID = workspaceID
+	restored.TargetKey = targetKey
+	restored.TmuxSession = tmuxSession
+	restored.SessionKey = key
+	return m.startRestoredSession(ctx, restored)
+}
+
+// startRestoredSession attaches or relaunches a stored session. The caller
+// holds the key's start lock and has found no running session for it.
+func (m *Manager) startRestoredSession(
+	ctx context.Context,
+	restored RestoredRuntimeSession,
+) error {
+	workspaceID := restored.WorkspaceID
+	targetKey := restored.TargetKey
+	tmuxSession := restored.TmuxSession
+	key := restored.SessionKey
+	if restored.Kind != LaunchTargetACP && tmuxSession != "" {
 		if err := m.requireTmuxSession(ctx, tmuxSession); err != nil {
 			return err
 		}
 	}
-	if tmuxSession == "" && m.ptyOwnerRuntime == nil {
+	if restored.Kind != LaunchTargetACP && tmuxSession == "" && m.ptyOwnerRuntime == nil {
 		return fmt.Errorf(
 			"%w: %q: pty owner runtime unavailable",
-			ErrSessionUnavailable, key,
-		)
-	} else if tmuxSession == "" && !m.ptyOwnerRuntime.HasState(key) {
-		return fmt.Errorf(
-			"%w: %q: pty owner state missing",
 			ErrSessionUnavailable, key,
 		)
 	}
@@ -671,7 +771,9 @@ func (m *Manager) restoreRuntimeSession(
 		TmuxSession: tmuxSession,
 	}
 	var started *session
-	if tmuxSession == "" {
+	if info.Kind == LaunchTargetACP {
+		started, err = m.restoreACP(ctx, info, restored.CWD)
+	} else if tmuxSession == "" {
 		started, err = attachPtyOwnerSession(ctx, m.ptyOwnerRuntime, info)
 	} else {
 		command, commandErr := m.restoredRuntimeCommand(restored)
@@ -685,13 +787,15 @@ func (m *Manager) restoreRuntimeSession(
 	if err != nil {
 		if tmuxSession != "" && isTmuxCommandUnavailable(err) {
 			return fmt.Errorf(
-				"%w: restored tmux attach unavailable for %q: %v",
+				"%w: restored tmux attach unavailable for %q: %w",
 				ErrSessionUnavailable, key, err,
 			)
 		}
 		return err
 	}
-	started.tmuxSession = tmuxSession
+	if info.Kind != LaunchTargetACP {
+		started.tmuxSession = tmuxSession
+	}
 
 	m.mu.Lock()
 	if m.closed {
@@ -702,6 +806,7 @@ func (m *Manager) restoreRuntimeSession(
 		return errManagerShutdown
 	}
 	m.sessions[key] = started
+	delete(m.exited, key)
 	m.mu.Unlock()
 	// startSession already starts drainOutput; restored tmux attach
 	// sessions only need the process watcher here.
@@ -854,6 +959,7 @@ func (m *Manager) ReattachTmuxClients(ctx context.Context) error {
 			continue
 		}
 		m.sessions[key] = replacement
+		delete(m.exited, key)
 		m.mu.Unlock()
 		go m.watchSession(replacement)
 		startMu.Unlock()
@@ -1098,6 +1204,11 @@ func (m *Manager) stopSession(ctx context.Context, s *session) error {
 		return nil
 	}
 	s.markStopRequested()
+	if s.acp != nil {
+		if err := s.stop(ctx); err != nil {
+			return err
+		}
+	}
 	if s.tmuxSession != "" {
 		if err := m.killTmuxSession(ctx, s.tmuxSession); err != nil {
 			_ = s.stop(ctx)
@@ -1105,6 +1216,9 @@ func (m *Manager) stopSession(ctx context.Context, s *session) error {
 				"kill tmux session %q: %w", s.tmuxSession, err,
 			)
 		}
+	}
+	if s.acp != nil {
+		return nil
 	}
 	return s.stop(ctx)
 }
@@ -1196,9 +1310,8 @@ func (m *Manager) tmuxSessionLaunchID(
 	if err != nil {
 		return "", false, err
 	}
-	args := append(
-		command[1:], "show-options", "-qv", "-t", session, "@forge_launch",
-	)
+	args := append([]string(nil), command[1:]...)
+	args = append(args, "show-options", "-qv", "-t", session, "@forge_launch")
 	cmd := procutil.CommandContext(ctx, command[0], args...)
 	cmd.Env = TmuxClientEnvironment(os.Environ(), m.currentStripEnvVars())
 	var stdout bytes.Buffer
@@ -1238,13 +1351,14 @@ func (m *Manager) killTmuxSession(
 	if err != nil {
 		return err
 	}
-	args := append(command[1:], "kill-session", "-t", session)
+	args := append([]string(nil), command[1:]...)
+	args = append(args, "kill-session", "-t", session)
 	cmd := procutil.CommandContext(ctx, command[0], args...)
 	cmd.Env = TmuxClientEnvironment(os.Environ(), m.currentStripEnvVars())
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	err = procutil.Run(ctx, cmd, "tmux subprocess capacity")
-	if err == nil || isTmuxSessionAbsent(stderr.Bytes(), err) {
+	if IsTmuxKillSessionGone(stderr.Bytes(), err) {
 		return nil
 	}
 	msg := strings.TrimSpace(stderr.String())
@@ -1283,10 +1397,8 @@ func (m *Manager) refreshTmuxSessionClients(
 		return nil
 	}
 
-	listArgs := append(
-		command[1:],
-		"list-clients", "-t", session, "-F", "#{client_tty}",
-	)
+	listArgs := append([]string(nil), command[1:]...)
+	listArgs = append(listArgs, "list-clients", "-t", session, "-F", "#{client_tty}")
 	listCmd := procutil.CommandContext(ctx, command[0], listArgs...)
 	listCmd.Env = TmuxClientEnvironment(os.Environ(), m.currentStripEnvVars())
 	var stdout bytes.Buffer
@@ -1306,10 +1418,8 @@ func (m *Manager) refreshTmuxSessionClients(
 
 	var errs []error
 	for client := range strings.FieldsSeq(stdout.String()) {
-		refreshArgs := append(
-			command[1:],
-			"refresh-client", "-t", client,
-		)
+		refreshArgs := append([]string(nil), command[1:]...)
+		refreshArgs = append(refreshArgs, "refresh-client", "-t", client)
 		refreshCmd := procutil.CommandContext(
 			ctx, command[0], refreshArgs...,
 		)
@@ -1329,13 +1439,23 @@ func (m *Manager) refreshTmuxSessionClients(
 	return errors.Join(errs...)
 }
 
+// IsTmuxKillSessionGone reports whether kill-session succeeded or the session is already gone.
+func IsTmuxKillSessionGone(stderr []byte, err error) bool {
+	if err == nil || isTmuxSessionAbsent(stderr, err) {
+		return true
+	}
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	return ok && exitErr.ExitCode() == 1 && strings.Contains(string(stderr), "server exited unexpectedly")
+}
+
 func isTmuxSessionAbsent(stderr []byte, err error) bool {
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	if !ok || exitErr.ExitCode() != 1 {
 		return false
 	}
 	msg := string(stderr)
 	return strings.Contains(msg, "can't find session") ||
+		strings.Contains(msg, "no current target") ||
 		strings.Contains(msg, "no server running") ||
 		(strings.Contains(msg, "error connecting to") &&
 			strings.Contains(msg, "No such file or directory"))
@@ -1442,7 +1562,7 @@ func (m *Manager) AttachSessionWithOptions(
 	s := m.sessions[key]
 	m.mu.Unlock()
 	attachment, err := attachToSession(
-		s, workspaceID, key, m.refreshSession, options,
+		s, workspaceID, key, m.refreshSession, func() { m.noteInput(workspaceID) }, options,
 	)
 	if err != nil {
 		slog.Debug(
@@ -1469,31 +1589,67 @@ func (m *Manager) SubmitInitialMessage(
 	workspaceID string,
 	sessionKey string,
 	message string,
+	sender ACPSender,
 ) error {
-	return m.SubmitAgentMessage(ctx, workspaceID, sessionKey, message)
+	return m.SubmitAgentMessage(ctx, workspaceID, sessionKey, message, sender)
 }
 
 // SubmitAgentMessage writes one bounded, already-normalized prompt through a
-// live agent runtime. It requires observed bracketed-paste mode and sends the
-// complete paste frame and Enter in one serialized terminal operation.
+// live agent runtime. ACP runtimes receive it as a chat prompt from sender,
+// queued behind any running turn. They reject it unwritten while
+// disconnected, and a coordinator's with ErrACPSupervised while another
+// coordinator supervises the chat. Terminal
+// runtimes require observed bracketed-paste mode and receive the complete
+// paste frame and Enter in one serialized terminal operation.
 func (m *Manager) SubmitAgentMessage(
 	ctx context.Context,
 	workspaceID string,
 	sessionKey string,
 	message string,
+	sender ACPSender,
 ) error {
 	if err := context.Cause(ctx); err != nil {
 		return fmt.Errorf("%w: %w", ErrInitialMessageNotWritten, err)
+	}
+	if acp, err := m.ACP(workspaceID, sessionKey); err == nil {
+		err := acp.Prompt(message, sender)
+		if errors.Is(err, ErrACPAgentUnavailable) {
+			return fmt.Errorf("%w: %w", ErrInitialMessageNotWritten, err)
+		}
+		return err
 	}
 	attachment, err := m.AttachSession(workspaceID, sessionKey)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrInitialMessageNotWritten, err)
 	}
 	defer attachment.Close()
-	if attachment.Info().Kind != LaunchTargetAgent {
+	info := attachment.Info()
+	if info.Kind != LaunchTargetAgent {
 		return fmt.Errorf("%w: runtime session is not an agent", ErrInitialMessageNotWritten)
 	}
+	if info.TmuxSession != "" {
+		ready, err := m.tmuxAgentInputReady(ctx, info.TmuxSession)
+		if err != nil {
+			return fmt.Errorf("%w: %w", ErrInitialMessageNotWritten, err)
+		}
+		if !ready {
+			return ErrBracketedPasteInactive
+		}
+	}
 	return attachment.submitInitialMessage(ctx, message)
+}
+
+// SetInputObserver reports each workspace whose runtimes receive input:
+// terminal input from any attachment, a submitted message, or an ACP prompt
+// or reply.
+func (m *Manager) SetInputObserver(observe func(workspaceID string)) {
+	m.inputObserver.Store(&observe)
+}
+
+func (m *Manager) noteInput(workspaceID string) {
+	if observe := m.inputObserver.Load(); observe != nil {
+		(*observe)(workspaceID)
+	}
 }
 
 func (a *Attachment) Write(data []byte) error {
@@ -1673,8 +1829,9 @@ func (m *Manager) shellLaunchCommand(
 	if len(command) == 0 || command[0] == "" {
 		return launchCommand{}, errors.New("session command is empty")
 	}
-	tmux, err := m.target(string(LaunchTargetShell))
-	if err != nil || !tmux.Available {
+	tmux, tmuxErr := m.target(string(LaunchTargetShell))
+	useTmux := tmuxErr == nil && tmux.Available
+	if !useTmux {
 		return launchCommand{Command: command}, nil
 	}
 	tmuxCommand := slices.Clone(m.tmuxCommand)
@@ -1685,7 +1842,7 @@ func (m *Manager) shellLaunchCommand(
 		tmuxCommand = config.DefaultTmuxCommand()
 	}
 	configureServer := config.IsDefaultTmuxCommand(tmuxCommand)
-	tmuxCommand, err = resolveTmuxCommand(tmuxCommand)
+	tmuxCommand, err := resolveTmuxCommand(tmuxCommand)
 	if err != nil {
 		return launchCommand{}, err
 	}
@@ -1705,6 +1862,7 @@ func (m *Manager) shellLaunchCommand(
 		os.Environ(), resolvedCommand, m.currentStripEnvVars(),
 	)
 	prepared, err := tmuxLauncher{
+		EnvironmentDir:  m.tmuxEnvironmentDir,
 		TmuxCommand:     tmuxCommand,
 		Session:         tmuxSession,
 		CWD:             cwd,
@@ -1730,6 +1888,9 @@ func (m *Manager) shellLaunchCommand(
 	return result, nil
 }
 
+// exitCallbackShutdownWait bounds how long Shutdown waits for exit handling.
+const exitCallbackShutdownWait = 5 * time.Second
+
 func (m *Manager) Shutdown() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -1749,17 +1910,41 @@ func (m *Manager) Shutdown() {
 	m.mu.Unlock()
 
 	for _, s := range sessions {
-		if m.detachForRestart {
+		if m.detachForRestart || s.acp != nil {
 			s.markRecoverableDetach()
 		}
 		s.detach()
 	}
+	m.waitSessionsDone(ctx, sessions)
+	m.waitExitCallbacks()
+}
+
+func (m *Manager) waitSessionsDone(ctx context.Context, sessions []*session) {
 	for _, s := range sessions {
 		select {
 		case <-s.done:
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// waitExitCallbacks lets exit handling that began before shutdown finish, such
+// as forgetting a finished agent's record, so the process does not exit or
+// close its database first. The wait is bounded so a stuck callback cannot
+// hold shutdown forever.
+func (m *Manager) waitExitCallbacks() {
+	done := make(chan struct{})
+	go func() {
+		m.exitCallbacks.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(exitCallbackShutdownWait)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		slog.Warn("shutdown stopped waiting for runtime exit handling")
 	}
 }
 
@@ -1842,6 +2027,9 @@ func (m *Manager) launchCommand(
 		cwd = optionalCWD[0]
 	}
 	command := slices.Clone(target.Command)
+	if target.Kind == LaunchTargetACP {
+		return m.acpLaunchCommand(ctx, target, workspaceID, sessionKey, cwd)
+	}
 	if target.Kind == LaunchTargetPlainShell {
 		if len(command) == 0 {
 			command = slices.Clone(m.shellCommand)
@@ -1855,8 +2043,9 @@ func (m *Manager) launchCommand(
 		return launchCommand{Command: command}, nil
 	}
 
-	tmux, err := m.target(string(LaunchTargetShell))
-	if err != nil || !tmux.Available {
+	tmux, tmuxErr := m.target(string(LaunchTargetShell))
+	useTmux := tmuxErr == nil && tmux.Available
+	if !useTmux {
 		return launchCommand{Command: command}, nil
 	}
 	tmuxCommand := slices.Clone(m.tmuxCommand)
@@ -1867,7 +2056,7 @@ func (m *Manager) launchCommand(
 		tmuxCommand = config.DefaultTmuxCommand()
 	}
 	configureServer := config.IsDefaultTmuxCommand(tmuxCommand)
-	tmuxCommand, err = resolveTmuxCommand(tmuxCommand)
+	tmuxCommand, err := resolveTmuxCommand(tmuxCommand)
 	if err != nil {
 		return launchCommand{}, err
 	}
@@ -1889,7 +2078,14 @@ func (m *Manager) launchCommand(
 			agentactivity.RuntimeSessionKeyEnv: sessionKey,
 		},
 	)
+	if m.agentExitDir != "" {
+		if err := os.MkdirAll(m.agentExitDir, 0o700); err != nil {
+			return launchCommand{}, fmt.Errorf("create agent exit directory: %w", err)
+		}
+		paneEnv.paneCommand = recordAgentExitPaneCommand(paneEnv.paneCommand, m.agentExitPaths(tmuxSession))
+	}
 	prepared, err := tmuxLauncher{
+		EnvironmentDir:  m.tmuxEnvironmentDir,
 		TmuxCommand:     tmuxCommand,
 		Session:         tmuxSession,
 		CWD:             cwd,
@@ -2026,8 +2222,25 @@ func (m *Manager) watchSession(
 		return
 	}
 	if m.removeExitedSession(info, s) && m.onSessionExit != nil {
+		defer m.exitCallbacks.Done()
 		m.onSessionExit(info)
 	}
+}
+
+// Exited reports whether this manager saw the session exit on its own. Such a
+// session is finished even while its stored record is still being forgotten.
+func (m *Manager) Exited(key string) bool {
+	_, exited := m.ExitedSession(key)
+	return exited
+}
+
+// ExitedSession returns how a session this manager saw exit on its own ended,
+// including its exit code.
+func (m *Manager) ExitedSession(key string) (SessionInfo, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	info, exited := m.exited[key]
+	return info, exited
 }
 
 func (m *Manager) removeExitedSession(
@@ -2042,6 +2255,10 @@ func (m *Manager) removeExitedSession(
 		return false
 	}
 	delete(m.sessions, info.Key)
+	m.exited[info.Key] = info
+	if m.onSessionExit != nil {
+		m.exitCallbacks.Add(1)
+	}
 	return true
 }
 
@@ -2052,6 +2269,9 @@ func (m *Manager) startOwnedSession(
 	cwd string,
 	extraStripVars []string,
 ) (*session, error) {
+	if info.Kind == LaunchTargetACP {
+		return m.startACPOwner(ctx, info, command, cwd, extraStripVars)
+	}
 	if info.TmuxSession != "" {
 		return startTmuxAttachSession(info, command, cwd, extraStripVars)
 	}
@@ -2081,6 +2301,18 @@ func (s *session) snapshot() SessionInfo {
 }
 
 func (s *session) watch() SessionInfo {
+	if s.acp != nil {
+		<-s.acp.Done()
+		exitCode := s.acp.ExitCode()
+		s.mu.Lock()
+		s.info.Status = SessionStatusExited
+		s.info.ExitedAt = new(time.Now().UTC())
+		s.info.ExitCode = &exitCode
+		info := s.info
+		s.mu.Unlock()
+		close(s.done)
+		return info
+	}
 	if s.pty != nil {
 		return s.watchPtyOwner()
 	}
@@ -2921,6 +3153,7 @@ func attachToSession(
 	workspaceID string,
 	key string,
 	refresh func(context.Context, *session) error,
+	typed func(),
 	options AttachSessionOptions,
 ) (*Attachment, error) {
 	if s == nil {
@@ -2955,9 +3188,17 @@ func attachToSession(
 		write: func(data []byte) error {
 			s.inputMu.Lock()
 			defer s.inputMu.Unlock()
-			return s.writeInput(data)
+			if err := s.writeInput(data); err != nil {
+				return err
+			}
+			if !TerminalRepliesOnly(data) {
+				typed()
+			}
+			return nil
 		},
-		submitInitialMessage: s.submitInitialMessage,
+		submitInitialMessage: func(ctx context.Context, message string) error {
+			return s.submitInitialMessage(ctx, message, typed)
+		},
 		resize: func(geometry ptysize.Geometry) error {
 			_, err := s.resizeAttachment(resizeAttachmentID, geometry, false)
 			return err
@@ -3004,7 +3245,9 @@ func attachToSession(
 	}, nil
 }
 
-func (s *session) submitInitialMessage(ctx context.Context, message string) error {
+// submitInitialMessage reports the paste through typed once it is written,
+// even after the caller stopped waiting.
+func (s *session) submitInitialMessage(ctx context.Context, message string, typed func()) error {
 	s.mu.Lock()
 	if !s.inputModes.observed[2004] {
 		s.mu.Unlock()
@@ -3041,6 +3284,7 @@ func (s *session) submitInitialMessage(ctx context.Context, message string) erro
 			result <- err
 			return
 		}
+		typed()
 		time.Sleep(initialMessageEnterDelay)
 		result <- s.writeInput([]byte("\r"))
 	}()

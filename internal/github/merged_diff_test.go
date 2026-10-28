@@ -11,13 +11,15 @@ import (
 	"testing"
 	"time"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/gitclone"
+	"go.kenn.io/forge/internal/testutil/gitsafe"
+	"go.kenn.io/forge/internal/testutil/reposeed"
 	"go.kenn.io/forge/platform"
-	gitcmd "go.kenn.io/kit/git/cmd"
 )
 
 // gitRun runs a git command in the given dir and returns trimmed stdout.
@@ -25,7 +27,7 @@ import (
 // cause test git operations to mutate the host repo's config.
 func gitRun(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := gitcmd.New().Command(t.Context(), dir, args...)
+	cmd := gitsafe.Runner().Command(t.Context(), dir, args...)
 	cmd.Env = append(cmd.Env,
 		"GIT_AUTHOR_NAME=test",
 		"GIT_AUTHOR_EMAIL=test@test.com",
@@ -69,9 +71,7 @@ func syncTestClonePath(
 ) string {
 	t.Helper()
 	path, err := mgr.ClonePathForContext(
-		gitclone.WithRepositoryIdentity(
-			t.Context(), "repo-"+strings.ToLower(owner+"-"+name),
-		),
+		gitclone.WithRepositoryIdentity(t.Context(), platform.RepositoryIdentity{Key: platform.RepositoryIDKey(testRepoID(owner, name))}),
 		"github", "github.com", owner, name,
 	)
 	require.NoError(t, err)
@@ -112,6 +112,8 @@ func insertMergedPR(t *testing.T, ctx context.Context, d *db.DB, repoID int64, n
 }
 
 func TestIntegrationComputeMergedPRDiffSHAs_MergeCommit(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -154,6 +156,8 @@ func TestIntegrationComputeMergedPRDiffSHAs_MergeCommit(t *testing.T) {
 }
 
 func TestIntegrationComputeMergedPRDiffSHAs_ForceOverwritesIncorrectSHAs(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -200,6 +204,8 @@ func TestIntegrationComputeMergedPRDiffSHAs_ForceOverwritesIncorrectSHAs(t *test
 }
 
 func TestIntegrationComputeMergedPRDiffSHAs_SquashMerge(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -240,6 +246,8 @@ func TestIntegrationComputeMergedPRDiffSHAs_SquashMerge(t *testing.T) {
 }
 
 func TestIntegrationComputeMergedPRDiffSHAs_RebaseMerge(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -297,6 +305,8 @@ func TestIntegrationComputeMergedPRDiffSHAs_RebaseMerge(t *testing.T) {
 // (before merge); second sync discovers it missing from ListOpenPullRequests,
 // calls fetchAndUpdateClosed, and computes diff SHAs via the merged-PR path.
 func TestIntegrationSyncOpenToMergedTransition(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -431,6 +441,8 @@ func TestIntegrationSyncOpenToMergedTransition(t *testing.T) {
 // computed), then on the second sync (with clone manager) it transitions to
 // merged and computeMergedMRDiffSHAs must fill in the diff SHAs.
 func TestIntegrationSyncFirstSeenMergedPR(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -530,6 +542,8 @@ func TestIntegrationSyncFirstSeenMergedPR(t *testing.T) {
 }
 
 func TestIntegrationSyncClosedMROnProviderRepairsDiffFromStableIdentityClone(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	ctx := t.Context()
@@ -563,8 +577,8 @@ func TestIntegrationSyncClosedMROnProviderRepairsDiffFromStableIdentityClone(t *
 		"the mutation resync must not depend on a legacy route clone")
 
 	database := openTestDB(t)
-	repoID, err := database.UpsertRepo(
-		ctx, verifiedGitHubRepoIdentity("github.com", "owner", "repo"),
+	repoID, err := reposeed.Seed(
+		ctx, database, verifiedGitHubRepoIdentity("github.com", "owner", "repo"),
 	)
 	require.NoError(err)
 	now := time.Now().UTC()
@@ -592,8 +606,8 @@ func TestIntegrationSyncClosedMROnProviderRepairsDiffFromStableIdentityClone(t *
 		map[string]Client{"github.com": client}, database, mgr,
 		[]RepoRef{{
 			Platform: platform.KindGitHub, PlatformHost: "github.com",
-			PlatformExternalID: "repo-owner-repo",
-			Owner:              "owner", Name: "repo", RepoPath: "owner/repo",
+			Key:   platform.RepositoryIDKey(testRepoID("owner", "repo")),
+			Owner: "owner", Name: "repo", RepoPath: "owner/repo",
 		}},
 		time.Minute, nil, testBudget(100),
 	)
@@ -613,6 +627,8 @@ func TestIntegrationSyncClosedMROnProviderRepairsDiffFromStableIdentityClone(t *
 // returns the failure as a *DiffSyncError. The handler distinguishes this
 // from hard sync failures so the user sees a warning instead of a 502.
 func TestIntegrationSyncMRWrapsDiffFailureAsDiffSyncError(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -724,6 +740,8 @@ func TestIntegrationSyncMRWrapsDiffFailureAsDiffSyncError(t *testing.T) {
 // PR detail view. The diff failure is preserved in the returned error so
 // the caller can surface it as a warning if it cares.
 func TestIntegrationSyncItemByNumberReturnsTypeOnDiffSyncError(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 

@@ -1,6 +1,10 @@
 <script lang="ts">
+  import ErrorShown from "../shared/ErrorShown.svelte";
+  import { reportWorkspaceOpenError, reportWorkspaceOpened } from "../../app/telemetry.js";
+  import { documentVisible } from "../../browser/document-visible.svelte.js";
   import { Modal, SelectDropdown, Spinner, type SelectDropdownOption } from "@kenn-io/kit-ui";
   import ArrowDownIcon from "@lucide/svelte/icons/arrow-down";
+  import MobileNavMenu from "./MobileNavMenu.svelte";
   import ArrowLeftIcon from "@lucide/svelte/icons/arrow-left";
   import ArrowRightIcon from "@lucide/svelte/icons/arrow-right";
   import ArrowUpIcon from "@lucide/svelte/icons/arrow-up";
@@ -13,7 +17,7 @@
   import RefreshCwIcon from "@lucide/svelte/icons/refresh-cw";
   import SpaceIcon from "@lucide/svelte/icons/space";
   import SquareIcon from "@lucide/svelte/icons/square";
-  import { Effect, Option } from "effect";
+  import { Deferred, Effect, Option, Stream } from "effect";
   import { tick, untrack } from "svelte";
   import type { RuntimeSession, TerminalSettings as TerminalSettingsType } from "../../api/types.js";
   import { apiErrorMessage } from "../../api/runtime.js";
@@ -32,9 +36,12 @@
     completeAcceptedWorkspaceLaunch,
     discardWorkspaceLaunch,
     failWorkspaceLaunch,
+    isWorkspaceDeletionPending,
+    isWorkspaceIdDeleted,
     pendingWorkspaceLaunch,
     type WorkspaceLaunchClaim,
   } from "../../stores/workspace-create-pending.svelte.js";
+  import { quickActionLaunches, quickActionWorkspaceKey } from "../../stores/workspace-quick-actions.js";
   import { showFlash } from "../../stores/flash.svelte.js";
   import { pushModalFrame } from "../../stores/keyboard/modal-stack.svelte.js";
   import {
@@ -53,6 +60,7 @@
   import type { TerminalKey } from "../terminal/terminal-key.js";
   import TerminalSettings from "../settings/TerminalSettings.svelte";
   import ConfirmDialog from "../shared/ConfirmDialog.svelte";
+  import { workspaceEventStream } from "../terminal/workspace-event-stream.js";
   import type { WorkspaceDetail } from "../terminal/workspace-detail.js";
   import {
     makeWorkspaceRuntimeOwner,
@@ -66,6 +74,8 @@
     mobileWorkspaceIdentity,
     mobileWorkspaceLinkedItem,
   } from "./mobile-workspace-detail.js";
+  import { workspaceItemAccent, workspaceItemState } from "../terminal/workspace-item-state.js";
+  import { sortLaunchTargets } from "../terminal/launchTargets.js";
   import {
     loadMobileWorkspaceSession,
     saveMobileWorkspaceSession,
@@ -93,15 +103,29 @@
 
   let { workspaceId, hostKey = undefined, visible = true, onBack, onMissing, onOpenItem }: Props = $props();
   const appRuntime = getAppRuntime();
-  const { settings: settingsStore } = getStores();
+  const { events: eventsStore, settings: settingsStore } = getStores();
   const runtimeOwner = makeWorkspaceRuntimeOwner("mobile-workspace");
   const presenterID = makeWorkspaceRuntimePresenterID();
+  let queuedLaunchRead: symbol | undefined;
 
   let workspace = $state.raw<WorkspaceDetail | null>(null);
+  const usableWorkspace = $derived(
+    workspace?.id === workspaceId && workspace.fleet_host_key === hostKey &&
+    workspace.status !== "deleting" && workspace.status !== "deletion_failed" &&
+    !isWorkspaceDeletionPending(workspaceId, hostKey) && !(hostKey === undefined && isWorkspaceIdDeleted(workspaceId))
+      ? workspace : null,
+  );
+  $effect(() => {
+    if (visible && documentVisible() && usableWorkspace) {
+      reportWorkspaceOpened(appRuntime, usableWorkspace.item_type);
+    }
+  });
+  let workspaceReadinessGeneration = 0;
   let runtime = $state.raw<WorkspaceRuntimeState | null>(null);
   let selectedSessionKey = $state<string | null>(null);
   let provisionalBaseSelection = false;
   let ownedHostKeys: SessionHostKey[] = [];
+  let runtimeErrorAttempt = $state(0);
   let loadError = $state<string | null>(null);
   let runtimeError = $state<string | null>(null);
   let launchingTarget = $state<string | null>(null);
@@ -122,6 +146,7 @@
 
   const sessions = $derived(mobileTerminalSessions(runtime, workspace));
   const launchTargets = $derived(runtime?.launch_targets ?? []);
+  const availableLaunchTargets = $derived(sortLaunchTargets(launchTargets.filter((target) => target.available)));
   const sessionOptions = $derived<SelectDropdownOption[]>(
     sessions.map((session) => ({ value: session.key, label: session.label })),
   );
@@ -132,7 +157,14 @@
     selectedSession ? pooledHostKey(selectedSession) : null,
   );
   const pendingLaunch = $derived(pendingWorkspaceLaunch(workspaceId, hostKey));
+  const quickActionLaunch = $derived(quickActionLaunches.get(quickActionWorkspaceKey(workspaceId, hostKey)));
+  const startingTargetKey = $derived(pendingLaunch?.targetKey ?? quickActionLaunch?.targetKey ?? launchingTarget);
+  const startingTargetLabel = $derived(launchTargets.find((target) => target.key === startingTargetKey)?.label ?? startingTargetKey);
+  let sessionSelectionExplicit = $state(false);
+  const showLaunchProgress = $derived(startingTargetKey !== null && startingTargetKey !== undefined &&
+    !selectedSession?.runtimeSession && !sessionSelectionExplicit);
   const linkedItem = $derived(workspace ? mobileWorkspaceLinkedItem(workspace) : null);
+  const linkedItemAccent = $derived(workspace && linkedItem ? workspaceItemAccent[workspaceItemState(workspace, linkedItem.itemType)] : undefined);
   const workspaceIdentity = $derived(
     workspace
       ? mobileWorkspaceIdentity(workspace, hostKey)
@@ -177,6 +209,8 @@
     ];
   }
 
+  const selectedChat = $derived(selectedSession?.runtimeSession?.kind === "acp");
+
   function pooledHostKey(session: MobileTerminalSession): SessionHostKey {
     return sessionHostKey(workspaceId, hostKey, session.key, session.generation);
   }
@@ -205,6 +239,8 @@
         ...(hostKey === undefined ? {} : { fleetHostKey: hostKey }),
         websocketPath: session.websocketPath,
         status: session.status,
+        kind: session.runtimeSession?.kind,
+        label: session.label,
         cursorWheelInput: session.cursorWheelInput,
       });
     }
@@ -281,28 +317,29 @@
         completeAcceptedWorkspaceLaunch(workspaceId, hostKey, session.key);
       }
     }
-    reconcileQueuedWorkspaceLaunch(next);
   }
 
   function reconcileQueuedWorkspaceLaunch(next: WorkspaceRuntimeState): void {
     const pending = pendingWorkspaceLaunch(workspaceId, hostKey);
-    if (!pending || pending.phase === "awaiting_session") return;
+    if (
+      workspace?.id !== workspaceId || workspace.fleet_host_key !== hostKey || workspace.status !== "ready" ||
+      pending?.phase !== "queued" || isWorkspaceDeletionPending(workspaceId, hostKey) ||
+      (hostKey === undefined && isWorkspaceIdDeleted(workspaceId))
+    ) return;
     if (next.sessions.length > 0) {
       discardWorkspaceLaunch(workspaceId, hostKey);
       return;
     }
     const launchTarget = next.launch_targets.find((candidate) => candidate.key === pending.targetKey);
-    if (!launchTarget || launchTarget.kind !== "agent" || !launchTarget.available) {
+    if (!launchTarget || (launchTarget.kind !== "agent" && launchTarget.kind !== "acp") || !launchTarget.available) {
       if (discardWorkspaceLaunch(workspaceId, hostKey) !== null) {
-        showFlash(
-          `Agent "${pending.targetKey}" could not launch: ${launchTarget?.disabled_reason ?? "not available"}`,
-          { tone: "danger" },
-        );
+        showFlash(`Agent "${pending.targetKey}" could not launch: ${launchTarget?.disabled_reason ?? "not available"}`, { tone: "danger" });
+        reportWorkspaceOpenError(appRuntime);
       }
       return;
     }
     const claim = claimWorkspaceLaunch(workspaceId, hostKey);
-    if (claim) launch(claim.targetKey, claim);
+    if (claim) launch(claim.targetKey, claim, next);
   }
 
   function requestSessionFocusForSelection(): void {
@@ -310,45 +347,84 @@
     if (session) requestSessionFocus(pooledHostKey(session), { soft: true });
   }
 
-  function readRuntime(force = false) {
+  // The page stays mounted behind other routes, so only a shown page views.
+  function viewingNow(): boolean {
+    return visible && document.visibilityState === "visible";
+  }
+
+  function readRuntime(force = false, viewing = false) {
+    const id = workspaceId;
+    const activeHostKey = hostKey;
+    const admission =
+      workspace?.id === id && workspace.fleet_host_key === activeHostKey && workspace.status === "ready" &&
+      pendingWorkspaceLaunch(id, activeHostKey)?.phase === "queued"
+        ? Symbol("queued-launch-read") : undefined;
     return Effect.gen(function* () {
+      if (admission !== undefined) queuedLaunchRead = admission;
       const workflow = yield* WorkspaceRuntimeWorkflow;
-      const result = yield* workflow.read(runtimeOwner, workspaceId, hostKey, { force });
-      if (Option.isSome(result)) {
-        yield* Effect.sync(() => applyRuntime(result.value));
+      const result = yield* workflow.read(runtimeOwner, id, activeHostKey, { force, viewing });
+      if (Option.isSome(result) && workspaceId === id && hostKey === activeHostKey) {
+        yield* Effect.sync(() => {
+          applyRuntime(result.value);
+          if (admission !== undefined) reconcileQueuedWorkspaceLaunch(result.value);
+        });
       }
     }).pipe(
       Effect.catch((failure) =>
         Effect.sync(() => {
+          if (workspaceId !== id || hostKey !== activeHostKey) return;
           if (failure instanceof ApiProblemError && failure.problem.code === ProblemCodes.workspaceNotFound) {
             handleWorkspaceMissing();
             return;
           }
+          if (force) runtimeErrorAttempt += 1;
           runtimeError = failureMessage(failure, "Runtime unavailable");
+        }),
+      ),
+      Effect.ensuring(Effect.sync(() => {
+        if (queuedLaunchRead === admission) queuedLaunchRead = undefined;
+      })),
+    );
+  }
+
+  // Background reloads only refresh metadata for a terminal already on
+  // screen, so a transient failure keeps that terminal instead of replacing it.
+  function loadWorkspace({ background = false }: { background?: boolean } = {}) {
+    const id = workspaceId;
+    const activeHostKey = hostKey;
+    return Effect.gen(function* () {
+      const readinessGeneration = workspaceReadinessGeneration;
+      const detail = yield* loadMobileWorkspaceDetail(id, activeHostKey);
+      yield* Effect.sync(() => {
+        if (workspaceId !== id || hostKey !== activeHostKey) return;
+        // Keep accepted readiness when an earlier setup snapshot arrives late.
+        if (detail.status === "creating" && workspace?.id === id && workspace.fleet_host_key === activeHostKey &&
+          workspace.status === "ready" && readinessGeneration !== workspaceReadinessGeneration) return;
+        applyWorkspace(detail);
+        loadError = null;
+      });
+    }).pipe(
+      Effect.catch((failure) =>
+        Effect.sync(() => {
+          if (workspaceId !== id || hostKey !== activeHostKey) return;
+          if (failure instanceof ApiProblemError && failure.problem.code === ProblemCodes.workspaceNotFound) {
+            handleWorkspaceMissing();
+            return;
+          }
+          if (background && workspace?.id === id && workspace.fleet_host_key === activeHostKey) return;
+          loadError = failureMessage(failure, hostKey ? "Fleet workspace unavailable" : "Workspace unavailable");
         }),
       ),
     );
   }
 
   function loadWorkspaceAndRuntime() {
-    return Effect.gen(function* () {
-      const detail = yield* loadMobileWorkspaceDetail(workspaceId, hostKey);
-      yield* Effect.sync(() => {
-        applyWorkspace(detail);
-        loadError = null;
-      });
-      if (detail.status === "ready") yield* readRuntime(true);
-    }).pipe(
-      Effect.catch((failure) =>
-        Effect.sync(() => {
-          if (failure instanceof ApiProblemError && failure.problem.code === ProblemCodes.workspaceNotFound) {
-            handleWorkspaceMissing();
-            return;
-          }
-          loadError = failureMessage(failure, hostKey ? "Fleet workspace unavailable" : "Workspace unavailable");
-        }),
-      ),
-    );
+    return Effect.all([
+      loadWorkspace(),
+      // A queued launch needs its runtime read after setup is ready. That same
+      // response supplies admission and the workflow's lost-response baseline.
+      pendingWorkspaceLaunch(workspaceId, hostKey)?.phase === "queued" ? Effect.void : readRuntime(false, viewingNow()),
+    ], { concurrency: "unbounded", discard: true });
   }
 
   function observeMutation(state: WorkspaceRuntimeMutationState): Effect.Effect<boolean> {
@@ -417,7 +493,9 @@
     state: Extract<WorkspaceRuntimeMutationState, { kind: "failed" | "uncertain" }>,
     fallback: string,
   ): void {
-    showFlash(failureMessage(state.error, fallback), { tone: "danger" });
+    const message = failureMessage(state.error, fallback);
+    showFlash(message, { tone: "danger" });
+    if (state.operation === "Launch") reportWorkspaceOpenError(appRuntime);
   }
 
   function requestRuntimeRefresh(): void {
@@ -429,9 +507,10 @@
   }
 
   function refreshWorkspaceState() {
-    return Effect.suspend(() =>
-      workspace?.status === "ready" ? readRuntime(true) : loadWorkspaceAndRuntime(),
-    );
+    return Effect.gen(function* () {
+      if (workspace?.status !== "ready") yield* loadWorkspace();
+      if (workspace?.status === "ready") yield* readRuntime(false, viewingNow());
+    });
   }
 
   function retryWorkspaceSetup(): void {
@@ -456,6 +535,7 @@
 
   function selectSession(sessionKey: string): void {
     provisionalBaseSelection = false;
+    sessionSelectionExplicit = true;
     selectedSessionKey = sessionKey;
     composedInput = "";
     inputError = null;
@@ -540,7 +620,7 @@
     if (direction === "close" && distance > 24) closeComposer();
   }
 
-  function launch(targetKey: string, launchClaim?: WorkspaceLaunchClaim): void {
+  function launch(targetKey: string, launchClaim?: WorkspaceLaunchClaim, admissionRuntime?: WorkspaceRuntimeState): void {
     if (launchingTarget || stoppingSession || (!launchClaim && pendingLaunch)) return;
     appRuntime.runCommand(
       Effect.gen(function* () {
@@ -568,7 +648,7 @@
                 },
               }
             : {}),
-        });
+        }, admissionRuntime);
       }),
       {
         operation: "launch mobile workspace session",
@@ -577,6 +657,7 @@
           launchingTarget = null;
           if (launchClaim) failWorkspaceLaunch(launchClaim);
           showFlash(failureMessage(failure, "Launch failed"), { tone: "danger" });
+          reportWorkspaceOpenError(appRuntime);
         },
       },
     );
@@ -602,6 +683,7 @@
           onExpired: Effect.sync(() => {
             if (workspaceId === launchClaim.workspaceId && hostKey === launchClaim.workspaceHostKey) {
               showFlash(`${label} launched, but its session did not become available`, { tone: "danger" });
+              reportWorkspaceOpenError(appRuntime);
             }
           }),
         });
@@ -661,6 +743,51 @@
   }
 
   $effect(() => {
+    if (
+      workspace?.id !== workspaceId || workspace.fleet_host_key !== hostKey || workspace.status !== "ready" ||
+      pendingLaunch?.phase !== "queued" || launchingTarget || stoppingSession
+    ) return;
+    if (isWorkspaceDeletionPending(workspaceId, hostKey) ||
+      (hostKey === undefined && isWorkspaceIdDeleted(workspaceId))) return;
+    untrack(() => {
+      if (queuedLaunchRead === undefined) requestRuntimeRefresh();
+    });
+  });
+
+  $effect(() => {
+    const session = quickActionLaunch?.session;
+    const current = runtime ?? { launch_targets: [], sessions: [] };
+    if (
+      !session || workspace?.id !== workspaceId || workspace.fleet_host_key !== hostKey || workspace.status !== "ready"
+    ) return;
+    untrack(() => {
+      selectedSessionKey = session.key;
+      provisionalBaseSelection = false;
+      applyRuntime({ ...current, sessions: [...current.sessions.filter((candidate) => candidate.key !== session.key), session] }, false);
+      quickActionLaunches.delete(quickActionWorkspaceKey(workspaceId, hostKey));
+      requestRuntimeRefresh();
+    });
+  });
+
+  // Item changes are skipped while the retained page is hidden.
+  let wasVisible = untrack(() => visible);
+  $effect(() => {
+    const shown = visible && !wasVisible;
+    wasVisible = visible;
+    if (!shown) return;
+    // Cleanup cancels a pending reload so a late reply cannot reclaim
+    // released sessions or navigate away from the next page.
+    return untrack(() => {
+      if (workspace?.id !== workspaceId) return;
+      return appRuntime.runCommand(loadWorkspace({ background: true }), {
+        operation: "reload shown mobile workspace",
+        safeContext: { workspaceId, remote: Boolean(hostKey) },
+        onFailure: () => undefined,
+      }).interrupt;
+    });
+  });
+
+  $effect(() => {
     if (!terminalOptionsOpen) return;
     return untrack(() => pushModalFrame("mobile-workspace-terminal-options", []));
   });
@@ -677,8 +804,11 @@
       workspaceId: activeWorkspaceId,
       ...(activeHostKey === undefined ? {} : { hostKey: activeHostKey }),
     };
+    workspaceReadinessGeneration += 1;
+    sessionSelectionExplicit = false;
     workspace = null;
     runtime = null;
+    launchingTarget = null;
     selectedSessionKey = loadMobileWorkspaceSession(activeWorkspaceId, activeHostKey);
     provisionalBaseSelection = false;
     loadError = null;
@@ -698,6 +828,7 @@
       appRuntime.runCommand(
         Effect.scoped(
           Effect.gen(function* () {
+            const initialLoad = yield* Deferred.make<void>();
             const workflow = yield* WorkspaceRuntimeWorkflow;
             yield* workflow.claimPresenter(activeTarget, presenterID, observeMutation, {
               presentationIsCurrent: () => workspaceId === activeWorkspaceId && hostKey === activeHostKey,
@@ -707,7 +838,49 @@
                 Effect.andThen(workflow.release(runtimeOwner)),
               ),
             );
+            yield* Effect.forkChild(
+              workspaceEventStream(eventsStore.subscribeWorkspaceEvents).pipe(Stream.runForEach((event) => {
+                if (event._tag === "Open") {
+                  // Opening a live stream is not invalidation. Only recover
+                  // enrichment that may have completed before subscribing.
+                  return Deferred.await(initialLoad).pipe(
+                    Effect.andThen(Effect.suspend(() =>
+                      workspace?.enrichment_status === "pending" ? loadWorkspace() : Effect.void,
+                    )),
+                    Effect.forkChild,
+                    Effect.asVoid,
+                  );
+                }
+                if (event._tag === "Status" && (event.workspaceId === undefined || event.workspaceId === activeWorkspaceId)) {
+                  return Effect.sync(() => {
+                    if (
+                      activeHostKey === undefined && event.workspaceId === activeWorkspaceId && event.status === "ready" &&
+                      workspace?.id === activeWorkspaceId && workspace.status === "creating" &&
+                      !isWorkspaceDeletionPending(activeWorkspaceId, activeHostKey) && !isWorkspaceIdDeleted(activeWorkspaceId)
+                    ) {
+                      workspaceReadinessGeneration += 1;
+                      applyWorkspace({ ...workspace, status: "ready" });
+                      if (pendingWorkspaceLaunch(activeWorkspaceId, activeHostKey)?.phase !== "queued") {
+                        requestRuntimeRefresh();
+                      }
+                    }
+                  }).pipe(Effect.andThen(loadWorkspace()), Effect.forkChild, Effect.asVoid);
+                }
+                if (event._tag === "ReconnectStale") {
+                  return loadWorkspaceAndRuntime().pipe(Effect.forkChild, Effect.asVoid);
+                }
+                // The linked-item pill colors by PR state, and the poll skips
+                // detail once ready. A hidden page reloads when shown again.
+                const itemMayHaveChanged = event._tag === "ItemDataChanged" ||
+                  (event._tag === "Associated" && event.workspaceId === activeWorkspaceId);
+                return itemMayHaveChanged && visible
+                  ? loadWorkspace({ background: true }).pipe(Effect.forkChild, Effect.asVoid)
+                  : Effect.void;
+              })),
+              { startImmediately: true },
+            );
             yield* loadWorkspaceAndRuntime();
+            yield* Deferred.succeed(initialLoad, undefined);
             yield* Effect.forever(
               Effect.sleep("5 seconds").pipe(Effect.andThen(refreshWorkspaceState())),
             );
@@ -750,7 +923,7 @@
     {#if sessions.length > 0}
       <div class="mobile-workspace-terminal__switcher">
         <SelectDropdown
-          title="Terminal session"
+          title={selectedChat ? "Chat session" : "Terminal session"}
           value={selectedSessionKey ?? ""}
           options={sessionOptions}
           onchange={selectSession}
@@ -766,6 +939,7 @@
         <button
           type="button"
           class="mobile-workspace-terminal__item"
+          style:--item-accent={linkedItemAccent}
           aria-label={hostKey
             ? `Linked ${linkedItem.itemType === "pr" ? "PR" : "issue"} #${linkedItem.number} unavailable for Fleet workspace`
             : `Open linked ${linkedItem.itemType === "pr" ? "PR" : "issue"} #${linkedItem.number}`}
@@ -776,7 +950,7 @@
       {/if}
       <button
         type="button"
-        aria-label="Terminal options"
+        aria-label={selectedChat ? "Chat options" : "Terminal options"}
         aria-haspopup="dialog"
         aria-expanded={terminalOptionsOpen}
         onclick={openTerminalOptions}
@@ -784,10 +958,12 @@
       >
         <MoreHorizontalIcon size="20" strokeWidth="2" aria-hidden="true" />
       </button>
+      <MobileNavMenu />
     </div>
   </header>
 
   {#if loadError}
+    <ErrorShown kind="workspace_opened" scope={quickActionWorkspaceKey(workspaceId, hostKey)} shown={visible} />
     <div class="mobile-workspace-terminal__state error">
       <strong>{hostKey ? `Fleet · ${hostKey}` : "Workspace unavailable"}</strong>
       <span>{loadError}</span>
@@ -811,19 +987,29 @@
           : workspace.status === "deletion_failed"
             ? "Workspace deletion failed"
             : "Workspace setup failed"}</strong>
+      {#if workspace.status === "creating" && startingTargetKey}
+        <Spinner size={18} /><span role="status">Preparing worktree…</span>
+      {/if}
       {#if workspace.error_message}<span>{workspace.error_message}</span>{/if}
       {#if runtimeError}<span>{runtimeError}</span>{/if}
       {#if workspace.status === "error"}
+        {#if !retryingSetup}<ErrorShown kind="workspace_opened" scope={quickActionWorkspaceKey(workspaceId, hostKey)} shown={visible} />{/if}
         <button type="button" disabled={retryingSetup} onclick={retryWorkspaceSetup}>
           {#if retryingSetup}<Spinner size={16} />{:else}<RefreshCwIcon size="18" aria-hidden="true" />{/if}
           Retry
         </button>
       {/if}
     </div>
+  {:else if showLaunchProgress && !runtimeError}
+    <div class="mobile-workspace-terminal__state" role="status">
+      <Spinner size={18} /><strong>Starting {startingTargetLabel}…</strong>
+      <span>Worktree ready. Waiting for the agent session.</span>
+    </div>
   {:else if !runtime && !runtimeError && !selectedHostKey}
     <div class="mobile-workspace-terminal__state"><Spinner size={18} /><span>Loading terminal sessions…</span></div>
   {:else if runtimeError && !runtime && !selectedHostKey}
     <div class="mobile-workspace-terminal__state error">
+      <ErrorShown kind="workspace_opened" scope={`${quickActionWorkspaceKey(workspaceId, hostKey)}:runtime:${runtimeErrorAttempt}`} shown={visible} />
       <strong>Terminal runtime unavailable</strong><span>{runtimeError}</span>
       <button type="button" onclick={requestRuntimeRefresh}><RefreshCwIcon size="18" aria-hidden="true" />Reconnect</button>
     </div>
@@ -831,6 +1017,7 @@
     <div class="mobile-workspace-terminal__stage" aria-label={`Selected terminal: ${selectedSession?.label ?? "Terminal"}`}>
       {#if runtimeError}
         <div class="mobile-workspace-terminal__runtime-error" role="status">
+          <ErrorShown kind="workspace_opened" scope={`${quickActionWorkspaceKey(workspaceId, hostKey)}:runtime:${runtimeErrorAttempt}`} shown={visible} />
           <span><strong>Runtime sessions unavailable</strong><small>{runtimeError}</small></span>
           <button type="button" aria-label="Retry runtime sessions" onclick={requestRuntimeRefresh}>
             <RefreshCwIcon size="16" aria-hidden="true" />Retry
@@ -840,6 +1027,7 @@
       <div class="mobile-workspace-terminal__viewport" data-terminal-software-keyboard="manual">
         <SessionTerminalSlot hostKey={selectedHostKey} {visible} />
       </div>
+      {#if !selectedChat}
       {#if composerOpen}
         <form class="mobile-workspace-terminal__composer" onsubmit={(event) => {
           event.preventDefault();
@@ -919,12 +1107,13 @@
           <ChevronUpIcon size="16" aria-hidden="true" />
         </button>
       {/if}
+      {/if}
     </div>
   {:else}
     <div class="mobile-workspace-terminal__empty">
       <div><strong>No terminal sessions</strong><span>Launch an agent or shell in this workspace.</span></div>
       <div class="mobile-workspace-terminal__launch-grid">
-        {#each launchTargets.filter((target) => target.available) as target (target.key)}
+        {#each availableLaunchTargets as target (target.key)}
           <button type="button" disabled={launchingTarget !== null || pendingLaunch !== null} onclick={() => launch(target.key)}>
             {#if launchingTarget === target.key}<Spinner size={16} />{/if}
             {target.kind === "plain_shell" ? "Shell" : target.label}
@@ -937,9 +1126,9 @@
 
 {#if terminalOptionsOpen}
   <Modal
-    title="Terminal options"
-    ariaLabel="Terminal options"
-    closeLabel="Close terminal options"
+    title={selectedChat ? "Chat options" : "Terminal options"}
+    ariaLabel={selectedChat ? "Chat options" : "Terminal options"}
+    closeLabel={selectedChat ? "Close chat options" : "Close terminal options"}
     width="min(100%, 38rem)"
     maxWidth="100%"
     onclose={closeTerminalOptions}
@@ -947,7 +1136,7 @@
     <div class="mobile-terminal-options-sheet">
       <div class="mobile-terminal-options-sheet__actions">
         <button type="button" disabled={terminalOptionsSaving || launchingTarget !== null || stoppingSession !== null || pendingLaunch !== null} onclick={openLaunchSheet}>
-          <span><PlusIcon size="18" strokeWidth="2" aria-hidden="true" />New terminal</span>
+          <span><PlusIcon size="18" strokeWidth="2" aria-hidden="true" />{selectedChat ? "New session" : "New terminal"}</span>
           <small>Launch a shell or configured agent.</small>
         </button>
       </div>
@@ -956,17 +1145,18 @@
         <div class="mobile-terminal-options-sheet__danger">
           <button
             type="button"
-            aria-label={`Stop terminal ${selectedSession.runtimeSession.label}`}
+            aria-label={`Stop ${selectedChat ? "chat" : "terminal"} ${selectedSession.runtimeSession.label}`}
             disabled={terminalOptionsSaving || stoppingSession !== null || launchingTarget !== null}
             onclick={promptStopSelectedSession}
           >
             {#if stoppingSession === selectedSession.runtimeSession.key}<Spinner size={16} />{:else}<SquareIcon size="17" strokeWidth="2" aria-hidden="true" />{/if}
-            Stop terminal…
+            {selectedChat ? "Stop chat…" : "Stop terminal…"}
           </button>
           <small>Terminates the process running in {selectedSession.runtimeSession.label}.</small>
         </div>
       {/if}
 
+      {#if !selectedChat}
       <section class="mobile-terminal-options-sheet__settings" aria-labelledby="mobile-terminal-settings-heading">
         <h3 id="mobile-terminal-settings-heading">Appearance and behavior</h3>
         <TerminalSettings
@@ -984,6 +1174,7 @@
           }}
         />
       </section>
+      {/if}
     </div>
   </Modal>
 {/if}
@@ -1000,13 +1191,13 @@
     <div class="mobile-terminal-sheet">
       <small class="mobile-terminal-sheet__branch">{workspace?.git_head_ref ?? workspaceId}</small>
       <div class="mobile-terminal-sheet__targets">
-        {#each launchTargets as target (target.key)}
-          <button type="button" disabled={!target.available || launchingTarget !== null || pendingLaunch !== null} title={target.disabled_reason} onclick={() => launch(target.key)}>
-            <span><strong><LaunchTargetName {target} label={target.kind === "plain_shell" ? "Shell" : target.label} iconSize={16} /></strong><small>{target.available ? target.source : target.disabled_reason}</small></span>
+        {#each availableLaunchTargets as target (target.key)}
+          <button type="button" disabled={launchingTarget !== null || pendingLaunch !== null} onclick={() => launch(target.key)}>
+            <span><strong><LaunchTargetName {target} label={target.kind === "plain_shell" ? "Shell" : target.label} iconSize={16} /></strong><small>{target.source}</small></span>
             {#if launchingTarget === target.key}<Spinner size={16} />{:else}<PlusIcon size="18" aria-hidden="true" />{/if}
           </button>
         {/each}
-        {#if launchTargets.length === 0}<p>No launch targets are configured for this workspace.</p>{/if}
+        {#if availableLaunchTargets.length === 0}<p>No launch targets are available for this workspace.</p>{/if}
       </div>
     </div>
   </Modal>
@@ -1014,10 +1205,10 @@
 
 <ConfirmDialog
   open={stopSession !== null}
-  title="Stop terminal?"
-  message={stopSession ? `Stop terminal "${stopSession.label}"?` : ""}
-  hint="This terminates the process running in this terminal session."
-  confirmLabel="Stop terminal"
+  title={selectedChat ? "Stop chat?" : "Stop terminal?"}
+  message={stopSession ? `Stop ${selectedChat ? "chat" : "terminal"} "${stopSession.label}"?` : ""}
+  hint={selectedChat ? "This terminates the agent process running in this chat session." : "This terminates the process running in this terminal session."}
+  confirmLabel={selectedChat ? "Stop chat" : "Stop terminal"}
   pendingLabel="Stopping…"
   busy={stoppingSession !== null}
   tone="danger"
@@ -1041,7 +1232,7 @@
   .mobile-workspace-terminal__identity strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .mobile-workspace-terminal__identity strong { color: var(--text-primary); font-size: var(--font-size-md); }
   .mobile-workspace-terminal__actions { display: flex; gap: 0.375rem; }
-  .mobile-workspace-terminal__item { min-width: auto !important; min-height: 2rem !important; color: var(--text-on-accent) !important; border-color: var(--accent-green) !important; background: var(--accent-green) !important; font-family: var(--font-mono) !important; font-weight: 700 !important; }
+  .mobile-workspace-terminal__item { min-width: auto !important; min-height: 2rem !important; color: color-mix(in srgb, var(--item-accent) 25%, var(--bubble-ink)) !important; border-color: color-mix(in srgb, var(--item-accent) 70%, #ffffff) !important; background: color-mix(in srgb, var(--item-accent) 70%, #ffffff) !important; font-family: var(--font-mono) !important; font-weight: 700 !important; }
   .mobile-workspace-terminal__item:disabled { cursor: not-allowed; opacity: var(--opacity-disabled); }
   .mobile-workspace-terminal__stage { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; background: var(--terminal-bg, var(--bg-primary)); }
   .mobile-workspace-terminal__runtime-error { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; padding: 0.5rem 0.75rem; color: var(--text-secondary); border-bottom: thin solid var(--border-default); background: var(--bg-surface); font-size: var(--font-size-sm); }
@@ -1089,7 +1280,7 @@
   .mobile-terminal-options-sheet__actions span { display: inline-flex; align-items: center; gap: 0.625rem; font-weight: 650; }
   .mobile-terminal-options-sheet__actions small, .mobile-terminal-options-sheet__danger small { color: var(--text-muted); font-size: var(--font-size-sm); }
   .mobile-terminal-options-sheet__settings { padding: 1rem 0.875rem 0; }
-  .mobile-terminal-options-sheet__settings h3 { margin: 0 0 0.875rem; color: var(--text-muted); font-size: var(--font-size-sm); font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+  .mobile-terminal-options-sheet__settings h3 { margin: 0 0 0.875rem; color: var(--text-muted); font-size: var(--font-size-sm); font-weight: 700; letter-spacing: var(--letter-spacing-label, 0.04em); text-transform: var(--label-transform, uppercase); }
   .mobile-terminal-options-sheet__settings :global(.terminal-settings.compact) { width: 100%; }
   .mobile-terminal-options-sheet__danger { display: flex; flex-direction: column; gap: 0.375rem; padding: 0.75rem 0.875rem; border-bottom: thin solid var(--border-muted); }
   .mobile-terminal-options-sheet__danger > button { min-height: 2.75rem; display: inline-flex; align-items: center; justify-content: flex-start; gap: 0.5rem; padding: 0; color: var(--accent-red); border: 0; background: transparent; font: inherit; font-weight: 700; }

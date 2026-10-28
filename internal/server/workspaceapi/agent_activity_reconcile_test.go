@@ -9,7 +9,7 @@ import (
 	"go.kenn.io/forge/internal/agentactivity"
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/testutil/dbtest"
-	"go.kenn.io/forge/internal/workspace"
+	"go.kenn.io/forge/internal/testutil/workspacetest"
 	"go.kenn.io/forge/internal/workspace/localruntime"
 )
 
@@ -18,6 +18,7 @@ import (
 // missing tmux session before restoration runs, is removed by restoration,
 // while a report backed by a persisted row survives.
 func TestRestoreRuntimeSessionsDropsReportsOfPrunedRuntimes(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
@@ -31,7 +32,7 @@ func TestRestoreRuntimeSessionsDropsReportsOfPrunedRuntimes(t *testing.T) {
 		GitHeadRef: "feature/reconcile", WorkspaceBranch: "feature/reconcile",
 		WorktreePath: worktree, Status: "ready",
 	}))
-	// A persisted runtime whose pty-owner state is gone restores as
+	// With no pty-owner runtime configured, a persisted runtime restores as
 	// unavailable, which keeps its row; its report must survive.
 	require.NoError(database.UpsertWorkspaceRuntimeSession(ctx, &db.WorkspaceRuntimeSession{
 		WorkspaceID: workspaceID, SessionKey: "runtime-kept",
@@ -53,7 +54,7 @@ func TestRestoreRuntimeSessionsDropsReportsOfPrunedRuntimes(t *testing.T) {
 	runtime := localruntime.NewManager(localruntime.Options{})
 	t.Cleanup(runtime.Shutdown)
 	handler := New(Deps{
-		DB: database, Workspaces: workspace.NewManager(database, t.TempDir()),
+		DB: database, Workspaces: workspacetest.NewManager(t, database, t.TempDir()),
 		Runtime: runtime, AgentActivity: activity,
 	})
 	require.NoError(handler.RestoreRuntimeSessions(ctx))

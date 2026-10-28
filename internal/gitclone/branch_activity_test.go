@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	providerplatform "go.kenn.io/forge/platform"
 )
 
 func TestBranchActivityWalksDefaultBranchFirstParent(t *testing.T) {
@@ -229,7 +230,7 @@ func TestResolveDefaultBranchFallsBackToOriginHEAD(t *testing.T) {
 
 	cloneDir, err := mgr.ClonePath("github", "github.com", "acme", "widgets")
 	require.NoError(err)
-	identityCtx := WithRepositoryIdentity(t.Context(), "different-storage-namespace")
+	identityCtx := WithRepositoryIdentity(t.Context(), providerplatform.RepositoryIdentity{Key: providerplatform.RepositoryIDKey(1001)})
 	branch, ref, err = mgr.ResolveDefaultBranchInDir(identityCtx, cloneDir, "stale")
 	require.NoError(err)
 	assert.Equal("main", branch)
@@ -344,4 +345,35 @@ func TestResolveDefaultBranchPrefersLiteralOriginPrefixedBranch(t *testing.T) {
 	require.NoError(err)
 	assert.Equal("origin/main", branch)
 	assert.Equal(literalSHA, ref)
+}
+
+// A repository with no pushes clones cleanly and reports that it is empty
+// rather than a missing origin HEAD; its first push makes it resolvable.
+func TestEmptyRepositoryClonesAndResolvesAfterFirstPush(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	dir := isolatedCommitFixtureDir(t)
+	remote := filepath.Join(dir, "remote.git")
+	commitTestRun(t, dir, "git", "init", "--bare", "--initial-branch=main", remote)
+	mgr := New(filepath.Join(dir, "clones"), nil)
+
+	require.NoError(mgr.EnsureClone(t.Context(), "github", "github.com", "acme", "empty", remote))
+	_, _, err := mgr.ResolveDefaultBranch(t.Context(), "github", "github.com", "acme", "empty", "main")
+	require.ErrorIs(err, ErrEmptyRepository)
+
+	work := filepath.Join(dir, "work")
+	commitTestRun(t, dir, "git", "clone", remote, work)
+	commitTestRun(t, work, "git", "config", "user.email", "alice@example.com")
+	commitTestRun(t, work, "git", "config", "user.name", "Alice")
+	require.NoError(os.WriteFile(filepath.Join(work, "first.txt"), []byte("first\n"), 0o644))
+	commitTestRun(t, work, "git", "add", ".")
+	commitTestRun(t, work, "git", "commit", "-m", "first")
+	commitTestRun(t, work, "git", "push", "origin", "main")
+
+	require.NoError(mgr.EnsureClone(t.Context(), "github", "github.com", "acme", "empty", remote))
+	branch, sha, err := mgr.ResolveDefaultBranch(t.Context(), "github", "github.com", "acme", "empty", "")
+	require.NoError(err, "the first fetch with branches records origin HEAD")
+	assert.Equal("main", branch)
+	assert.Equal(gitSHA(t, work, "HEAD"), sha)
 }

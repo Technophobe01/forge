@@ -1,8 +1,11 @@
+import { startTestTelemetry } from "../../testing/telemetry.js";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { Effect } from "effect";
 import { tick, type ComponentProps } from "svelte";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import type { DiffResult, Label, PullDetail } from "../../api/types.js";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vite-plus/test";
+import type { DiffResult, Label, PullDetail, RuntimeSession } from "../../api/types.js";
+import { quickActionLaunches, quickActionWorkspaces } from "../../stores/workspace-quick-actions.js";
+import { loadFleetSnapshot } from "../../api/fleet-snapshot.js";
 import { makeAppRuntime, type OwnedAppRuntime } from "../../app/runtime.js";
 import { NAVIGATE_KEY, STORES_KEY } from "../../context.js";
 import { createDetailActivityViewStore } from "../../stores/detail-activity-view.svelte.js";
@@ -40,7 +43,11 @@ const launchTargets = [
 // The pending-create store is module-scoped so it can survive component
 // remounts; tests that leave a deferred create unresolved must not leak
 // that pending identity into later tests.
-afterEach(resetWorkspaceCreatePendingForTest);
+afterEach(() => {
+  resetWorkspaceCreatePendingForTest();
+  quickActionLaunches.clear();
+  quickActionWorkspaces.clear();
+});
 
 let detailRuntime: OwnedAppRuntime | null = null;
 
@@ -89,6 +96,8 @@ vi.mock("../../utils/markdown.js", async (importOriginal) => {
 
 import PullDetailComponent from "./PullDetail.svelte";
 import PullDetailTestHarness from "./PullDetailTestHarness.svelte";
+import { getCommentDraftKey, setCommentDraft } from "./comment-drafts.svelte.js";
+import { repositoryKeyFromWire } from "../../api/repository-key.js";
 
 const capabilities = {
   read_repositories: true,
@@ -168,7 +177,7 @@ function pullDetail(): PullDetail {
       owner: "acme",
       name: "widget",
       repo_path: "acme/widget",
-      platform_repo_id: "widget-repo-id",
+      platform_repo_id: 1001,
     },
     merge_request: {
       ID: 1,
@@ -230,10 +239,12 @@ function renderPullDetail(
   },
   options: {
     hideWorkspaceAction?: boolean;
+    defaultExecutionTarget?: string;
     phonePresentation?: boolean;
     onOpenWorkspace?: (workspaceId: string) => void;
     hideTabs?: boolean;
     detailLoading?: boolean;
+    detailFromCache?: boolean;
     detailSyncing?: boolean;
     deferRefresh?: boolean;
     refreshFailure?: string;
@@ -243,6 +254,7 @@ function renderPullDetail(
     onDetailTabChange?: ((tab: "conversation" | "files") => void) | undefined;
     runtimeClient?: GeneratedClient;
     actionsModeVisible?: boolean;
+    store?: ReturnType<typeof createDetailStore>;
     detailProps?: Partial<ComponentProps<typeof PullDetailComponent>>;
   } = {},
 ) {
@@ -292,9 +304,11 @@ function renderPullDetail(
     stopDetailPolling: vi.fn(),
     getDetail: () => detail,
     getDetailEnvelopeTick: () => envelopeTick,
+    isDetailFromCache: () => options.detailFromCache ?? false,
     isDetailLoading: () => options.detailLoading ?? false,
     getDetailError: () => null,
     isDetailSyncing: () => options.detailSyncing ?? false,
+    isPullMerging: () => false,
     getDetailLoaded: () => true,
     getDiscussionLoaded: () => true,
     updateKanbanState: vi.fn(),
@@ -342,6 +356,7 @@ function renderPullDetail(
         runMergeAction(deferred ? "/merge/deferred" : "/merge", body, callbacks),
     ),
     editComment: vi.fn(),
+    submitComment: vi.fn(),
     savePRBodyInBackground: vi.fn(),
     setLocalPRBody: vi.fn(),
     applyReviewSuggestions: vi.fn(
@@ -364,6 +379,10 @@ function renderPullDetail(
   detailRuntime = runtime;
   const settings = createSettingsStore();
   settings.setLaunchTargets(launchTargets);
+  settings.setWorkspaceSettings({
+    ...settings.getWorkspaceSettings(),
+    default_execution_target: options.defaultExecutionTarget ?? "",
+  });
   settings.setDetailSettings({ initial_timeline_entry_limit: 250 });
   settings.setModeVisibility({
     ...settings.getModeVisibility(),
@@ -394,7 +413,7 @@ function renderPullDetail(
       [
         STORES_KEY,
         {
-          detail: detailStore,
+          detail: options.store ?? detailStore,
           ...(options.diff === undefined ? {} : { diff: options.diff }),
           ...(options.diffReviewDraft === undefined ? {} : { diffReviewDraft: options.diffReviewDraft }),
           pulls: { loadPulls: vi.fn() },
@@ -892,7 +911,15 @@ describe("PullDetail provider workflow actions", () => {
     const detail = pullDetail();
     enableWorkflowActions(detail);
     const api = workflowClient(detail);
-    api.GET.mockRejectedValueOnce(new Error("Unavailable"));
+    const get = api.GET.getMockImplementation()!;
+    let catalogFailed = false;
+    api.GET.mockImplementation(async (path, options) => {
+      if (path.endsWith("/workflows") && !catalogFailed) {
+        catalogFailed = true;
+        throw new Error("Unavailable");
+      }
+      return get(path, options);
+    });
     renderPullDetail(detail, api.repoSettings, api.client, {
       actionsModeVisible: true,
       runtimeClient: api.client,
@@ -982,7 +1009,7 @@ describe("PullDetail provider workflow actions", () => {
         owner: "acme",
         name: "widget",
         repoPath: "acme/widget",
-        platformRepoId: "widget-repo-id",
+        repositoryKey: { kind: "id", id: 1001 },
       },
       "release.yml",
     );
@@ -1014,6 +1041,84 @@ describe("PullDetail provider workflow actions", () => {
 });
 
 describe("PullDetail activity refresh", () => {
+  it.each([
+    { provider: "gitlab" },
+    { platformHost: "code.example.com" },
+    { owner: "other-team", name: "other-widget", repoPath: "other-team/other-widget" },
+    { repositoryKey: { kind: "id", id: 7999 } },
+  ] satisfies Partial<ComponentProps<typeof PullDetailComponent>>[])(
+    "reloads merge settings after a repository change: %j",
+    async (next) => {
+      const detail = pullDetail();
+      detail.repo.capabilities.merge_mutation = true;
+      const initialSettings = {
+        AllowSquashMerge: true,
+        AllowMergeCommit: false,
+        AllowRebaseMerge: false,
+        ViewerCanMerge: true,
+      };
+      const refreshedSettings = Promise.withResolvers<{ data: typeof initialSettings }>();
+      let refreshing = false;
+      const apiClient = {
+        GET: vi.fn(async () => (refreshing ? refreshedSettings.promise : { data: initialSettings })),
+        POST: vi.fn(async () => ({ data: {} })),
+      };
+      const { rerender } = renderPullDetail(detail, initialSettings, apiClient, {
+        detailProps: { repositoryKey: repositoryKeyFromWire(detail.repo) },
+      });
+      await screen.findByRole("button", { name: "Squash and merge" });
+
+      const initialReads = apiClient.GET.mock.calls.length;
+      refreshing = true;
+      detail.repo.provider = next.provider ?? detail.repo.provider;
+      detail.repo.platform_host = next.platformHost ?? detail.repo.platform_host;
+      detail.repo_owner = next.owner ?? detail.repo_owner;
+      detail.repo_name = next.name ?? detail.repo_name;
+      detail.repo.repo_path = next.repoPath ?? detail.repo.repo_path;
+      if (next.repositoryKey?.kind === "id") detail.repo.platform_repo_id = next.repositoryKey.id;
+      await rerender(next);
+      await waitFor(() => expect(apiClient.GET.mock.calls.length).toBeGreaterThan(initialReads));
+      expect(screen.queryByRole("button", { name: "Squash and merge" })).toBeNull();
+      refreshedSettings.resolve({
+        data: { ...initialSettings, AllowSquashMerge: false, AllowRebaseMerge: true },
+      });
+      expect(await screen.findByRole("button", { name: "Rebase and merge" })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Squash and merge" })).toBeNull();
+    },
+  );
+
+  it.each([false, true])("allows a cached pull draft only for the selected item (mismatch=%s)", async (mismatch) => {
+    const detail = pullDetail();
+    detail.repo.capabilities = { ...detail.repo.capabilities, comment_mutation: true };
+    detail.repo.operations = { add_comment: { available: true } };
+    const number = detail.merge_request.Number + (mismatch ? 1 : 0);
+    const draftKey = getCommentDraftKey("pull", {
+      provider: "github",
+      platformHost: "github.com",
+      owner: "acme",
+      name: "widget",
+      repoPath: "acme/widget",
+      number,
+      repositoryKey: repositoryKeyFromWire(detail.repo),
+    });
+    setCommentDraft(draftKey, "Draft while refreshing");
+    onTestFinished(() => setCommentDraft(draftKey, ""));
+    const { container, detailStore } = renderPullDetail(detail, undefined, undefined, {
+      detailFromCache: true,
+      detailLoading: true,
+      detailProps: { number },
+    });
+
+    await waitFor(() =>
+      expect(container.querySelector(".comment-editor-input")?.textContent).toBe("Draft while refreshing"),
+    );
+    expect(container.querySelector(".comment-editor-input")?.getAttribute("contenteditable")).toBe(String(!mismatch));
+    const submit = screen.getByRole("button", { name: "Comment", exact: true }) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    await fireEvent.click(submit);
+    expect(detailStore.submitComment).not.toHaveBeenCalled();
+  });
+
   afterEach(() => {
     cleanup();
     for (const item of getFlashes()) dismissFlash(item.id);
@@ -1050,7 +1155,7 @@ describe("PullDetail activity refresh", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Refresh detail" }));
     expect((screen.getByRole("button", { name: "Refresh detail" }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByLabelText("Refreshing detail")).toBeTruthy();
-    expect(document.querySelector(".sync-indicator")).toBeNull();
+    expect(screen.queryByRole("status", { name: "Syncing from GitHub" })).toBeNull();
 
     settleRefresh();
     await waitFor(() => {
@@ -1063,7 +1168,7 @@ describe("PullDetail activity refresh", () => {
 
     expect((screen.getByRole("button", { name: "Refresh detail" }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.queryByLabelText("Refreshing detail")).toBeNull();
-    expect(document.querySelector(".sync-indicator")?.textContent).toContain("Syncing");
+    expect(screen.getByRole("status", { name: "Syncing from GitHub" })).toBeTruthy();
   });
 
   it("blocks manual refresh while pull-request detail navigation is loading or stale", async () => {
@@ -1161,6 +1266,7 @@ describe("PullDetail activity refresh", () => {
             activity: { loadActivity: vi.fn() },
             detailActivityView: createDetailActivityViewStore(),
             settings: {
+              getWorkspaceSettings: () => ({ default_execution_target: "" }),
               getLaunchTargets: () => launchTargets,
               getDetailSettings: () => ({ initial_timeline_entry_limit: 250 }),
               isModeVisible: () => false,
@@ -1186,6 +1292,466 @@ describe("PullDetail activity refresh", () => {
   });
 });
 
+describe("PullDetail pending mutations across selections", () => {
+  beforeEach(() => localStorage.clear());
+  afterEach(() => {
+    cleanup();
+    for (const item of getFlashes()) dismissFlash(item.id);
+  });
+
+  const labelCatalog: Label[] = [
+    { name: "bug", color: "ff0000", description: "" },
+    { name: "enhancement", color: "00ff00", description: "" },
+  ];
+
+  function renderPendingMutations(configure?: (detail: PullDetail) => void, initialNumber = 1) {
+    const pulls = [pullDetail(), pullDetail()];
+    pulls.forEach((detail, index) => {
+      detail.merge_request = {
+        ...detail.merge_request,
+        ID: index + 1,
+        Number: index + 1,
+        URL: `https://github.com/acme/widget/pull/${index + 1}`,
+        Title: `Pull request ${index + 1}`,
+        Body: `Description ${index + 1}`,
+      };
+      configure?.(detail);
+    });
+    type MutationResponse = { data?: unknown; error?: ProblemBody };
+    const responses = pulls.map(() => Promise.withResolvers<MutationResponse>());
+    const reloads = new Map<number, Promise<{ data: PullDetail }>>();
+    const mutation = vi.fn((path: string, options?: Record<string, unknown>) => {
+      if (
+        path !== "/pulls/{provider}/{owner}/{name}/{number}" &&
+        path !== "/pulls/{provider}/{owner}/{name}/{number}/github-state" &&
+        path !== "/pulls/{provider}/{owner}/{name}/{number}/labels" &&
+        path !== "/pulls/{provider}/{owner}/{name}/{number}/assignees" &&
+        path !== "/pulls/{provider}/{owner}/{name}/{number}/comments/{comment_id}"
+      ) {
+        throw new Error(`Unexpected mutation: ${path}`);
+      }
+      const {
+        path: { number },
+      } = options?.params as { path: { number: number } };
+      return responses[number - 1].promise;
+    });
+    detailRuntime = makeTestAppRuntime({
+      GET: vi.fn(async (path: string, options?: Record<string, unknown>) => {
+        if (path === "/repo/{provider}/{owner}/{name}/labels") return { data: { labels: labelCatalog } };
+        if (path === "/repo/{provider}/{owner}/{name}/comment-autocomplete")
+          return { data: { users: ["alice", "bob"] } };
+        if (path !== "/pulls/{provider}/{owner}/{name}/{number}") return { data: {} };
+        const {
+          path: { number },
+        } = options?.params as { path: { number: number } };
+        return reloads.get(number) ?? { data: pulls[number - 1] };
+      }),
+      PUT: mutation,
+      PATCH: mutation,
+      POST: mutation,
+    });
+    const commands = vi.spyOn(detailRuntime, "runCommand");
+    const store = createDetailStore({ runtime: detailRuntime });
+    const view = renderPullDetail(pulls[0], undefined, undefined, {
+      store,
+      detailProps: {
+        number: initialNumber,
+        repositoryKey: repositoryKeyFromWire(pulls[0].repo),
+        autoSync: false,
+        hideStaleWhileLoading: true,
+      },
+    });
+    const finishMutation = async (number: number, response: MutationResponse = { data: pulls[number - 1] }) => {
+      const index = commands.mock.calls.findIndex(
+        ([, options]) =>
+          options.safeContext.number === number &&
+          [
+            "update pull request content",
+            "change pull request state",
+            "update pull request labels",
+            "update pull request assignees",
+            "edit pull request comment",
+          ].includes(options.operation),
+      );
+      expect(index).toBeGreaterThanOrEqual(0);
+      responses[number - 1].resolve(response);
+      expect((await commands.mock.results[index].value.exit)._tag).toBe(response.error ? "Failure" : "Success");
+      await tick();
+    };
+    const selectCachedPull = async (number: number) => {
+      const pending = Promise.withResolvers<{ data: PullDetail }>();
+      reloads.set(number, pending.promise);
+      await view.rerender({ number });
+      await waitFor(() => expect(store.isDetailFromCache()).toBe(true));
+      expect(screen.getByRole("heading", { name: `Pull request ${number}`, exact: true })).toBeTruthy();
+      reloads.delete(number);
+      pending.resolve({ data: pulls[number - 1] });
+      await waitFor(() => expect(store.isDetailFromCache()).toBe(false));
+    };
+    return { ...view, pulls, mutation, finishMutation, selectCachedPull };
+  }
+
+  it.each([
+    ["route", false],
+    ["route", true],
+    ["repository ID", false],
+    ["repository ID", true],
+  ] as const)("discards another repository's label catalog after a %s change (failure=%s)", async (change, fail) => {
+    const oldDetail = pullDetail();
+    const nextDetail = pullDetail();
+    const nextName = change === "route" ? "other" : "widget";
+    const retainedLabel = { name: "priority", color: "0000ff", description: "" };
+    for (const [index, detail] of [oldDetail, nextDetail].entries()) {
+      detail.repo.capabilities = { ...capabilities, read_labels: true, label_mutation: true };
+      detail.merge_request.Title = `Repository ${index + 1} pull request`;
+    }
+    nextDetail.repo_name = nextName;
+    nextDetail.repo = {
+      ...nextDetail.repo,
+      ID: 2,
+      Name: nextName,
+      name: nextName,
+      repo_path: `acme/${nextName}`,
+      platform_repo_id: 1002,
+    };
+    nextDetail.merge_request.RepoID = 2;
+    nextDetail.merge_request.labels = [labelCatalog[0], retainedLabel];
+    let selectedDetail = oldDetail;
+    const pendingCatalog = Promise.withResolvers<{ data?: { labels: Label[] }; error?: ProblemBody }>();
+    const loadCatalog = vi
+      .fn()
+      .mockResolvedValueOnce({ data: { labels: labelCatalog } })
+      .mockImplementation(() => pendingCatalog.promise);
+    const mutation = vi.fn(async () => ({ data: { labels: [retainedLabel] } }));
+    detailRuntime = makeTestAppRuntime({
+      GET: vi.fn(async (path: string, options?: Record<string, unknown>) => {
+        if (path === "/repo/{provider}/{owner}/{name}/labels") return loadCatalog(options);
+        if (path === "/pulls/{provider}/{owner}/{name}/{number}") return { data: selectedDetail };
+        return { data: {} };
+      }),
+      PUT: mutation,
+    });
+    const store = createDetailStore({ runtime: detailRuntime });
+    const view = renderPullDetail(oldDetail, undefined, undefined, {
+      store,
+      detailProps: {
+        repositoryKey: repositoryKeyFromWire(oldDetail.repo),
+        autoSync: false,
+        hideStaleWhileLoading: true,
+      },
+    });
+    await screen.findByRole("heading", { name: oldDetail.merge_request.Title, exact: true });
+    await fireEvent.click(screen.getByRole("button", { name: "Labels", exact: true }));
+    await screen.findByRole("menuitemcheckbox", { name: "enhancement", exact: true });
+
+    selectedDetail = nextDetail;
+    await view.rerender({
+      name: nextName,
+      repoPath: `acme/${nextName}`,
+      repositoryKey: repositoryKeyFromWire(nextDetail.repo),
+    });
+    await screen.findByRole("heading", { name: nextDetail.merge_request.Title, exact: true });
+    await fireEvent.click(screen.getByRole("button", { name: "Labels", exact: true }));
+    await waitFor(() => expect(loadCatalog).toHaveBeenCalledTimes(2));
+    expect(loadCatalog).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        params: { path: { provider: "github", owner: "acme", name: nextName } },
+      }),
+    );
+    const picker = within(screen.getByRole("dialog", { name: "Edit labels" }));
+    if (fail) {
+      pendingCatalog.resolve({
+        error: { code: "internalError", status: 500, title: "Catalog unavailable", type: "about:blank" },
+      });
+      await picker.findByRole("alert");
+    }
+    expect(picker.queryAllByRole("menuitemcheckbox")).toHaveLength(0);
+    expect(mutation).not.toHaveBeenCalled();
+    if (fail) return;
+
+    pendingCatalog.resolve({ data: { labels: [labelCatalog[0], retainedLabel] } });
+    await picker.findByRole("menuitemcheckbox", { name: "priority", exact: true });
+    await fireEvent.click(picker.getByRole("menuitemcheckbox", { name: "bug", exact: true }));
+    await waitFor(() =>
+      expect(mutation).toHaveBeenCalledWith(
+        "/pulls/{provider}/{owner}/{name}/{number}/labels",
+        expect.objectContaining({
+          params: { path: { provider: "github", owner: "acme", name: nextName, number: 1 } },
+          body: { labels: ["priority"] },
+        }),
+      ),
+    );
+  });
+
+  it.each(["toggle", "clear"] as const)(
+    "keeps pending assignee %s acknowledgements with their cached PR",
+    async (action) => {
+      const view = renderPendingMutations((detail) => {
+        detail.repo.capabilities = { ...detail.repo.capabilities, assignee_mutation: true };
+        detail.merge_request.assignees = ["alice"];
+      }, 2);
+      await screen.findByRole("heading", { name: "Pull request 2", exact: true });
+      await view.rerender({ number: 1 });
+      await screen.findByRole("heading", { name: "Pull request 1", exact: true });
+      for (const number of [1, 2]) {
+        if (number === 2) await view.selectCachedPull(2);
+        await fireEvent.click(screen.getByRole("button", { name: "Edit assignees" }));
+        const picker = within(await screen.findByRole("dialog", { name: "Edit assignees" }));
+        const bob = await picker.findByRole("menuitemcheckbox", { name: "bob", exact: true });
+        await fireEvent.click(action === "toggle" ? bob : picker.getByRole("button", { name: "Clear selected users" }));
+        await waitFor(() =>
+          expect(view.mutation).toHaveBeenCalledWith(
+            "/pulls/{provider}/{owner}/{name}/{number}/assignees",
+            expect.objectContaining({
+              params: { path: { provider: "github", owner: "acme", name: "widget", number } },
+              body: { assignees: action === "toggle" ? ["alice", "bob"] : [] },
+            }),
+          ),
+        );
+      }
+
+      const picker = within(screen.getByRole("dialog", { name: "Edit assignees" }));
+      const bob = picker.getByRole("menuitemcheckbox", { name: /bob/ }) as HTMLButtonElement;
+      expect(bob.disabled).toBe(true);
+      const response = { data: { assignees: action === "toggle" ? ["alice", "bob"] : [] } };
+      await view.finishMutation(1, response);
+      expect(bob.disabled).toBe(true);
+      if (action === "toggle") expect(picker.getByText("Saving…")).toBeTruthy();
+      await view.finishMutation(2, response);
+      expect(bob.disabled).toBe(false);
+      expect(bob.getAttribute("aria-checked")).toBe(String(action === "toggle"));
+    },
+  );
+
+  it("keeps pending comment edits separate when navigating to a cached PR", async () => {
+    // jsdom has no layout API for ProseMirror's selection scrolling.
+    for (const [name, value] of Object.entries({
+      getClientRects: () => [],
+      getBoundingClientRect: () => new DOMRect(),
+    })) {
+      const descriptor = Object.getOwnPropertyDescriptor(Range.prototype, name);
+      Object.defineProperty(Range.prototype, name, { configurable: true, value });
+      onTestFinished(() => {
+        if (descriptor) Object.defineProperty(Range.prototype, name, descriptor);
+        else Reflect.deleteProperty(Range.prototype, name);
+      });
+    }
+    const view = renderPendingMutations((detail) => {
+      detail.repo.capabilities = { ...detail.repo.capabilities, comment_mutation: true };
+      detail.events = [
+        {
+          ...reviewEvent("alice"),
+          ID: detail.merge_request.Number + 100,
+          PlatformID: detail.merge_request.Number + 100,
+          EventType: "issue_comment",
+          Body: `Comment on PR ${detail.merge_request.Number}`,
+        },
+      ];
+    }, 2);
+    await screen.findByRole("heading", { name: "Pull request 2", exact: true });
+    await view.rerender({ number: 1 });
+    await screen.findByRole("heading", { name: "Pull request 1", exact: true });
+    for (const number of [1, 2]) {
+      if (number === 2) await view.selectCachedPull(2);
+      const edit = (await screen.findByRole("button", { name: "Edit comment" })) as HTMLButtonElement;
+      expect(edit.disabled).toBe(false);
+      expect((screen.getByRole("button", { name: "Delete comment" }) as HTMLButtonElement).disabled).toBe(false);
+      await fireEvent.click(edit);
+      const input = view.container.querySelector<HTMLElement>(".edit-panel .comment-editor-input")!;
+      input.focus();
+      input.innerHTML = `<p>Edited comment on PR ${number}</p>`;
+      await fireEvent.input(input);
+      // Let ProseMirror's DOM observer publish the edited content before saving.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await waitFor(() =>
+        expect(view.container.querySelector<HTMLButtonElement>(".edit-action--primary")?.disabled).toBe(false),
+      );
+      await fireEvent.click(screen.getByRole("button", { name: "Save", exact: true }));
+      await waitFor(() =>
+        expect(view.mutation).toHaveBeenCalledWith(
+          "/pulls/{provider}/{owner}/{name}/{number}/comments/{comment_id}",
+          expect.objectContaining({
+            params: { path: { provider: "github", owner: "acme", name: "widget", number, comment_id: number + 100 } },
+            body: { body: `Edited comment on PR ${number}` },
+          }),
+        ),
+      );
+    }
+    await view.finishMutation(1, { data: {} });
+    expect(view.container.querySelector(".edit-panel .comment-editor-input")?.textContent).toBe(
+      "Edited comment on PR 2",
+    );
+    expect((screen.getByRole("button", { name: "Saving...", exact: true }) as HTMLButtonElement).disabled).toBe(true);
+    view.pulls[1].events[0].Body = "Edited comment on PR 2";
+    await view.finishMutation(2, { data: {} });
+    expect(view.container.querySelector(".edit-panel")).toBeNull();
+    expect(screen.getByText("Edited comment on PR 2", { exact: true })).toBeTruthy();
+  });
+
+  it.each([
+    ["toggle", false],
+    ["toggle", true],
+    ["clear", false],
+    ["clear", true],
+  ] as const)("keeps an old %s-label result out of the next picker (failure=%s)", async (action, failFirst) => {
+    const view = renderPendingMutations((detail) => {
+      detail.repo.capabilities = { ...detail.repo.capabilities, read_labels: true, label_mutation: true };
+      detail.merge_request.labels = [labelCatalog[0]];
+    });
+    await screen.findByRole("heading", { name: "Pull request 1", exact: true });
+    await fireEvent.click(screen.getByRole("button", { name: "Labels", exact: true }));
+    await screen.findByRole("menuitemcheckbox", { name: "enhancement", exact: true });
+    await fireEvent.click(
+      action === "toggle"
+        ? screen.getByRole("menuitemcheckbox", { name: "enhancement", exact: true })
+        : screen.getByRole("button", { name: "Clear selected labels" }),
+    );
+    await waitFor(() =>
+      expect(view.mutation).toHaveBeenCalledWith(
+        "/pulls/{provider}/{owner}/{name}/{number}/labels",
+        expect.objectContaining({
+          params: { path: { provider: "github", owner: "acme", name: "widget", number: 1 } },
+          body: { labels: action === "toggle" ? ["bug", "enhancement"] : [] },
+        }),
+      ),
+    );
+
+    await view.rerender({ number: 2 });
+    await screen.findByRole("heading", { name: "Pull request 2", exact: true });
+    await fireEvent.click(screen.getByRole("button", { name: "Labels", exact: true }));
+    await fireEvent.click(await screen.findByRole("menuitemcheckbox", { name: "enhancement", exact: true }));
+    await waitFor(() =>
+      expect(view.mutation).toHaveBeenCalledWith(
+        "/pulls/{provider}/{owner}/{name}/{number}/labels",
+        expect.objectContaining({
+          params: { path: { provider: "github", owner: "acme", name: "widget", number: 2 } },
+          body: { labels: ["bug", "enhancement"] },
+        }),
+      ),
+    );
+
+    await view.finishMutation(
+      1,
+      failFirst
+        ? {
+            error: {
+              code: "internalError",
+              status: 500,
+              title: "Label update failed",
+              detail: "PR 1 label update failed",
+              type: "about:blank",
+            },
+          }
+        : { data: { labels: action === "toggle" ? labelCatalog : [] } },
+    );
+    const picker = within(screen.getByRole("dialog", { name: "Edit labels" }));
+    const pending = picker.getByRole("menuitemcheckbox", { name: /enhancement/ }) as HTMLButtonElement;
+    expect(pending.disabled).toBe(true);
+    expect(picker.getByText("Saving…")).toBeTruthy();
+    expect(picker.queryByRole("alert")).toBeNull();
+
+    await view.finishMutation(2, { data: { labels: labelCatalog } });
+    expect(pending.disabled).toBe(false);
+    expect(pending.getAttribute("aria-checked")).toBe("true");
+    expect(picker.queryByRole("alert")).toBeNull();
+  });
+
+  it.each([
+    ["title", false],
+    ["title", true],
+    ["body", false],
+    ["body", true],
+  ] as const)("keeps a pending %s save scoped to its selection (next PR saving=%s)", async (field, savingNext) => {
+    const view = renderPendingMutations();
+    const editorSelector = field === "title" ? ".title-edit-input" : ".body-edit-textarea";
+    const editor = () => view.container.querySelector<HTMLInputElement | HTMLTextAreaElement>(editorSelector)!;
+    const editButton = () => view.container.querySelector<HTMLButtonElement>(`.edit-${field}-btn`)!;
+    await screen.findByRole("heading", { name: "Pull request 1", exact: true });
+    await fireEvent.click(editButton());
+    await fireEvent.input(editor(), { target: { value: "Saved on PR 1" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Save", exact: true }));
+    await waitFor(() =>
+      expect(view.mutation).toHaveBeenCalledWith(
+        "/pulls/{provider}/{owner}/{name}/{number}",
+        expect.objectContaining({
+          params: { path: { provider: "github", owner: "acme", name: "widget", number: 1 } },
+          body: { [field]: "Saved on PR 1" },
+        }),
+      ),
+    );
+
+    await view.rerender({ number: 2 });
+    await screen.findByRole("heading", { name: "Pull request 2", exact: true });
+    await fireEvent.click(editButton());
+    expect(editor().disabled).toBe(false);
+    await fireEvent.input(editor(), { target: { value: "Draft on PR 2" } });
+    if (savingNext) {
+      await fireEvent.click(screen.getByRole("button", { name: "Save", exact: true }));
+      await waitFor(() => expect(view.mutation).toHaveBeenCalledTimes(2));
+    }
+
+    await view.finishMutation(1);
+    expect(editor()).not.toBeNull();
+    expect(editor().value).toBe("Draft on PR 2");
+    expect(editor().disabled).toBe(savingNext);
+    if (!savingNext) {
+      await fireEvent.click(screen.getByRole("button", { name: "Save", exact: true }));
+    }
+    await waitFor(() =>
+      expect(view.mutation).toHaveBeenCalledWith(
+        "/pulls/{provider}/{owner}/{name}/{number}",
+        expect.objectContaining({
+          params: { path: { provider: "github", owner: "acme", name: "widget", number: 2 } },
+          body: { [field]: "Draft on PR 2" },
+        }),
+      ),
+    );
+    if (field === "title") view.pulls[1].merge_request.Title = "Draft on PR 2";
+    else view.pulls[1].merge_request.Body = "Draft on PR 2";
+    await view.finishMutation(2);
+    expect(editor()).toBeNull();
+    expect(await screen.findByText("Draft on PR 2", { exact: true })).toBeTruthy();
+  });
+
+  it("keeps pending state changes scoped to their selections", async () => {
+    const view = renderPendingMutations();
+    await screen.findByRole("heading", { name: "Pull request 1", exact: true });
+    await fireEvent.click(screen.getByRole("button", { name: "Close", exact: true }));
+    await waitFor(() =>
+      expect(view.mutation).toHaveBeenCalledWith(
+        "/pulls/{provider}/{owner}/{name}/{number}/github-state",
+        expect.objectContaining({
+          params: { path: { provider: "github", owner: "acme", name: "widget", number: 1 } },
+          body: { state: "closed" },
+        }),
+      ),
+    );
+
+    await view.rerender({ number: 2 });
+    await screen.findByRole("heading", { name: "Pull request 2", exact: true });
+    const close = screen.getByRole("button", { name: "Close", exact: true }) as HTMLButtonElement;
+    expect(close.disabled).toBe(false);
+    await fireEvent.click(close);
+    await waitFor(() =>
+      expect(view.mutation).toHaveBeenCalledWith(
+        "/pulls/{provider}/{owner}/{name}/{number}/github-state",
+        expect.objectContaining({
+          params: { path: { provider: "github", owner: "acme", name: "widget", number: 2 } },
+          body: { state: "closed" },
+        }),
+      ),
+    );
+
+    await view.finishMutation(1);
+    const closing = screen.getByRole("button", { name: "Closing...", exact: true }) as HTMLButtonElement;
+    expect(closing.disabled).toBe(true);
+    view.pulls[1].merge_request.State = "closed";
+    await view.finishMutation(2);
+    const reopen = (await screen.findByRole("button", { name: "Reopen", exact: true })) as HTMLButtonElement;
+    expect(reopen.disabled).toBe(false);
+  });
+});
+
 describe("PullDetail approvals", () => {
   beforeEach(() => {
     localStorage.clear();
@@ -1203,12 +1769,14 @@ describe("PullDetail approvals", () => {
       detailSyncing: true,
     });
 
-    expect(document.querySelector(".sync-indicator")?.textContent).toContain("Syncing");
+    expect(screen.getByRole("status", { name: "Syncing from GitHub" })).toBeTruthy();
     expect(document.querySelector(".refresh-banner")).toBeNull();
     expect(screen.queryByText("Refreshing...")).toBeNull();
   });
 
-  it("keeps task checkboxes disabled while highlighted markdown is pending", () => {
+  // The full render can wait up to 30s on a video attachment check, so the
+  // first paint must already accept task toggles.
+  it("keeps task checkboxes usable while highlighted markdown is pending", () => {
     markdownMockState.pending = true;
     const detail = pullDetail();
     detail.merge_request.Body = ["- [ ] pending task", "", "```toml", 'model_provider = "my-custom"', "```"].join("\n");
@@ -1217,8 +1785,8 @@ describe("PullDetail approvals", () => {
 
     const checkbox = container.querySelector<HTMLInputElement>(".markdown-body input[type='checkbox']");
     expect(checkbox).not.toBeNull();
-    expect(checkbox?.disabled).toBe(true);
-    expect(checkbox?.dataset.taskIndex).toBeUndefined();
+    expect(checkbox?.disabled).toBe(false);
+    expect(checkbox?.dataset.taskIndex).toBe("0");
   });
 
   it("explains that creating a workspace enables agent sessions", () => {
@@ -1244,7 +1812,7 @@ describe("PullDetail approvals", () => {
     renderPullDetail(detail);
 
     const trigger = screen.getByRole("button", {
-      name: "APPROVED (2)",
+      name: "Approved (2)",
     });
     await fireEvent.click(trigger);
 
@@ -2011,6 +2579,7 @@ describe("PullDetail approvals", () => {
             },
             detailActivityView: createDetailActivityViewStore(),
             settings: {
+              getWorkspaceSettings: () => ({ default_execution_target: "" }),
               getLaunchTargets: () => [],
               getDetailSettings: () => ({ initial_timeline_entry_limit: 250 }),
               isModeVisible: () => false,
@@ -2091,6 +2660,59 @@ describe("PullDetail approvals", () => {
     expect(screen.getByRole("button", { name: "Merge after CI is complete" })).toBeTruthy();
   });
 
+  it("tells the merge modal which native stack members stay open", async () => {
+    const detail = pullDetail();
+    detail.repo.capabilities.merge_mutation = true;
+    detail.merge_request.Number = 1;
+    detail.stack = {
+      stack_id: 1,
+      stack_name: "feature",
+      position: 1,
+      size: 2,
+      health: "ready",
+      native: true,
+      members: [
+        {
+          number: 1,
+          title: "base",
+          state: "open",
+          ci_status: "success",
+          review_decision: "",
+          mergeable_state: "clean",
+          position: 1,
+          is_draft: false,
+          base_branch: "main",
+          blocked_by: null,
+        },
+        {
+          number: 2,
+          title: "follow-up",
+          state: "open",
+          ci_status: "success",
+          review_decision: "",
+          mergeable_state: "clean",
+          position: 2,
+          is_draft: false,
+          base_branch: "feature/base",
+          blocked_by: null,
+        },
+      ],
+    };
+
+    renderPullDetail(detail, {
+      AllowSquashMerge: true,
+      AllowMergeCommit: false,
+      AllowRebaseMerge: false,
+      ViewerCanMerge: true,
+    });
+
+    await fireEvent.click(await screen.findByRole("button", { name: "Squash and merge" }));
+
+    const dialog = screen.getByRole("dialog", { name: "Merge Pull Request" });
+    expect(within(dialog).getByText("Only this pull request merges.")).toBeTruthy();
+    expect(within(dialog).getByText(/#2\s+stays open/)).toBeTruthy();
+  });
+
   it("does not offer a merge action when no merge method is enabled", async () => {
     const detail = pullDetail();
     detail.repo.capabilities.merge_mutation = true;
@@ -2139,7 +2761,7 @@ describe("PullDetail approvals", () => {
         error: undefined,
       })),
     };
-    const { detailStore } = renderPullDetail(
+    renderPullDetail(
       detail,
       {
         AllowSquashMerge: true,
@@ -2165,7 +2787,6 @@ describe("PullDetail approvals", () => {
           tone: "warning",
         }),
       );
-      expect(detailStore.loadDetail).toHaveBeenCalled();
     });
     expect(apiClient.POST.mock.calls.at(-1)?.[1]).toMatchObject({ body: { delete_workspace_id: "ws-1" } });
     expect(notifyWorkspaceDeleted).not.toHaveBeenCalled();
@@ -2218,18 +2839,20 @@ describe("PullDetail approvals", () => {
     notifyWorkspaceDeleted.mockRestore();
   });
 
-  it("keeps an in-flight merge modal mounted across transient eligibility refreshes", async () => {
+  it("closes the merge modal immediately, shows progress, and reports a delayed rejection", async () => {
     const detail = pullDetail();
     detail.repo.capabilities.merge_mutation = true;
     let resolveMerge!: (value: unknown) => void;
     const apiClient = {
-      GET: vi.fn(async () => ({
-        data: {
-          AllowSquashMerge: true,
-          AllowMergeCommit: false,
-          AllowRebaseMerge: false,
-          ViewerCanMerge: true,
-        },
+      GET: vi.fn(async (path: string) => ({
+        data: path.startsWith("/repo/")
+          ? {
+              AllowSquashMerge: true,
+              AllowMergeCommit: false,
+              AllowRebaseMerge: false,
+              ViewerCanMerge: true,
+            }
+          : detail,
       })),
       POST: vi.fn(
         () =>
@@ -2238,7 +2861,16 @@ describe("PullDetail approvals", () => {
           }),
       ),
     };
-    const { rerender } = renderPullDetail(
+    detailRuntime = makeTestAppRuntime(apiClient as unknown as GeneratedClient);
+    const store = createDetailStore({ runtime: detailRuntime });
+    store.loadDetail("acme", "widget", 1, {
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widget",
+      sync: false,
+    });
+    await waitFor(() => expect(store.isDetailLoading()).toBe(false));
+    renderPullDetail(
       detail,
       {
         AllowSquashMerge: true,
@@ -2247,6 +2879,7 @@ describe("PullDetail approvals", () => {
         ViewerCanMerge: true,
       },
       apiClient,
+      { store, detailProps: { autoSync: false } },
     );
 
     await fireEvent.click(await screen.findByRole("button", { name: "Squash and merge" }));
@@ -2255,15 +2888,27 @@ describe("PullDetail approvals", () => {
         name: "Squash and merge",
       }),
     );
-    expect(screen.getByRole("button", { name: "Merging..." })).toBeTruthy();
-
-    detail.repo.capabilities.merge_mutation = false;
-    await rerender({ hideWorkspaceAction: false });
-    expect(screen.getByRole("dialog", { name: "Merge Pull Request" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Merging..." })).toBeTruthy();
-
-    resolveMerge({ data: { merged: true, sha: "merge-sha", message: "merged" } });
-    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Merge Pull Request" })).toBeNull());
+    expect(screen.queryByRole("dialog", { name: "Merge Pull Request" })).toBeNull();
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Merging" }).disabled).toBe(true);
+    await waitFor(() => expect(apiClient.POST).toHaveBeenCalledOnce());
+    resolveMerge({
+      error: {
+        code: "conflict",
+        type: "about:blank",
+        status: 409,
+        detail: "merge blocked by provider",
+        details: { reason: "conflict" },
+      },
+    });
+    await waitFor(() =>
+      expect(getFlashes()).toContainEqual(
+        expect.objectContaining({
+          message: expect.stringContaining("merge blocked by provider"),
+          tone: "danger",
+        }),
+      ),
+    );
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Squash and merge" }).disabled).toBe(false);
   });
 
   it("opens the merge modal in deferred mode when aggregate CI is pending without check rows", async () => {
@@ -2322,6 +2967,73 @@ describe("PullDetail approvals", () => {
     expect(screen.getByRole("dialog", { name: "Merge Pull Request" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Merge after CI is complete" })).toBeNull();
     expect(screen.getByRole("button", { name: "Squash and merge" })).toBeTruthy();
+  });
+
+  it("adds the pull request to the merge queue instead of offering merge methods when the base branch is queued", async () => {
+    const detail = pullDetail();
+    detail.repo.capabilities.merge_mutation = true;
+    detail.merge_queue_target = { branch: "main", merge_method: "squash" };
+
+    renderPullDetail(detail, {
+      AllowSquashMerge: true,
+      AllowMergeCommit: true,
+      AllowRebaseMerge: false,
+      ViewerCanMerge: true,
+    });
+
+    const enqueue = await screen.findByRole("button", { name: "Add to merge queue" });
+    expect(screen.queryByRole("button", { name: "Merge" })).toBeNull();
+    await fireEvent.click(enqueue);
+
+    const dialog = within(screen.getByRole("dialog", { name: "Add to Merge Queue" }));
+    expect(dialog.queryByRole("group", { name: "Merge method" })).toBeNull();
+    expect(dialog.queryByLabelText("Commit title")).toBeNull();
+    expect(dialog.getByRole("button", { name: "Add to merge queue" })).toBeTruthy();
+  });
+
+  it("shows a disabled in-queue merge action naming the queue position while the pull request is queued", async () => {
+    const detail = pullDetail();
+    detail.repo.capabilities.merge_mutation = true;
+    detail.merge_queue_target = { branch: "main", merge_method: "squash" };
+    detail.merge_queue = {
+      position: 2,
+      state: "awaiting_checks",
+      enqueued_at: "2026-05-01T12:00:00Z",
+      observed_at: "2026-05-01T12:04:00Z",
+    };
+
+    renderPullDetail(detail, {
+      AllowSquashMerge: true,
+      AllowMergeCommit: false,
+      AllowRebaseMerge: false,
+      ViewerCanMerge: true,
+    });
+
+    const inQueue = await screen.findByRole<HTMLButtonElement>("button", { name: "In merge queue" });
+    expect(inQueue.disabled).toBe(true);
+    expect(inQueue.title).toContain("Position 2 in the merge queue.");
+    expect(screen.queryByRole("button", { name: "Add to merge queue" })).toBeNull();
+    expect(screen.getByText("Queued #2 · Awaiting checks")).toBeTruthy();
+  });
+
+  it("keeps a persistent notice with the humanized reason after the merge queue removes the pull request", async () => {
+    const detail = pullDetail();
+    detail.repo.capabilities.merge_mutation = true;
+    detail.merge_queue_target = { branch: "main", merge_method: "squash" };
+    detail.merge_queue_removal = { removed_at: "2026-05-01T12:00:00Z", reason: "branch_protection_failure" };
+
+    renderPullDetail(detail, {
+      AllowSquashMerge: true,
+      AllowMergeCommit: false,
+      AllowRebaseMerge: false,
+      ViewerCanMerge: true,
+    });
+
+    const notice = await screen.findByText(/^Removed from the merge queue /);
+    expect(notice.textContent).toContain(": Branch protection failure.");
+    expect(notice.textContent).toContain("Fix the problem, then add it to the queue again.");
+    expect(screen.getByText("Removed from queue")).toBeTruthy();
+    expect((await screen.findByRole<HTMLButtonElement>("button", { name: "Add to merge queue" })).disabled).toBe(false);
   });
 
   it.each(["failure", "failed", "error", "cancelled", "canceled", "timed_out"])(
@@ -2468,75 +3180,201 @@ describe("PullDetail approvals", () => {
     expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it("ignores a delayed merge conflict after an A-to-B-to-A route cycle", async () => {
-    const detail = pullDetail();
-    detail.repo.capabilities.merge_mutation = true;
-    detail.repo.capabilities.review_mutation = true;
-    let resolveMerge: ((value: unknown) => void) | undefined;
-    const apiClient = {
-      GET: vi.fn(async () => ({
-        data: {
+  it.each(["route cycle", "unmount", "repository replacement", "repository replacement cycle"])(
+    "reports a delayed merge conflict without refreshing an old view after %s",
+    async (navigation) => {
+      const detail = pullDetail();
+      detail.repo.capabilities.merge_mutation = true;
+      detail.repo.capabilities.review_mutation = true;
+      let resolveMerge: ((value: unknown) => void) | undefined;
+      const apiClient = {
+        GET: vi.fn(async () => ({
+          data: {
+            AllowSquashMerge: true,
+            AllowMergeCommit: false,
+            AllowRebaseMerge: false,
+            ViewerCanMerge: true,
+          },
+        })),
+        POST: vi.fn(
+          () =>
+            new Promise((resolve) => {
+              resolveMerge = resolve;
+            }),
+        ),
+      };
+      const { rerender, detailStore, unmount } = renderPullDetail(
+        detail,
+        {
           AllowSquashMerge: true,
           AllowMergeCommit: false,
           AllowRebaseMerge: false,
           ViewerCanMerge: true,
         },
-      })),
-      POST: vi.fn(
-        () =>
-          new Promise((resolve) => {
-            resolveMerge = resolve;
+        apiClient,
+      );
+
+      await fireEvent.click(await screen.findByRole("button", { name: "Squash and merge" }));
+      await fireEvent.click(
+        within(screen.getByRole("dialog", { name: "Merge Pull Request" })).getByRole("button", {
+          name: "Squash and merge",
+        }),
+      );
+      expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(false);
+      if (navigation === "unmount") {
+        unmount();
+      } else if (navigation.startsWith("repository replacement")) {
+        detail.repo.platform_repo_id = 7999;
+        await rerender({ repositoryKey: { kind: "id", id: 7999 } });
+        if (navigation === "repository replacement cycle") {
+          detail.repo.platform_repo_id = 7101;
+          await rerender({ repositoryKey: { kind: "id", id: 7101 } });
+        }
+      } else {
+        await rerender({
+          owner: "acme",
+          name: "other-widget",
+          number: 2,
+          provider: "gitlab",
+          platformHost: "gitlab.example.com",
+          repoPath: "acme/other-widget",
+          hideWorkspaceAction: true,
+        });
+        await rerender({
+          owner: "acme",
+          name: "widget",
+          number: 1,
+          provider: "github",
+          platformHost: "github.com",
+          repoPath: "acme/widget",
+          hideWorkspaceAction: true,
+        });
+      }
+      resolveMerge?.({
+        error: {
+          code: "conflict",
+          type: "about:blank",
+          status: 409,
+          detail: "head changed",
+          details: { reason: "stale_state" },
+        },
+      });
+
+      await vi.waitFor(() =>
+        expect(getFlashes()).toContainEqual(
+          expect.objectContaining({
+            message: "acme/widget #1: head changed",
+            tone: "danger",
           }),
-      ),
+        ),
+      );
+      expect(detailStore.syncDetailNow).not.toHaveBeenCalled();
+      expect(screen.queryByText(/head commit changed since/i)).toBeNull();
+    },
+  );
+
+  it("keeps a delayed merge conflict when a list refresh drops the route repository ID", async () => {
+    const current = pullDetail();
+    current.repo.capabilities.merge_mutation = true;
+    const merge = Promise.withResolvers<unknown>();
+    const refreshedDetail = Promise.withResolvers<{ data: PullDetail }>();
+    let reloading = false;
+    const repoSettings = {
+      AllowSquashMerge: true,
+      AllowMergeCommit: false,
+      AllowRebaseMerge: false,
+      ViewerCanMerge: true,
     };
-    const { rerender, detailStore } = renderPullDetail(
-      detail,
-      {
+    detailRuntime = makeTestAppRuntime({
+      GET: vi.fn(async (path: string) =>
+        path.startsWith("/pulls/") ? (reloading ? refreshedDetail.promise : { data: current }) : { data: repoSettings },
+      ),
+      POST: vi.fn(() => merge.promise),
+    });
+    const store = createDetailStore({ runtime: detailRuntime });
+    const { rerender } = renderPullDetail(current, repoSettings, undefined, {
+      store,
+      detailProps: { autoSync: false, repositoryKey: repositoryKeyFromWire(current.repo) },
+    });
+    await fireEvent.click(await screen.findByRole("button", { name: "Squash and merge" }));
+    await fireEvent.click(
+      within(await screen.findByRole("dialog", { name: "Merge Pull Request" })).getByRole("button", {
+        name: "Squash and merge",
+      }),
+    );
+    await screen.findByText("Merging");
+
+    reloading = true;
+    await rerender({ repositoryKey: undefined });
+    await waitFor(() => expect(store.getDetail()).toBeNull());
+    refreshedDetail.resolve({ data: current });
+    await waitFor(() => expect(store.getDetail()?.repo.platform_repo_id).toBe(current.repo.platform_repo_id));
+    merge.resolve({
+      error: {
+        code: "conflict",
+        type: "about:blank",
+        status: 409,
+        detail: "pull request closed",
+        details: { reason: "not_open" },
+      },
+    });
+    expect(await screen.findByText(/this pull request is no longer open/i)).toBeTruthy();
+  });
+
+  it.each(["open", "submitted"])(
+    "clears %s merge state when refreshed detail identifies a replacement repository",
+    async (phase) => {
+      let current = pullDetail();
+      current.repo.capabilities.merge_mutation = true;
+      const merge = Promise.withResolvers<unknown>();
+      const repoSettings = {
         AllowSquashMerge: true,
         AllowMergeCommit: false,
         AllowRebaseMerge: false,
         ViewerCanMerge: true,
-      },
-      apiClient,
-    );
+      };
+      detailRuntime = makeTestAppRuntime({
+        GET: vi.fn(async (path: string) => ({ data: path.startsWith("/pulls/") ? current : repoSettings })),
+        POST: vi.fn(() => merge.promise),
+      });
+      const store = createDetailStore({ runtime: detailRuntime });
+      const sync = vi.spyOn(store, "syncDetailNow");
+      renderPullDetail(current, repoSettings, undefined, {
+        store,
+        detailProps: { autoSync: false },
+      });
+      await fireEvent.click(await screen.findByRole("button", { name: "Squash and merge" }));
+      const modal = await screen.findByRole("dialog", { name: "Merge Pull Request" });
+      if (phase === "submitted") {
+        await fireEvent.click(within(modal).getByRole("button", { name: "Squash and merge" }));
+        await screen.findByText("Merging");
+      }
 
-    await fireEvent.click(await screen.findByRole("button", { name: "Squash and merge" }));
-    await fireEvent.click(
-      within(screen.getByRole("dialog", { name: "Merge Pull Request" })).getByRole("button", {
-        name: "Squash and merge",
-      }),
-    );
-    expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(false);
-    await rerender({
-      owner: "acme",
-      name: "other-widget",
-      number: 2,
-      provider: "gitlab",
-      platformHost: "gitlab.example.com",
-      repoPath: "acme/other-widget",
-      hideWorkspaceAction: true,
-    });
-    await rerender({
-      owner: "acme",
-      name: "widget",
-      number: 1,
-      provider: "github",
-      platformHost: "github.com",
-      repoPath: "acme/widget",
-      hideWorkspaceAction: true,
-    });
-    resolveMerge?.({
-      error: {
-        status: 409,
-        detail: "head changed",
-        details: { reason: "stale_state" },
-      },
-    });
-
-    await vi.waitFor(() => expect(apiClient.POST).toHaveBeenCalledTimes(1));
-    expect(detailStore.syncDetailNow).not.toHaveBeenCalled();
-    expect(screen.queryByText(/head commit changed since/i)).toBeNull();
-  });
+      current = { ...current, repo: { ...current.repo, platform_repo_id: 7999 } };
+      store.loadDetail("acme", "widget", 1, {
+        provider: "github",
+        platformHost: "github.com",
+        repoPath: "acme/widget",
+        sync: false,
+      });
+      await waitFor(() => expect(store.getDetail()?.repo.platform_repo_id).toBe(7999));
+      await waitFor(() => expect(screen.queryByRole("dialog", { name: "Merge Pull Request" })).toBeNull());
+      if (phase === "submitted") {
+        merge.resolve({
+          error: {
+            code: "conflict",
+            type: "about:blank",
+            status: 409,
+            detail: "head changed",
+            details: { reason: "stale_state" },
+          },
+        });
+        await waitFor(() => expect(getFlashes()).toContainEqual(expect.objectContaining({ tone: "danger" })));
+        expect(sync).not.toHaveBeenCalled();
+        expect(screen.queryByText(/head commit changed since/i)).toBeNull();
+      }
+    },
+  );
 });
 
 describe("PullDetail inline workspace handoff", () => {
@@ -2558,6 +3396,154 @@ describe("PullDetail inline workspace handoff", () => {
     number: 1,
     itemType: "pull",
   };
+
+  it.each([
+    ["github.com", true, ""],
+    ["github.com", false, "Devbox is in maintenance"],
+    ["github.example.com", true, "Devboxes currently support only github.com"],
+  ])("checks the saved devbox before creating from %s (workspaceWrite=%s)", async (platformHost, available, reason) => {
+    const detail = pullDetail();
+    detail.platform_host = platformHost;
+    Object.assign(detail.repo, { Host: platformHost, PlatformHost: platformHost, platform_host: platformHost });
+    const snapshot = Promise.withResolvers<unknown>();
+    const apiClient = {
+      GET: vi.fn().mockImplementation(() =>
+        reason
+          ? Promise.resolve({
+              data: {
+                hosts: [
+                  {
+                    configKey: "devbox:compute-a",
+                    kind: "devbox",
+                    operationAvailability: { workspaceWrite: { available, unavailableReason: reason } },
+                  },
+                ],
+              },
+            })
+          : snapshot.promise,
+      ),
+      POST: vi.fn().mockResolvedValue({ data: { id: "ws-devbox", status: "provisioning" } }),
+    };
+    renderPullDetail(detail, undefined, apiClient, {
+      hideWorkspaceAction: false,
+      defaultExecutionTarget: "devbox:compute-a",
+      detailProps: { platformHost },
+    });
+    const create = screen.getAllByRole("button", { name: "Create Workspace", exact: true })[0]!;
+    if (reason) {
+      await waitFor(() => expect(create.getAttribute("title")).toContain(reason));
+      expect((create as HTMLButtonElement).disabled).toBe(true);
+      await fireEvent.click(create);
+      expect(apiClient.POST).not.toHaveBeenCalled();
+    } else {
+      await waitFor(() => expect((create as HTMLButtonElement).disabled).toBe(false));
+      await fireEvent.click(create);
+      await waitFor(() =>
+        expect(apiClient.POST).toHaveBeenCalledWith(
+          "/devboxes/{connection_id}/workspaces",
+          expect.objectContaining({ params: { path: { connection_id: "compute-a" } } }),
+        ),
+      );
+    }
+    snapshot.resolve({ data: { hosts: [] } });
+  });
+
+  it("shows a quiet status hint after directory failure and still creates on the saved devbox", async () => {
+    const snapshot = Promise.withResolvers<unknown>();
+    const apiClient = {
+      GET: vi
+        .fn()
+        .mockImplementation((path: string) =>
+          path === "/snapshot" ? snapshot.promise : Promise.resolve({ data: {} }),
+        ),
+      POST: vi.fn().mockResolvedValue({ data: { id: "ws-devbox", status: "provisioning" } }),
+    };
+    renderPullDetail(pullDetail(), undefined, apiClient, {
+      hideWorkspaceAction: false,
+      defaultExecutionTarget: "devbox:compute-a",
+    });
+    const create = screen.getAllByRole("button", { name: "Create Workspace", exact: true })[0] as HTMLButtonElement;
+    await waitFor(() => expect(apiClient.GET).toHaveBeenCalledWith("/snapshot", expect.anything()));
+    snapshot.reject(new Error("directory unavailable"));
+    await waitFor(() => expect(create.title).toContain("Preferred devbox status unavailable."));
+    expect(document.getElementById(create.getAttribute("aria-describedby")!)?.textContent).toContain(
+      "Preferred devbox status unavailable.",
+    );
+    expect(create.disabled).toBe(false);
+    await fireEvent.click(create);
+    await waitFor(() =>
+      expect(apiClient.POST).toHaveBeenCalledWith(
+        "/devboxes/{connection_id}/workspaces",
+        expect.objectContaining({ params: { path: { connection_id: "compute-a" } } }),
+      ),
+    );
+  });
+
+  it.each(["pending", "failed"])(
+    "creates on the saved devbox when cached availability is unavailable and directory refresh is %s",
+    async (refresh) => {
+      const snapshot = Promise.withResolvers<unknown>();
+      const apiClient = {
+        GET: vi
+          .fn()
+          .mockResolvedValueOnce({
+            data: {
+              hosts: [
+                {
+                  configKey: "devbox:compute-a",
+                  kind: "devbox",
+                  operationAvailability: {
+                    workspaceWrite: { available: false, unavailableReason: "Devbox is in maintenance" },
+                  },
+                },
+              ],
+            },
+          })
+          .mockImplementation((path: string) =>
+            path === "/snapshot" ? snapshot.promise : Promise.resolve({ data: {} }),
+          ),
+        POST: vi.fn().mockResolvedValue({ data: { id: "ws-devbox", status: "provisioning" } }),
+      };
+      detailRuntime = makeTestAppRuntime(apiClient);
+      const warm = detailRuntime.runCommand(loadFleetSnapshot(), {
+        operation: "warm workspace directory",
+        safeContext: {},
+        onFailure: () => {},
+      });
+      expect((await warm.exit)._tag).toBe("Success");
+
+      renderPullDetail(pullDetail(), undefined, apiClient, {
+        hideWorkspaceAction: false,
+        defaultExecutionTarget: "devbox:compute-a",
+      });
+      const create = screen.getAllByRole("button", { name: "Create Workspace", exact: true })[0] as HTMLButtonElement;
+      await waitFor(() => expect(apiClient.GET.mock.calls.filter(([path]) => path === "/snapshot")).toHaveLength(2));
+      if (refresh === "failed") {
+        snapshot.reject(new Error("directory unavailable"));
+        await waitFor(() => expect(create.title).toContain("Preferred devbox status unavailable."));
+      }
+      expect(create.disabled).toBe(false);
+      await fireEvent.click(create);
+      await waitFor(() =>
+        expect(apiClient.POST).toHaveBeenCalledWith(
+          "/devboxes/{connection_id}/workspaces",
+          expect.objectContaining({
+            params: { path: { connection_id: "compute-a" } },
+            body: {
+              provider: "github",
+              platform_host: "github.com",
+              platform_repo_id: 1001,
+              owner: "acme",
+              name: "widget",
+              mr_number: 1,
+            },
+          }),
+        ),
+      );
+      expect(apiClient.POST).toHaveBeenCalledTimes(1);
+      snapshot.resolve({ data: { hosts: [] } });
+    },
+  );
 
   function deferredWorkspaceApiClient() {
     let resolvePost!: (value: { data?: { id: string; status: string; created?: boolean } }) => void;
@@ -2585,7 +3571,12 @@ describe("PullDetail inline workspace handoff", () => {
     });
 
     await fireEvent.click(screen.getAllByRole("button", { name: "Create Workspace" })[0]!);
-    await waitFor(() => expect(runtimeClient.POST).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(runtimeClient.POST).toHaveBeenCalledWith(
+        "/workspaces",
+        expect.objectContaining({ body: expect.objectContaining({ platform_repo_id: 1001 }) }),
+      ),
+    );
     resolvePost({ data: { id: "ws-runtime", status: "provisioning" } });
 
     await waitFor(() => expect(controller.recordCreated).toHaveBeenCalled());
@@ -2679,6 +3670,35 @@ describe("PullDetail inline workspace handoff", () => {
     await vi.waitFor(() => expect(apiClient.POST).toHaveBeenCalled());
   });
 
+  it.each(["create", "agent", "quick action"])("reports rejected creation only for launches: %s", async (intent) => {
+    const apiClient = {
+      GET: vi.fn(async () => ({ data: {} })),
+      POST: vi.fn().mockResolvedValue({ error: { status: 403, title: "Create denied" } }),
+    };
+    const { settings } = renderPullDetail(pullDetail(), undefined, apiClient, { hideWorkspaceAction: false });
+    settings.setQuickActions([{ label: "Review", agent: "codex", prompt: "Review this change" }]);
+    const telemetry = vi.fn();
+    await startTestTelemetry(detailRuntime!, (event) => telemetry(event)).ready;
+    if (intent === "agent") {
+      await fireEvent.click(screen.getAllByRole("button", { name: "Create Workspace options" })[0]!);
+      await fireEvent.click(screen.getByRole("menuitem", { name: "Codex" }));
+    } else if (intent === "quick action") {
+      await fireEvent.click(screen.getByRole("button", { name: "Quick actions" }));
+      await fireEvent.click(screen.getByRole("menuitem", { name: /Review/ }));
+    } else await fireEvent.click(screen.getAllByRole("button", { name: "Create Workspace" })[0]!);
+    await waitFor(() =>
+      expect(getFlashes()).toEqual(expect.arrayContaining([expect.objectContaining({ message: "Create denied" })])),
+    );
+    if (intent === "create") expect(telemetry).not.toHaveBeenCalled();
+    else
+      await waitFor(() =>
+        expect(telemetry).toHaveBeenCalledExactlyOnceWith({
+          event: "error_shown",
+          properties: { surface: "web", kind: "workspace_opened" },
+        }),
+      );
+  });
+
   it("keeps the primary workspace create action launch-free", async () => {
     const { apiClient, resolvePost } = deferredWorkspaceApiClient();
     const { navigate } = renderPullDetail(pullDetail(), undefined, apiClient, {
@@ -2728,28 +3748,40 @@ describe("PullDetail inline workspace handoff", () => {
     expect(discardWorkspaceLaunch("ws-new", undefined)).toBe("codex");
   });
 
-  it("runs a quick action: creates the workspace, then hands the prompt to the agent", async () => {
-    const rebase = { label: "Rebase", agent: "codex", prompt: "rebase this pull request onto main" };
+  it("retains an ACP quick-action handoff for the workspace view after creation", async () => {
+    const controller = createTestController("split");
+    const telemetry = vi.fn();
+    const rebase = { label: "Rebase", agent: "chat", prompt: "rebase this pull request onto main" };
+    const session: RuntimeSession = {
+      key: "runtime-1",
+      workspace_id: "ws-new",
+      target_key: "chat",
+      label: "Chat agent",
+      kind: "acp",
+      display_region: "workflow",
+      status: "running",
+      created_at: "2026-10-01T00:00:00Z",
+    };
+    const handoff = Promise.withResolvers<{ data: { session: RuntimeSession; initial_message: { state: string } } }>();
     const posts: Array<{ path: string; options: Record<string, unknown> | undefined }> = [];
     const apiClient = {
       GET: vi.fn(async () => ({ data: {} })),
       POST: vi.fn(async (path: string, options?: Record<string, unknown>) => {
         posts.push({ path, options });
         if (path === "/workspaces") return { data: { id: "ws-new", status: "creating", created: true } };
-        return {
-          data: {
-            session: { key: "runtime-1", target_key: "codex" },
-            initial_message: { state: "delivered", target_key: "codex", message_bytes: 34 },
-          },
-        };
+        return handoff.promise;
       }),
     };
     const { navigate, settings } = renderPullDetail(pullDetail(), undefined, apiClient, {
       hideWorkspaceAction: false,
+      inlineWorkspace: controller,
     });
+    settings.setLaunchTargets([{ key: "chat", label: "Chat agent", kind: "acp", available: true }]);
+    startTestTelemetry(detailRuntime!, (event) => telemetry(event));
     settings.setQuickActions([rebase]);
 
     await fireEvent.click(await screen.findByRole("button", { name: "Quick actions" }));
+    expect(screen.getByRole("menuitem", { name: /Rebase/ }).hasAttribute("disabled")).toBe(false);
     await fireEvent.click(screen.getByRole("menuitem", { name: /Rebase/ }));
 
     await waitFor(() => expect(posts).toHaveLength(2));
@@ -2757,11 +3789,22 @@ describe("PullDetail inline workspace handoff", () => {
     expect(posts[1]!.path).toBe("/workspaces/{id}/runtime/agent-handoffs");
     expect(posts[1]!.options).toMatchObject({
       params: { path: { id: "ws-new" } },
-      body: { target_key: "codex", message: "rebase this pull request onto main" },
+      body: { target_key: "chat", message: "rebase this pull request onto main" },
     });
-    await waitFor(() => expect(navigate).toHaveBeenCalledWith("/terminal/ws-new"));
+    await waitFor(() => expect(controller.recordCreated).toHaveBeenCalled());
+    expect(navigate).not.toHaveBeenCalledWith("/terminal/ws-new");
+    await waitFor(() =>
+      expect(telemetry).toHaveBeenCalledExactlyOnceWith({
+        event: "workspace_opened",
+        properties: { item_type: "pull_request", surface: "web" },
+      }),
+    );
     // A quick action never queues a frontend launch; the server owns it.
     expect(discardWorkspaceLaunch("ws-new", undefined)).toBeNull();
+    expect(quickActionLaunches.get("ws-new")).toMatchObject({ targetKey: "chat" });
+    expect(quickActionLaunches.get("ws-new")?.session).toBeUndefined();
+    handoff.resolve({ data: { session, initial_message: { state: "delivered" } } });
+    await waitFor(() => expect(quickActionLaunches.get("ws-new")?.session).toEqual(session));
     expect(getFlashes()).toEqual([]);
   });
 
@@ -3004,6 +4047,7 @@ describe("PullDetail inline workspace handoff", () => {
 
   it("phone presentation renders the actions as one kit action grid instead of fit stages", async () => {
     const detail = pullDetail();
+    detail.repo.capabilities = { ...detail.repo.capabilities, review_mutation: true };
     detail.workspace = { id: "ws-1", status: "ready" };
 
     const { navigate } = renderPullDetail(detail, undefined, undefined, {
@@ -3024,21 +4068,10 @@ describe("PullDetail inline workspace handoff", () => {
     expect(navigate).toHaveBeenCalledWith("/terminal/ws-1");
   });
 
-  it("phone presentation shows sync as a top bar instead of an inline row", async () => {
-    const detail = pullDetail();
-    renderPullDetail(detail, undefined, undefined, { phonePresentation: true, detailSyncing: true });
+  it.each([false, true])("shows background sync progress with phonePresentation=%s", (phonePresentation) => {
+    renderPullDetail(pullDetail(), undefined, undefined, { phonePresentation, detailSyncing: true });
 
-    const bar = screen.getByRole("status", { name: "Syncing from GitHub" });
-    expect(bar.classList.contains("sync-bar")).toBe(true);
-    expect(document.querySelector(".sync-indicator")).toBeNull();
-  });
-
-  it("desktop presentation keeps the inline syncing indicator", async () => {
-    const detail = pullDetail();
-    renderPullDetail(detail, undefined, undefined, { detailSyncing: true });
-
-    expect(document.querySelector(".sync-indicator")).not.toBeNull();
-    expect(document.querySelector(".sync-bar")).toBeNull();
+    expect(screen.getByRole("status", { name: "Syncing from GitHub" })).toBeTruthy();
   });
 
   it("without a controller open renders a single Open Workspace button that navigates", async () => {

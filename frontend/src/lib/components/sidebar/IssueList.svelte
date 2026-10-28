@@ -1,4 +1,5 @@
 <script lang="ts">
+  import QuerySearchInput from "../shared/QuerySearchInput.svelte";
   import { Effect } from "effect";
   import { pollWhileVisible } from "../../effect/poll-while-visible.js";
   import { onDestroy, untrack } from "svelte";
@@ -6,17 +7,27 @@
   import type { AppExecution } from "../../app/runtime.js";
   import { getStores, getNavigate, getSidebar } from "../../context.js";
   import IssueItem from "./IssueItem.svelte";
+  import ItemActionsMenu from "./ItemActionsMenu.svelte";
+  import type { MenuAnchorPoint } from "@kenn-io/kit-ui";
+  import type { ListItemTarget } from "../../stores/item-actions.js";
+  import { createRangeSelection } from "../../utils/range-selection.svelte.js";
   import GroupedSidebarSection from "../shared/GroupedSidebarSection.svelte";
   import {
     Chip,
     FilterDropdown,
     ScrollBox,
-    SearchInput,
     SidebarToggle,
     StatusDot,
   } from "@kenn-io/kit-ui";
   import type { Issue } from "../../api/types.js";
   import { createRepoLabelFormatter } from "../../utils/repo-label.js";
+  import {
+    INITIAL_RENDER_BUDGET,
+    RENDER_BUDGET_STEP,
+    applyGroupRenderBudget,
+    effectiveRenderBudget,
+    revealWhenNear,
+  } from "../../utils/render-budget.js";
   import {
     buildIssueRoute,
     type IssueRouteRef,
@@ -72,15 +83,20 @@
 
   onDestroy(() => searchExecution?.interrupt());
 
+  function applySearch(value: string, submitted = false): void {
+    if (submitted) searchExecution?.interrupt();
+    issues.setIssueSearchQuery(value.trim() === "" ? undefined : value.trim());
+    issues.loadIssues(undefined, { submitted: submitted && value.trim() !== "" });
+  }
+
   function onSearchInput(value: string): void {
     searchInput = value;
-
+    issues.searchTextChanged();
     searchExecution?.interrupt();
     searchExecution = runtime.runCommand(
       Effect.sleep("300 millis").pipe(
         Effect.andThen(Effect.sync(() => {
-          issues.setIssueSearchQuery(value.trim() === "" ? undefined : value.trim());
-          issues.loadIssues();
+          applySearch(value);
         })),
       ),
       { operation: "debounce issue sidebar search", safeContext: {}, onFailure: () => {} },
@@ -237,9 +253,116 @@
       && sel.provider === ref.provider
       && sel.platformHost === ref.platformHost;
   }
+
+  // Mount rows progressively so large result sets do not block the main
+  // thread on every filter change. The budget resets when the query changes.
+  const renderViewKey = $derived(JSON.stringify([
+    issues.getIssueFilterState(),
+    issues.getIssueSearchQuery(),
+    issues.getIssueFilterStarred(),
+    issues.getInvolvesMe(),
+    issues.getUnassigned(),
+    issues.getReferencedByPR(),
+    issues.getHideBots(),
+    grouping.getGroupByRepo(),
+  ]));
+  let renderBudget = $derived.by(() => {
+    void renderViewKey;
+    return INITIAL_RENDER_BUDGET;
+  });
+
+  const displayGroups = $derived(
+    grouping.getGroupByRepo()
+      ? [...issues.issuesByRepo().entries()].map(([repo, items]) => ({
+        repo,
+        items,
+        count: items.length,
+        collapsed: collapsedRepos.isCollapsed("issues", repo),
+      }))
+      : null,
+  );
+
+  const selectedDisplayIndex = $derived.by(() => {
+    if (issues.getSelectedIssue() === null) return -1;
+    const ordered = displayGroups === null
+      ? issues.getIssues()
+      : displayGroups.flatMap((group) => (group.collapsed ? [] : group.items));
+    return ordered.findIndex((issue) => isSelected(routeRefForIssue(issue)));
+  });
+
+  const mountBudget = $derived(effectiveRenderBudget(renderBudget, selectedDisplayIndex));
+  const renderedGroups = $derived(
+    displayGroups === null ? null : applyGroupRenderBudget(displayGroups, mountBudget),
+  );
+  const renderedFlatIssues = $derived(issues.getIssues().slice(0, mountBudget));
+  const hasUnmountedRows = $derived(
+    renderedGroups === null ? issues.getIssues().length > mountBudget : renderedGroups.truncated,
+  );
+
+  function revealMoreRows(): void {
+    renderBudget = mountBudget + RENDER_BUDGET_STEP;
+  }
+
+  // On-screen order: issues in collapsed groups or not yet mounted are not
+  // selectable, so a range never reaches issues the user cannot see.
+  const renderedIssues = $derived(
+    renderedGroups === null
+      ? renderedFlatIssues
+      : renderedGroups.groups.flatMap((group) => (group.collapsed ? [] : group.items)),
+  );
+  const issueSelection = createRangeSelection<Issue>({
+    rows: () => renderedIssues,
+    key: (issue) => String(issue.ID),
+    openedKey: () => {
+      const opened = renderedIssues.find((issue) => isSelected(routeRefForIssue(issue)));
+      return opened ? String(opened.ID) : null;
+    },
+  });
+  let contextMenu = $state.raw<{
+    targets: ListItemTarget[];
+    anchor: MenuAnchorPoint;
+    row: HTMLElement | undefined;
+  } | null>(null);
+  let contextMenuOpen = $state(false);
+
+  function handleRowClick(event: MouseEvent, issue: Issue): void {
+    if (issueSelection.activate(event, issue)) handleSelect(routeRefForIssue(issue));
+  }
+
+  function openContextMenu(event: MouseEvent, issue: Issue): void {
+    event.preventDefault();
+    // Right-clicking outside the selection acts on that issue alone.
+    const multi = issueSelection.selected.length > 1 && issueSelection.has(issue);
+    if (!multi) issueSelection.clear();
+    contextMenu = {
+      targets: (multi ? issueSelection.selected : [issue]).map((item) => ({ kind: "issue", item })),
+      anchor: { x: event.clientX, y: event.clientY },
+      row: event.currentTarget instanceof HTMLElement ? event.currentTarget : undefined,
+    };
+    contextMenuOpen = true;
+  }
+
+  // Menu actions change items on the provider; the open issue reloads too,
+  // in case it was one of them.
+  function reloadAfterItemAction(): void {
+    issues.loadIssues();
+    runtime.runCommand(issues.refreshActiveIssueDetailEffect(), {
+      operation: "refresh issue detail after list action",
+      safeContext: {},
+      onFailure: () => {},
+    });
+  }
+
+  function clearSelectionOnEscape(event: KeyboardEvent): void {
+    if (event.key === "Escape" && issueSelection.active) {
+      event.preventDefault();
+      issueSelection.clear();
+    }
+  }
 </script>
 
-<div class="issue-list">
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="issue-list" onkeydown={clearSelectionOnEscape}>
   <div class="filter-bar" class:filter-bar--compact={useCompactFilters}>
     <Chip size="xs" tone="muted" uppercase={false} class="list-count-chip">
       {issues.getIssues().length} issues
@@ -300,13 +423,14 @@
   </div>
   <div class="search-bar">
     <div class="search-wrap">
-      <SearchInput
+      <QuerySearchInput
         bind:value={searchInput}
         size="sm"
         block
         placeholder="Search issues..."
         ariaLabel="Search issues"
         oninput={onSearchInput}
+        onsubmit={(value) => applySearch(value, true)}
       />
     </div>
     <button
@@ -348,9 +472,8 @@
     {:else if issues.getIssues().length === 0}
       <p class="state-message">No issues found.</p>
     {:else}
-      {#if grouping.getGroupByRepo()}
-        {#each [...issues.issuesByRepo().entries()] as [repo, repoIssues] (repo)}
-          {@const collapsed = collapsedRepos.isCollapsed("issues", repo)}
+      {#if renderedGroups !== null}
+        {#each renderedGroups.groups as { repo, items: repoIssues, count, collapsed } (repo)}
           {@const repoLabel = repoIssues[0] ? repoLabelFormatter.format({
             provider: repoIssues[0].repo.provider,
             platformHost: repoIssues[0].repo.platform_host,
@@ -360,7 +483,7 @@
           }) : repo}
           <GroupedSidebarSection
             label={repoLabel}
-            count={repoIssues.length}
+            {count}
             {collapsed}
             onclick={() => collapsedRepos.toggle("issues", repo)}
           >
@@ -377,13 +500,15 @@
                   })}
                   showRepo={false}
                   selected={isSelected(issueRef)}
-                  onclick={() => handleSelect(issueRef)}
+                  multiSelected={issueSelection.has(issue)}
+                  onclick={(event) => handleRowClick(event, issue)}
+                  oncontextmenu={(event) => openContextMenu(event, issue)}
                 />
               {/each}
           </GroupedSidebarSection>
         {/each}
       {:else}
-        {#each issues.getIssues() as issue (issue.ID)}
+        {#each renderedFlatIssues as issue (issue.ID)}
           {@const issueRef = routeRefForIssue(issue)}
           <IssueItem
             {issue}
@@ -396,9 +521,16 @@
             })}
             showRepo={true}
             selected={isSelected(issueRef)}
-            onclick={() => handleSelect(issueRef)}
+            multiSelected={issueSelection.has(issue)}
+            onclick={(event) => handleRowClick(event, issue)}
+            oncontextmenu={(event) => openContextMenu(event, issue)}
           />
         {/each}
+      {/if}
+      {#if hasUnmountedRows}
+        {#key mountBudget}
+          <div class="render-sentinel" aria-hidden="true" {@attach revealWhenNear(revealMoreRows)}></div>
+        {/key}
       {/if}
     {/if}
   </ScrollBox>
@@ -411,7 +543,21 @@
   </div>
 </div>
 
+<ItemActionsMenu
+  bind:open={contextMenuOpen}
+  anchor={contextMenu?.anchor}
+  returnFocus={contextMenu?.row}
+  targets={contextMenu?.targets ?? []}
+  onChanged={reloadAfterItemAction}
+  selectionActive={issueSelection.active}
+  onClearSelection={() => issueSelection.clear()}
+/>
+
 <style>
+  .render-sentinel {
+    height: 1px;
+  }
+
   .issue-list {
     display: flex;
     flex-direction: column;

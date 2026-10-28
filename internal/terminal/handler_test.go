@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"go.kenn.io/forge/internal/ptyowner"
 	"go.kenn.io/forge/internal/terminalwebsocket"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/workspacetest"
 	"go.kenn.io/forge/internal/workspace"
 )
 
@@ -28,10 +30,10 @@ func openTestDB(t *testing.T) *db.DB {
 
 func TestHandlerWorkspaceNotFound(t *testing.T) {
 	d := openTestDB(t)
-	mgr := workspace.NewManager(d, t.TempDir())
+	mgr := workspacetest.NewManager(t, d, t.TempDir())
 	h := &Handler{Workspaces: mgr}
 
-	req := httptest.NewRequest(
+	req := httptest.NewRequestWithContext(t.Context(),
 		http.MethodGet, "/api/v1/workspaces/nonexistent/terminal",
 		nil,
 	)
@@ -49,7 +51,7 @@ func TestHandlerWorkspaceNotReady(t *testing.T) {
 	d := openTestDB(t)
 	wtDir := t.TempDir()
 
-	mgr := workspace.NewManager(d, wtDir)
+	mgr := workspacetest.NewManager(t, d, wtDir)
 	ws := &workspace.Workspace{
 		ID: "ws-creating", Platform: "github", PlatformHost: "github.com",
 		RepoOwner: "acme", RepoName: "widget",
@@ -62,7 +64,7 @@ func TestHandlerWorkspaceNotReady(t *testing.T) {
 
 	h := &Handler{Workspaces: mgr}
 
-	req := httptest.NewRequest(
+	req := httptest.NewRequestWithContext(t.Context(),
 		http.MethodGet,
 		"/api/v1/workspaces/"+ws.ID+"/terminal",
 		nil,
@@ -98,6 +100,59 @@ func TestHandlerRejectsConcurrentWorkspaceTerminals(t *testing.T) {
 	release3()
 }
 
+type blockingStopPtyOwnerClient struct {
+	workspace.PtyOwnerClient
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *blockingStopPtyOwnerClient) Stop(ctx context.Context, _ string) error {
+	close(c.started)
+	select {
+	case <-c.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestStopUnattachedTerminalReservesOnlyWorkspaceSlot(t *testing.T) {
+	require := require.New(t)
+	client := &blockingStopPtyOwnerClient{started: make(chan struct{}), release: make(chan struct{})}
+	unblock := sync.OnceFunc(func() { close(client.release) })
+	t.Cleanup(unblock)
+	mgr := workspacetest.NewManager(t, nil, t.TempDir())
+	mgr.SetPtyOwnerClient(client)
+	h := &Handler{Workspaces: mgr}
+	ws := &db.Workspace{ID: "ws-1", TerminalBackend: workspace.TerminalBackendPtyOwner}
+	done := make(chan error, 1)
+	go func() { done <- h.StopUnattachedTerminal(t.Context(), ws) }()
+	require.Eventually(func() bool {
+		select {
+		case <-client.started:
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second, time.Millisecond)
+
+	require.True(h.mu.TryLock(), "stopping a terminal must release the shared admission lock")
+	h.mu.Unlock()
+	release, err := h.claimTerminalSlot(ws.ID)
+	require.Error(err)
+	require.Nil(release)
+	releaseOther, err := h.claimTerminalSlot("ws-2")
+	require.NoError(err)
+	releaseOther()
+	require.NoError(h.StopUnattachedTerminal(t.Context(), ws))
+
+	unblock()
+	require.NoError(<-done)
+	release, err = h.claimTerminalSlot(ws.ID)
+	require.NoError(err)
+	release()
+}
+
 func TestTmuxAttachCommandForcesUTF8(t *testing.T) {
 	assert.Equal(
 		t,
@@ -116,7 +171,7 @@ func TestHandlerAttachesPtyOwnerTerminal(t *testing.T) {
 	require := require.New(t)
 
 	d := openTestDB(t)
-	mgr := workspace.NewManager(d, t.TempDir())
+	mgr := workspacetest.NewManager(t, d, t.TempDir())
 	ownerRoot := t.TempDir()
 	mgr.SetPtyOwnerClient(&ptyowner.Client{Root: ownerRoot})
 	ws := &workspace.Workspace{
@@ -281,7 +336,7 @@ func TestProcessExitCode(t *testing.T) {
 }
 
 func TestParseGeometryFallsBack(t *testing.T) {
-	req := httptest.NewRequest(
+	req := httptest.NewRequestWithContext(t.Context(),
 		http.MethodGet, "/?cols=bad&rows=0", nil,
 	)
 	geometry := parseGeometry(req)
@@ -297,7 +352,7 @@ func readWebSocketUntil(
 ) string {
 	t.Helper()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 2*time.Second)
 	defer cancel()
 	var builder strings.Builder
 	for {

@@ -11,6 +11,11 @@ import (
 // HeartbeatMessage is the terminal liveness probe and reply payload.
 const HeartbeatMessage = `{"type":"heartbeat"}`
 
+// ACPReadLimit removes the websocket frame limit on ACP chat connections,
+// local and relayed. Chat prompts, transcript pages, and agent content have no
+// size limit; the library would otherwise default to 32 KiB.
+const ACPReadLimit = -1
+
 // WriteHeartbeat acknowledges a terminal liveness probe.
 func WriteHeartbeat(ctx context.Context, conn *websocket.Conn) error {
 	return conn.Write(ctx, websocket.MessageText, []byte(HeartbeatMessage))

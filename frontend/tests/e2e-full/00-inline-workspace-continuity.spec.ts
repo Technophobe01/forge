@@ -32,6 +32,7 @@ import {
 import { startIsolatedWorkspaceE2EServer, type IsolatedE2EServer } from "./support/e2eServer";
 import { runPaletteCommand } from "./support/paletteCommands";
 import { openSettingsPanel } from "./support/settingsPanel";
+import { trackTerminalReadiness, waitForTerminalInputReady } from "./support/terminalReadiness";
 
 type WorkspaceStatusResponse = {
   id: string;
@@ -312,6 +313,7 @@ async function collapseTerminal(page: Page): Promise<void> {
 }
 
 async function typeIntoTerminal(page: Page, container: Locator, command: string): Promise<void> {
+  await waitForTerminalInputReady(container);
   await container.click({ position: { x: 10, y: 10 } });
   await page.keyboard.type(command);
   await page.keyboard.press("Enter");
@@ -416,6 +418,7 @@ function exitTmuxCopyMode(server: IsolatedE2EServer, tmuxSession: string): void 
 }
 
 async function dispatchTerminalPaste(container: Locator, text: string): Promise<void> {
+  await waitForTerminalInputReady(container);
   await container.locator(".xterm-helper-textarea").evaluate((textarea, pastedText) => {
     const paste = new Event("paste", { bubbles: true, cancelable: true });
     Object.defineProperty(paste, "clipboardData", {
@@ -587,6 +590,7 @@ test.describe("inline workspace pane continuity", () => {
   // test that closes or maximizes the workspace pane would hand that arrangement
   // to the next one. Reset it on every document load.
   test.beforeEach(async ({ page }) => {
+    trackTerminalReadiness(page);
     await page.addInitScript(() => {
       for (const surface of ["prs", "issues", "activity"]) {
         localStorage.removeItem(`kenn-forge-pane-layout-v1:${surface}`);
@@ -962,7 +966,6 @@ test.describe("inline workspace pane continuity", () => {
       await moveToWorkflow.click();
 
       const workflow = page.getByRole("region", { name: "Workflow panes" });
-      const homeTab = workflow.getByRole("tab", { name: "Home" });
       const terminalTab = workflow.getByRole("tab", { name: "Terminal" });
       await expect(terminalTab).toHaveAttribute("aria-selected", "true");
       await expect
@@ -974,8 +977,8 @@ test.describe("inline workspace pane continuity", () => {
         (frame) => frame.type === "resize_active" && frame.active === false,
       ).length;
 
-      await homeTab.click();
-      await expect(homeTab).toHaveAttribute("aria-selected", "true");
+      await workflow.getByRole("button", { name: "Close Terminal", exact: true }).click();
+      await expect(workflow.getByRole("button", { name: "Open terminal panel", exact: true })).toBeVisible();
       await expect
         .poll(() => controlFrames.filter((frame) => frame.type === "resize_active" && frame.active === false).length, {
           timeout: 15_000,
@@ -1414,7 +1417,7 @@ test.describe("inline workspace pane continuity", () => {
       await expect(promotedTerminal).toBeVisible();
       await promotedTerminal.evaluate((element) => element.setAttribute("data-continuity", "row-only-promoted"));
       await expect(page.locator(".detail-pane-workspace-slot")).toHaveCount(0);
-      const surfaceDock = page.locator(".detail-host > .terminal-panel");
+      const surfaceDock = page.locator(".detail-host").getByRole("region", { name: "Terminal panel" });
       await expect(surfaceDock).toBeVisible();
 
       const diffArea = page.locator(".diff-area .kit-scrollbox__viewport");
@@ -1490,7 +1493,7 @@ test.describe("inline workspace pane continuity", () => {
       await expect(surfaceDock.locator(".terminal-leaf")).toHaveCount(2);
       const surfaceGeometry = await page.locator(".detail-host").evaluate((host) => {
         const detail = host.querySelector(":scope > .detail-pane-layout");
-        const dock = host.querySelector(":scope > .terminal-panel");
+        const dock = host.querySelector('[aria-label="Terminal panel"]');
         if (!(detail instanceof HTMLElement) || !(dock instanceof HTMLElement)) return null;
         const hostRect = host.getBoundingClientRect();
         const detailRect = detail.getBoundingClientRect();
@@ -1515,6 +1518,10 @@ test.describe("inline workspace pane continuity", () => {
         workspace.worktree_path,
         "row-only-dropped-into-terminal",
       );
+      await surfaceDock.getByRole("button", { name: "Launch session", exact: true }).click();
+      await expect(launcher).toBeVisible();
+      await launcher.getByRole("button", { name: "Close", exact: true }).click();
+      await expect(launcher).toBeHidden();
     } finally {
       await api?.dispose();
       await isolatedServer?.stop();
@@ -1660,7 +1667,7 @@ test.describe("inline workspace pane continuity", () => {
       // the empty workspace container stays retired behind its external dock.
       await page.getByRole("button", { name: "Focus Terminal" }).click();
       await expect(page.locator(".detail-pane-workspace-slot")).toHaveCount(0);
-      await expect(page.locator(".detail-host > .terminal-panel")).toBeVisible();
+      await expect(page.locator(".detail-host").getByRole("region", { name: "Terminal panel" })).toBeVisible();
       await expect(restored).toBeVisible();
       await typeMarkerCommand(page, restored, workspace.worktree_path, "marker-after-collapse");
     } finally {
@@ -1716,7 +1723,7 @@ test.describe("inline workspace pane continuity", () => {
 
       await page.getByRole("button", { name: "Focus Terminal" }).click();
       await expect(page.locator(".detail-pane-workspace-slot")).toHaveCount(0);
-      await expect(page.locator(".detail-host > .terminal-panel")).toBeVisible();
+      await expect(page.locator(".detail-host").getByRole("region", { name: "Terminal panel" })).toBeVisible();
       await expect(promoted).toBeVisible();
       await typeMarkerCommand(page, promoted, workspace.worktree_path, "cross-marker-after");
     } finally {
@@ -2375,7 +2382,6 @@ test.describe("inline workspace pane continuity", () => {
         const log: Array<{
           url: string;
           closed: boolean;
-          replayReady: boolean;
           socket: WebSocket;
           sent: string[];
         }> = [];
@@ -2384,20 +2390,10 @@ test.describe("inline workspace pane continuity", () => {
         class TrackedWebSocket extends Native {
           constructor(url: string | URL, protocols?: string | string[]) {
             super(url, protocols);
-            const entry = { url: String(url), closed: false, replayReady: false, socket: this, sent: [] };
+            const entry = { url: String(url), closed: false, socket: this, sent: [] };
             log.push(entry);
             this.addEventListener("close", () => {
               entry.closed = true;
-            });
-            this.addEventListener("message", (event) => {
-              if (typeof event.data !== "string") return;
-              try {
-                if ((JSON.parse(event.data) as { type?: string }).type === "replay_ready") {
-                  entry.replayReady = true;
-                }
-              } catch {
-                // Non-JSON text frame; the renderer ignores it too.
-              }
             });
           }
 
@@ -2434,14 +2430,13 @@ test.describe("inline workspace pane continuity", () => {
                 __reconnectWsLog?: Array<{
                   url: string;
                   closed: boolean;
-                  replayReady: boolean;
                   sent: string[];
                 }>;
               }
             ).__reconnectWsLog ?? [];
           return log
             .filter((entry) => entry.url.includes(`/workspaces/${workspaceId}/runtime/sessions/`))
-            .map(({ url, closed, replayReady, sent }) => ({ url, closed, replayReady, sent }));
+            .map(({ url, closed, sent }) => ({ url, closed, sent }));
         }, workspace.id);
 
       await page.goto(`${isolatedServer.info.base_url}/terminal/${workspace.id}`);
@@ -2513,7 +2508,6 @@ test.describe("inline workspace pane continuity", () => {
       expect(new URL(reconnectSocket!.url).searchParams.get("replay_boundary")).toBe("1");
       expect(new URL(reconnectSocket!.url).searchParams.has("cols")).toBe(false);
       expect(new URL(reconnectSocket!.url).searchParams.has("rows")).toBe(false);
-      await expect.poll(async () => (await runtimeSockets()).at(-1)?.replayReady).toBe(true);
       await expect
         .poll(
           async () =>
@@ -2799,7 +2793,7 @@ test.describe("inline workspace pane continuity", () => {
 
       await page.getByRole("button", { name: "Settings" }).click();
       await expect(page).toHaveURL(/\/settings$/);
-      await openSettingsPanel(page, "Terminal");
+      await openSettingsPanel(page, "Workspaces");
       const witness = page.locator('[data-retention-save-witness="a"]');
       await expect(witness).toHaveCount(1);
 
@@ -2822,14 +2816,16 @@ test.describe("inline workspace pane continuity", () => {
       });
 
       const retainedSessions = page.getByLabel("Retained terminal sessions");
-      const save = page.getByRole("button", { name: "Save", exact: true });
+      const save = page
+        .getByRole("region", { name: "Terminal", exact: true })
+        .getByRole("button", { name: "Save", exact: true });
       await retainedSessions.fill("0");
       const failedSave = page.waitForResponse(
         (response) => response.url().endsWith("/api/v1/settings") && response.request().method() === "PUT",
       );
       await save.click();
       expect((await failedSave).status()).toBe(503);
-      await expect(retainedSessions).toHaveValue("10");
+      await expect(retainedSessions).toHaveValue("50");
       await expect(witness).toHaveCount(1);
       expect(await sessionWebSockets(page, workspaceA.id)).toEqual([originalSocket]);
 

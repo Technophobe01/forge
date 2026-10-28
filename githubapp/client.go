@@ -49,8 +49,11 @@ func NewClient(host string) *Client {
 // URL. Tests point this at a local fake server.
 func NewClientWithBase(apiBase string) *Client {
 	return &Client{
-		apiBase:    strings.TrimRight(apiBase, "/"),
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		apiBase: strings.TrimRight(apiBase, "/"),
+		httpClient: &http.Client{
+			Timeout:       30 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
 	}
 }
 
@@ -92,10 +95,21 @@ type Installation struct {
 	SuspendedAt         *time.Time `json:"suspended_at"`
 }
 
-// InstallationToken is a minted installation access token.
+// InstallationTokenRequest optionally narrows an installation token's access.
+// Nil fields retain the installation's repository or permission grants.
+type InstallationTokenRequest struct {
+	Repositories  []string          `json:"repositories,omitzero"`
+	RepositoryIDs []int64           `json:"repository_ids,omitzero"`
+	Permissions   map[string]string `json:"permissions,omitzero"`
+}
+
+// InstallationToken is a minted installation access token and its returned scope.
 type InstallationToken struct {
-	Token     string    `json:"token"`
-	ExpiresAt time.Time `json:"expires_at"`
+	Token               string            `json:"token"`
+	ExpiresAt           time.Time         `json:"expires_at"`
+	Repositories        []Repository      `json:"repositories"`
+	Permissions         map[string]string `json:"permissions"`
+	RepositorySelection string            `json:"repository_selection"`
 }
 
 // RateLimit is the core REST rate budget for a credential.
@@ -110,7 +124,7 @@ type RateLimit struct {
 // works exactly once, expiring after one hour.
 func (c *Client) ConvertManifest(ctx context.Context, code string) (*AppCredentials, error) {
 	if code == "" {
-		return nil, fmt.Errorf("manifest conversion code is required")
+		return nil, errors.New("manifest conversion code is required")
 	}
 	var creds AppCredentials
 	err := c.do(ctx, http.MethodPost,
@@ -146,15 +160,22 @@ func (c *Client) ListInstallations(ctx context.Context, appJWT string) ([]Instal
 	}
 }
 
-// CreateInstallationToken mints an installation access token. Tokens
-// expire after one hour.
+// CreateInstallationToken mints an installation access token that expires after
+// one hour. A nil request retains the installation's full access. Callers own
+// validation of the returned scope and must not cache narrowed tokens by
+// installation alone or share them with the ordinary sync token cache.
 func (c *Client) CreateInstallationToken(
 	ctx context.Context, appJWT string, installationID int64,
+	request *InstallationTokenRequest,
 ) (*InstallationToken, error) {
+	var body any
+	if request != nil {
+		body = request
+	}
 	var token InstallationToken
 	err := c.do(ctx, http.MethodPost,
 		fmt.Sprintf("/app/installations/%d/access_tokens", installationID),
-		appJWT, nil, &token)
+		appJWT, body, &token)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"creating installation token for installation %d: %w", installationID, err,
@@ -260,8 +281,8 @@ func (e *StatusError) RetryDeadline(now time.Time) time.Time {
 
 // IsStatus reports whether err is a StatusError with the given code.
 func IsStatus(err error, code int) bool {
-	var se *StatusError
-	if !errors.As(err, &se) || se == nil {
+	se, ok := errors.AsType[*StatusError](err)
+	if !ok || se == nil {
 		return false
 	}
 	return se.StatusCode == code

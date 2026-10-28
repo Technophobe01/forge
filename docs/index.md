@@ -43,6 +43,7 @@ Returning users can jump to a task:
 - [Review a pull request](workflows/code-reviewer.md)
 - [Browse repository source](workflows/repositories.md)
 - [Work in local sessions](workflows/workspaces.md)
+- [Work through a worklist](workflows/worklists.md)
 - [Read and edit local Docs](workflows/docs.md)
 - [Run daily maintainer workflows](workflows.md)
 - [Connect Roborev, Kata, or Docs](integrations.md)
@@ -61,16 +62,17 @@ unavailable.
 
 **Workspaces** opens durable local shells and configured agents against
 repository worktrees. **Repos** browses branches, tags, files, previews, and
-file history. **Reviews** connects to a running Roborev daemon. **Docs** reads,
-edits, pulls, and publishes registered Markdown folders. Kata issues appear
-where they are linked to a pull request, provider issue, or workspace rather
-than in a separate mode.
+file history. The **Reviews** panel in a local workspace connects to a running
+Roborev daemon when displayed. **Docs** reads, edits, pulls, and publishes
+registered Markdown folders. Kata issues appear where they are linked to a
+pull request, provider issue, or workspace rather than in a separate mode.
 
 ## Advanced use
 
 - [Command reference](commands.md)
 - [Historical activity archives](archive.md)
 - [Federated fleets](federated-fleet.md)
+- [GitHub CLI shim for agents](gh-shim.md)
 
 Forge runs on your machine. Your provider, Kata daemons, and local files
 remain the source of truth.

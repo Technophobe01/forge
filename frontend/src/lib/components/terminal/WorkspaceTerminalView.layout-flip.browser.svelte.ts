@@ -1,4 +1,6 @@
 import { render } from "vitest-browser-svelte";
+import { page } from "vite-plus/test/browser";
+import "../../../app.css";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { Effect } from "effect";
 import { DEFAULT_TERMINAL_SETTINGS } from "../../api/types.js";
@@ -80,7 +82,8 @@ class NoopEventSource {
 }
 
 describe("WorkspaceTerminalView layout flip", () => {
-  it("keeps the main subtree's DOM identity when hideWorkspaceList flips", async () => {
+  it("keeps compact workspace controls usable when hideWorkspaceList flips", async () => {
+    await page.viewport(1200, 800);
     const api = createMockApiFetch([workspaceRoutes()]);
     const originalFetch = globalThis.fetch;
     const originalEventSource = globalThis.EventSource;
@@ -92,6 +95,7 @@ describe("WorkspaceTerminalView layout flip", () => {
     // main subtree cannot mount without a settings store on STORES_KEY.
     const settingsStore = {
       getTerminalFontSize: () => DEFAULT_TERMINAL_SETTINGS.font_size,
+      getQuickActions: () => [{ label: "Review", agent: "codex", prompt: "Review this change" }],
       getTerminalSettings: () => DEFAULT_TERMINAL_SETTINGS,
       getWorkspaceSettings: () => ({ auto_assign_on_create: false, default_sidebar_view: "diff" as const }),
     };
@@ -103,6 +107,35 @@ describe("WorkspaceTerminalView layout flip", () => {
     });
 
     try {
+      const info = screen.getByRole("button", { name: "Workspace info", exact: true });
+      const launch = screen.getByRole("button", { name: "Launch", exact: true });
+      const quickActions = screen.getByRole("button", { name: "Quick actions", exact: true });
+      const presets = screen.getByRole("button", { name: "Workflow presets", exact: true });
+      await expect.element(info).toBeVisible();
+      for (const [control, anchor] of [
+        [launch, info],
+        [quickActions, info],
+        [presets, screen.getByRole("button", { name: "Delete", exact: true })],
+      ]) {
+        const titleRow = anchor!.element().getBoundingClientRect();
+        const button = control!.element().getBoundingClientRect();
+        expect(Math.abs(button.y + button.height / 2 - titleRow.y - titleRow.height / 2)).toBeLessThan(2);
+        expect(button.width).toBeLessThan(50);
+      }
+      await presets.click();
+      const save = screen.getByRole("button", { name: "Save as preset" });
+      await expect.element(save).toBeVisible();
+      const rect = save.element().getBoundingClientRect();
+      expect(
+        save.element().contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)),
+      ).toBe(true);
+      await launch.click();
+      await expect.element(screen.getByText("Run configurations", { exact: true })).toBeVisible();
+      expect(quickActions.element().getBoundingClientRect().width).toBe(24);
+      await quickActions.click();
+      await expect.element(screen.getByRole("dialog", { name: "Quick actions" })).toBeVisible();
+      await expect.element(screen.getByRole("dialog", { name: "Run configurations" })).not.toBeInTheDocument();
+
       const before = await vi.waitFor(() => {
         const el = document.querySelector(".workspace-stage");
         expect(el).not.toBeNull();
@@ -113,6 +146,29 @@ describe("WorkspaceTerminalView layout flip", () => {
 
       expect(before.isConnected).toBe(true);
       expect(document.contains(before)).toBe(true);
+
+      await page.viewport(480, 640);
+      const launchRect = launch.element().getBoundingClientRect();
+      expect(quickActions.element().getBoundingClientRect().right).toBeLessThanOrEqual(480);
+      expect(launchRect.right).toBeLessThanOrEqual(480);
+      expect(
+        launch
+          .element()
+          .contains(
+            document.elementFromPoint(launchRect.x + launchRect.width / 2, launchRect.y + launchRect.height / 2),
+          ),
+      ).toBe(true);
+
+      await screen.getByRole("button", { name: "Workspace controls", exact: true }).click();
+      await presets.click();
+      const narrowMenu = screen
+        .getByRole("dialog", { name: "Workflow presets", exact: true })
+        .element()
+        .getBoundingClientRect();
+      expect(narrowMenu.left).toBeGreaterThanOrEqual(0);
+      expect(narrowMenu.right).toBeLessThanOrEqual(480);
+
+      await page.viewport(1200, 800);
 
       await screen.rerender({ runtime, workspaceId: "ws-1", hideWorkspaceList: false, hideRightSidebar: true });
       expect(before.isConnected).toBe(true);

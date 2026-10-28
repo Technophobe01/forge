@@ -1,0 +1,311 @@
+<!-- Copied from the shared console chat; imports and touch sizing adapted for Forge. -->
+<script lang="ts">
+  import { Ban, Bot, Brain, Check, ChevronDown, Clock, Wrench, X } from "@lucide/svelte"
+  import { Spinner } from "@kenn-io/kit-ui"
+  import ChatMessageView from "./ChatMessageView.svelte"
+  import ChatToolDetails from "./ChatToolDetails.svelte"
+  import ChatContentBlock from "./ChatContentBlock.svelte"
+  import { isImageContent } from "./chat-content.js"
+  import { decodeAppDescriptor } from "./mcp-app.js"
+  import type { ContentScrollPositions } from "./chat-content-scroll.js"
+  import { toolStatus, type ChatMessage } from "./chat-types.js"
+
+  let {
+    messages,
+    anchorId,
+    openEntries,
+    expanded,
+    expandedThoughts,
+    rawOpen,
+    contentScroll,
+    onToggleThought,
+    onRawToggle,
+    onToggleGroup,
+    onToggleTool,
+    childCounts = {},
+    streaming = false,
+  }: {
+    messages: ChatMessage[]
+    anchorId: string
+    openEntries: Readonly<Record<string, boolean>>
+    expanded: Readonly<Record<string, boolean>>
+    expandedThoughts: Readonly<Record<string, boolean>>
+    contentScroll: ContentScrollPositions
+    rawOpen: Readonly<Record<string, { input?: boolean; output?: boolean }>>
+    onToggleThought: (id: string) => void
+    onRawToggle: (id: string, field: "input" | "output", open: boolean) => void
+    onToggleGroup: (messages: readonly ChatMessage[], open: boolean) => void
+    onToggleTool: (id: string) => void
+    /** Tool calls made inside each sub-agent, keyed by its toolCallId. */
+    childCounts?: Readonly<Record<string, number>>
+    /** The group's last message is still receiving chunks. */
+    streaming?: boolean
+  } = $props()
+  const id = $props.id()
+  const open = $derived(messages.some((message) => openEntries[message.id]))
+  function hasDetails(message: ChatMessage): boolean {
+    return !!(
+      message.kind ||
+      message.locations?.length ||
+      message.toolContent?.length ||
+      message.rawInput ||
+      message.rawOutput
+    )
+  }
+
+  const tools = $derived(messages.filter((message) => message.role === "tool"))
+  const thoughts = $derived(messages.length - tools.length)
+  const failed = $derived(
+    tools.filter((message) => toolStatus(message) === "failed").length,
+  )
+  const running = $derived(
+    tools.some(
+      (message) =>
+        toolStatus(message) === "pending" ||
+        toolStatus(message) === "in_progress",
+    ),
+  )
+  const subagents = $derived(
+    tools.filter((message) => message.subagent).length,
+  )
+  const summary = $derived(
+    [
+      tools.length ? `${tools.length} ${tools.length === 1 ? "tool" : "tools"}` : "",
+      thoughts ? `${thoughts} ${thoughts === 1 ? "thought" : "thoughts"}` : "",
+      subagents ? `${subagents} ${subagents === 1 ? "sub-agent" : "sub-agents"}` : "",
+      failed ? `${failed} failed` : "",
+      running ? "running" : "",
+    ]
+      .filter(Boolean)
+      .join(" · "),
+  )
+</script>
+
+<div class="tool-group" data-activity-group={anchorId}>
+  <button
+    type="button"
+    class="chip kit-control-states"
+    class:failed={failed > 0}
+    aria-expanded={open}
+    aria-controls={`${id}-list`}
+    onclick={() => onToggleGroup(messages, !open)}
+  >
+    {#if running}<Spinner size={12} label="Tools running" />{:else if subagents}<Bot
+        size={12}
+        aria-hidden="true"
+      />{:else if !tools.length}<Brain size={12} aria-hidden="true" />{:else}<Wrench
+        size={12}
+        aria-hidden="true"
+      />{/if}
+    <span>{summary}</span>
+    <ChevronDown size={12} class="chevron" aria-hidden="true" />
+  </button>
+  {#if open}
+    <ul id={`${id}-list`} class="list">
+      {#each messages as message, index (message.id)}
+        {@const key = message.id}
+        {#if message.role === "thought"}
+          <li class="thought-row" data-message-id={message.id}><ChatMessageView {message} thoughtOpen={!!expandedThoughts[message.id]} onThoughtToggle={() => onToggleThought(message.id)} streaming={streaming && index === messages.length - 1} /></li>
+        {:else}
+        {@const status = toolStatus(message)}
+        {@const expandable = hasDetails(message)}
+        <li class={`status-${status}`} data-message-id={message.id}>
+          {#snippet row()}
+          <span class="icon" aria-hidden="true">
+            {#if status === "failed"}<X size={12} />
+            {:else if status === "in_progress"}<Spinner
+                size={12}
+                label=""
+              />
+            {:else if status === "pending"}<Clock size={12} />
+            {:else if status === "cancelled"}<Ban size={12} />
+            {:else}<Check size={12} />{/if}
+          </span>
+          <span class="tool-name">
+            {#if message.subagent}
+              {@const children = message.toolCallId ? (childCounts[message.toolCallId] ?? 0) : 0}
+              <span class="subagent"
+                ><Bot size={12} aria-hidden="true" />{children
+                  ? `Sub-agent · ${children} ${children === 1 ? "tool call" : "tool calls"}`
+                  : "Sub-agent"}</span
+              >
+            {/if}
+            {message.text}
+          </span>
+          <span
+            class="state"
+            title={message.createdAt
+              ? new Date(message.createdAt).toLocaleString()
+              : undefined}
+            >{status.replaceAll("_", " ")}</span
+          >
+          {/snippet}
+          {#if expandable}
+            <button
+              type="button"
+              class="row row--button"
+              aria-expanded={!!expanded[key]}
+              aria-controls={`${id}-tool-${index}`}
+              onclick={() => onToggleTool(key)}
+            >
+              {@render row()}
+            </button>
+            {#if expanded[key]}
+              <ChatToolDetails {message} {contentScroll} id={`${id}-tool-${index}`} rawInputOpen={!!rawOpen[message.id]?.input} rawOutputOpen={!!rawOpen[message.id]?.output} onRawToggle={(field, open) => onRawToggle(message.id, field, open)} />
+            {/if}
+          {:else}
+            <div class="row">{@render row()}</div>
+          {/if}
+        </li>
+        {/if}
+      {/each}
+    </ul>
+  {/if}
+  {#each messages as message (message.id)}
+    {#each message.toolContent ?? [] as item, contentIndex (contentIndex)}
+      {#if item.content && (isImageContent(item.content) || decodeAppDescriptor(item.content))}
+        <ChatContentBlock content={item.content} />
+      {/if}
+    {/each}
+  {/each}
+</div>
+
+<style>
+  .tool-group {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-3);
+    min-width: 0;
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-3);
+    min-height: 24px;
+    padding: 0 var(--space-4);
+    border: 1px solid var(--border-default);
+    border-radius: 999px;
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: var(--font-size-xs);
+    font-variant-numeric: tabular-nums;
+    cursor: pointer;
+    transition:
+      background var(--transition-fast) ease-out,
+      border-color var(--transition-fast) ease-out,
+      color var(--transition-fast) ease-out;
+  }
+  .chip:hover {
+    background: var(--bg-surface-hover);
+    color: var(--text-primary);
+  }
+  .chip:focus-visible {
+    outline: var(--focus-ring);
+    outline-offset: 2px;
+  }
+  .chip[aria-expanded="true"] {
+    border-color: var(--accent-blue);
+    color: var(--text-primary);
+  }
+  .chip.failed {
+    border-color: color-mix(
+      in srgb,
+      var(--accent-red) 30%,
+      var(--border-default)
+    );
+  }
+  .chip :global(.chevron) {
+    transition: transform var(--transition-fast) ease-out;
+  }
+  .chip[aria-expanded="true"] :global(.chevron) {
+    transform: rotate(180deg);
+  }
+
+  .list {
+    align-self: stretch;
+    margin: 0;
+    padding: var(--space-2) 0;
+    list-style: none;
+    background: var(--bg-inset);
+    border: 1px solid var(--border-muted);
+    border-radius: var(--radius-md);
+    font-size: var(--font-size-xs);
+  }
+  .thought-row {
+    padding: var(--space-3) var(--space-5);
+  }
+  .row {
+    display: grid;
+    grid-template-columns: 14px minmax(0, 1fr) auto;
+    align-items: baseline;
+    gap: var(--space-4);
+    padding: var(--space-3) var(--space-5);
+  }
+  .row--button {
+    width: 100%;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .row--button:hover {
+    background: var(--bg-surface-hover);
+  }
+  .row--button:focus-visible {
+    outline: var(--focus-ring);
+    outline-offset: -2px;
+  }
+  .icon {
+    display: inline-flex;
+    align-self: center;
+    color: var(--accent-green);
+  }
+  .status-failed .icon,
+  .status-failed .state {
+    color: var(--accent-red);
+  }
+  .status-pending .icon,
+  .status-in_progress .icon,
+  .status-cancelled .icon {
+    color: var(--text-secondary);
+  }
+  .tool-name {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    color: var(--text-primary);
+  }
+  .subagent {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    margin-right: var(--space-3);
+    padding: 0 var(--space-2);
+    border: 1px solid color-mix(in srgb, var(--accent-purple) 35%, var(--border-default));
+    border-radius: var(--radius-sm);
+    color: var(--accent-purple);
+    white-space: nowrap;
+  }
+  .state {
+    color: var(--text-secondary);
+    white-space: nowrap;
+  }
+
+  @media (pointer: coarse) {
+    .chip { min-height: 44px; }
+    .row--button { min-height: var(--mobile-chrome-hit-target); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .chip,
+    .chip :global(.chevron) {
+      transition: none;
+    }
+    .tool-group :global(.kit-spinner) {
+      animation: none;
+    }
+  }
+</style>

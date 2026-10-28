@@ -12,19 +12,19 @@ import { WorkflowDispatchProgressEvent } from "./provider-events-workflow.js";
 import { createWorkflowActionsStore, type WorkflowActionsStore } from "./workflow-actions.svelte.js";
 
 const ref = {
-  platformRepoId: "repo-app",
+  repositoryKey: { kind: "id", id: 1014 },
   provider: "github",
   platformHost: "github.com",
   owner: "acme",
   name: "app",
   repoPath: "acme/app",
 };
-const otherRef = { ...ref, platformRepoId: "repo-other", name: "other", repoPath: "acme/other" };
+const otherRef = { ...ref, repositoryKey: { kind: "id", id: 1016 }, name: "other", repoPath: "acme/other" };
 
 const repo = {
   provider: "github",
   platform_host: "github.com",
-  platform_repo_id: "repo-app",
+  platform_repo_id: 1014,
   owner: "acme",
   name: "app",
   repo_path: "acme/app",
@@ -100,7 +100,7 @@ function progress(
   return new WorkflowDispatchProgressEvent({
     provider: "github",
     platform_host: "github.com",
-    platform_repo_id: "repo-app",
+    platform_repo_id: 1014,
     repo_path: "acme/app",
     owner: "acme",
     name: "app",
@@ -185,13 +185,13 @@ describe("workflow actions store", () => {
     expect(store.getCatalog(renamed)).toBe(store.getCatalog(ref));
     expect(store.getJobs(renamed, "run-old")).toEqual(jobs);
 
-    const replacement = { ...ref, platformRepoId: "repo-replacement" };
-    fixture.repository = { ...repo, platform_repo_id: replacement.platformRepoId };
+    const replacement = { ...ref, repositoryKey: { kind: "id", id: 1012 } };
+    fixture.repository = { ...repo, platform_repo_id: replacement.repositoryKey.id };
     expect(store.getSnapshot(replacement)).toBeNull();
     store.loadCatalog(replacement);
     await settle();
     expect(fixture.catalogReads).toBe(2);
-    expect(store.getCatalog(replacement)?.repo.platform_repo_id).toBe("repo-replacement");
+    expect(store.getCatalog(replacement)?.repo.platform_repo_id).toBe(1012);
     expect(store.getRuns(replacement)).toEqual([]);
     expect(store.getJobs(replacement, "run-old")).toEqual([]);
     expect(store.getDispatch(replacement, "deploy.yml")).toBeNull();
@@ -212,7 +212,7 @@ describe("workflow actions store", () => {
       store.loadCatalog(ref);
       await settle();
     }
-    fixture.repository = { ...repo, platform_repo_id: "repo-replacement" };
+    fixture.repository = { ...repo, platform_repo_id: 1012 };
     api = createMockApiFetch([
       (request) =>
         request.url.pathname.endsWith("/jobs")
@@ -376,6 +376,70 @@ describe("workflow actions store", () => {
     },
   );
 
+  it.each(["first page", "pagination"])("refreshes after activity during a pending %s read", async (phase) => {
+    const stalePage = Promise.withResolvers<Response>();
+    const staleRead = phase === "pagination" ? 2 : 1;
+    let reads = 0;
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), "http://localhost");
+      if (!url.pathname.endsWith("/runs")) return api.fetch(input, init);
+      reads++;
+      if (reads === staleRead) return stalePage.promise;
+      return jsonResponse({
+        repo,
+        items: [run("run-old", reads > staleRead ? "completed" : "queued")],
+        exhausted: reads > staleRead,
+        ...(reads < staleRead && { next_cursor: "page-2" }),
+      });
+    };
+    store.loadCatalog(ref);
+    await settle();
+    store.selectWorkflow(ref, "deploy.yml");
+    await settle();
+    if (phase === "pagination") {
+      store.loadMoreRuns(ref);
+      await settle();
+      expect(store.getSnapshot(ref)?.runsPage.loadingMore).toBe(true);
+    } else {
+      expect(store.getLoading(ref).runs).toBe(true);
+    }
+    try {
+      store.refreshRuns(ref);
+      await settle();
+      expect(store.getRuns(ref)[0]?.status).toBe("completed");
+    } finally {
+      stalePage.resolve(jsonResponse({ repo, items: [run("run-old", "queued")], exhausted: true }));
+    }
+    await settle();
+    expect(store.getRuns(ref)[0]?.status).toBe("completed");
+    expect(store.getLoading(ref).runs).toBe(false);
+    expect(store.getSnapshot(ref)?.runsPage.loadingMore).toBe(false);
+  });
+
+  it("uses fresh run status instead of retaining an older dispatch snapshot on refresh", async () => {
+    fixture.dispatchResponse = () =>
+      jsonResponse(
+        { accepted: true, dispatch_id: "dispatch-1", actor: "maintainer", run: run("run-old", "queued") },
+        202,
+      );
+    store.loadCatalog(ref);
+    await settle();
+    store.selectWorkflow(ref, "deploy.yml");
+    await settle();
+    store.dispatch({
+      ref,
+      workflowId: "deploy.yml",
+      expectedDefinitionSha: "definition-1",
+      dispatchRef: "main",
+      inputs: {},
+    });
+    await settle();
+    expect(store.getRuns(ref)[0]?.status).toBe("queued");
+    store.refreshRuns(ref);
+    await settle();
+    expect(store.getRuns(ref)[0]?.status).toBe("completed");
+  });
+
   it("retains the dispatched run when an older first page finishes afterward", async () => {
     const pageReady = Promise.withResolvers<void>();
     globalThis.fetch = async (input, init) => {
@@ -493,7 +557,7 @@ describe("workflow actions store", () => {
 
     store.applyDispatchProgress({
       ...progress("located", "dispatch-1", run("run-x", "queued")),
-      platform_repo_id: "repo-other",
+      platform_repo_id: 1016,
     } as WorkflowDispatchProgressEvent);
     expect(store.getDispatch(ref, "deploy.yml")).toEqual({ kind: "locating", dispatchId: "dispatch-1" });
     expect(store.getSnapshot(otherRef)).toBeNull();

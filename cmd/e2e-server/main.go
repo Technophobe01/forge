@@ -29,27 +29,32 @@ import (
 	"syscall"
 	"time"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/federation"
 	"go.kenn.io/forge/internal/federationauth"
 	"go.kenn.io/forge/internal/gitclone"
 	ghclient "go.kenn.io/forge/internal/github"
+	"go.kenn.io/forge/internal/mcpserver"
 	"go.kenn.io/forge/internal/procutil"
 	"go.kenn.io/forge/internal/profiler"
 	"go.kenn.io/forge/internal/ptyowner"
 	"go.kenn.io/forge/internal/server"
+	"go.kenn.io/forge/internal/server/authapi"
+	"go.kenn.io/forge/internal/server/hostapi"
 	"go.kenn.io/forge/internal/server/httpapi"
+	"go.kenn.io/forge/internal/server/syncevents"
 	"go.kenn.io/forge/internal/server/workspaceapi"
 	"go.kenn.io/forge/internal/stacks"
 	"go.kenn.io/forge/internal/testutil"
 	"go.kenn.io/forge/internal/testutil/federationtest"
-	"go.kenn.io/forge/internal/tokenauth"
 	"go.kenn.io/forge/internal/web"
 	"go.kenn.io/forge/internal/workspace"
+	"go.kenn.io/forge/internal/workspace/localruntime"
 	"go.kenn.io/forge/platform"
 	platformgithub "go.kenn.io/forge/platform/github"
+	"go.kenn.io/kit/atomicfile"
 	gitcmd "go.kenn.io/kit/git/cmd"
 	oteltelemetry "go.kenn.io/kit/telemetry"
 )
@@ -73,6 +78,14 @@ const (
 )
 
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "acp-owner" {
+		if err := localruntime.RunACPOwner(context.Background(), os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	scenario := flag.String("scenario", "", "fixture scenario (archive-context)")
 	port := flag.Int("port", 0, "port to listen on (0 selects a random free port)")
 	roborev := flag.String(
 		"roborev", defaultRoborevEndpoint,
@@ -99,6 +112,10 @@ func main() {
 		"server-info-file", "",
 		"path to write discovered server port info as JSON",
 	)
+	markdownVideo := flag.String(
+		"markdown-video", "",
+		"serve this local clip as a synthetic GitHub video attachment",
+	)
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(
@@ -106,7 +123,6 @@ func main() {
 		syscall.SIGINT,
 		syscall.SIGTERM,
 	)
-	defer stop()
 
 	var err error
 	if *federatedForges {
@@ -120,8 +136,11 @@ func main() {
 			*defaultPlatformHost,
 			*visibleImportedModes,
 			*providerCollision,
+			*scenario,
+			*markdownVideo,
 		)
 	}
+	stop()
 	if err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
@@ -152,16 +171,10 @@ type e2eFederationInfo struct {
 	SpokeBNodeID string `json:"spoke_b_node_id"`
 }
 
-type staticTokenSource string
-
-func (s staticTokenSource) Token(context.Context) (string, error) {
-	return string(s), nil
-}
-
-func (s staticTokenSource) Invalidate(string) {}
-
-func (s staticTokenSource) Descriptor() tokenauth.Descriptor {
-	return tokenauth.Descriptor{Key: tokenauth.Key{Platform: "github", Host: "github.com"}}
+func newE2EGraphQLFetcher(rateTracker *ghclient.RateTracker) *ghclient.GraphQLFetcher {
+	// The fetcher exposes seeded rate data. No credential source means
+	// AuthTransport rejects reads locally, preserving stored fixture state.
+	return ghclient.NewGraphQLFetcher(nil, "e2e.invalid", rateTracker, nil)
 }
 
 const (
@@ -669,7 +682,7 @@ type globRefreshContextKey struct{}
 
 func e2eGit(ctx context.Context, dir string, args ...string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("git: no args")
+		return errors.New("git: no args")
 	}
 	cmd := gitcmd.New().Command(ctx, dir, args...)
 	cmd.Env = append(cmd.Env,
@@ -742,7 +755,7 @@ func activityIdentityRepoRef(repo db.Repo, configuredRepoPath string) ghclient.R
 		Name:               repo.Name,
 		PlatformHost:       repo.PlatformHost,
 		RepoPath:           repo.RepoPath,
-		PlatformExternalID: repo.PlatformRepoID,
+		Key:                repo.Key,
 		WebURL:             repo.WebURL,
 		CloneURL:           repo.CloneURL,
 		DefaultBranch:      repo.DefaultBranch,
@@ -878,14 +891,14 @@ func seedReviewSuggestionFixture(
 		return fmt.Errorf("get review suggestion repo: %w", err)
 	}
 	if repo == nil {
-		return fmt.Errorf("get review suggestion repo: not found")
+		return errors.New("get review suggestion repo: not found")
 	}
 	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, number)
 	if err != nil {
 		return fmt.Errorf("get review suggestion pull request: %w", err)
 	}
 	if mr == nil {
-		return fmt.Errorf("get review suggestion pull request: not found")
+		return errors.New("get review suggestion pull request: not found")
 	}
 
 	const providerThreadID = "e2e-review-suggestion-1"
@@ -1011,23 +1024,23 @@ func seedGitLabReadOnlyCapabilityFixture(
 ) error {
 	now := time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC)
 	issue, events := gitLabReadOnlyIssueFixture(now, cloneURL)
-	repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
-		Platform:       "gitlab",
-		PlatformHost:   "gitlab.example.com",
-		PlatformRepoID: "7001",
-		Owner:          issue.Repo.Owner,
-		Name:           issue.Repo.Name,
-		RepoPath:       issue.Repo.RepoPath,
-	})
+	repoID, err := e2eObserveRepo(
+		ctx, database, db.RepoIdentity{
+			Platform:     "gitlab",
+			PlatformHost: "gitlab.example.com",
+			Key:          platform.RepositoryIDKey(7001),
+			Owner:        issue.Repo.Owner,
+			Name:         issue.Repo.Name,
+			RepoPath:     issue.Repo.RepoPath,
+		})
 	if err != nil {
 		return fmt.Errorf("upsert gitlab repo: %w", err)
 	}
-	if err := database.UpdateRepoProviderMetadata(ctx, repoID, db.RepoProviderMetadata{
-		PlatformRepoID: "7001",
-		WebURL:         issue.Repo.WebURL,
-		CloneURL:       issue.Repo.CloneURL,
-		DefaultBranch:  issue.Repo.DefaultBranch,
-	}); err != nil {
+	if err := database.UpdateRepoProviderObservation(ctx, repoID, db.RepoProviderMetadata{
+		WebURL:        issue.Repo.WebURL,
+		CloneURL:      issue.Repo.CloneURL,
+		DefaultBranch: issue.Repo.DefaultBranch,
+	}, nil, nil); err != nil {
 		return fmt.Errorf("update gitlab repo metadata: %w", err)
 	}
 	issueID, err := database.UpsertIssue(ctx, &db.Issue{
@@ -1068,16 +1081,15 @@ func seedGitLabReadOnlyCapabilityFixture(
 func giteaProviderCollisionIssue(now time.Time) platform.Issue {
 	return platform.Issue{
 		Repo: platform.RepoRef{
-			Platform:           platform.KindGitea,
-			Host:               "github.com",
-			Owner:              "acme",
-			Name:               "widgets",
-			RepoPath:           "acme/widgets",
-			PlatformID:         9100,
-			PlatformExternalID: "gitea-acme-widgets",
-			WebURL:             "https://github.com/acme/widgets",
-			CloneURL:           "https://github.com/acme/widgets.git",
-			DefaultBranch:      "main",
+			Platform:      platform.KindGitea,
+			Host:          "github.com",
+			Owner:         "acme",
+			Name:          "widgets",
+			RepoPath:      "acme/widgets",
+			Key:           platform.RepositoryIDKey(9100),
+			WebURL:        "https://github.com/acme/widgets",
+			CloneURL:      "https://github.com/acme/widgets.git",
+			DefaultBranch: "main",
 		},
 		PlatformID:         9101,
 		PlatformExternalID: "gitea-acme-widgets-901",
@@ -1099,14 +1111,15 @@ func seedGiteaProviderCollisionFixture(
 	database *db.DB,
 	issue platform.Issue,
 ) error {
-	repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
-		Platform:       string(issue.Repo.Platform),
-		PlatformHost:   issue.Repo.Host,
-		PlatformRepoID: issue.Repo.PlatformExternalID,
-		Owner:          issue.Repo.Owner,
-		Name:           issue.Repo.Name,
-		RepoPath:       issue.Repo.RepoPath,
-	})
+	repoID, err := e2eObserveRepo(
+		ctx, database, db.RepoIdentity{
+			Platform:     string(issue.Repo.Platform),
+			PlatformHost: issue.Repo.Host,
+			Key:          issue.Repo.Key,
+			Owner:        issue.Repo.Owner,
+			Name:         issue.Repo.Name,
+			RepoPath:     issue.Repo.RepoPath,
+		})
 	if err != nil {
 		return fmt.Errorf("upsert gitea collision repo: %w", err)
 	}
@@ -1270,6 +1283,7 @@ func setPR1CIState(
 // state. The same options feed the initial startup and every
 // /__e2e/reset rebuild.
 type appOptions struct {
+	scenario             string
 	roborevEndpoint      string
 	defaultPlatformHost  string
 	visibleImportedModes bool
@@ -1277,6 +1291,7 @@ type appOptions struct {
 	preferPtyOwner       bool
 	nodeID               string
 	federation           *e2eFederationRuntime
+	markdownVideo        string
 }
 
 type e2eFederationRuntime struct {
@@ -1296,6 +1311,8 @@ type e2eFederationRuntime struct {
 // Playwright tests can reuse the process (and its port) instead of
 // paying a full spawn/teardown per test.
 type appState struct {
+	agentMCPHTTP *httptest.Server
+	agentMCP     *mcpserver.Server
 	tmpDir       string
 	database     *db.DB
 	srv          *server.Server
@@ -1332,9 +1349,9 @@ func (r *appStateRegistry) Swap(next *appState) *appState {
 	return r.current.Swap(next)
 }
 
-func (r *appStateRegistry) closeAsync(close func()) {
+func (r *appStateRegistry) closeAsync(fn func()) {
 	r.closers.Go(func() {
-		close()
+		fn()
 	})
 }
 
@@ -1529,6 +1546,8 @@ func (st *appState) stopTmux() {
 // handlers and background goroutines before the workspace cleanup
 // and database close, mirroring the old process-exit defer ordering.
 func (st *appState) close() {
+	st.agentMCPHTTP.Close()
+	_ = st.agentMCP.Close()
 	// tmux is an isolated test resource, not durable product state. Tear it
 	// down before graceful HTTP draining so a stuck handler cannot strand the
 	// daemon after SIGTERM or a reset.
@@ -1599,6 +1618,9 @@ func buildAppState(
 	assets fs.FS,
 	opts appOptions,
 ) (*appState, error) {
+	if opts.scenario != "" && opts.scenario != "archive-context" {
+		return nil, fmt.Errorf("unknown fixture scenario %q", opts.scenario)
+	}
 	defaultPlatformHost := strings.TrimSpace(opts.defaultPlatformHost)
 	if defaultPlatformHost == "" {
 		defaultPlatformHost = "github.com"
@@ -1725,6 +1747,7 @@ func buildAppState(
 		Host:                "127.0.0.1",
 		Port:                8091,
 		BasePath:            "/",
+		MCP:                 config.MCP{Enabled: new(false)},
 		Repos:               repos,
 		Activity: config.Activity{
 			ViewMode:  "flat",
@@ -1775,7 +1798,7 @@ func buildAppState(
 		if owner == "import-lab" {
 			return []*gh.Repository{
 				{
-					NodeID:      new("repo-import-lab-api"),
+					ID:          new(testutil.FixtureRepoID(owner, "api")),
 					Name:        new("api"),
 					Owner:       &gh.User{Login: new(owner)},
 					Description: new("Import API"),
@@ -1784,7 +1807,7 @@ func buildAppState(
 					PushedAt:    &pushedForge,
 				},
 				{
-					NodeID:      new("repo-import-lab-worker"),
+					ID:          new(testutil.FixtureRepoID(owner, "worker")),
 					Name:        new("worker"),
 					Owner:       &gh.User{Login: new(owner)},
 					Description: new("Import worker"),
@@ -1793,7 +1816,7 @@ func buildAppState(
 					PushedAt:    &pushedWorker,
 				},
 				{
-					NodeID:      new("repo-import-lab-archived"),
+					ID:          new(testutil.FixtureRepoID(owner, "archived")),
 					Name:        new("archived"),
 					Owner:       &gh.User{Login: new(owner)},
 					Description: new("Archived import fixture"),
@@ -1809,7 +1832,7 @@ func buildAppState(
 
 		repos := []*gh.Repository{
 			{
-				NodeID:      new("repo-roborev-dev-kenn-forge"),
+				ID:          new(testutil.FixtureRepoID(owner, "kenn-forge")),
 				Name:        new("kenn-forge"),
 				Owner:       &gh.User{Login: new(owner)},
 				Description: new("Main dashboard"),
@@ -1818,7 +1841,7 @@ func buildAppState(
 				PushedAt:    &pushedForge,
 			},
 			{
-				NodeID:      new("repo-roborev-dev-worker"),
+				ID:          new(testutil.FixtureRepoID(owner, "worker")),
 				Name:        new("worker"),
 				Owner:       &gh.User{Login: new(owner)},
 				Description: new("Background jobs"),
@@ -1827,7 +1850,7 @@ func buildAppState(
 				PushedAt:    &pushedWorker,
 			},
 			{
-				NodeID:      new("repo-roborev-dev-archived"),
+				ID:          new(testutil.FixtureRepoID(owner, "archived")),
 				Name:        new("archived"),
 				Owner:       &gh.User{Login: new(owner)},
 				Description: new("Archived service"),
@@ -1838,7 +1861,7 @@ func buildAppState(
 		}
 		if includeRefreshRepo, _ := ctx.Value(globRefreshContextKey{}).(bool); includeRefreshRepo {
 			repos = append(repos, &gh.Repository{
-				NodeID:      new("repo-roborev-dev-review-bot"),
+				ID:          new(testutil.FixtureRepoID(owner, "review-bot")),
 				Name:        new("review-bot"),
 				Owner:       &gh.User{Login: new(owner)},
 				Description: new("Review automation"),
@@ -1889,7 +1912,17 @@ func buildAppState(
 		}
 	}
 
-	workflowClient := newE2EWorkflowClient(fc)
+	baseWorkflowClient := newE2EWorkflowClient(fc)
+	var workflowClient ghclient.Client = baseWorkflowClient
+	if opts.markdownVideo != "" {
+		if err := seedMarkdownVideoFixture(ctx, database, fc, diffRepo.HeadSHA); err != nil {
+			return nil, err
+		}
+		workflowClient = &e2eMarkdownVideoClient{
+			e2eWorkflowClient: baseWorkflowClient,
+			path:              opts.markdownVideo,
+		}
+	}
 	fixtureClients := map[string]ghclient.Client{
 		"github.com":        workflowClient,
 		defaultPlatformHost: workflowClient,
@@ -1900,28 +1933,28 @@ func buildAppState(
 		cfg.Repos,
 	)
 	for _, repo := range startupResolved.Expanded {
-		if _, err := database.UpsertRepo(
-			ctx, db.RepoIdentity{
-				Platform:       string(repo.Platform),
-				PlatformHost:   repo.PlatformHost,
-				PlatformRepoID: repo.PlatformExternalID,
-				Owner:          repo.Owner,
-				Name:           repo.Name,
-				RepoPath:       repo.RepoPath,
+		if _, err := e2eObserveRepo(
+			ctx, database, db.RepoIdentity{
+				Platform:     string(repo.Platform),
+				PlatformHost: repo.PlatformHost,
+				Key:          repo.Key,
+				Owner:        repo.Owner,
+				Name:         repo.Name,
+				RepoPath:     repo.RepoPath,
 			},
 		); err != nil {
 			return nil, fmt.Errorf("seed startup repo %s/%s: %w", repo.Owner, repo.Name, err)
 		}
 	}
 	if !strings.EqualFold(defaultPlatformHost, "github.com") {
-		if _, err := database.UpsertRepo(
-			ctx, db.RepoIdentity{
-				Platform:       "github",
-				PlatformHost:   defaultPlatformHost,
-				PlatformRepoID: "e2e-enterprise-service",
-				Owner:          "enterprise",
-				Name:           "service",
-				RepoPath:       "enterprise/service",
+		if _, err := e2eObserveRepo(
+			ctx, database, db.RepoIdentity{
+				Platform:     "github",
+				PlatformHost: defaultPlatformHost,
+				Key:          platform.RepositoryIDKey(7201),
+				Owner:        "enterprise",
+				Name:         "service",
+				RepoPath:     "enterprise/service",
 			},
 		); err != nil {
 			return nil, fmt.Errorf("seed default-host repo: %w", err)
@@ -1986,8 +2019,8 @@ func buildAppState(
 					Owner:    "acme",
 					Name:     "widgets",
 					RepoPath: "acme/widgets",
+					Key:      platform.RepositoryIDKey(9100),
 				},
-				PlatformID:    9100,
 				Description:   "Gitea provider collision repo",
 				Private:       false,
 				UpdatedAt:     giteaCollisionIssue.UpdatedAt,
@@ -2017,14 +2050,14 @@ func buildAppState(
 							Owner:    "forge-lab",
 							Name:     "service",
 							RepoPath: "forge-lab/service",
+							Key:      platform.RepositoryIDKey(8101),
 						},
-						PlatformExternalID: "forgejo-repo-service",
-						Description:        "Forgejo service",
-						Private:            false,
-						UpdatedAt:          forgeUpdated,
-						DefaultBranch:      "main",
-						WebURL:             "https://codeberg.org/forge-lab/service",
-						CloneURL:           "https://codeberg.org/forge-lab/service.git",
+						Description:   "Forgejo service",
+						Private:       false,
+						UpdatedAt:     forgeUpdated,
+						DefaultBranch: "main",
+						WebURL:        "https://codeberg.org/forge-lab/service",
+						CloneURL:      "https://codeberg.org/forge-lab/service.git",
 					},
 					{
 						Ref: platform.RepoRef{
@@ -2033,9 +2066,9 @@ func buildAppState(
 							Owner:    "forge-lab",
 							Name:     "archived",
 							RepoPath: "forge-lab/archived",
+							Key:      platform.RepositoryIDKey(8102),
 						},
-						PlatformExternalID: "forgejo-repo-archived",
-						Archived:           true,
+						Archived: true,
 					},
 				},
 			},
@@ -2053,14 +2086,14 @@ func buildAppState(
 							Owner:    "gitea-team",
 							Name:     "service",
 							RepoPath: "gitea-team/service",
+							Key:      platform.RepositoryIDKey(8201),
 						},
-						PlatformExternalID: "gitea-repo-service",
-						Description:        "Gitea service",
-						Private:            false,
-						UpdatedAt:          giteaUpdated,
-						DefaultBranch:      "main",
-						WebURL:             "https://gitea.com/gitea-team/service",
-						CloneURL:           "https://gitea.com/gitea-team/service.git",
+						Description:   "Gitea service",
+						Private:       false,
+						UpdatedAt:     giteaUpdated,
+						DefaultBranch: "main",
+						WebURL:        "https://gitea.com/gitea-team/service",
+						CloneURL:      "https://gitea.com/gitea-team/service.git",
 					},
 					{
 						Ref: platform.RepoRef{
@@ -2069,11 +2102,11 @@ func buildAppState(
 							Owner:    "gitea-team",
 							Name:     "private-service",
 							RepoPath: "gitea-team/private-service",
+							Key:      platform.RepositoryIDKey(8202),
 						},
-						PlatformExternalID: "gitea-repo-private-service",
-						Description:        "Private Gitea service",
-						Private:            true,
-						UpdatedAt:          giteaUpdated.Add(-time.Hour),
+						Description: "Private Gitea service",
+						Private:     true,
+						UpdatedAt:   giteaUpdated.Add(-time.Hour),
 					},
 					{
 						Ref: platform.RepoRef{
@@ -2082,9 +2115,9 @@ func buildAppState(
 							Owner:    "gitea-team",
 							Name:     "archived",
 							RepoPath: "gitea-team/archived",
+							Key:      platform.RepositoryIDKey(8203),
 						},
-						PlatformExternalID: "gitea-repo-archived",
-						Archived:           true,
+						Archived: true,
 					},
 				},
 			},
@@ -2132,9 +2165,7 @@ func buildAppState(
 	)
 
 	// Wire GraphQL fetcher so GQL rate data appears in the endpoint.
-	gqlFetcher := ghclient.NewGraphQLFetcher(
-		staticTokenSource("fake-token"), "github.com", gqlRT, budget,
-	)
+	gqlFetcher := newE2EGraphQLFetcher(gqlRT)
 	syncer.SetFetchers(map[string]*ghclient.GraphQLFetcher{
 		"github.com":        gqlFetcher,
 		defaultPlatformHost: gqlFetcher,
@@ -2151,8 +2182,17 @@ func buildAppState(
 		PtyOwnerInProcess:             opts.preferPtyOwner,
 		FederationSpokeID:             opts.nodeID,
 	}
+	if opts.scenario == "archive-context" {
+		service, err := seedArchiveContext(ctx, database, registry)
+		if err != nil {
+			return nil, err
+		}
+		serverOptions.Archive = service
+		// Keep cached inventory readable while scenario controls own observations.
+		serverSyncer.DisableSync()
+	}
 	if opts.federation != nil {
-		serverOptions.DaemonAccess = server.DaemonAccessOptions{
+		serverOptions.DaemonAccess = authapi.DaemonAccessOptions{
 			Token: opts.federation.localToken, RequireAPIAuth: true,
 		}
 		serverOptions.FederationCredentials = opts.federation.credentials
@@ -2164,23 +2204,63 @@ func buildAppState(
 			serverSyncer = nil
 		}
 	}
+	// Match production's dedicated agent endpoint. Browser tests can now
+	// exercise MCP tool results over ACP instead of injecting mock content.
+	if serverOptions.DaemonAccess.Token == "" {
+		serverOptions.DaemonAccess.Token = cryptorand.Text()
+	}
+	mcpSwitch := hostapi.NewSwitchHandler(http.NotFoundHandler())
+	agentMCPHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+serverOptions.DaemonAccess.Token {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		mcpSwitch.ServeHTTP(w, r)
+	}))
+	defer func() {
+		if !built {
+			agentMCPHTTP.Close()
+		}
+	}()
+	serverOptions.AgentMCPURL = agentMCPHTTP.URL + "/mcp"
 	srv := server.NewWithConfig(
 		database, serverSyncer, diffRepo.Manager, assets, cfg, cfgPath,
 		serverOptions,
 	)
+	agentMCP, err := mcpserver.New(mcpserver.Options{Backend: srv.MCPBackend(), Version: "e2e"})
+	if err != nil {
+		return nil, err
+	}
+	mcpSwitch.Swap(agentMCP.HTTPHandler())
+	// Mirror production status events so connected clients observe sync completion.
+	if serverSyncer != nil {
+		wasRunning := syncer.Status().Running
+		syncer.SetOnStatusChange(func(status *ghclient.SyncStatus) {
+			srv.Hub().Broadcast(syncevents.Event{Type: "sync_status", Data: status})
+			if wasRunning && !status.Running {
+				srv.Hub().Broadcast(syncevents.Event{Type: "data_changed", Data: struct{}{}})
+			}
+			wasRunning = status.Running
+		})
+		srv.Hub().Broadcast(syncevents.Event{Type: "sync_status", Data: syncer.Status()})
+	}
 	// Mirror production wiring so notification syncs nudge an open activity
 	// feed to reload (the feed's incremental poll skips backfilled rows).
 	syncer.SetOnNotificationSyncComplete(func() {
-		srv.Hub().Broadcast(server.Event{Type: "data_changed", Data: struct{}{}})
+		srv.Hub().Broadcast(syncevents.Event{Type: "data_changed", Data: struct{}{}})
 	})
 	syncer.SetOnWatchedMRSyncCompleted(func() {
-		srv.Hub().Broadcast(server.Event{Type: "data_changed", Data: struct{}{}})
+		srv.Hub().Broadcast(syncevents.Event{Type: "data_changed", Data: struct{}{}})
 	})
 	var failNextRepoBrowserTree atomic.Bool
 	var failNextNotificationRead atomic.Bool
 	forkGitRoot := filepath.Join(tmpDir, "forks")
 	forkGitHandler := http.FileServer(http.Dir(forkGitRoot))
 	rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if opts.scenario == "archive-context" && r.Method == http.MethodPost && r.URL.Path == "/__e2e/archive-context" {
+			archiveContextControl(database, w, r)
+			return
+		}
 		if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
 			strings.EqualFold(r.Host, "github.com") &&
 			strings.HasPrefix(r.URL.Path, "/forker/widgets.git/") {
@@ -2190,7 +2270,7 @@ func buildAppState(
 		if r.Method == http.MethodPost &&
 			r.URL.Path == "/__e2e/issue-workspace/reused-branch" {
 			identityClonePath, err := diffRepo.Manager.ClonePathForContext(
-				gitclone.WithRepositoryIdentity(r.Context(), diffRepo.PlatformRepoID),
+				gitclone.WithRepositoryIdentity(r.Context(), platform.RepositoryIdentity{Key: diffRepo.Key}),
 				"github", "github.com", "acme", "widgets",
 			)
 			if err != nil {
@@ -2238,7 +2318,7 @@ func buildAppState(
 			forkSnapshot := *mr
 			forkSnapshot.UpdatedAt = time.Now().UTC()
 			clonePath, err := diffRepo.Manager.ClonePathForContext(
-				gitclone.WithRepositoryIdentity(r.Context(), diffRepo.PlatformRepoID),
+				gitclone.WithRepositoryIdentity(r.Context(), platform.RepositoryIdentity{Key: diffRepo.Key}),
 				"github", "github.com", "acme", "widgets",
 			)
 			if err != nil {
@@ -2346,7 +2426,6 @@ func buildAppState(
 			number := 1
 			body := "Pull request detail activity older than the feed cursor"
 			commitSuffix := "1"
-			parentID := int64(0)
 			mr, err := database.GetMergeRequest(
 				r.Context(), "github", "github.com", "acme", "widgets", number,
 			)
@@ -2354,7 +2433,7 @@ func buildAppState(
 				http.Error(w, "pull request not found", http.StatusNotFound)
 				return
 			}
-			parentID = mr.ID
+			parentID := mr.ID
 			if itemType == "issue" {
 				number = 10
 				body = "Issue detail activity older than the feed cursor"
@@ -2479,7 +2558,7 @@ func buildAppState(
 					return
 				}
 			}
-			eventID := srv.Hub().Broadcast(server.Event{Type: "data_changed", Data: struct{}{}})
+			eventID := srv.Hub().Broadcast(syncevents.Event{Type: "data_changed", Data: struct{}{}})
 			w.Header().Set("X-Kenn-E2E-Event-ID", strconv.FormatUint(eventID, 10))
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -2544,7 +2623,7 @@ func buildAppState(
 				return
 			}
 			w.Header().Set("X-Kenn-E2E-Parent-Activity-At", activityAt.Format(time.RFC3339Nano))
-			srv.Hub().Broadcast(server.Event{Type: "data_changed", Data: struct{}{}})
+			srv.Hub().Broadcast(syncevents.Event{Type: "data_changed", Data: struct{}{}})
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -2574,7 +2653,7 @@ func buildAppState(
 				http.Error(w, "reconcile fixture pull request comments", http.StatusInternalServerError)
 				return
 			}
-			eventID := srv.Hub().Broadcast(server.Event{Type: "data_changed", Data: struct{}{}})
+			eventID := srv.Hub().Broadcast(syncevents.Event{Type: "data_changed", Data: struct{}{}})
 			w.Header().Set("X-Kenn-E2E-Event-ID", strconv.FormatUint(eventID, 10))
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -2606,72 +2685,6 @@ func buildAppState(
 				"Viewed hot fast-sync comment",
 			); err != nil {
 				http.Error(w, "create provider pull request comment", http.StatusInternalServerError)
-				return
-			}
-
-			syncer.SyncWatchedMRs(r.Context())
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		if r.Method == http.MethodPost &&
-			r.URL.Path == "/__e2e/activity/notification-fast-sync" {
-			if srv.SubscriberCount() == 0 {
-				http.Error(w, "event stream not connected", http.StatusConflict)
-				return
-			}
-			mr, err := database.GetMergeRequest(
-				r.Context(), "github", "github.com", "acme", "widgets", 1,
-			)
-			if err != nil || mr == nil {
-				http.Error(w, "pull request not found", http.StatusNotFound)
-				return
-			}
-
-			now := time.Now().UTC()
-			if _, err := database.WriteDB().ExecContext(r.Context(), `
-				UPDATE forge_merge_requests
-				SET last_activity_at = ?, detail_fetched_at = ?
-				WHERE id = ?`,
-				now.Add(-5*time.Hour), now.Add(-10*time.Minute), mr.ID,
-			); err != nil {
-				http.Error(w, "make pull request detail stale", http.StatusInternalServerError)
-				return
-			}
-			if _, err := database.WriteDB().ExecContext(r.Context(), `
-				DELETE FROM forge_hot_merge_requests
-				WHERE merge_request_id = ?`, mr.ID); err != nil {
-				http.Error(w, "clear pull request hot view", http.StatusInternalServerError)
-				return
-			}
-			if _, err := fc.CreateIssueComment(
-				r.Context(), "acme", "widgets", 1,
-				"Notification-driven fast-sync comment",
-			); err != nil {
-				http.Error(w, "create provider pull request comment", http.StatusInternalServerError)
-				return
-			}
-			number := 1
-			repoID := mr.RepoID
-			if err := database.UpsertNotifications(r.Context(), []db.Notification{{
-				Platform:               "github",
-				PlatformHost:           "github.com",
-				PlatformNotificationID: "notif-activity-fast-sync-1",
-				RepoID:                 &repoID,
-				RepoOwner:              "acme",
-				RepoName:               "widgets",
-				SubjectType:            "PullRequest",
-				SubjectTitle:           "Add widget caching layer",
-				WebURL:                 "https://github.com/acme/widgets/pull/1",
-				ItemNumber:             &number,
-				ItemType:               "pr",
-				ItemAuthor:             "alice",
-				Reason:                 "comment",
-				Unread:                 true,
-				Participating:          true,
-				SourceUpdatedAt:        now,
-				SyncedAt:               now,
-			}}); err != nil {
-				http.Error(w, "persist pull request notification", http.StatusInternalServerError)
 				return
 			}
 
@@ -2713,9 +2726,8 @@ func buildAppState(
 			const (
 				originalRepoPath    = "acme/widgets"
 				renamedRepoPath     = "acme/widgets-renamed"
-				replacementProvider = "e2e-replacement-widgets"
+				replacementProvider = 990100
 			)
-			observedAt := time.Now().UTC().Add(time.Minute)
 			var entry *db.RepositoryCatalogEntry
 			var err error
 			switch r.URL.Query().Get("phase") {
@@ -2727,14 +2739,18 @@ func buildAppState(
 					http.Error(w, "original repository not found", http.StatusNotFound)
 					return
 				}
-				entry, _, err = database.ReconcileRepositoryObservation(r.Context(), db.RepoIdentity{
-					Platform:       original.Platform,
-					PlatformHost:   original.PlatformHost,
-					PlatformRepoID: original.PlatformRepoID,
-					Owner:          "acme",
-					Name:           "widgets-renamed",
-					RepoPath:       renamedRepoPath,
-				}, observedAt)
+				// The fixture still serves this ID at its seeded route, and a
+				// sync pass observing that would undo the rename.
+				originalID, _ := original.Key.ID()
+				fc.ForgetRepository(originalID)
+				entry, err = database.ObserveRepository(r.Context(), db.RepoIdentity{
+					Platform:     original.Platform,
+					PlatformHost: original.PlatformHost,
+					Key:          original.Key,
+					Owner:        "acme",
+					Name:         "widgets-renamed",
+					RepoPath:     renamedRepoPath,
+				})
 				if err == nil && entry != nil {
 					_, err = database.WriteDB().ExecContext(r.Context(), `
 						UPDATE forge_merge_requests
@@ -2744,14 +2760,14 @@ func buildAppState(
 					)
 				}
 			case "reuse":
-				entry, _, err = database.ReconcileRepositoryObservation(r.Context(), db.RepoIdentity{
-					Platform:       "github",
-					PlatformHost:   "github.com",
-					PlatformRepoID: replacementProvider,
-					Owner:          "acme",
-					Name:           "widgets",
-					RepoPath:       originalRepoPath,
-				}, observedAt.Add(time.Minute))
+				entry, err = database.ObserveRepository(r.Context(), db.RepoIdentity{
+					Platform:     "github",
+					PlatformHost: "github.com",
+					Key:          platform.RepositoryIDKey(replacementProvider),
+					Owner:        "acme",
+					Name:         "widgets",
+					RepoPath:     originalRepoPath,
+				})
 				if err == nil && entry != nil {
 					now := time.Now().UTC().Truncate(time.Second)
 					_, err = database.UpsertMergeRequest(r.Context(), &db.MergeRequest{
@@ -2780,10 +2796,15 @@ func buildAppState(
 				activityIdentityRepoRef(entry.Repository, originalRepoPath),
 			})
 			w.Header().Set("Content-Type", "application/json")
-			if err := json.MarshalWrite(w, map[string]string{
-				"platform_repo_id": entry.Repository.PlatformRepoID,
+			repoID, _ := entry.Repository.Key.Wire()
+			body := map[string]any{
+				"platform_repo_id": repoID,
 				"repo_path":        entry.Repository.RepoPath,
-			}); err != nil {
+			}
+			if repositoryUUID, ok := entry.Repository.Key.UUID(); ok {
+				body["bitbucket_repository_uuid"] = repositoryUUID
+			}
+			if err := json.MarshalWrite(w, body); err != nil {
 				slog.Warn("write repository identity fixture response", "err", err)
 			}
 			return
@@ -3253,7 +3274,7 @@ func buildAppState(
 				fc, "acme", "widgets", 1,
 				diffRepo.AltHeadSHA, diffRepo.BaseSHA,
 			)
-			eventID := srv.Hub().Broadcast(server.Event{
+			eventID := srv.Hub().Broadcast(syncevents.Event{
 				Type: "pr_detail_refreshed",
 				Data: workspaceapi.PRDetailRefreshedPayload{
 					Provider:     "github",
@@ -3353,7 +3374,7 @@ func buildAppState(
 			if headSHA == "" {
 				headSHA = fc.PullRequestHeadSHA("acme", "widgets", 1)
 			}
-			srv.Hub().Broadcast(server.Event{
+			srv.Hub().Broadcast(syncevents.Event{
 				Type: "pr_detail_refreshed",
 				Data: map[string]any{
 					"provider":      repo.Platform,
@@ -3393,16 +3414,18 @@ func buildAppState(
 
 	built = true
 	return &appState{
-		tmpDir:      tmpDir,
-		database:    database,
-		srv:         srv,
-		handler:     rootHandler,
-		cfgPath:     cfgPath,
-		worktreeDir: e2eWorktreeDir,
-		tmuxCommand: tmuxCommand,
-		tmuxGate:    tmuxGate,
-		ptyOwner:    opts.preferPtyOwner,
-		clones:      diffRepo.Manager,
+		agentMCPHTTP: agentMCPHTTP,
+		agentMCP:     agentMCP,
+		tmpDir:       tmpDir,
+		database:     database,
+		srv:          srv,
+		handler:      rootHandler,
+		cfgPath:      cfgPath,
+		worktreeDir:  e2eWorktreeDir,
+		tmuxCommand:  tmuxCommand,
+		tmuxGate:     tmuxGate,
+		ptyOwner:     opts.preferPtyOwner,
+		clones:       diffRepo.Manager,
 	}, nil
 }
 
@@ -3725,6 +3748,8 @@ func run(
 	roborevEndpoint, serverInfoFile, defaultPlatformHost string,
 	visibleImportedModes bool,
 	providerCollision bool,
+	scenario string,
+	markdownVideo string,
 ) error {
 	assets, err := web.Assets()
 	if err != nil {
@@ -3732,11 +3757,13 @@ func run(
 	}
 
 	baseOpts := appOptions{
+		scenario:             scenario,
 		roborevEndpoint:      roborevEndpoint,
 		defaultPlatformHost:  defaultPlatformHost,
 		visibleImportedModes: visibleImportedModes,
 		providerCollision:    providerCollision,
 		nodeID:               e2eStandaloneNodeID,
+		markdownVideo:        markdownVideo,
 	}
 
 	state, err := buildAppState(ctx, assets, baseOpts)
@@ -3753,7 +3780,7 @@ func run(
 		states.waitForClosers()
 	}()
 
-	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
@@ -3818,7 +3845,7 @@ func run(
 	}
 	defer cleanupServerInfoFile(serverInfoFile)
 
-	slog.Info(fmt.Sprintf("starting e2e server at %s", info.BaseURL))
+	slog.Info("starting e2e server at " + info.BaseURL)
 
 	// /__e2e/reset rebuilds the full fixture state in-process and
 	// swaps it in, so Playwright can reuse one server process (and
@@ -3988,14 +4015,14 @@ func writeServerInfoFile(path string, info e2eServerInfo) error {
 		return fmt.Errorf("marshal server info: %w", err)
 	}
 
-	tmpPath := path + ".tmp"
 	// Federation-mode server info contains local API bearers for its three
-	// isolated daemons. Keep the file private even in a caller-supplied directory.
-	if err := os.WriteFile(tmpPath, append(content, '\n'), 0o600); err != nil {
-		return fmt.Errorf("write temp server info file: %w", err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("rename server info file: %w", err)
+	// isolated daemons. Keep the file private (0600, atomicfile's default)
+	// even in a caller-supplied directory.
+	// ErrPublished means the file is already in place and only a later
+	// directory fsync failed.
+	err = atomicfile.WriteFile(path, append(content, '\n'))
+	if err != nil && !errors.Is(err, atomicfile.ErrPublished) {
+		return fmt.Errorf("write server info file: %w", err)
 	}
 	return nil
 }
@@ -4020,7 +4047,12 @@ func cleanupE2EWorkspaces(
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	manager := workspace.NewManager(database, worktreeDir)
+	coordinator, err := workspace.NewRepositoryCoordinator(worktreeDir)
+	if err != nil {
+		slog.Warn("e2e workspace cleanup coordination failed", "err", err)
+		return
+	}
+	manager := workspace.NewManager(database, worktreeDir, coordinator)
 	manager.SetTmuxCommand(tmuxCmd)
 	if preferPtyOwner {
 		manager.SetPtyOwnerClient(&ptyowner.Client{
@@ -4044,4 +4076,14 @@ func cleanupE2EWorkspaces(
 			)
 		}
 	}
+}
+
+// e2eObserveRepo records a seeded repository as the provider would report it
+// and returns its row ID.
+func e2eObserveRepo(ctx context.Context, database *db.DB, identity db.RepoIdentity) (int64, error) {
+	entry, err := database.ObserveRepository(ctx, identity)
+	if err != nil {
+		return 0, err
+	}
+	return entry.Repository.ID, nil
 }

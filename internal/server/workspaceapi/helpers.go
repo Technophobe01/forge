@@ -3,6 +3,7 @@ package workspaceapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"mime"
 	"net/http"
@@ -34,7 +35,7 @@ func expandHomeCWD(cwd string) string {
 
 func (s *Handler) lookupRepoByProviderRoute(
 	ctx context.Context, provider, platformHost, owner, name string,
-) (*db.Repo, error) {
+) (*db.ActiveRepo, error) {
 	if s.lookupRepo != nil {
 		return s.lookupRepo(ctx, provider, platformHost, owner, name)
 	}
@@ -53,8 +54,7 @@ func providerRouteLookupError(err error) error {
 	if errors.Is(err, httpapi.ErrRepoNotFound) {
 		return httpapi.NotFound(httpapi.CodeRepoNotFound, "repo not found", nil)
 	}
-	if strings.Contains(err.Error(), "platform_host is required") ||
-		strings.Contains(err.Error(), "unsupported platform") {
+	if errors.Is(err, httpapi.ErrPlatformHostRequired) || errors.Is(err, httpapi.ErrUnsupportedPlatform) {
 		return httpapi.BadRequest(httpapi.CodeBadRequest, err.Error(), nil)
 	}
 	return httpapi.Internal("get repo failed")
@@ -78,7 +78,7 @@ func repoProviderHost(repo db.Repo) string {
 }
 
 func (s *Handler) repoRefFromParts(
-	provider, host, owner, name string,
+	provider, host, owner, name string, repoKey platform.RepositoryKey,
 ) httpapi.RepoRefResponse {
 	provider = strings.TrimSpace(provider)
 	if provider == "" {
@@ -86,6 +86,7 @@ func (s *Handler) repoRefFromParts(
 	}
 	resp := httpapi.RepoRefResponse{
 		Provider: provider, PlatformHost: host,
+		Key:      repoKey,
 		RepoPath: owner + "/" + name, Owner: owner, Name: name,
 	}
 	if s.resolver != nil {
@@ -118,7 +119,7 @@ func normalizeRouteProvider(raw string) (string, error) {
 	}
 	kind, err := platform.NormalizeKind(raw)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: %w", httpapi.ErrUnsupportedPlatform, err)
 	}
 	return string(kind), nil
 }
@@ -169,9 +170,9 @@ func toWorkspaceResponse(summary *db.WorkspaceSummary) workspaceResponse {
 		ID: summary.ID,
 		Repo: httpapi.RepoRefResponse{
 			Provider: summary.Platform, PlatformHost: summary.PlatformHost,
-			PlatformRepoID: summary.RepoPlatformID,
-			RepoPath:       summary.RepoOwner + "/" + summary.RepoName,
-			Owner:          summary.RepoOwner, Name: summary.RepoName,
+			Key:      summary.RepoKey,
+			RepoPath: summary.RepoOwner + "/" + summary.RepoName,
+			Owner:    summary.RepoOwner, Name: summary.RepoName,
 		},
 		PlatformHost:       summary.PlatformHost,
 		RepoOwner:          summary.RepoOwner,
@@ -188,6 +189,7 @@ func toWorkspaceResponse(summary *db.WorkspaceSummary) workspaceResponse {
 		ErrorMessage:       summary.ErrorMessage,
 		CreatedAt:          summary.CreatedAt.UTC().Format(time.RFC3339),
 		ItemLastActivityAt: itemLastActivityAt,
+		ItemAuthor:         summary.ItemAuthor,
 		MRTitle:            summary.MRTitle,
 		MRState:            summary.MRState,
 		MRIsDraft:          summary.MRIsDraft,

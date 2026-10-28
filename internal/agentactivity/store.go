@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"go.kenn.io/kit/atomicfile"
 )
 
 type State string
@@ -27,13 +29,23 @@ const (
 
 const RuntimeSessionKeyEnv = "KENN_FORGE_RUNTIME_SESSION_KEY"
 
+var (
+	errInvalidReport = errors.New("invalid report")
+	errEmptyReport   = errors.New("empty report")
+)
+
 type Report struct {
-	Agent             string    `json:"agent"`
-	SessionID         string    `json:"session_id"`
-	RuntimeSessionKey string    `json:"runtime_session_key"`
-	CWD               string    `json:"cwd"`
-	State             State     `json:"state"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	Agent             string `json:"agent"`
+	SessionID         string `json:"session_id"`
+	RuntimeSessionKey string `json:"runtime_session_key"`
+	CWD               string `json:"cwd"`
+	State             State  `json:"state"`
+	// Continued marks an idle session that resumed or forked an earlier
+	// conversation, rather than one that started fresh. A compaction is not one:
+	// it can fire mid-turn.
+	Continued   bool      `json:"continued,omitempty"`
+	PendingWork bool      `json:"pending_work,omitempty"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type Snapshot struct {
@@ -41,29 +53,52 @@ type Snapshot struct {
 	UpdatedAt time.Time
 }
 
+type storedReport struct {
+	Report
+	path string
+}
+
 // HookEvent is the agent-neutral lifecycle payload shared by hook integrations.
-// Agent-specific payload fields are ignored unless they affect activity state.
+// Agent-specific payload fields are ignored unless they affect activity or idle stop.
 type HookEvent struct {
-	SessionID        string   `json:"session_id"`
-	CWD              string   `json:"cwd"`
-	HookEventName    string   `json:"hook_event_name"`
-	ToolName         string   `json:"tool_name,omitempty"`
-	NotificationType string   `json:"notification_type,omitempty"`
-	AgentID          string   `json:"agent_id,omitempty"`
-	_                struct{} `json:"-" additionalProperties:"true"`
+	SessionID        string `json:"session_id"`
+	CWD              string `json:"cwd"`
+	HookEventName    string `json:"hook_event_name"`
+	ToolName         string `json:"tool_name,omitempty"`
+	NotificationType string `json:"notification_type,omitempty"`
+	AgentID          string `json:"agent_id,omitempty"`
+	// Source is how a SessionStart session began: startup, resume, clear, compact or fork.
+	Source string `json:"source,omitempty"`
+	// Reason is why a SessionEnd session ended, as the agent names it. Claude
+	// and the agents that share its reasons report "other" for a termination
+	// signal.
+	Reason          string   `json:"reason,omitempty"`
+	BackgroundTasks any      `json:"background_tasks,omitempty"`
+	SessionCrons    any      `json:"session_crons,omitempty"`
+	_               struct{} `json:"-" additionalProperties:"true"`
 }
 
 type Store struct {
 	root string
 	now  func() time.Time
 
+	// reportLock is a one-token lock serializing each report's read, merge
+	// and write, so one event's merge can't overwrite another's concurrent
+	// update.
+	reportLock chan struct{}
+
 	cacheMu      sync.Mutex
 	cacheFiles   map[string]os.FileInfo
-	cacheReports []Report
+	cacheReports []storedReport
 }
 
 func NewStore(root string) *Store {
-	return &Store{root: root, now: time.Now}
+	return NewStoreWithClock(root, time.Now)
+}
+
+// NewStoreWithClock timestamps reports using now.
+func NewStoreWithClock(root string, now func() time.Time) *Store {
+	return &Store{root: root, now: now, reportLock: make(chan struct{}, 1)}
 }
 
 func (s *Store) HandleHook(agent string, input io.Reader, runtimeSessionKey string) error {
@@ -97,48 +132,141 @@ func (s *Store) HandleEvent(agent string, hook HookEvent, runtimeSessionKey stri
 	if !ok {
 		return nil
 	}
+	s.reportLock <- struct{}{}
+	defer func() { <-s.reportLock }()
 	if remove {
-		err := os.Remove(s.reportPath(agent, hook.SessionID))
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		if err == nil {
-			s.invalidateCache()
-		}
-		return err
+		return s.remove(agent, hook.SessionID, runtimeSessionKey)
 	}
 
 	cwd, err := canonicalWorkspacePath(hook.CWD)
-	if err != nil {
-		return nil
-	}
-	report := Report{
-		Agent:             agent,
-		SessionID:         hook.SessionID,
-		RuntimeSessionKey: runtimeSessionKey,
-		CWD:               cwd,
-		State:             state,
-		UpdatedAt:         s.now().UTC(),
-	}
-	if state == StateDone {
-		previous, ok := s.readReport(s.reportPath(agent, hook.SessionID))
-		if ok && previous.RuntimeSessionKey == runtimeSessionKey {
-			switch {
-			case isIdlePrompt(hook) && (previous.State == StateInput ||
-				previous.State == StateApproval):
-				// Claude Code raises idle_prompt after a minute of waiting for
-				// input whatever it is waiting for; an unanswered question or
-				// permission prompt is still pending, not finished.
-				return nil
-			case previous.State == StateDone:
+	if err == nil {
+		backgroundTasks, _ := hook.BackgroundTasks.([]any)
+		sessionCrons, _ := hook.SessionCrons.([]any)
+		report := Report{
+			Agent:             agent,
+			SessionID:         hook.SessionID,
+			RuntimeSessionKey: runtimeSessionKey,
+			CWD:               cwd,
+			State:             state,
+			Continued:         state == StateIdle && (hook.Source == "resume" || hook.Source == "fork"),
+			PendingWork:       hook.HookEventName == "Stop" && (len(backgroundTasks) > 0 || len(sessionCrons) > 0),
+		}
+		previous, ok := s.previousReport(agent, hook.SessionID, runtimeSessionKey)
+		if isIdlePrompt(hook) && (!ok || previous.State != StateWorking && previous.State != StateDone) {
+			// Claude Code raises idle_prompt after a minute of waiting for
+			// input whatever it is waiting for. Only a recorded turn makes
+			// it a completion: an unanswered question or permission prompt
+			// is still pending, and a session never prompted has no
+			// conversation to finish or resume.
+			return nil
+		}
+		report.UpdatedAt = s.now().UTC()
+		if ok {
+			if hook.HookEventName != "Stop" {
+				report.PendingWork = previous.PendingWork
+			}
+			if state == StateDone && previous.State == StateDone {
 				// A completion that is already recorded keeps its original
 				// timestamp: idle_prompt follows Stop, and a fresh timestamp
 				// would make an acknowledged "done" reappear as new.
 				report.UpdatedAt = previous.UpdatedAt
 			}
 		}
+		return s.writeReport(report)
+	}
+	return nil
+}
+
+// Record stores state reported directly by a runtime protocol rather than by a
+// hook, such as an ACP connection. A repeated completion keeps its original
+// timestamp so an acknowledged done does not reappear as new.
+func (s *Store) Record(agent, sessionID, runtimeSessionKey, cwd string, state State) error {
+	if s == nil || strings.TrimSpace(s.root) == "" {
+		return nil
+	}
+	agent = strings.ToLower(strings.TrimSpace(agent))
+	sessionID = strings.TrimSpace(sessionID)
+	runtimeSessionKey = strings.TrimSpace(runtimeSessionKey)
+	if agent == "" || sessionID == "" || runtimeSessionKey == "" {
+		return nil
+	}
+	if statePriority(state) == 0 {
+		return fmt.Errorf("unknown agent activity state %q", state)
+	}
+	canonicalCWD, err := canonicalWorkspacePath(cwd)
+	if err != nil {
+		return err
+	}
+	s.reportLock <- struct{}{}
+	defer func() { <-s.reportLock }()
+	report := Report{
+		Agent: agent, SessionID: sessionID, RuntimeSessionKey: runtimeSessionKey,
+		CWD: canonicalCWD, State: state, UpdatedAt: s.now().UTC(),
+	}
+	if state == StateDone {
+		previous, ok := s.previousReport(agent, sessionID, runtimeSessionKey)
+		if ok && previous.State == StateDone {
+			report.UpdatedAt = previous.UpdatedAt
+		}
 	}
 	return s.writeReport(report)
+}
+
+// Remove deletes one session's report when its runtime protocol ends it.
+func (s *Store) Remove(agent, sessionID, runtimeSessionKey string) error {
+	if s == nil || strings.TrimSpace(s.root) == "" {
+		return nil
+	}
+	agent = strings.ToLower(strings.TrimSpace(agent))
+	sessionID = strings.TrimSpace(sessionID)
+	if agent == "" || sessionID == "" {
+		return nil
+	}
+	s.reportLock <- struct{}{}
+	defer func() { <-s.reportLock }()
+	return s.remove(agent, sessionID, runtimeSessionKey)
+}
+
+func (s *Store) remove(agent, sessionID, runtimeSessionKey string) error {
+	legacy := s.legacyReportPath(agent, sessionID)
+	paths := []string{s.reportPath(agent, sessionID, runtimeSessionKey)}
+	var errs []error
+	legacyReport, legacyErr := s.readReport(legacy)
+	ownsLegacy := legacyErr == nil && legacyReport.RuntimeSessionKey == runtimeSessionKey
+	// An empty legacy report holds no activity, so any session may finish deleting it.
+	if ownsLegacy || errors.Is(legacyErr, errEmptyReport) {
+		paths = append(paths, legacy)
+	} else if legacyErr != nil && !errors.Is(legacyErr, os.ErrNotExist) &&
+		!errors.Is(legacyErr, errInvalidReport) {
+		errs = append(errs, legacyErr)
+	}
+	removed := false
+	for _, path := range paths {
+		err := os.Remove(path)
+		switch {
+		case err == nil:
+			removed = true
+		case isReportLockError(err):
+			// Zero-length reports stay hidden until a scan can delete them.
+			writeErr := os.Truncate(path, 0)
+			if writeErr != nil {
+				if info, statErr := os.Stat(path); statErr == nil && info.Size() == 0 {
+					writeErr = nil
+				}
+			}
+			if writeErr != nil {
+				errs = append(errs, errors.Join(err, writeErr))
+			} else {
+				removed = true
+			}
+		case !errors.Is(err, os.ErrNotExist):
+			errs = append(errs, err)
+		}
+	}
+	if removed {
+		s.invalidateCache()
+	}
+	return errors.Join(errs...)
 }
 
 func isIdlePrompt(hook HookEvent) bool {
@@ -182,6 +310,9 @@ func (s *Store) LiveReportsForWorkspace(cwd string, liveSessionKeys []string) []
 		return nil
 	}
 
+	// Reports saved before terminals had their own name can sit beside a newer copy, and an agent started before the upgrade keeps writing the old one.
+	type identity struct{ agent, session, runtime string }
+	newest := make(map[identity]int)
 	reports := make([]Report, 0)
 	for _, report := range s.reports() {
 		if report.CWD != target {
@@ -190,7 +321,15 @@ func (s *Store) LiveReportsForWorkspace(cwd string, liveSessionKeys []string) []
 		if _, ok := live[report.RuntimeSessionKey]; !ok {
 			continue
 		}
-		reports = append(reports, report)
+		id := identity{report.Agent, report.SessionID, report.RuntimeSessionKey}
+		if i, ok := newest[id]; ok {
+			if report.UpdatedAt.After(reports[i].UpdatedAt) {
+				reports[i] = report.Report
+			}
+			continue
+		}
+		newest[id] = len(reports)
+		reports = append(reports, report.Report)
 	}
 	slices.SortFunc(reports, func(a, b Report) int {
 		if order := b.UpdatedAt.Compare(a.UpdatedAt); order != 0 {
@@ -205,6 +344,14 @@ func (s *Store) LiveReportsForWorkspace(cwd string, liveSessionKeys []string) []
 		return strings.Compare(a.RuntimeSessionKey, b.RuntimeSessionKey)
 	})
 	return reports
+}
+
+// SameWorkspace reports whether two paths name the same workspace directory
+// once made absolute and resolved through symlinks.
+func SameWorkspace(a, b string) bool {
+	canonicalA, errA := canonicalWorkspacePath(a)
+	canonicalB, errB := canonicalWorkspacePath(b)
+	return errA == nil && errB == nil && canonicalA == canonicalB
 }
 
 func canonicalWorkspacePath(path string) (string, error) {
@@ -238,7 +385,7 @@ func (s *Store) RemoveRuntimeSession(runtimeSessionKey string) error {
 		if report.RuntimeSessionKey != runtimeSessionKey {
 			continue
 		}
-		if err := os.Remove(s.reportPath(report.Agent, report.SessionID)); err != nil &&
+		if err := os.Remove(report.path); err != nil &&
 			!errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
 		}
@@ -260,7 +407,7 @@ func (s *Store) RetainRuntimeSessions(keep map[string]struct{}) error {
 		if _, ok := keep[report.RuntimeSessionKey]; ok {
 			continue
 		}
-		err := os.Remove(s.reportPath(report.Agent, report.SessionID))
+		err := os.Remove(report.path)
 		switch {
 		case err == nil:
 			removed = true
@@ -274,7 +421,7 @@ func (s *Store) RetainRuntimeSessions(keep map[string]struct{}) error {
 	return errors.Join(errs...)
 }
 
-func (s *Store) reports() []Report {
+func (s *Store) reports() []storedReport {
 	s.cacheMu.Lock()
 	defer s.cacheMu.Unlock()
 
@@ -284,6 +431,7 @@ func (s *Store) reports() []Report {
 		return nil
 	}
 	files := make(map[string]os.FileInfo)
+	emptyFiles := make(map[string]bool)
 	metadataComplete := true
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
@@ -294,21 +442,27 @@ func (s *Store) reports() []Report {
 			metadataComplete = false
 			continue
 		}
+		if info.Size() == 0 {
+			emptyFiles[entry.Name()] = true
+			// Empty reports have no activity; retry cleanup before reusing the remaining reports' cache.
+			_ = os.Remove(filepath.Join(s.root, entry.Name()))
+			continue
+		}
 		files[entry.Name()] = info
 	}
 	if metadataComplete && sameReportFiles(files, s.cacheFiles) {
 		return slices.Clone(s.cacheReports)
 	}
 
-	reports := make([]Report, 0, len(entries))
+	reports := make([]storedReport, 0, len(entries))
 	cleanupPending := false
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" || emptyFiles[entry.Name()] {
 			continue
 		}
 		path := filepath.Join(s.root, entry.Name())
-		report, ok := s.readReport(path)
-		if !ok {
+		report, err := s.readReport(path)
+		if err != nil {
 			continue
 		}
 		report.Agent = strings.ToLower(strings.TrimSpace(report.Agent))
@@ -321,7 +475,7 @@ func (s *Store) reports() []Report {
 			}
 			continue
 		}
-		reports = append(reports, report)
+		reports = append(reports, storedReport{Report: report, path: path})
 	}
 	s.cacheFiles = files
 	if cleanupPending || !metadataComplete {
@@ -429,53 +583,71 @@ func (s *Store) writeReport(report Report) error {
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(s.root, ".agent-activity-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, s.reportPath(report.Agent, report.SessionID)); err != nil {
+	// Reports are rewritten on every activity event, so skip fsync as
+	// before. ErrPublished means the report is already visible.
+	err = atomicfile.WriteFile(s.reportPath(report.Agent, report.SessionID, report.RuntimeSessionKey), data, atomicfile.WithoutSync())
+	if err != nil && !errors.Is(err, atomicfile.ErrPublished) {
 		return err
 	}
 	s.invalidateCache()
 	return nil
 }
 
-func (s *Store) readReport(path string) (Report, bool) {
-	file, err := os.Open(path)
+func (s *Store) readReport(path string) (Report, error) {
+	// Windows opens through os.Root with delete sharing, so this read does not block report cleanup.
+	file, err := os.OpenInRoot(s.root, filepath.Base(path))
 	if err != nil {
-		return Report{}, false
+		return Report{}, fmt.Errorf("read report %s: %w", path, err)
 	}
 	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 64<<10))
+	if err != nil {
+		return Report{}, fmt.Errorf("read report %s: %w", path, err)
+	}
+	if len(data) == 0 {
+		return Report{}, fmt.Errorf("%w %s", errEmptyReport, path)
+	}
 	var report Report
-	if err := json.UnmarshalRead(io.LimitReader(file, 64<<10), &report); err != nil {
-		return Report{}, false
+	if err := json.Unmarshal(data, &report); err != nil {
+		return Report{}, fmt.Errorf("%w %s: %w", errInvalidReport, path, err)
 	}
 	if statePriority(report.State) == 0 || report.RuntimeSessionKey == "" ||
 		report.CWD == "" || report.UpdatedAt.IsZero() {
-		return Report{}, false
+		return Report{}, fmt.Errorf("%w %s", errInvalidReport, path)
 	}
 	cwd, err := canonicalWorkspacePath(report.CWD)
 	if err != nil {
-		return Report{}, false
+		return Report{}, fmt.Errorf("%w %s workspace: %w", errInvalidReport, path, err)
 	}
 	report.CWD = cwd
-	return report, true
+	return report, nil
 }
 
-func (s *Store) reportPath(agent string, sessionID string) string {
+// ReportUpdatedAt returns when one terminal last reported a conversation, and
+// whether it still has a report. SessionEnd removes the report, so one that
+// remains means the conversation had not ended when it last reported.
+func (s *Store) ReportUpdatedAt(agent, sessionID, runtimeSessionKey string) (time.Time, bool) {
+	report, ok := s.previousReport(agent, sessionID, runtimeSessionKey)
+	return report.UpdatedAt, ok
+}
+
+// previousReport returns the newest report for one terminal, including one saved under its name from before terminals had their own.
+func (s *Store) previousReport(agent, sessionID, runtimeSessionKey string) (Report, bool) {
+	report, err := s.readReport(s.reportPath(agent, sessionID, runtimeSessionKey))
+	legacy, legacyErr := s.readReport(s.legacyReportPath(agent, sessionID))
+	if legacyErr == nil && legacy.RuntimeSessionKey == runtimeSessionKey &&
+		(err != nil || legacy.UpdatedAt.After(report.UpdatedAt)) {
+		return legacy, true
+	}
+	return report, err == nil
+}
+
+func (s *Store) legacyReportPath(agent, sessionID string) string {
 	sum := sha256.Sum256([]byte(agent + "\x00" + sessionID))
+	return filepath.Join(s.root, hex.EncodeToString(sum[:])+".json")
+}
+
+func (s *Store) reportPath(agent, sessionID, runtimeSessionKey string) string {
+	sum := sha256.Sum256([]byte(agent + "\x00" + sessionID + "\x00" + runtimeSessionKey))
 	return filepath.Join(s.root, hex.EncodeToString(sum[:])+".json")
 }

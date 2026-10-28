@@ -10,6 +10,7 @@
     isCommentSubmitPending,
     setCommentDraft,
   } from "./comment-drafts.svelte.js";
+  import type { RepositoryKey } from "../../api/repository-key.js";
 
   const { issues } = getStores();
 
@@ -19,8 +20,10 @@
     number: number;
     provider: string;
     platformHost?: string | undefined;
+    repositoryKey?: RepositoryKey | undefined;
     repoPath: string;
     disabled?: boolean;
+    editorDisabled?: boolean;
     /** Shown under the editor when the box is disabled for a reason
      * the user can act on (e.g. missing write credential). */
     disabledReason?: string | undefined;
@@ -32,21 +35,23 @@
     number,
     provider,
     platformHost,
+    repositoryKey,
     repoPath,
     disabled = false,
+    editorDisabled = disabled,
     disabledReason = undefined,
   }: Props = $props();
 
   const currentDraftKey = $derived(
-    getCommentDraftKey("issue", owner, name, number, platformHost),
+    getCommentDraftKey("issue", { provider, platformHost: platformHost ?? "", repositoryKey, repoPath, owner, name, number }),
   );
   const body = $derived(
-    getCommentDraft("issue", owner, name, number, platformHost),
+    getCommentDraft(currentDraftKey),
   );
 
   const isEmpty = $derived(body.trim() === "");
   const isPostingCurrent = $derived(
-    isCommentSubmitPending("issue", owner, name, number, platformHost),
+    isCommentSubmitPending(currentDraftKey),
   );
 
   function handleSubmit(): void {
@@ -55,39 +60,21 @@
     const submittedName = name;
     const submittedNumber = number;
     const submittedBody = body.trim();
-    const submittedPlatformHost = platformHost;
-    beginCommentSubmit(
-      "issue",
-      submittedOwner,
-      submittedName,
-      submittedNumber,
-      submittedPlatformHost,
-    );
+    const submittedDraftKey = currentDraftKey;
+    beginCommentSubmit(submittedDraftKey);
     issues.submitIssueComment(submittedOwner, submittedName, submittedNumber, submittedBody, {
       onSuccess: () => {
-        clearCommentDraft(
-          "issue",
-          submittedOwner,
-          submittedName,
-          submittedNumber,
-          submittedPlatformHost,
-        );
+        clearCommentDraft(submittedDraftKey);
       },
       onSettled: () => {
-        finishCommentSubmit(
-        "issue",
-        submittedOwner,
-        submittedName,
-        submittedNumber,
-        submittedPlatformHost,
-        );
+        finishCommentSubmit(submittedDraftKey);
       },
     });
   }
 </script>
 
 <div class="comment-box">
-  {#key `issue:${owner}/${name}/${number}`}
+  {#key currentDraftKey}
     <div class="comment-editor-shell">
       <CommentEditor
         {owner}
@@ -98,9 +85,9 @@
         itemType="issue"
         itemNumber={number}
         value={body}
-        disabled={isPostingCurrent || disabled}
+        disabled={isPostingCurrent || editorDisabled}
         oninput={(nextBody) => {
-          setCommentDraft("issue", owner, name, number, nextBody, platformHost);
+          setCommentDraft(currentDraftKey, nextBody);
         }}
         onsubmit={() => {
           handleSubmit();
@@ -138,7 +125,7 @@
   }
 
   .comment-editor-shell :global(.comment-editor-input) {
-    min-height: 112px;
+    min-height: 80px;
     max-height: 75dvh;
     padding-bottom: calc(var(--focus-detail-hit-target, 39.5px) + var(--focus-detail-space-sm, 7.5px));
   }

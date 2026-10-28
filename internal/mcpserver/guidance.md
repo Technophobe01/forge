@@ -17,9 +17,12 @@ require user authorization and are outside this MCP server's capabilities.
 
 Recommended flow:
 
-1. Call `kenn_forge_list_repos` first to discover valid repo filters, stable
-   `platform_repo_id` values, and sync freshness. Copy the stable ID into every
-   later repository or item reference; do not reconstruct references from routes.
+1. Call `kenn_forge_list_repos` first to discover valid repo filters,
+   repository keys, and sync freshness. The key is `platform_repo_id` (the
+   provider's integer repository ID), or `bitbucket_repository_uuid` for
+   Bitbucket Cloud repositories, which have no integer ID. Copy that key into
+   every later repository or item reference; do not reconstruct references
+   from routes.
 2. For all open PRs in a repository, use `kenn_forge_list_pull_contexts` with
    the repository filter. Use `kenn_forge_find_review_candidates` for recent PR
    and issue activity instead.
@@ -31,7 +34,7 @@ Recommended flow:
 6. Prefer cached evidence over assumptions, and report stale cache signals or
    uncertainty.
 7. Avoid provider writes. MCP mutations are limited to Kenn Forge-local workflow
-   state and an explicitly requested local workspace/agent handoff.
+   state, worklists, and an explicitly requested local workspace/agent handoff.
 8. Set workflow state only when the reason is clear. Include `expected_status`
    when marking an item so a stale agent run does not overwrite humans or other
    agents. Use `force: true` only for a deliberate unconditional local
@@ -43,10 +46,12 @@ Recommended flow:
     `kenn_forge_spawn_workspace_with_agent` with one PR, issue, or ad-hoc source
     and one initial message. Report the workspace and runtime identifiers even
     when a later stage fails.
-11. Use `kenn_forge_list_workspace_agent_sessions` for fresh hook-reported
-    coding session IDs. Do not infer IDs from terminal text. To continue work in
-    a live runtime, call `kenn_forge_send_agent_message` with its workspace ID,
-    runtime session key, and the follow-up message.
+11. Use `kenn_forge_list_workspace_agent_sessions` for fresh coding session
+    IDs and states. Terminal agents report them through hooks; ACP agents
+    through their ACP connection. Do not infer IDs from terminal text. To
+    continue work in a live runtime, call `kenn_forge_send_agent_message` with
+    its workspace ID, runtime session key, and the follow-up message. An ACP
+    agent in the middle of a turn queues the follow-up for after that turn.
 
 Repository-wide PR scans:
 
@@ -66,9 +71,40 @@ Repository-wide PR scans:
   A clean merge state or green review check alone does not prove approval,
   resolved bot findings, satisfied branch protection, or permission to merge.
 - When calling a single-item tool, copy only its declared identity fields:
-  `type`, `provider`, `platform_host`, `platform_repo_id`, `owner`, `name`, and
+  `type`, `provider`, `platform_host`, `platform_repo_id` (or
+  `bitbucket_repository_uuid` for Bitbucket Cloud), `owner`, `name`, and
   `number`. Passing the entire returned item, including title or state, fails
   input validation.
+
+Worklists:
+
+- When asked for a queue of PRs and issues to work through, write it with
+  `kenn_forge_put_worklist`. Items go in rank order. Put readiness in
+  `section`, importance from 1 to 10 in `score`, the reason in `note`, and
+  anything else the maintainer should see in `caveat`. Set `caveat_level` to
+  `warning` only for something to check before acting, and to `critical`
+  only for a risk that should stop them; leave it unset otherwise, and the
+  caveat shows as quiet info.
+- Include a `recipe`: the criteria in plain text and the searches you ran.
+  Forge stores and shows it but never evaluates it.
+- Every item must be a PR or issue Forge has synced. Copy identities from
+  Forge reads; one unknown item fails the whole write.
+- To refresh a list, read it with `kenn_forge_get_worklist`, rerun its
+  recipe's searches, reconcile the full candidate set, and put it again with
+  the same `worklist_id`. Freshness only tracks state, commits, comments, CI,
+  and review decision, so treat `changed` and `gone` as where to look first:
+  labels, assignees, draft status, or titles can change on a `fresh` item, and
+  new matches appear only in the searches. A put replaces the items and resets
+  what Forge recorded for each. To make another list like it, put its recipe
+  without a `worklist_id`.
+- The maintainer marks items handled as they work through a list; reads report
+  `handled_at` per item, and `handled_count` and `remaining_count` (items
+  neither handled nor merged, closed, or gone) per list. A mark stays on an item that remains on
+  a replaced list. You cannot mark items. Call
+  `kenn_forge_clear_worklist_marks` only when the maintainer asks to clear
+  the marks.
+- Changes since an item was written are informational; they never certify
+  review status or permission to merge.
 
 Example guidance flow:
 
@@ -90,7 +126,7 @@ Handoff flow:
 2. Call kenn_forge_spawn_workspace_with_agent once with the selected source,
    target, and initial message.
 3. Do not retry an ambiguous workspace or runtime mutation. If prompt delivery
-   or hook observation times out after a runtime identifier is returned, call
+   or session observation times out after a runtime identifier is returned, call
    the tool with resume, the returned workspace and runtime identifiers, and
    the same target and initial message. Resume never launches another runtime.
 4. Report every returned workspace, runtime, prompt-delivery, and coding-session
@@ -99,3 +135,29 @@ Handoff flow:
    workspace ID and runtime session key. It submits the message to that running
    agent and does not launch or resume anything.
 ```
+
+## Generated interactive components (prototype)
+
+When asked for a dashboard or another rich component, compose it yourself and
+call `kenn_forge_render_app` with a title and a self-contained HTML fragment.
+Forge supplies a generic renderer, not predefined dashboard layouts. Inline
+scripts execute after `window.app` is connected. Use
+`await window.app.callServerTool({name, arguments})` and read the returned
+`structuredContent`; check `isError` before using the data. Use
+`window.app.openLink({url})` for HTTP(S) links initiated by a user click.
+External imports and direct network requests are unavailable.
+
+Apps may read repositories, bulk PR contexts, item contexts, activity, search,
+review candidates, stacks, workflow lists, and worklists. They may not change
+workflow state, write, dismiss, or clear worklists, merge PRs, launch agents, read
+local workspace sessions, or write diffs.
+Use the schemas from those tools rather than guessing field names. Discover
+stable repository IDs with `kenn_forge_list_repos` and preserve pagination.
+Refresh means rereading the cache. Show freshness and missing evidence; cached
+mergeability does not grant merge permission. Insert tool-returned strings
+with `textContent`, not HTML interpolation.
+
+MCP Apps hosts discover the renderer from the tool's `ui.resourceUri` metadata.
+Forge ACP chat also recognizes the tool's embedded component descriptor, so
+agents must preserve its resource content. Include a text explanation for
+clients without widget rendering. Generated HTML stays in the transcript.

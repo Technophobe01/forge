@@ -4,12 +4,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,10 +26,14 @@ import (
 	"go.kenn.io/forge/internal/mcpserver"
 	"go.kenn.io/forge/internal/providerplane"
 	"go.kenn.io/forge/internal/server"
+	"go.kenn.io/forge/internal/server/authapi"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/server/pullapi"
+	"go.kenn.io/forge/internal/server/syncevents"
 	"go.kenn.io/forge/internal/testutil/dbtest"
 	"go.kenn.io/forge/internal/testutil/federationtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/platform"
 )
 
@@ -66,11 +70,13 @@ func (h *switchableFederationHandler) ServeHTTP(w http.ResponseWriter, r *http.R
 	if h.offline.Load() {
 		w.Header().Set("Content-Type", "application/problem+json")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		if err := json.NewEncoder(w).Encode(map[string]any{
 			"status": http.StatusServiceUnavailable,
 			"code":   httpapi.CodeHubUnavailable,
 			"detail": "the federation hub is unavailable",
-		})
+		}); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
 	h.current.Load().handler.ServeHTTP(w, r)
@@ -88,23 +94,21 @@ type federatedDaemonFixture struct {
 	Switch      *switchableFederationHandler
 }
 
-type countingSyntheticProvider struct {
-}
+type countingSyntheticProvider struct{}
 
 func (p *countingSyntheticProvider) Seed(t *testing.T, database *db.DB) int64 {
 	t.Helper()
 	identity := verifiedRepoIdentity(db.GitHubRepoIdentity(
 		"github.com", "acme", "widget",
 	))
-	repoID, err := database.UpsertRepo(t.Context(), identity)
+	repoID, err := reposeed.Seed(t.Context(), database, identity)
 	require.NoError(t, err)
-	require.NoError(t, database.UpdateRepoProviderMetadata(
+	require.NoError(t, database.UpdateRepoProviderObservation(
 		t.Context(), repoID, db.RepoProviderMetadata{
-			PlatformRepoID: identity.PlatformRepoID,
-			WebURL:         "https://github.com/acme/widget",
-			CloneURL:       "https://github.com/acme/widget.git",
-			DefaultBranch:  "main",
-		},
+			WebURL:        "https://github.com/acme/widget",
+			CloneURL:      "https://github.com/acme/widget.git",
+			DefaultBranch: "main",
+		}, nil, nil,
 	))
 	now := time.Now().UTC().Truncate(time.Second)
 	for _, pull := range []db.MergeRequest{
@@ -171,7 +175,7 @@ func newFederatedForgesFixture(t *testing.T) *federatedForgesFixture {
 			Owner: "acme", Name: "widget",
 		}},
 		Fleet: config.Fleet{
-			Enabled: true, Role: config.FleetRoleHub, PeerTimeout: "500ms",
+			Enabled: true, Role: config.FleetRoleHub, PeerTimeout: "5s",
 			Members: []config.FleetMember{
 				{NodeID: nodeA.NodeID, Name: nodeA.Name, BaseURL: nodeA.HTTP.URL, State: federation.EnrollmentActive},
 				{NodeID: nodeB.NodeID, Name: nodeB.Name, BaseURL: nodeB.HTTP.URL, State: federation.EnrollmentActive},
@@ -188,7 +192,7 @@ func newFederatedForgesFixture(t *testing.T) *federatedForgesFixture {
 			BasePath: "/",
 			Tmux:     config.Tmux{Command: []string{"kenn-forge-no-such-tmux"}},
 			Fleet: config.Fleet{
-				Enabled: true, Role: config.FleetRoleSpoke, PeerTimeout: "500ms",
+				Enabled: true, Role: config.FleetRoleSpoke, PeerTimeout: "5s",
 				Hub: &config.FleetHub{
 					NodeID: hub.NodeID, Name: hub.Name,
 					BaseURL: hub.HTTP.URL,
@@ -298,15 +302,15 @@ func newFederatedDaemonServer(
 			nil, daemon.Database, nil, []ghclient.RepoRef{{
 				Platform: platform.KindGitHub, PlatformHost: "github.com",
 				Owner: "acme", Name: "widget", RepoPath: "acme/widget",
-				PlatformExternalID: verifiedRepoIdentity(db.GitHubRepoIdentity(
+				Key: verifiedRepoIdentity(db.GitHubRepoIdentity(
 					"github.com", "acme", "widget",
-				)).PlatformRepoID,
+				)).Key,
 			}}, time.Minute, nil, nil,
 		)
 		t.Cleanup(syncer.Stop)
 	}
 	srv := server.New(daemon.Database, syncer, nil, "/", cfg, server.ServerOptions{
-		DaemonAccess: server.DaemonAccessOptions{
+		DaemonAccess: authapi.DaemonAccessOptions{
 			Token: daemon.LocalToken, RequireAPIAuth: true,
 		},
 		FederationSpokeID: daemon.NodeID, FederationSpokeActive: activeSpoke,
@@ -315,7 +319,7 @@ func newFederatedDaemonServer(
 		FederationHTTPClient:               client,
 		WorktreeDir:                        filepath.Join(t.TempDir(), "worktrees"),
 		DisableWorkspaceBackgroundMonitors: true,
-		HostCheck: server.HostCheckOptions{
+		HostCheck: authapi.HostCheckOptions{
 			Bind:                 config.HostKey{Host: "127.0.0.1", Port: "8091"},
 			AllowLoopbackAnyPort: true,
 		},
@@ -329,15 +333,14 @@ func seedFederatedNodeRepository(t *testing.T, database *db.DB) {
 	identity := verifiedRepoIdentity(db.GitHubRepoIdentity(
 		"github.com", "acme", "widget",
 	))
-	repoID, err := database.UpsertRepo(t.Context(), identity)
+	repoID, err := reposeed.Seed(t.Context(), database, identity)
 	require.NoError(t, err)
-	require.NoError(t, database.UpdateRepoProviderMetadata(
+	require.NoError(t, database.UpdateRepoProviderObservation(
 		t.Context(), repoID, db.RepoProviderMetadata{
-			PlatformRepoID: identity.PlatformRepoID,
-			WebURL:         "https://github.com/acme/widget",
-			CloneURL:       "https://github.com/acme/widget.git",
-			DefaultBranch:  "main",
-		},
+			WebURL:        "https://github.com/acme/widget",
+			CloneURL:      "https://github.com/acme/widget.git",
+			DefaultBranch: "main",
+		}, nil, nil,
 	))
 }
 
@@ -351,7 +354,7 @@ func seedFederatedWorkspace(
 		ID: id, Platform: "github", PlatformHost: "github.com",
 		RepoOwner: "acme", RepoName: "widget",
 		ItemType: db.WorkspaceItemTypePullRequest, ItemNumber: number,
-		ItemKey: fmt.Sprint(number), GitHeadRef: branch, WorkspaceBranch: branch,
+		ItemKey: strconv.Itoa(number), GitHeadRef: branch, WorkspaceBranch: branch,
 		WorktreePath: filepath.Join(t.TempDir(), id), Status: "ready", CreatedAt: now,
 	}
 	require.NoError(t, database.CreateWorkspaceWithLaunchSpec(
@@ -359,14 +362,14 @@ func seedFederatedWorkspace(
 			Version: db.WorkspaceLaunchSpecVersion,
 			Repository: db.WorkspaceLaunchRepository{
 				Provider: "github", PlatformHost: "github.com",
-				PlatformRepoID: verifiedRepoIdentity(db.GitHubRepoIdentity(
+				Key: verifiedRepoIdentity(db.GitHubRepoIdentity(
 					"github.com", "acme", "widget",
-				)).PlatformRepoID,
+				)).Key,
 				Owner: "acme", Name: "widget",
 				CloneURL: "https://github.com/acme/widget.git", DefaultBranch: "main",
 			},
 			ItemType: db.WorkspaceItemTypePullRequest, ItemNumber: number,
-			ItemKey: fmt.Sprint(number), GitHeadRef: branch,
+			ItemKey: strconv.Itoa(number), GitHeadRef: branch,
 			Pull: &db.WorkspaceLaunchPull{
 				HeadBranch: branch, HeadRepoKind: "same_repo", SnapshotRevision: 1,
 			},
@@ -456,6 +459,7 @@ func workspaceByID(rows []fleet.WorkspaceSummary, id string) *fleet.WorkspaceSum
 // workspace overlays, one-hop fleet projection, outage behavior, event
 // re-stamping, protocol enforcement, and synchronous credential revocation.
 func TestFederatedForgesE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	fixture := newFederatedForgesFixture(t)
@@ -522,9 +526,9 @@ func TestFederatedForgesE2E(t *testing.T) {
 	}
 	item := mcpserver.ItemIdentity{
 		Type: "pr", Provider: "github", PlatformHost: "github.com",
-		PlatformRepoID: verifiedRepoIdentity(db.GitHubRepoIdentity(
+		RepoKey: verifiedRepoIdentity(db.GitHubRepoIdentity(
 			"github.com", "acme", "widget",
-		)).PlatformRepoID,
+		)).Key,
 		Owner: "acme", Name: "widget", Number: 1,
 	}
 	mutation, err := fixture.NodeA.Server.MCPBackend().SetWorkflowState(
@@ -551,7 +555,7 @@ func TestFederatedForgesE2E(t *testing.T) {
 
 	require.Eventually(func() bool {
 		records, _ := fixture.NodeA.Server.Hub().RingSnapshotSince(0)
-		return slices.ContainsFunc(records, func(record server.RecordedEvent) bool {
+		return slices.ContainsFunc(records, func(record syncevents.RecordedEvent) bool {
 			return record.Event.Type == "hub_connection_changed"
 		})
 	}, 3*time.Second, 10*time.Millisecond)
@@ -572,11 +576,11 @@ func TestFederatedForgesE2E(t *testing.T) {
 	fixture.Hub.Switch.offline.Store(false)
 	localFloor := fixture.NodeA.Server.Hub().Generation()
 	require.Eventually(func() bool {
-		fixture.Hub.Server.Hub().Broadcast(server.Event{
+		fixture.Hub.Server.Hub().Broadcast(syncevents.Event{
 			Type: "data_changed", Data: map[string]string{"source": "hub"},
 		})
 		records, stale := fixture.NodeA.Server.Hub().RingSnapshotSince(localFloor)
-		return !stale && slices.ContainsFunc(records, func(record server.RecordedEvent) bool {
+		return !stale && slices.ContainsFunc(records, func(record syncevents.RecordedEvent) bool {
 			return record.ID > localFloor && record.Event.Type == "data_changed"
 		})
 	}, 8*time.Second, 200*time.Millisecond)
@@ -616,11 +620,11 @@ func TestFederatedForgesE2E(t *testing.T) {
 func mcpRepositoryIdentity(item mcpserver.ItemIdentity) mcpserver.RepositoryIdentity {
 	return mcpserver.RepositoryIdentity{
 		Provider: item.Provider, PlatformHost: item.PlatformHost,
-		PlatformRepoID: item.PlatformRepoID, Owner: item.Owner, Name: item.Name,
+		Key: item.RepoKey, Owner: item.Owner, Name: item.Name,
 	}
 }
 
-func TestFederatedActivityWorkspaceIndicators(t *testing.T) {
+func TestFederatedActivityWorkspaceIndicators(t *testing.T) { //nolint:paralleltest // hub Activity read waits only the production 1s activityPeerWait for member fetches
 	fixture := newFederatedForgesFixture(t)
 	for _, tc := range []struct {
 		daemon *federatedDaemonFixture

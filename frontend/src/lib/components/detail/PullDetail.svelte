@@ -4,6 +4,7 @@
 
 <script lang="ts">
   import { tablistKeyTarget } from "../shared/tablist-keyboard.js";
+  import { getCommentNavigation } from "../../stores/router.svelte.js";
   import { Effect } from "effect";
   import { pollWhileVisible } from "../../effect/poll-while-visible.js";
   import { onDestroy, tick, untrack, type ComponentProps } from "svelte";
@@ -14,6 +15,7 @@
   import { retryIdempotentRead } from "../../api/retry-policy.js";
   import type { AppExecution } from "../../app/runtime.js";
   import { getAppRuntime } from "../../app/runtime-context.js";
+  import { reportWorkspaceOpenError } from "../../app/telemetry.js";
   import { nextAnimationFrame } from "../../browser/animation-frame.js";
   import { transientClipboardFeedback } from "../../browser/clipboard-feedback.js";
   import type {
@@ -35,6 +37,8 @@
     getNavigate,
   } from "../../context.js";
   import MarkdownHtml from "../shared/MarkdownHtml.svelte";
+  import { providerItemKey } from "../../stores/provider-key.js";
+  import ErrorShown from "../shared/ErrorShown.svelte";
   import WorkflowDispatchDialog from "../actions/WorkflowDispatchDialog.svelte";
   import type { WorkflowDispatchRequest } from "../actions/WorkflowDispatchForm.svelte";
   import { workflowDispatchPresentation } from "../actions/workflow-dispatch-presentation.js";
@@ -42,17 +46,22 @@
   import { moveTaskListItem, toggleTaskListItem } from "../../utils/task-list.js";
   import type { ApplySuggestionRequest } from "../../utils/markdown-suggestions.js";
   import { firstUnavailableGate, operationGate } from "./operation-gates.js";
+  import { ciChecksHavePending, ciStatusHasFailed, shouldDeferMergeForCI } from "./merge-policy.js";
   import { AdaptiveActionGrid, FitStages, copyToClipboard, formatRelativeTime } from "@kenn-io/kit-ui";
   import EventTimeline from "./EventTimeline.svelte";
   import CollapsibleDescription from "./CollapsibleDescription.svelte";
+  import ExternalContextCards from "./ExternalContextCards.svelte";
   import DetailActivityViewMenu from "./DetailActivityViewMenu.svelte";
   import DetailRefreshButton from "./DetailRefreshButton.svelte";
   import CommentBox from "./CommentBox.svelte";
   import ApproveButton from "./ApproveButton.svelte";
   import ApproveWorkflowsButton from "./ApproveWorkflowsButton.svelte";
   import MergeModal from "./MergeModal.svelte";
+  import { nativeStackMergeScope } from "./stack-merge.js";
   import ReadyForReviewButton from "./ReadyForReviewButton.svelte";
   import ReviewDecisionChip from "./ReviewDecisionChip.svelte";
+  import MergeQueueChip from "./MergeQueueChip.svelte";
+  import { mergeQueueEntryDescription, mergeQueueRemovalReason } from "./merge-queue.js";
   import {
     runOpenMerge,
     type PRDetailActionInput,
@@ -63,7 +72,9 @@
   import ClockIcon from "@lucide/svelte/icons/clock";
   import ExternalLinkIcon from "@lucide/svelte/icons/external-link";
   import GitMergeIcon from "@lucide/svelte/icons/git-merge";
+  import ListOrderedIcon from "@lucide/svelte/icons/list-ordered";
   import MonitorUpIcon from "@lucide/svelte/icons/monitor-up";
+  import PackagePlusIcon from "@lucide/svelte/icons/package-plus";
   import RefreshCwIcon from "@lucide/svelte/icons/refresh-cw";
   import SendHorizontalIcon from "@lucide/svelte/icons/send-horizontal";
   import TagsIcon from "@lucide/svelte/icons/tags";
@@ -75,6 +86,7 @@
   import { Spinner } from "@kenn-io/kit-ui";
   import LabelRow from "../shared/LabelRow.svelte";
   import WorkspaceCreateSplitButton from "../workspace/WorkspaceCreateSplitButton.svelte";
+  import { createDefaultWorkspaceTarget } from "../../stores/workspace-target.svelte.js";
   import { ScrollBox } from "@kenn-io/kit-ui";
   import LabelPicker from "./LabelPicker.svelte";
   import UserListEditor from "./UserListEditor.svelte";
@@ -128,6 +140,14 @@
     resolveControllerlessWorkspaceRef,
   } from "../../stores/workspace-create-pending.svelte.js";
   import type { WorkflowDefinition, WorkflowRepositoryRef } from "../../stores/workflow-actions.svelte.js";
+  import {
+    repositoryKeyAllows,
+    repositoryKeyFromWire,
+    repositoryKeyString,
+    repositoryKeyToWire,
+    sameRepositoryKey,
+    type RepositoryKey,
+  } from "../../api/repository-key.js";
 
   type ChipTrailing = ComponentProps<typeof Chip>["trailing"];
 
@@ -135,7 +155,6 @@
 
   const {
     detail: detailStore,
-    pulls,
     activity,
     diff: diffStore,
     detailActivityView,
@@ -163,7 +182,7 @@
       || detailStore.isDetailLoading()
       || detailStore.isDetailSyncing()
       || sync?.getProviderAvailable() === false
-      || stalePR
+      || detailMismatch
     ) return;
     const requestIdentity = $state.snapshot(itemIdentity);
     const requestGeneration = ++manualRefreshGeneration;
@@ -172,7 +191,7 @@
       owner,
       name,
       number,
-      { provider, platformHost, repoPath },
+      { provider, platformHost, repositoryKey, repoPath },
       {
         onFailure: (message) => {
           if (isCurrentManualRefresh(requestGeneration, requestIdentity)) {
@@ -201,10 +220,12 @@
     workflow_dispatch: false,
     read_labels: false,
     read_markdown_images: false,
+    read_markdown_media: false,
     read_authenticated_user: false,
     comment_mutation: true,
     state_mutation: true,
     merge_mutation: true,
+    merge_queue_mutation: false,
     review_mutation: true,
     workflow_approval: true,
     ready_for_review: true,
@@ -230,11 +251,13 @@
   }
 
   interface Props {
+    visible?: boolean;
     owner: string;
     name: string;
     number: number;
     provider: string;
     platformHost?: string | undefined;
+    repositoryKey?: RepositoryKey | undefined;
     repoPath: string;
     hideTabs?: boolean;
     hideWorkspaceAction?: boolean;
@@ -254,11 +277,13 @@
   }
 
   const {
+    visible = true,
     owner,
     name,
     number,
     provider,
     platformHost,
+    repositoryKey,
     repoPath,
     hideTabs = false,
     hideWorkspaceAction = false,
@@ -276,6 +301,7 @@
   const routeRef = $derived({
     provider,
     platformHost,
+    repositoryKey,
     owner,
     name,
     repoPath,
@@ -332,39 +358,6 @@
     activePRTimelineFilterCount(timelineFilter) > 0,
   );
   const timelineFilterScope = $derived(JSON.stringify(timelineFilter));
-
-  function ciChecksHavePending(checksJSON: string): boolean {
-    if (!checksJSON) return false;
-    try {
-      const checks = JSON.parse(checksJSON) as Array<{ status?: string }>;
-      return checks.some((check) => check.status !== "completed");
-    } catch {
-      return false;
-    }
-  }
-
-  function ciStatusIsPending(status: string): boolean {
-    return ["pending", "in_progress", "queued"].includes(status.toLowerCase());
-  }
-
-  function ciStatusHasFailed(status: string): boolean {
-    return [
-      "failure",
-      "failed",
-      "error",
-      "cancelled",
-      "canceled",
-      "timed_out",
-    ].includes(status.toLowerCase());
-  }
-
-  function shouldDeferMergeForCI(status: string, checksJSON: string): boolean {
-    // The backend rejects a deferred merge once aggregate CI has failed, so a
-    // failed pipeline with a check still running must use the normal merge path
-    // rather than route to the deferred endpoint that would 409.
-    if (ciStatusHasFailed(status)) return false;
-    return ciStatusIsPending(status) || ciChecksHavePending(checksJSON);
-  }
 
   function requiredStatusChecksHaveNotPassed(checksJSON: string): boolean {
     if (!checksJSON) return false;
@@ -463,7 +456,7 @@
     }
     const requestGeneration = mutationRouteGeneration;
     let durableConflict = false;
-    detailStore.applyReviewSuggestions(routeRef, number, input, {
+    detailStore.applyReviewSuggestions(mutationRef, number, input, {
       onConflict: (conflict) => {
         durableConflict = handleStateConflict(
           conflict.reason,
@@ -557,7 +550,7 @@
   // load completes. `stalePR` is true in that window, and every mutation
   // handler short-circuits on it so a click during the transition can't
   // operate on the freshly-routed PR while showing the previous one.
-  const stalePR = $derived.by(() => {
+  const detailMismatch = $derived.by(() => {
     const d = detailStore.getDetail();
     if (d == null) return false;
     return (
@@ -571,8 +564,17 @@
       canonicalProvider(d.repo?.provider ?? "") !== canonicalProvider(provider) ||
       resolvedPlatformHost(provider, d.repo?.platform_host) !==
         resolvedPlatformHost(provider, platformHost) ||
-      d.repo?.repo_path !== repoPath
+      d.repo?.repo_path !== repoPath ||
+      !repositoryKeyAllows(repositoryKey, repositoryKeyFromWire(d.repo))
     );
+  });
+
+  // A restored snapshot stays readable, but cannot authorize actions until revalidated.
+  const stalePR = $derived(detailMismatch || detailStore.isDetailFromCache());
+  // URLs may omit the repository ID; the matching detail supplies its verified identity.
+  const mutationRef = $derived({
+    ...routeRef,
+    repositoryKey: repositoryKey ?? (detailMismatch ? undefined : repositoryKeyFromWire(detailStore.getDetail()?.repo)),
   });
 
   // Same comparison shape as PRListView's detailMatchesSelected, but
@@ -591,7 +593,8 @@
       canonicalProvider(detail.repo?.provider ?? "") === canonicalProvider(identity.provider) &&
       resolvedPlatformHost(identity.provider, detail.repo?.platform_host) ===
         resolvedPlatformHost(identity.provider, identity.platformHost) &&
-      detail.repo?.repo_path === identity.repoPath
+      detail.repo?.repo_path === identity.repoPath &&
+      repositoryKeyAllows(repositoryKey, repositoryKeyFromWire(detail.repo))
     );
   }
 
@@ -614,6 +617,7 @@
             detailStore.refreshPendingCI(owner, name, number, {
               provider,
               platformHost,
+              repositoryKey,
               repoPath,
               workflowApprovalSync,
             });
@@ -632,6 +636,7 @@
   });
 
   let lastDetailLoadIdentity: WorkspaceItemIdentity | null = null;
+  let lastDetailLoadRepositoryKey: RepositoryKey | undefined;
   let lastDetailLoadAutoSync: DetailSyncMode | undefined;
   let lastDetailLoadWorkflowApprovalSync: boolean | undefined;
 
@@ -641,6 +646,7 @@
     const requestNumber = number;
     const requestProvider = provider;
     const requestPlatformHost = platformHost;
+    const requestRepositoryKey = repositoryKey;
     const requestRepoPath = repoPath;
     const requestAutoSync = autoSync;
     const requestWorkflowApprovalSync = workflowApprovalSync;
@@ -648,10 +654,12 @@
     const shouldLoad =
       lastDetailLoadIdentity === null
       || !identityEquals(lastDetailLoadIdentity, requestIdentity)
+      || !sameRepositoryKey(lastDetailLoadRepositoryKey, requestRepositoryKey)
       || lastDetailLoadAutoSync !== requestAutoSync
       || lastDetailLoadWorkflowApprovalSync !== requestWorkflowApprovalSync;
     if (shouldLoad) {
       lastDetailLoadIdentity = requestIdentity;
+      lastDetailLoadRepositoryKey = requestRepositoryKey;
       lastDetailLoadAutoSync = requestAutoSync;
       lastDetailLoadWorkflowApprovalSync = requestWorkflowApprovalSync;
     }
@@ -666,6 +674,7 @@
             workflowApprovalSync: requestWorkflowApprovalSync,
             provider: requestProvider,
             platformHost: requestPlatformHost,
+            repositoryKey: requestRepositoryKey,
             repoPath: requestRepoPath,
           },
         );
@@ -677,6 +686,7 @@
         {
           provider: requestProvider,
           platformHost: requestPlatformHost,
+          repositoryKey: requestRepositoryKey,
           repoPath: requestRepoPath,
         },
       );
@@ -694,7 +704,8 @@
     void pullDetailScroller;
     void activeTab;
     void detailStore.getDetail()?.detail_fetched_at;
-    if (activeTab !== "conversation") return;
+    pullDetailScrollRestoreExecution?.interrupt();
+    if (activeTab !== "conversation" || getCommentNavigation({ provider, platformHost, repoPath, number, itemType: "pull" })) return;
     restorePullDetailScroll();
   });
 
@@ -719,13 +730,20 @@
   // would discard an in-flight create's success and re-enable the button
   // for a duplicate request.
   let lastResetIdentity: WorkspaceItemIdentity | null = null;
+  let lastResetRepositoryKey: RepositoryKey | undefined;
   $effect(() => {
-    // Full provider-aware PR identity (via itemIdentity's deps): the same
-    // owner/name/number can exist on another provider or host, and stale
-    // head-conflict state must not leak across that navigation either.
+    // Reset for another provider/host/item or a replacement repository at the same route.
     const current = $state.snapshot(itemIdentity);
-    if (lastResetIdentity !== null && identityEquals(lastResetIdentity, current)) return;
+    const currentRepositoryKey = mutationRef.repositoryKey;
+    if (lastResetIdentity !== null && identityEquals(lastResetIdentity, current)
+      && (currentRepositoryKey === undefined || lastResetRepositoryKey === undefined
+        || sameRepositoryKey(lastResetRepositoryKey, currentRepositoryKey))) {
+      // Detail hydration and reload gaps do not replace a verified repository.
+      lastResetRepositoryKey = currentRepositoryKey ?? lastResetRepositoryKey;
+      return;
+    }
     lastResetIdentity = current;
+    lastResetRepositoryKey = currentRepositoryKey;
     manualRefreshGeneration += 1;
     manualRefreshPending = false;
     mutationRouteGeneration = untrack(() => mutationRouteGeneration) + 1;
@@ -751,6 +769,9 @@
     expandedPanel = keepStackExpanded ? "stack" : null;
     editingTitle = false;
     editingBody = false;
+    savingTitle = false;
+    savingBody = false;
+    stateSubmitting = false;
     titleDraft = "";
     bodyDraft = "";
     // Flush any pending checkbox/reorder save before clearing state.
@@ -760,6 +781,7 @@
     flushBodySave();
     clearDragState();
     closeLabelPicker();
+    labelCatalog = [];
   });
 
 
@@ -837,13 +859,16 @@
       cancelEditTitle();
       return;
     }
+    const requestGeneration = mutationRouteGeneration;
     savingTitle = true;
     detailStore.updatePRContent(routeRef, number, { title: trimmed }, {
       onSuccess: () => {
+        if (componentDestroyed || requestGeneration !== mutationRouteGeneration) return;
         editingTitle = false;
         titleDraft = "";
       },
       onSettled: () => {
+        if (componentDestroyed || requestGeneration !== mutationRouteGeneration) return;
         savingTitle = false;
       },
     });
@@ -885,13 +910,16 @@
       cancelEditBody();
       return;
     }
+    const requestGeneration = mutationRouteGeneration;
     savingBody = true;
     detailStore.updatePRContent(routeRef, number, { body: bodyDraft }, {
       onSuccess: () => {
+        if (componentDestroyed || requestGeneration !== mutationRouteGeneration) return;
         editingBody = false;
         bodyDraft = "";
       },
       onSettled: () => {
+        if (componentDestroyed || requestGeneration !== mutationRouteGeneration) return;
         savingBody = false;
       },
     });
@@ -913,10 +941,12 @@
     } else if (!caps.state_mutation) {
       return;
     }
+    const requestGeneration = mutationRouteGeneration;
     stateSubmitting = true;
     detailStore.setPullState(routeRef, number, newState, {
       onSuccess: () => activity.loadActivity(),
       onSettled: () => {
+        if (componentDestroyed || requestGeneration !== mutationRouteGeneration) return;
         stateSubmitting = false;
       },
     });
@@ -972,6 +1002,13 @@
   const deferredMergePending = $derived(
     detailStore.getDetail()?.deferred_merge_pending ?? false,
   );
+  const mergePending = $derived(!stalePR && detailStore.isPullMerging(mutationRef, number));
+  // GitHub merge queue state. The entry is present while the PR waits in
+  // the queue; the removal persists (server state) after the queue drops
+  // it without merging; the target means Merge enqueues instead of merging.
+  const mergeQueueEntry = $derived(detailStore.getDetail()?.merge_queue);
+  const mergeQueueRemoval = $derived(detailStore.getDetail()?.merge_queue_removal);
+  const mergeQueueTarget = $derived(detailStore.getDetail()?.merge_queue_target);
   const midStackBlocker = $derived.by(() => {
     const stack = detailStore.getDetail()?.stack;
     if (!stack) return undefined;
@@ -990,18 +1027,19 @@
     reason: Exclude<ConflictReason, "conflict">,
     context?: string,
     failedHeadSha?: string,
-    failedRef: ProviderRouteRef = routeRef,
+    failedRef: ProviderRouteRef = mutationRef,
     failedNumber: number = number,
     failedGeneration: number = mutationRouteGeneration,
   ): boolean {
     if (
-      failedGeneration !== mutationRouteGeneration
+      componentDestroyed || failedGeneration !== mutationRouteGeneration
       || failedNumber !== number
       || failedRef.provider !== routeRef.provider
       || failedRef.platformHost !== routeRef.platformHost
       || failedRef.owner !== routeRef.owner
       || failedRef.name !== routeRef.name
       || failedRef.repoPath !== routeRef.repoPath
+      || !sameRepositoryKey(failedRef.repositoryKey, mutationRef.repositoryKey)
     ) return false;
     conflictReviewedHead = failedHeadSha ?? detailHeadSha;
     stateConflict = reason;
@@ -1039,12 +1077,12 @@
     const reason = stateConflict;
     if (!reason || conflictRefreshBusy) return;
     const requestID = ++conflictRefreshRequestID;
-    const routeKey = `${provider}\n${platformHost}\n${repoPath}\n${owner}\n${name}\n${number}`;
+    const routeKey = `${provider}\n${platformHost}\n${repoPath}\n${owner}\n${name}\n${number}\n${mutationRef.repositoryKey ? repositoryKeyString(mutationRef.repositoryKey) : ""}`;
     const reviewedHeadAtConflict = conflictReviewedHead;
     conflictRefreshBusy = true;
     conflictRefreshError = null;
     const finish = (refreshed: boolean): void => {
-      const currentRouteKey = `${provider}\n${platformHost}\n${repoPath}\n${owner}\n${name}\n${number}`;
+      const currentRouteKey = `${provider}\n${platformHost}\n${repoPath}\n${owner}\n${name}\n${number}\n${mutationRef.repositoryKey ? repositoryKeyString(mutationRef.repositoryKey) : ""}`;
       if (requestID !== conflictRefreshRequestID || routeKey !== currentRouteKey) return;
       if (stateConflict !== reason) {
         conflictRefreshBusy = false;
@@ -1063,7 +1101,7 @@
       owner,
       name,
       number,
-      { provider, platformHost, repoPath },
+      mutationRef,
       { onSuccess: finish, onFailure: () => finish(false) },
     );
   }
@@ -1079,14 +1117,19 @@
     handleStateConflict(reason, context, failedHeadSha, failedRef, failedNumber, failedGeneration);
   }
 
+  const mergeSettingsIdentity = $derived(JSON.stringify([
+    canonicalProvider(provider),
+    resolvedPlatformHost(provider, platformHost),
+    owner,
+    name,
+    repoPath,
+    repositoryKey ? repositoryKeyString(repositoryKey) : null,
+  ]));
+
   $effect(() => {
-    const selectedRef = {
-      provider: routeRef.provider,
-      platformHost: routeRef.platformHost,
-      owner: routeRef.owner,
-      name: routeRef.name,
-      repoPath: routeRef.repoPath,
-    };
+    // Feed refreshes replace route objects without changing the repository.
+    void mergeSettingsIdentity;
+    const selectedRef = untrack(() => ({ ...routeRef }));
     repoSettings = null;
     const program = executeGeneratedApiRequest("GET repository merge settings", (client, signal) =>
       providerUsesHostRoute(selectedRef) ? client.RepositoriesService.getRepoOnHost({ ...providerHostRouteParams(selectedRef) }, { signal }) : client.RepositoriesService.getRepo({ ...providerRouteParams(selectedRef) }, { signal }),
@@ -1188,6 +1231,33 @@
     return "Merge";
   }
 
+  type MergeButtonPresentation = {
+    label: string;
+    shortLabel: string;
+    icon: "merge" | "deferred" | "queue";
+    hasMenu: boolean;
+  };
+
+  // Shared by the live merge button and its FitStages measurement copy so
+  // both always measure the same labels.
+  function mergeButtonPresentation(settings: RepoSettings): MergeButtonPresentation {
+    if (mergeQueueEntry) {
+      return { label: "In merge queue", shortLabel: "Queued", icon: "queue", hasMenu: false };
+    }
+    if (deferredMergePending) {
+      return { label: "Merge queued", shortLabel: "Queued", icon: "deferred", hasMenu: false };
+    }
+    if (mergeQueueTarget) {
+      return { label: "Add to merge queue", shortLabel: "Queue", icon: "queue", hasMenu: false };
+    }
+    return {
+      label: mergeActionLabel(settings),
+      shortLabel: mergeActionShortLabel(settings),
+      icon: "merge",
+      hasMenu: mergeActionHasMenu(settings),
+    };
+  }
+
   function hasMergeConflicts(
     pr: Pick<PullRequest, "State" | "MergeableState">,
   ): boolean {
@@ -1219,7 +1289,7 @@
       repoSettings,
       // Treat a blocked head as stale for gating: the merge modal must
       // not open while the reviewed head is unknown.
-      stale: stalePR || headActionsBlocked || midStackMergeBlocked,
+      stale: stalePR || headActionsBlocked || midStackMergeBlocked || mergePending,
       stores: { detail: detailStore },
       requireHeadPin: capabilities.mutation_head_binding,
       ...(detailHeadSha !== "" && { expectedHeadSha: detailHeadSha }),
@@ -1295,6 +1365,10 @@
   });
 
   let wsCreating = $state(false);
+  const workspaceTarget = createDefaultWorkspaceTarget(runtime,
+    () => settings.getWorkspaceSettings().default_execution_target ?? "",
+    () => itemIdentity,
+  );
   // The shared pending store outlives this component and its local flag:
   // route resets and remounts clear wsCreating while the POST is still in
   // flight, and a round-trip back to this PR must keep the button disabled
@@ -1325,17 +1399,20 @@
 
   let workflowDialogWorkflowId = $state<string | null>(null);
   let actionMenuTriggerEl = $state<HTMLButtonElement>();
-  const captureActionMenuTrigger: Attachment<HTMLButtonElement> = (button) => {
+  // Kit Button owns its element, so the host wrapper captures the trigger.
+  const captureActionMenuTrigger: Attachment<HTMLElement> = (host) => {
+    const button = host.querySelector<HTMLButtonElement>(":scope > .actions-menu-trigger");
+    if (!button) return;
     actionMenuTriggerEl = button;
     return () => {
       if (actionMenuTriggerEl === button) actionMenuTriggerEl = undefined;
     };
   };
-  const workflowPlatformRepoId = $derived(
-    !stalePR ? detailStore.getDetail()?.repo.platform_repo_id : undefined,
+  const workflowRepositoryKey = $derived(
+    !stalePR ? repositoryKeyFromWire(detailStore.getDetail()?.repo) : undefined,
   );
   const workflowRef = $derived<WorkflowRepositoryRef | null>(
-    workflowPlatformRepoId ? { ...routeRef, platformRepoId: workflowPlatformRepoId } : null,
+    workflowRepositoryKey ? { ...routeRef, repositoryKey: workflowRepositoryKey } : null,
   );
   const workflowCatalogDemandEnabled = $derived(
     workflowRef !== null
@@ -1617,14 +1694,17 @@
   function toggleLabel(labelName: string): void {
     if (labelGate.unavailable) return;
     if (pendingLabel !== null) return;
+    const requestGeneration = mutationRouteGeneration;
     pendingLabel = labelName;
     labelPickerError = null;
     const nextLabels = nextCatalogLabels(labels, labelCatalog, labelName);
     detailStore.setPullLabels(owner, name, number, nextLabels, {
       onFailure: (message) => {
+        if (componentDestroyed || requestGeneration !== mutationRouteGeneration) return;
         labelPickerError = message;
       },
       onSettled: () => {
+        if (componentDestroyed || requestGeneration !== mutationRouteGeneration) return;
         pendingLabel = null;
       },
     });
@@ -1633,13 +1713,16 @@
   function clearLabels(): void {
     if (labelGate.unavailable) return;
     if (pendingLabel !== null || labels.length === 0) return;
+    const requestGeneration = mutationRouteGeneration;
     pendingLabel = CLEAR_LABELS_PENDING;
     labelPickerError = null;
     detailStore.setPullLabels(owner, name, number, [], {
       onFailure: (message) => {
+        if (componentDestroyed || requestGeneration !== mutationRouteGeneration) return;
         labelPickerError = message;
       },
       onSettled: () => {
+        if (componentDestroyed || requestGeneration !== mutationRouteGeneration) return;
         pendingLabel = null;
       },
     });
@@ -1658,6 +1741,21 @@
             : "Could not reach Kenn Forge",
         ),
       ),
+    );
+  }
+
+  function loadReviewerAccounts() {
+    return executeGeneratedApiRequest("GET pull request reviewer accounts", (client, signal) =>
+      providerUsesHostRoute(routeRef)
+        ? client.PullRequestsService.getPrReviewerAccountsOnHost({ ...providerHostRouteParams(routeRef), number }, { signal })
+        : client.PullRequestsService.getPrReviewerAccounts({ ...providerRouteParams(routeRef), number }, { signal }),
+    ).pipe(
+      retryIdempotentRead,
+      Effect.mapError((failure) => new Error(
+        failure._tag === "ApiProblemError"
+          ? failure.problem.detail ?? failure.problem.title ?? "Could not load reviewer accounts"
+          : "Could not reach Kenn Forge",
+      )),
     );
   }
 
@@ -1718,6 +1816,7 @@
     detailStore.refreshDetailOnly(owner, name, number, {
       provider,
       platformHost,
+      repositoryKey,
       repoPath,
     });
   }
@@ -1725,7 +1824,7 @@
   // A quick action never queues a frontend launch: the server launches the
   // agent and delivers the prompt once the workspace is ready.
   function createWorkspace(launchTargetKey?: string, quickAction?: QuickAction): void {
-    if (stalePR) return;
+    if (stalePR || workspaceTarget.reason) return;
     const detail = detailStore.getDetail();
     if (!detail) return;
     const requestIdentity = $state.snapshot(itemIdentity);
@@ -1743,6 +1842,7 @@
     const requestBody = {
       provider: requestIdentity.provider,
       platform_host: detail.platform_host,
+      ...repositoryKeyToWire(repositoryKeyFromWire(detail.repo)),
       owner: detail.repo_owner,
       name: detail.repo_name,
       mr_number: detail.merge_request.Number,
@@ -1750,11 +1850,26 @@
 
     wsCreating = true;
     beginWorkspaceCreate(requestIdentity, launchTargetKey);
+    const devboxTarget = workspaceTarget.hostKey;
     const program = executeGeneratedApiRequest("POST pull request workspace", (client, signal) =>
-      client.WorkspacesService.createWorkspace(requestBody, { signal }),
+      devboxTarget
+        ? client.DevboxesService.createDevboxWorkspace(
+            { connectionId: devboxTarget.slice(7) },
+            requestBody,
+            { signal },
+          )
+        : client.WorkspacesService.createWorkspace(requestBody, { signal }),
     ).pipe(
       Effect.flatMap((data) =>
         Effect.sync(() => {
+          if (data?.id && devboxTarget) {
+            promoteWorkspaceCreateLaunch(requestIdentity, data.id, devboxTarget);
+            if (quickAction) runWorkspaceQuickAction(runtime, data.id, "pull_request", quickAction, devboxTarget);
+            if (!responseIsStale()) {
+              navigate(`/terminal/fleet/${encodeURIComponent(devboxTarget)}/${encodeURIComponent(data.id)}`);
+            }
+            return;
+          }
           if (data?.id) {
             // Publish the confirmed creation to identity-scoped shared state
             // BEFORE any liveness guard: the workspace exists server-side
@@ -1766,7 +1881,7 @@
             promoteWorkspaceCreateLaunch(requestIdentity, createdRef.id, undefined);
             recordWorkspaceCreated(requestIdentity, createdRef);
             inlineWorkspace?.recordCreated(requestIdentity, createdRef);
-            if (quickAction) runWorkspaceQuickAction(runtime, createdRef.id, quickAction);
+            if (quickAction) runWorkspaceQuickAction(runtime, createdRef.id, "pull_request", quickAction);
           }
           if (responseIsStale() || !data?.id) return;
           if (inlineWorkspace) {
@@ -1798,12 +1913,12 @@
       },
       onFailure: (failure) => {
         if (responseIsStale()) return;
-        showFlash(
+        const message =
           failure._tag === "ApiProblemError"
             ? failure.problem.detail ?? failure.problem.title ?? "failed to create workspace"
-            : "Could not reach Kenn Forge",
-          { tone: "danger" },
-        );
+            : "Could not reach Kenn Forge";
+        showFlash(message, { tone: "danger" });
+        if (launchTargetKey || quickAction) reportWorkspaceOpenError(runtime);
       },
     });
   }
@@ -2103,15 +2218,20 @@
 <svelte:window onkeydown={onActionMenuKeydown} />
 <svelte:document onmousedown={onDocumentMousedown} />
 
-{#if detailStore.isDetailLoading() && (detailStore.getDetail() === null || (stalePR && hideStaleWhileLoading))}
+{#if !detailStore.isDetailLoading() && detailStore.getDetailError() !== null && (detailStore.getDetail() === null || detailMismatch)}
+  <ErrorShown kind="pr_viewed" scope={`${providerItemKey({ provider, platformHost: platformHost ?? "", owner, name, number })}:detail`} shown={visible} />
+{/if}
+
+{#if detailStore.isDetailLoading() && (detailStore.getDetail() === null || (detailMismatch && hideStaleWhileLoading))}
   <div class="state-center"><p class="state-msg">Loading…</p></div>
-{:else if detailStore.getDetailError() !== null && (detailStore.getDetail() === null || (stalePR && hideStaleWhileLoading))}
+{:else if detailStore.getDetailError() !== null && (detailStore.getDetail() === null || (detailMismatch && hideStaleWhileLoading))}
   <div class="state-center"><p class="state-msg state-msg--error">Error: {detailStore.getDetailError()}</p></div>
 {:else}
   {@const detail = detailStore.getDetail()}
-  {@const staleLoadError = stalePR && detailStore.getDetailError() !== null}
+  {@const detailLoadError = detailStore.getDetailError() !== null}
   {#if detail !== null}
     {@const pr = detail.merge_request}
+    {@const detailRepositoryKey = repositoryKeyFromWire(detail.repo)}
     {@const capabilities = detail.repo?.capabilities ?? defaultProviderCapabilities}
     {@const canReadyAction = pr.State === "open" && pr.IsDraft && capabilities.ready_for_review}
     {@const canApproveAction = pr.State === "open" && capabilities.review_mutation}
@@ -2133,9 +2253,10 @@
       detail.repo?.name ?? name,
     )}
     <div class="pull-detail-wrap" {@attach loadWorkflowCatalog(workflowCatalogDemandEnabled ? workflowRef : null)}>
-      {#if staleLoadError}
+      {#if detailLoadError}
         <div class="detail-load-error" data-testid="detail-load-error">
-          Couldn't load this pull request: {detailStore.getDetailError()}
+          {detailMismatch ? "Couldn't load this pull request:" : "Couldn't refresh this pull request. Showing previously loaded content:"}
+          {detailStore.getDetailError()}
         </div>
       {/if}
       {#if !hideTabs}
@@ -2192,10 +2313,9 @@
           onscroll={handlePullDetailScroll}
         >
         <div class="pull-detail">
-          {#if phonePresentation && detailStore.isDetailSyncing() && !manualRefreshPending}
-            <!-- Phones get a top progress bar instead of the inline "Syncing" row:
-                 the row wraps under the branch line and shifts the whole page. -->
-            <div class="sync-bar" role="status" aria-label="Syncing from GitHub"></div>
+          {#if detailStore.isDetailSyncing() && !manualRefreshPending}
+            <!-- Keep background progress out of the layout, including narrow desktop panels. -->
+            <div class="sync-indicator" role="status" aria-label="Syncing from GitHub"></div>
           {/if}
           <div
             class="pull-detail-content"
@@ -2331,13 +2451,6 @@
             </span>
           </span>
         {/if}
-        {#if detailStore.isDetailSyncing() && !manualRefreshPending && !phonePresentation}
-          <span class="meta-sep meta-sep--sync">·</span>
-          <span class="sync-indicator" title="Syncing from GitHub">
-            <Spinner size={12} label="Syncing" />
-            Syncing
-          </span>
-        {/if}
       </div>
 
       <div class="chips-row">
@@ -2406,6 +2519,7 @@
           expanded={expandedPanel === "merge"}
           ontoggle={(next) => { expandedPanel = next ? "merge" : null; }}
         />
+        <MergeQueueChip entry={detail.merge_queue} removal={detail.merge_queue_removal} />
         <StackStatus
           {owner}
           {name}
@@ -2445,6 +2559,7 @@
             {@render labelActionButton()}
           </div>
         {/if}
+        {#key mutationRouteGeneration}
         <UserListEditor
           label="Assignees"
           users={prAssignees}
@@ -2459,8 +2574,11 @@
             <UsersIcon size={12} aria-hidden="true" />
           {/snippet}
         </UserListEditor>
+        {/key}
+        {#key `${provider}:${platformHost}:${owner}:${name}:${number}`}
         <UserListEditor
           label="Reviewers"
+          loadAccounts={canonicalProvider(provider) === "bitbucket" && (platformHost ?? "bitbucket.org") === "bitbucket.org" ? loadReviewerAccounts : undefined}
           users={prReviewers}
           canEdit={capabilities.reviewer_mutation}
           disabled={stalePR || reviewerGate.unavailable}
@@ -2474,6 +2592,7 @@
             <UserCheckIcon size={12} aria-hidden="true" />
           {/snippet}
         </UserListEditor>
+        {/key}
         {#if labelPickerOpen}
           <!-- Escape precedence: a non-empty filter claims Escape to clear itself
                (kit SearchInput stops propagation); only an empty-field Escape
@@ -2555,6 +2674,7 @@
           {number}
           {provider}
           {platformHost}
+          repositoryKey={mutationRef.repositoryKey}
           {repoPath}
           size="sm"
           disabled={stalePR || headActionsBlocked || approveGate.unavailable}
@@ -2590,11 +2710,18 @@
         {@const mergeOp = repoOperations?.merge_pr}
         {@const mergeGate = operationGate(mergeOp)}
         {@const mergeOpUnavailable = mergeGate.unavailable}
-        {#if repoSettings && hasEnabledMergeMethod(repoSettings) && (mergeOp !== undefined
+        {#if mergePending}
+          <Button class="btn--merge" disabled tone="success" surface="soft" size="sm" label="Merging" ariaLabel="Merging">
+            <Spinner size={14} label="Merging" />
+          </Button>
+        {:else if repoSettings && hasEnabledMergeMethod(repoSettings) && (mergeOp !== undefined
             || (capabilities.merge_mutation && repoSettings.viewerCanMerge))}
           {@const mergeSettings = repoSettings}
+          {@const mergeButton = mergeButtonPresentation(mergeSettings)}
           {@const mergeDisabledByConflicts = hasMergeConflicts(pr)}
-          {@const mergeTitle = midStackMergeBlocked
+          {@const mergeTitle = mergeQueueEntry
+            ? mergeQueueEntryDescription(mergeQueueEntry)
+            : midStackMergeBlocked
             ? `Merge #${midStackBlocker?.number ?? "the bottom branch"} first; mid-stack merges are disabled in settings`
             : mergeDisabledByConflicts
               ? "Resolve merge conflicts before merging"
@@ -2605,39 +2732,39 @@
               : mergeOpUnavailable
                 ? mergeGate.reason
                 : deferredMergePending
-                  ? "A background merge is queued to run if its pending CI checks pass. Click to merge immediately; close the pull request to cancel."
-                  : ""}
+                  ? mergeQueueTarget
+                    ? "A background request is waiting to add this pull request to the merge queue if its pending CI checks pass. Click to add it now; close the pull request to cancel."
+                    : "A background merge is queued to run if its pending CI checks pass. Click to merge immediately; close the pull request to cancel."
+                  : mergeQueueTarget
+                    ? `${mergeQueueTarget.branch} uses a merge queue; this adds the pull request to the queue`
+                    : ""}
           <Button
-            class={deferredMergePending ? "btn--merge btn--merge-queued" : "btn--merge"}
-            disabled={stalePR || midStackMergeBlocked || mergeDisabledByConflicts || mergeOpUnavailable || headActionsBlocked || headPinMissing}
+            class={mergeQueueEntry
+              ? "btn--merge btn--merge-in-queue"
+              : deferredMergePending
+                ? "btn--merge btn--merge-queued"
+                : "btn--merge"}
+            disabled={stalePR || mergeQueueEntry !== undefined || midStackMergeBlocked || mergeDisabledByConflicts || mergeOpUnavailable || headActionsBlocked || headPinMissing}
             title={mergeTitle}
             onclick={() => {
-              if (stalePR || midStackMergeBlocked || mergeOpUnavailable || headActionsBlocked || headPinMissing) return;
+              if (stalePR || mergeQueueEntry || midStackMergeBlocked || mergeOpUnavailable || headActionsBlocked || headPinMissing) return;
               runOpenMerge(buildOpenMergeInput(pr, capabilities));
             }}
             tone="success"
-            surface={deferredMergePending ? "soft" : "solid"}
+            surface={mergeQueueEntry || deferredMergePending ? "soft" : "solid"}
             size="sm"
-            ariaLabel={compactLabels
-              ? deferredMergePending
-                ? "Merge queued"
-                : mergeActionLabel(mergeSettings)
-              : undefined}
-            label={compactLabels
-              ? deferredMergePending
-                ? "Queued"
-                : mergeActionShortLabel(mergeSettings)
-              : deferredMergePending
-                ? "Merge queued"
-                : mergeActionLabel(mergeSettings)}
+            ariaLabel={compactLabels ? mergeButton.label : undefined}
+            label={compactLabels ? mergeButton.shortLabel : mergeButton.label}
           >
-            {#if deferredMergePending}
+            {#if mergeButton.icon === "deferred"}
               <ClockIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+            {:else if mergeButton.icon === "queue"}
+              <ListOrderedIcon size="14" strokeWidth="2.2" aria-hidden="true" />
             {:else}
               <GitMergeIcon size="14" strokeWidth="2.2" aria-hidden="true" />
             {/if}
             {#snippet trailing()}
-              {#if !deferredMergePending && mergeActionHasMenu(mergeSettings)}
+              {#if mergeButton.hasMenu}
                 <ChevronDownIcon size="13" strokeWidth="2.2" aria-hidden="true" />
               {/if}
             {/snippet}
@@ -2773,10 +2900,10 @@
             size="sm"
             launchTargets={settings.getLaunchTargets()}
             busy={wsCreateBlocked}
-            disabled={stalePR}
+            disabled={stalePR || workspaceTarget.reason !== ""}
             disabledReason={stalePR
               ? "Refresh details before creating a workspace."
-              : createWorkspaceTitle}
+              : workspaceTarget.reason || workspaceTarget.hint || createWorkspaceTitle}
             descriptionId={createWorkspaceDescriptionId}
             onCreate={(targetKey) => createWorkspace(targetKey)}
             quickActions={settings.getQuickActions()}
@@ -2818,19 +2945,26 @@
         </section>
       {/snippet}
       {#snippet workflowDispatchAction(compactLabels = false)}
-        <div class="workflow-actions-control" bind:this={workflowActionControlEl}>
-          <button
-            {@attach captureActionMenuTrigger}
-            type="button"
+        <div
+          class="workflow-actions-control"
+          bind:this={workflowActionControlEl}
+          {@attach captureActionMenuTrigger}
+        >
+          <Button
             class="actions-menu-trigger"
-            aria-haspopup="true"
-            aria-expanded={actionMenuOpen}
             onclick={() => { actionMenuOpen = !actionMenuOpen; }}
+            tone="neutral"
+            surface="soft"
+            size="sm"
+            ariaExpanded={actionMenuOpen}
+            ariaLabel={compactLabels ? "Run workflow" : undefined}
+            label={compactLabels ? "Workflow" : "Run workflow"}
           >
             <WorkflowIcon size="14" strokeWidth="2.2" aria-hidden="true" />
-            <span>{compactLabels ? "Workflow" : "Run workflow"}</span>
-            <ChevronDownIcon size="14" strokeWidth="2.2" aria-hidden="true" />
-          </button>
+            {#snippet trailing()}
+              <ChevronDownIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+            {/snippet}
+          </Button>
           {#if actionMenuOpen}
             {@render workflowActionsMenu(true)}
           {/if}
@@ -2880,23 +3014,20 @@
             {@const mergeOp = repoOperations?.merge_pr}
             {#if repoSettings && (mergeOp !== undefined
                 || (capabilities.merge_mutation && repoSettings.viewerCanMerge))}
+              {@const measuredMergeButton = mergeButtonPresentation(repoSettings)}
               <Button
                 size="sm"
-                label={compactLabels
-                  ? deferredMergePending
-                    ? "Queued"
-                    : mergeActionShortLabel(repoSettings)
-                  : deferredMergePending
-                    ? "Merge queued"
-                    : mergeActionLabel(repoSettings)}
+                label={compactLabels ? measuredMergeButton.shortLabel : measuredMergeButton.label}
               >
-                {#if deferredMergePending}
+                {#if measuredMergeButton.icon === "deferred"}
                   <ClockIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+                {:else if measuredMergeButton.icon === "queue"}
+                  <ListOrderedIcon size="14" strokeWidth="2.2" aria-hidden="true" />
                 {:else}
                   <GitMergeIcon size="14" strokeWidth="2.2" aria-hidden="true" />
                 {/if}
                 {#snippet trailing()}
-                  {#if !deferredMergePending && repoSettings !== null && mergeActionHasMenu(repoSettings)}
+                  {#if measuredMergeButton.hasMenu}
                     <ChevronDownIcon size="13" strokeWidth="2.2" aria-hidden="true" />
                   {/if}
                 {/snippet}
@@ -2921,12 +3052,71 @@
         </div>
       {/snippet}
 
+      {#snippet measuredUtilityActions(compactLabels = false)}
+        <div
+          class="actions-row actions-row--utility actions-row--measure"
+          aria-hidden="true"
+          inert
+        >
+          {#if !hideWorkspaceAction}
+            {#if workspace}
+              {#if inlineWorkspace}
+                <Button size="sm" label={compactLabels ? "Terminal" : "Focus Terminal"}>
+                  <MonitorUpIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+                </Button>
+                <Button
+                  size="sm"
+                  label={compactLabels
+                    ? "Workspaces"
+                    : workspaceDeletionLifecycle ? "View in Workspaces" : "Open in Workspaces"}
+                >
+                  <ExternalLinkIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+                </Button>
+              {:else}
+                <Button
+                  size="sm"
+                  label={workspaceDeletionLifecycle
+                    ? compactLabels ? "Workspaces" : "View in Workspaces"
+                    : compactLabels ? "Workspace" : "Open Workspace"}
+                >
+                  <MonitorUpIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+                </Button>
+              {/if}
+            {:else}
+              <div class="workspace-create-measure">
+                <Button
+                  class="workspace-create-measure__primary"
+                  size="sm"
+                  label={wsCreateBlocked ? "Creating..." : "Create Workspace"}
+                >
+                  <PackagePlusIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+                </Button>
+                {#if settings.getQuickActions().length > 0}
+                  <span class="workspace-create-measure__options"></span>
+                {/if}
+                <span class="workspace-create-measure__options"></span>
+              </div>
+            {/if}
+          {/if}
+          {#if hasWorkflowActions}
+            <Button size="sm" label={compactLabels ? "Workflow" : "Run workflow"}>
+              <WorkflowIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+              {#snippet trailing()}
+                <ChevronDownIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+              {/snippet}
+            </Button>
+          {/if}
+        </div>
+      {/snippet}
+
       {#snippet fullPrimaryActionMeasure()}
-        {@render measuredPrimaryActions(false)}
+        {#if hasPrimaryPRActions}{@render measuredPrimaryActions(false)}{/if}
+        {@render measuredUtilityActions(false)}
       {/snippet}
 
       {#snippet compactPrimaryActionMeasure()}
-        {@render measuredPrimaryActions(true)}
+        {#if hasPrimaryPRActions}{@render measuredPrimaryActions(true)}{/if}
+        {@render measuredUtilityActions(true)}
       {/snippet}
 
       {#snippet menuPrimaryActionMeasure()}
@@ -2935,17 +3125,18 @@
           aria-hidden="true"
           inert
         >
-          <button type="button" class="actions-menu-trigger">
-            <span>Actions</span>
-            <ChevronDownIcon size="14" strokeWidth="2.2" aria-hidden="true" />
-          </button>
+          <Button class="actions-menu-trigger" tone="neutral" surface="soft" size="sm" label="Actions">
+            {#snippet trailing()}
+              <ChevronDownIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+            {/snippet}
+          </Button>
         </div>
       {/snippet}
 
       <!-- Approve / Merge / Close / Reopen actions -->
       {#if !workspace}
         <span id={createWorkspaceDescriptionId} class="kit-sr-only">
-          {stalePR ? "Refresh details before creating a workspace." : createWorkspaceTitle}
+          {stalePR ? "Refresh details before creating a workspace." : workspaceTarget.reason || workspaceTarget.hint || createWorkspaceTitle}
         </span>
       {/if}
       {#if showActionSurface}
@@ -2973,20 +3164,16 @@
               collapseBelow={0}
             />
           {:else}
-            {#if hasPrimaryPRActions}
             <FitStages
               class="primary-actions-fit"
               bind:stage={primaryActionStage}
               onstagechange={(stage) => {
                 if (stage !== 2) closeActionMenu();
               }}
-              stages={[
-                fullPrimaryActionMeasure,
-                compactPrimaryActionMeasure,
-                menuPrimaryActionMeasure,
-              ]}
+              stages={hasPrimaryPRActions
+                ? [fullPrimaryActionMeasure, compactPrimaryActionMeasure, menuPrimaryActionMeasure]
+                : [fullPrimaryActionMeasure, compactPrimaryActionMeasure]}
             />
-          {/if}
           <div
             class={[
               "actions-menu-wrap",
@@ -3028,7 +3215,7 @@
                     {@render workspaceActionButton(primaryActionStage === 1)}
                   {/if}
                   {#if hasWorkflowActions && (!hasPrimaryPRActions || primaryActionStage !== 2)}
-                    {@render workflowDispatchAction()}
+                    {@render workflowDispatchAction(primaryActionStage === 1)}
                   {/if}
                 </div>
               {/if}
@@ -3038,21 +3225,31 @@
               {/if}
             </div>
             {#if hasPrimaryPRActions && primaryActionStage === 2}
-              <button
-                {@attach captureActionMenuTrigger}
-                type="button"
-                class="actions-menu-trigger"
-                aria-haspopup="true"
-                aria-expanded={actionMenuOpen}
-                onclick={() => { actionMenuOpen = !actionMenuOpen; }}
-              >
-                <span>Actions</span>
-                <ChevronDownIcon size="14" strokeWidth="2.2" aria-hidden="true" />
-              </button>
+              <div class="actions-menu-trigger-host" {@attach captureActionMenuTrigger}>
+                <Button
+                  class="actions-menu-trigger"
+                  onclick={() => { actionMenuOpen = !actionMenuOpen; }}
+                  tone="neutral"
+                  surface="soft"
+                  size="sm"
+                  ariaExpanded={actionMenuOpen}
+                  label="Actions"
+                >
+                  {#snippet trailing()}
+                    <ChevronDownIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+                  {/snippet}
+                </Button>
+              </div>
             {/if}
           </div>
           {/if}
           {#if hasPrimaryPRActions}
+            {#if mergeQueueRemoval && !mergeQueueEntry}
+              <p class="merge-queue-removal-notice" role="status">
+                Removed from the merge queue {formatRelativeTime(mergeQueueRemoval.removed_at)}: {mergeQueueRemovalReason(mergeQueueRemoval)}.
+                Fix the problem, then add it to the queue again.
+              </p>
+            {/if}
             {#if stateConflict === "stale_state"}
               <span class="action-error action-error--state" role="status">
                 The head commit changed since this pull request was reviewed. Re-review the latest changes before approving or merging.
@@ -3122,6 +3319,7 @@
           {number}
           {provider}
           {platformHost}
+          repositoryKey={repositoryKeyFromWire(d.repo)}
           {repoPath}
           prTitle={p.Title}
           prBody={p.Body}
@@ -3135,34 +3333,23 @@
           routeGeneration={mutationRouteGeneration}
           deferUntilChecksPass={shouldDeferMergeForCI(p.CIStatus, p.CIChecksJSON)}
           ciFailed={ciStatusHasFailed(p.CIStatus)}
+          isDraft={p.IsDraft}
           alreadyQueued={deferredMergePending}
-          workspaceId={d.workspace?.id}
-          midStackWarning={midStackBlocker
-            ? `This is stack position ${d.stack?.position ?? "?"} of ${d.stack?.size ?? "?"}. Branch #${midStackBlocker.number} below it has not been merged.`
+          mergeQueue={d.merge_queue_target
+            ? { branch: d.merge_queue_target.branch, mergeMethod: d.merge_queue_target.merge_method }
             : undefined}
+          workspaceId={d.workspace?.id}
+          stackNote={midStackBlocker
+            ? `Stack position ${d.stack?.position ?? "?"} of ${d.stack?.size ?? "?"}.`
+            : undefined}
+          nativeStackMerge={nativeStackMergeScope(d.stack, number)}
           onstateconflict={handleStateConflict}
           onclose={() => { showMergeModal = false; }}
-          onqueued={() => {
-            showMergeModal = false;
-            // Pick up deferred_merge_pending so the merge action renders
-            // as queued until the background worker completes.
-            detailStore.refreshDetailOnly(owner, name, number, {
-              provider,
-              platformHost,
-              repoPath,
-            });
-          }}
-          onmerged={() => {
-            showMergeModal = false;
-            detailStore.loadDetail(owner, name, number, {
-              provider,
-              platformHost,
-              repoPath,
-            });
-            pulls.loadPulls();
-            activity.loadActivity();
-          }}
         />
+      {/if}
+
+      {#if detailRepositoryKey}
+        <ExternalContextCards ref={routeRef} repositoryKey={detailRepositoryKey} {number} headSha={detail.platform_head_sha} />
       {/if}
 
       <!-- PR body -->
@@ -3234,7 +3421,7 @@
                   repo={{ provider, platformHost, owner, name, repoPath }}
                   options={{
                     interactiveTasks: capabilities.state_mutation && !contentGate.unavailable,
-                    collapseSingleLineBreaks: settings.getDetailSettings().collapse_single_line_breaks,
+                    collapseSingleLineBreaks: true,
                   }}
                 />
               </div>
@@ -3275,8 +3462,10 @@
           {number}
           provider={detail.repo.provider}
           platformHost={detail.platform_host}
+          repositoryKey={repositoryKeyFromWire(detail.repo)}
           repoPath={detail.repo.repo_path}
           disabled={stalePR || !capabilities.comment_mutation || addCommentGate.unavailable}
+          editorDisabled={detailMismatch || !capabilities.comment_mutation || addCommentGate.unavailable}
           disabledReason={addCommentGate.unavailable ? addCommentGate.reason : undefined}
         />
       </div>
@@ -3287,7 +3476,7 @@
           <h3 class="section-title">Activity</h3>
           <div class="section-title-actions">
             <DetailRefreshButton
-              disabled={detailStore.isDetailLoading() || detailStore.isDetailSyncing() || stalePR || sync?.getProviderAvailable() === false}
+              disabled={detailStore.isDetailLoading() || detailStore.isDetailSyncing() || detailMismatch || sync?.getProviderAvailable() === false}
               disabledReason={sync?.getProviderAvailable() === false ? "Hub unavailable" : undefined}
               refreshing={manualRefreshPending}
               onRefresh={refreshDetail}
@@ -3303,11 +3492,14 @@
           </div>
         </div>
         {#if detailStore.getDiscussionLoaded()}
+          {#key mutationRouteGeneration}
           <EventTimeline
+            {visible}
             events={filteredTimelineEvents}
             orderingEvents={timelineEvents}
             {provider}
             {platformHost}
+            {repositoryKey}
             repoOwner={owner}
             repoName={name}
             {repoPath}
@@ -3338,6 +3530,7 @@
                 : undefined}
             {jumpToReviewThread}
           />
+          {/key}
         {:else if detailStore.isDetailSyncing()}
           <div class="loading-placeholder">
             <Spinner size={14} label="Syncing" />
@@ -3577,7 +3770,7 @@
     color: var(--text-muted);
   }
 
-  .sync-bar {
+  .sync-indicator {
     position: absolute;
     top: 0;
     left: 0;
@@ -3588,7 +3781,7 @@
     background: color-mix(in srgb, var(--accent-blue) 25%, transparent);
   }
 
-  .sync-bar::before {
+  .sync-indicator::before {
     content: "";
     position: absolute;
     top: 0;
@@ -3609,18 +3802,10 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .sync-bar::before {
+    .sync-indicator::before {
       animation: none;
       width: 100%;
     }
-  }
-
-  .sync-indicator {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    font-size: var(--font-size-xs);
-    color: var(--accent-blue);
   }
 
   .meta-branch {
@@ -3830,10 +4015,6 @@
     flex-wrap: nowrap;
   }
 
-  .primary-actions-wrap :global(.actions-row--measure > .actions-menu-trigger) {
-    display: inline-flex;
-  }
-
   .actions-row {
     display: flex;
     align-items: flex-start;
@@ -3848,6 +4029,19 @@
   }
 
   .approve-action-measure__options {
+    width: 24px;
+    flex: 0 0 24px;
+  }
+
+  .workspace-create-measure {
+    display: inline-flex;
+  }
+
+  .workspace-create-measure :global(.workspace-create-measure__primary) {
+    padding-inline: var(--space-4);
+  }
+
+  .workspace-create-measure__options {
     width: 24px;
     flex: 0 0 24px;
   }
@@ -3868,7 +4062,8 @@
   .primary-actions-wrap :global(.phone-actions-grid .kit-adaptive-action-grid__item > .approve-section),
   .primary-actions-wrap :global(.phone-actions-grid .kit-adaptive-action-grid__item > .ready-section),
   .primary-actions-wrap :global(.phone-actions-grid .kit-adaptive-action-grid__item > .workflow-approval-section),
-  .primary-actions-wrap :global(.phone-actions-grid .kit-adaptive-action-grid__item > .workspace-create-split) {
+  .primary-actions-wrap :global(.phone-actions-grid .kit-adaptive-action-grid__item > .workspace-create-split),
+  .primary-actions-wrap :global(.phone-actions-grid .kit-adaptive-action-grid__item > .workflow-actions-control) {
     width: 100%;
     min-width: 0;
   }
@@ -3876,7 +4071,8 @@
   .primary-actions-wrap :global(.phone-actions-grid.kit-adaptive-action-grid--grid .approve-section > .kit-button),
   .primary-actions-wrap :global(.phone-actions-grid.kit-adaptive-action-grid--grid .ready-section > .kit-button),
   .primary-actions-wrap :global(.phone-actions-grid.kit-adaptive-action-grid--grid .workflow-approval-section > .kit-button),
-  .primary-actions-wrap :global(.phone-actions-grid.kit-adaptive-action-grid--grid .workspace-create-split > .create-primary) {
+  .primary-actions-wrap :global(.phone-actions-grid.kit-adaptive-action-grid--grid .workspace-create-split > .create-primary),
+  .primary-actions-wrap :global(.phone-actions-grid.kit-adaptive-action-grid--grid .workflow-actions-control > .kit-button) {
     width: 100%;
   }
 
@@ -3907,26 +4103,7 @@
     z-index: 65;
   }
 
-  .actions-menu-trigger {
-    display: none;
-    align-items: center;
-    gap: 6px;
-    min-height: 28px;
-    padding: 5px 11px;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-sm);
-    background: var(--bg-surface);
-    color: var(--text-secondary);
-    font-size: var(--font-size-sm);
-    font-weight: 600;
-    cursor: pointer;
-  }
-
-  .workflow-actions-control > .actions-menu-trigger {
-    display: inline-flex;
-  }
-
-  .actions-menu-wrap--menu > .actions-menu-trigger {
+  .actions-menu-trigger-host {
     display: inline-flex;
   }
 
@@ -3944,11 +4121,6 @@
 
   .actions-menu-wrap--menu .primary-actions-live > .actions-menu-popover__item {
     display: block;
-  }
-
-  .actions-menu-trigger:hover {
-    background: var(--bg-surface-hover);
-    color: var(--text-primary);
   }
 
   .actions-menu-popover {
@@ -4078,6 +4250,19 @@
     margin-top: 6px;
   }
 
+  .merge-queue-removal-notice {
+    box-sizing: border-box;
+    margin: 6px 0 0;
+    padding: var(--space-3) var(--space-4);
+    border: 1px solid color-mix(in srgb, var(--accent-red) 40%, var(--border-default));
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--accent-red) 7%, var(--bg-surface));
+    color: var(--text-primary);
+    font-size: var(--font-size-xs);
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+  }
+
   .state-conflict-recovery {
     display: flex;
     align-items: center;
@@ -4111,28 +4296,36 @@
   }
 
   .section-title {
-    font-size: var(--font-size-sm);
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--text-muted);
+    font-size: var(--font-size-md);
+    font-weight: var(--font-weight-semibold);
+    text-transform: var(--label-transform, uppercase);
+    letter-spacing: var(--letter-spacing-label, 0.05em);
+    color: var(--text-primary);
   }
 
   .section-title-inline {
-    font-size: var(--font-size-sm);
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--text-muted);
+    font-size: var(--font-size-md);
+    font-weight: var(--font-weight-semibold);
+    text-transform: var(--label-transform, uppercase);
+    letter-spacing: var(--letter-spacing-label, 0.05em);
+    color: var(--text-primary);
   }
 
   .inset-box__content {
-    padding: 10px 12px;
+    padding: var(--space-2) 0;
     font-size: var(--font-size-root);
     color: var(--text-primary);
     word-break: break-word;
     line-height: 1.6;
   }
+  .inset-box__content > :global(:first-child) {
+    margin-top: 0;
+  }
+
+  .inset-box__content > :global(:last-child) {
+    margin-bottom: 0;
+  }
+
 
   .files-stat {
     font-family: var(--font-mono);
@@ -4312,7 +4505,6 @@
     .meta-sep,
     .meta-branch,
     .branch-name-btn,
-    .sync-indicator,
     .section-title,
     .section-title-inline,
     .files-stat,
@@ -4323,8 +4515,7 @@
       line-height: 1.35;
     }
 
-    .meta-sep--branch,
-    .meta-sep--sync {
+    .meta-sep--branch {
       display: none;
     }
 
@@ -4367,7 +4558,7 @@
     }
 
     .actions-row :global(.kit-button),
-    .actions-menu-trigger,
+    .actions-menu-trigger-host :global(.kit-button),
     .detail-tab,
     .title-edit-save,
     .title-edit-cancel,

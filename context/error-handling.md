@@ -49,6 +49,7 @@ not an exhaustive enum.
 | `issueNotFound` | 404 | Issue lookup miss. |
 | `commentNotFound` | 404 | Comment lookup miss. |
 | `projectNotFound` | 404 | Local project record lookup miss. |
+| `worklistNotFound` | 404 | Worklist lookup miss; `details.worklist_id` names the requested ID. |
 | `workspaceNotFound` | 404 | Workspace lookup miss; it does not prove that the workspace was deleted. |
 | `settingsUnavailable` | 404 | Settings store is unavailable in the current server mode. |
 | `conflict` | 409 | Generic state conflict. Head-bound provider mutations include `details.reason` as a stable discriminator: `stale_state` (target moved past the reviewed commit; reload and re-review), `conflict` (provider refuses the current state), or `head_unknown` (no reviewed head synced locally). Review suggestion apply adds `not_open` (PR closed/merged, locally or upstream) and `head_repo_unknown` (head repo identity missing or inaccessible); both fail closed with no branch mutation. For providers with hard head binding only `stale_state` triggers a server-side MR resync — refreshing on other conflicts would persist a head nobody reviewed and arm stale retries; providers without hard binding also resync on generic merge conflicts to refresh the local mergeable view. Three head states have distinct contracts: (1) initial missing synced head — first-party clients disable head-bound actions preflight and fire no request; the head arrives via normal detail-load or periodic sync; (2) stale pinned head — the 409 `stale_state` makes the client reload the detail (a sync-enabled load) and prompt re-review; (3) server `head_unknown` — reachable only from clients without preflight gating; it never syncs server-side (a freshly persisted head would arm stale retries) and recovery is the same client-initiated reload with head-bound actions disabled until the response carries `platform_head_sha`. When a `stale_state` failure leaves a provider side effect behind — an approval that could not be revoked after the head moved, a review note already posted before the approval failed — `details.context` carries that context verbatim and the human-readable `detail` repeats it; clients still branch on `reason`, but should show `context` so the user knows a blind retry duplicates the side effect. Approval revocation outcomes additionally carry stable members, but only on post-submit staleness — when an approval was actually created upstream and then found to sit on a moved head: `details.revocation` (`succeeded` — the approval was dismissed/deleted upstream; `failed` — it may still stand and the user must verify or remove it manually, identified by `details.review_id`). Pre-check stale approvals omit both members because no approval was created. A post-submit verification read that fails outright is treated like a moved head — the approval is revoked and the response carries the revocation members — because an approval whose head cannot be proven must not stand; `details.cause` (`moved_head` or `head_unverifiable`) distinguishes the two so clients can prompt re-review versus a possibly-unchanged head after a transient read failure. When a review-draft publish both leaves published content behind and hits a stale approval, the 409 `stale_state` envelope wins: it carries the revocation members plus `details.partialPublish` and `details.publishedCommentCount`, and the server clears the published local draft copies before responding — `partially_published` success responses are reserved for non-stale partial failures. Clients must treat the members as optional and only branch on `revocation` when present. |
@@ -57,6 +58,8 @@ not an exhaustive enum.
 | `unsupportedCapability` | 409 | Provider lacks the operation capability. Include `details.capability`, `details.provider`, and `details.platformHost`. |
 | `resyncRequired` | 409 | A provider item lacks stable external identity required for a safe mutation. Include `details.subject_kind` and `details.item_number`; clients should request a successful resync before retrying. |
 | `payloadTooLarge` | 413 | A bounded payload exceeds its accepted size. Request-body failures include `details.maxBytes` when known. Archive detailed-report failures use `details.reason = "reportTooLarge"` with integer `observedRecords`, `maxRecords`, `observedTextBytes`, and `maxTextBytes`; clients branch on the reason and camelCase fields, not prose. |
+| `unsupportedMediaType` | 415 | The provider served the markdown media source and it is not an allowed video type. It is the only media rejection that proves the asset is not a video, so clients may remember it; every other media failure says nothing about the asset type. |
+| `rangeNotSatisfiable` | 416 | The provider rejected the requested media byte range. |
 | `rateLimited` | 429 | Upstream provider quota is exhausted. Include `details.retryAfter` as a UTC RFC3339 timestamp when known. |
 | `internalError` | 500 | Generic kenn-forge bug or unexpected local failure. |
 | `mutationOutcomeUnknown` | 502 | A non-idempotent upstream mutation may have been applied despite transport failure. Clients fence related writes, reconcile fresh authority, and never replay the request automatically. |
@@ -71,16 +74,16 @@ branch. Keep the OpenAPI enum stable and regenerate API artifacts with
 - After dispatching a non-idempotent provider write, preserve only typed errors that prove rejection;
   unverified provider failures, unreadable or oversized hub responses, and local persistence
   failures after provider success return `mutationOutcomeUnknown`
-  (`internal/server/httpapi/problems.go::ProviderMutationProblem`, `internal/server/provider_proxy.go::providerProxy.ServeHTTP`).
+  (`internal/server/httpapi/problems.go::ProviderMutationProblem`, `internal/server/routepolicy/provider_proxy.go::ProviderProxy.ServeHTTP`).
 - A stale manual-workflow definition is `conflict` with
   `details.reason = "workflow_definition_changed"` and expected/live SHAs, so
   clients can require a catalog reload (`internal/server/workflowapi/routes.go::Handler.dispatch`).
 
 ## Server Construction
 
-`internal/server/httpapi` owns the shared HTTP problem contract. Server domain
-packages must use its constructors instead of direct `huma.Error4xx` /
-`huma.Error5xx` calls so status, wire code, and details stay consistent
+`internal/server/httpapi` owns the shared HTTP problem contract. All Huma services,
+including standalone devbox services, must use its constructors instead of direct
+`huma.Error4xx` / `huma.Error5xx` calls so status, wire code, and details stay consistent
 (`internal/server/httpapi/problems.go::ProblemError`).
 
 Huma uses Go's JSON v2 semantics for API bodies. Ordinary nil slices serialize
@@ -104,7 +107,7 @@ Rules for handler code:
 - Branch-conflict payloads put branch names in top-level `details`; do not rely
   on nested `errors[].value` payloads.
 - Mid-stack merges fail closed for immediate and deferred paths unless explicitly
-  enabled; return `conflict` with reason `mid_stack_merge_disallowed` and `blocking_number` (`internal/server/huma_routes.go::requireMidStackMergeAllowed`).
+  enabled; return `conflict` with reason `mid_stack_merge_disallowed` and `blocking_number` (`internal/server/pullapi/routes.go::Handler.requireMidStackMergeAllowed`).
 - Huma's `errors[]` field is reserved for Huma validation compatibility. Do not
   add new machine-readable contracts there.
 - Map domain failures to statuses from typed or sentinel errors with
@@ -120,6 +123,8 @@ Translate `platform` typed errors at the server boundary:
 | `unsupported_capability` | `409 unsupportedCapability` |
 | `stale_state` | `409 conflict` |
 | `conflict` | `409 conflict` |
+| `unsupported_media_type` | `415 unsupportedMediaType` |
+| `range_not_satisfiable` | `416 rangeNotSatisfiable` |
 | `rate_limited` | `429 rateLimited` |
 | `permission_denied` | `403 forbidden` |
 | `not_found` | `404 notFound`, or a more specific not-found code when the caller knows the resource type |
@@ -128,7 +133,7 @@ Translate `platform` typed errors at the server boundary:
 
 Cancellation and deadline errors pass through only when the request context is
 done; a provider child-context deadline while the request remains active is a
-`502 upstreamError` (`internal/server/markdown_images.go::markdownImageError`).
+`502 upstreamError` (`internal/server/providerapi/markdown_images.go::markdownImageError`).
 
 ## Frontend Handling
 

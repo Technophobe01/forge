@@ -83,7 +83,7 @@ func requireProcessGone(t *testing.T, pid int) {
 		if processGone(pid) {
 			return
 		}
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(25 * time.Millisecond) //nolint:kennlint // polls the OS until the tmux subprocess has exited
 	}
 	require.Fail(t, "process survived cleanup", "pid=%d", pid)
 }
@@ -224,7 +224,7 @@ func TestRootLockSerializesAcrossProcesses(t *testing.T) {
 	case err := <-acquired:
 		require.NoError(err)
 		require.Fail("second process entered the root critical section")
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond): //nolint:kennlint // shows the event does not happen; the helper process holds the root lock until the release file appears
 	}
 
 	require.NoError(os.WriteFile(release, []byte("release\n"), 0o600))
@@ -526,7 +526,7 @@ func TestProcessStartIsStableForLiveProcess(t *testing.T) {
 	}
 	first, err := processStart(os.Getpid())
 	require.NoError(err)
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(10 * time.Millisecond) //nolint:kennlint // separates OS process-start samples to verify identity stays stable across wall-clock time
 	second, err := processStart(os.Getpid())
 	require.NoError(err)
 	assert.NotEmpty(first)
@@ -622,7 +622,7 @@ func TestOwnerCleanupStopsRegisteredServerAndPreservesControl(t *testing.T) {
 	}
 	controlPID := startTmuxServer(t, tmuxPath, controlCommand)
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 2*time.Second)
 		defer cancel()
 		_ = procutil.CommandContext(
 			ctx, tmuxPath, "-S", controlSocket, "kill-server",
@@ -701,7 +701,7 @@ esac
 	case cleanupErr := <-cleanupDone:
 		require.NoError(cleanupErr)
 		require.Fail("cleanup returned while admitted tmux startup was blocked")
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond): //nolint:kennlint // shows the event does not happen; the admitted tmux startup blocks Cleanup until the release file appears
 	}
 
 	require.NoError(os.WriteFile(release, []byte("release\n"), 0o600))
@@ -917,6 +917,52 @@ func TestReapStaleRemovesAdmissionWithoutRun(t *testing.T) {
 	require.NoDirExists(admissionDir)
 }
 
+func TestReapStaleRunWithoutAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		removeRun     bool
+		removeMarker  bool
+		wantErrorText string
+	}{
+		{name: "run removed after directory snapshot", removeRun: true},
+		{name: "retained run without marker", removeMarker: true, wantErrorText: "inspect stale tmux test owner"},
+		{name: "retained run without admission", wantErrorText: "without admission gate"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			root := filepath.Join(t.TempDir(), "root")
+			require.NoError(prepareRoot(root))
+			start := "dead-owner"
+			identity := processIdentity{pid: 999_999, startToken: tokenForStart(start)}
+			runName := fmt.Sprintf("run.%d.%s.abcdef", identity.pid, identity.startToken)
+			runDir, err := publishRun(root, runName, ownerMarker{
+				PID: identity.pid, ProcessStart: start, StartToken: identity.startToken,
+			}, os.Rename)
+			require.NoError(err)
+			if tc.removeMarker {
+				require.NoError(os.Remove(filepath.Join(runDir, "owner.json")))
+			}
+
+			err = reapStaleWithLookup(root, func(pid int) (string, error) {
+				require.Equal(identity.pid, pid)
+				// Owner cleanup does not hold the root lock and can finish
+				// after ReadDir captured this run but before the identity lookup.
+				if tc.removeRun {
+					require.NoError(os.RemoveAll(runDir))
+				}
+				return "", errProcessAbsent
+			})
+			if tc.wantErrorText != "" {
+				require.ErrorContains(err, tc.wantErrorText)
+				require.DirExists(runDir)
+				return
+			}
+			require.NoError(err)
+			require.NoDirExists(runDir)
+		})
+	}
+}
+
 func TestReapStalePreservesAdmissionWhenRunValidationFails(t *testing.T) {
 	require := require.New(t)
 	root := filepath.Join(t.TempDir(), "root")
@@ -1058,7 +1104,7 @@ func TestNewAtRefusesUnmarkedStaleRun(t *testing.T) {
 	command := []string{tmuxPath, "-f", "/dev/null", "-S", socket}
 	serverPID := startTmuxServer(t, tmuxPath, command)
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 2*time.Second)
 		defer cancel()
 		_ = procutil.CommandContext(ctx, tmuxPath, "-S", socket, "kill-server").Run()
 	})

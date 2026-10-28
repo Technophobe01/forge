@@ -13,7 +13,7 @@ func seedMetadataTestMR(t *testing.T, database *DB) (int64, int64, int64) {
 	ctx := t.Context()
 	now := time.Date(2026, 8, 5, 10, 30, 0, 0, time.UTC)
 	repoID := insertTestRepo(t, database, "owner", "repo")
-	mrID, revision, accepted, err := database.UpsertMergeRequestSnapshotWithLabels(ctx, &MergeRequest{
+	mrID, _, accepted, err := database.UpsertMergeRequestSnapshotWithLabels(ctx, &MergeRequest{
 		RepoID: repoID, PlatformID: 1, Number: 1, Title: "Synthetic merge request",
 		State: MergeRequestStateOpen, PlatformHeadSHA: "head", PlatformBaseSHA: "base",
 		CreatedAt: now.Add(-time.Hour), UpdatedAt: now, LastActivityAt: now,
@@ -30,7 +30,10 @@ func seedMetadataTestMR(t *testing.T, database *DB) (int64, int64, int64) {
 		CreatedAt:      now,
 		DedupeKey:      "commit-1",
 	}}))
-	return repoID, mrID, revision
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 1)
+	require.NoError(t, err)
+	require.NotNil(t, mr)
+	return repoID, mrID, mr.SnapshotRevision
 }
 
 func assertMetadataTestEvent(t *testing.T, database *DB, mrID int64, wantMetadata string) {
@@ -47,6 +50,8 @@ func assertMetadataTestEvent(t *testing.T, database *DB, mrID int64, wantMetadat
 }
 
 func TestChildSnapshotEventMetadataUpdates(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name         string
 		updateKey    string
@@ -83,6 +88,8 @@ func TestChildSnapshotEventMetadataUpdates(t *testing.T) {
 }
 
 func TestChildSnapshotEventMetadataUpdatesRejectStaleRevision(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	database := openTestDB(t)
@@ -110,6 +117,8 @@ func TestChildSnapshotEventMetadataUpdatesRejectStaleRevision(t *testing.T) {
 }
 
 func TestParentSnapshotComputesTerminalEventMetadataInTransaction(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	database := openTestDB(t)
 	ctx := t.Context()
@@ -128,18 +137,14 @@ func TestParentSnapshotComputesTerminalEventMetadataInTransaction(t *testing.T) 
 	}
 	upsert := func(state MergeRequestState, title string, updatedAt time.Time) bool {
 		t.Helper()
-		release, err := database.LockRepositoryReconciliationRead(ctx)
-		require.NoError(t, err)
-		defer release()
-		_, _, accepted, err :=
-			database.UpsertMergeRequestSnapshotWithLabelsUnderRepositoryReconciliationRead(
-				ctx, &MergeRequest{
-					RepoID: repoID, PlatformID: 1, Number: 1, Title: title,
-					State: state, PlatformHeadSHA: "head", PlatformBaseSHA: "base",
-					CreatedAt: now.Add(-time.Hour), UpdatedAt: updatedAt,
-					LastActivityAt: updatedAt,
-				}, computer,
-			)
+		_, _, accepted, err := database.UpsertMergeRequestSnapshotWithLabelsAndEventMetadata(
+			ctx, &MergeRequest{
+				RepoID: repoID, PlatformID: 1, Number: 1, Title: title,
+				State: state, PlatformHeadSHA: "head", PlatformBaseSHA: "base",
+				CreatedAt: now.Add(-time.Hour), UpdatedAt: updatedAt,
+				LastActivityAt: updatedAt,
+			}, computer,
+		)
 		require.NoError(t, err)
 		return accepted
 	}
@@ -172,6 +177,8 @@ func TestParentSnapshotComputesTerminalEventMetadataInTransaction(t *testing.T) 
 }
 
 func TestMarkDetailFetchedEventMetadataUpdates(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	database := openTestDB(t)

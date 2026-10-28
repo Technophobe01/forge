@@ -1,0 +1,318 @@
+package localruntime
+
+import (
+	"encoding/json/v2"
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+)
+
+// Streamed assistant text is published in finished markdown blocks rather
+// than token by token. A block whose shape can still change as more text
+// arrives (an open paragraph, list item, or code fence) stays held.
+
+// maxHeldTextBytes delivers held text as is to cap memory during a turn that
+// never reaches a block boundary.
+const maxHeldTextBytes = 24_000
+
+// minTextDeliveryInterval keeps blocks that finish shortly after a delivery
+// held so they land together, and a fast agent does not repaint the message
+// several times a second.
+const minTextDeliveryInterval = 400 * time.Millisecond
+
+var (
+	acpFencePattern     = regexp.MustCompile("^( {0,3})(`{3,}|~{3,})")
+	acpBlankLinePattern = regexp.MustCompile(`^[ \t]*$`)
+	acpListItemPattern  = regexp.MustCompile(`^ {0,3}(?:[-+*]|\d{1,9}[.)])[ \t]`)
+)
+
+// deliverableTextPrefix returns how much of text ends at a block boundary: a
+// blank line, the line after a closing code fence, or the start of a list
+// item, none of them inside an open fence.
+func deliverableTextPrefix(text string) int {
+	var fenceMarker string
+	fenceIndent, fenceOpen := 0, false
+	boundary, lineStart := -1, 0
+	for {
+		newline := strings.IndexByte(text[lineStart:], '\n')
+		end := len(text)
+		if newline >= 0 {
+			newline += lineStart
+			end = newline
+		}
+		line := strings.TrimRight(text[lineStart:end], " \t\r")
+		if !fenceOpen && lineStart > 0 && acpListItemPattern.MatchString(line) {
+			boundary = lineStart
+		}
+		if newline < 0 {
+			break
+		}
+		if fence := acpFencePattern.FindStringSubmatch(line); fence != nil {
+			indent, marker := len(fence[1]), fence[2]
+			switch {
+			case !fenceOpen:
+				fenceOpen, fenceMarker, fenceIndent = true, marker, indent
+			case marker[0] == fenceMarker[0] && len(marker) >= len(fenceMarker) &&
+				indent <= fenceIndent+3 && len(line) == indent+len(marker):
+				fenceOpen = false
+				boundary = newline + 1
+			}
+		} else if !fenceOpen && lineStart > 0 && acpBlankLinePattern.MatchString(line) {
+			boundary = newline + 1
+		}
+		lineStart = newline + 1
+	}
+	return max(boundary, 0)
+}
+
+// holdTextLocked records streamed text appended to the last assistant
+// message. It is published only when deliverTextLocked releases it.
+func (a *ACP) holdTextLocked(startedMessage bool, text string) {
+	if startedMessage {
+		a.releaseHeldTextLocked()
+		a.heldSeq++
+	}
+	a.heldBytes += len(text)
+	a.deliverTextLocked()
+}
+
+// deliverTextLocked publishes held text up to its last block boundary once the
+// pacing window has passed, or everything when the hold exceeds the cap.
+func (a *ACP) deliverTextLocked() {
+	pending := a.heldTextLocked()
+	if pending == "" {
+		return
+	}
+	if len(pending) > maxHeldTextBytes {
+		a.releaseHeldTextLocked()
+		a.publishProgressLocked()
+		return
+	}
+	ready := pending[:deliverableTextPrefix(pending)]
+	wait := time.Until(a.lastTextDelivery.Add(minTextDeliveryInterval))
+	if strings.TrimSpace(ready) == "" || wait > 0 {
+		if wait <= 0 {
+			wait = minTextDeliveryInterval
+		}
+		a.scheduleTextDeliveryLocked(wait)
+		return
+	}
+	a.heldBytes -= len(ready)
+	a.publishMessageLocked(len(a.state.Messages) - 1)
+	a.lastTextDelivery = time.Now()
+	a.publishProgressLocked()
+	if a.heldBytes > 0 {
+		a.scheduleTextDeliveryLocked(minTextDeliveryInterval)
+	}
+}
+
+// scheduleTextDeliveryLocked looks again once the pacing window closes. An
+// agent that went quiet in the middle of a block gets that text shown instead
+// of held indefinitely.
+func (a *ACP) scheduleTextDeliveryLocked(wait time.Duration) {
+	if a.textDelivery != nil || a.heldBytes == 0 {
+		return
+	}
+	seq, received := a.heldSeq, a.lastMessageBytesLocked()
+	a.textDelivery = time.AfterFunc(wait, func() {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		a.textDelivery = nil
+		if a.heldBytes == 0 {
+			return
+		}
+		if a.heldSeq == seq && a.lastMessageBytesLocked() == received {
+			a.releaseHeldTextLocked()
+			a.publishProgressLocked()
+			return
+		}
+		a.deliverTextLocked()
+	})
+}
+
+// releaseHeldTextLocked makes every received character visible. Callers
+// publish afterwards.
+func (a *ACP) releaseHeldTextLocked() {
+	if a.textDelivery != nil {
+		a.textDelivery.Stop()
+		a.textDelivery = nil
+	}
+	if a.heldBytes == 0 {
+		return
+	}
+	a.heldBytes = 0
+	a.publishMessageLocked(len(a.state.Messages) - 1)
+	a.lastTextDelivery = time.Now()
+}
+
+func (a *ACP) publishProgressLocked() {
+	_ = a.persistLocked()
+	a.changedLocked()
+}
+
+func (a *ACP) lastMessageBytesLocked() int {
+	if len(a.state.Messages) == 0 {
+		return 0
+	}
+	return len(a.state.Messages[len(a.state.Messages)-1].Text)
+}
+
+// heldTextLocked is the unpublished suffix of the last assistant message.
+func (a *ACP) heldTextLocked() string {
+	if a.heldBytes == 0 || len(a.state.Messages) == 0 {
+		a.heldBytes = 0
+		return ""
+	}
+	text := a.state.Messages[len(a.state.Messages)-1].Text
+	// Replacing the last message (a restore or reset) can leave it shorter.
+	a.heldBytes = min(a.heldBytes, len(text))
+	return text[len(text)-a.heldBytes:]
+}
+
+// publishedMetadataLocked describes the transcript without scanning or copying
+// its entries. A last message that is entirely held is left out.
+func (a *ACP) publishedMetadataLocked() ACPState {
+	a.initializeMessagesLocked()
+	state := a.state
+	state.Messages = nil
+	state.MessageOffset = 0
+	state.MessageCount = len(a.state.Messages)
+	held := len(a.heldTextLocked())
+	if held > 0 && held == len(a.state.Messages[state.MessageCount-1].Text) {
+		state.MessageCount--
+	}
+	state.MessageCursor = a.messageCursor
+	state.LastMessageID = ""
+	if state.MessageCount > 0 {
+		state.LastMessageID = a.state.Messages[state.MessageCount-1].ID
+	}
+	state.Answered = nil
+	return state
+}
+
+func (a *ACP) publishedStateLocked() ACPState {
+	state := a.publishedMetadataLocked()
+	start := max(0, state.MessageCount-acpMessageWindow)
+	messages := a.publishedMessagesLocked(start, state.MessageCount)
+	size := acpMessageBatchSize(messages, true)
+	state.MessageOffset = state.MessageCount - size
+	state.Messages = messages[len(messages)-size:]
+	return state
+}
+
+// acpMessageWindow caps recent messages in the initial snapshot.
+const acpMessageWindow = 200
+
+// acpHistoryPage is the page size when a history request names none.
+const acpHistoryPage = 100
+
+// acpMessageBatchBytes is a delivery target, not a content limit. Keep at
+// least one whole message so an oversized tool result remains readable and
+// every nonempty history page advances its cursor. Metadata is additional.
+const acpMessageBatchBytes = 256 << 10
+
+// acpMessageBatchSize counts a contiguous prefix or suffix by its JSON size,
+// including escaping, attachments, and tool output, rather than text length.
+func acpMessageBatchSize(messages []ACPMessage, newestFirst bool) int {
+	bytes, count := 2, 0 // JSON array brackets
+	for n := range messages {
+		i := n
+		if newestFirst {
+			i = len(messages) - 1 - n
+		}
+		data, err := json.Marshal(messages[i])
+		if err != nil {
+			// Include the invalid message so the caller's marshal reports it.
+			return count + 1
+		}
+		size := len(data)
+		if count > 0 {
+			size++ // comma
+			if bytes+size > acpMessageBatchBytes {
+				break
+			}
+		}
+		bytes += size
+		count++
+		if bytes >= acpMessageBatchBytes {
+			break
+		}
+	}
+	return count
+}
+
+// publishedMessageLocked hides the unpublished suffix of one entry.
+func (a *ACP) publishedMessageLocked(index int) ACPMessage {
+	message := a.state.Messages[index]
+	if index == len(a.state.Messages)-1 {
+		message.Text = message.Text[:len(message.Text)-len(a.heldTextLocked())]
+	}
+	return message
+}
+
+func (a *ACP) publishedMessagesLocked(start, end int) []ACPMessage {
+	messages := a.state.Messages[start:end]
+	if end == len(a.state.Messages) && end > start && a.heldBytes > 0 {
+		messages = append([]ACPMessage(nil), messages...)
+		messages[len(messages)-1] = a.publishedMessageLocked(end - 1)
+	}
+	return messages
+}
+
+// ACPHistory is a page of earlier transcript messages starting at the
+// absolute transcript index Offset.
+type ACPHistory struct {
+	BeforeID string       `json:"beforeId"`
+	Offset   int          `json:"offset"`
+	Messages []ACPMessage `json:"messages"`
+}
+
+// historyLocked returns messages [before-limit, before) of the published
+// transcript, as the {"history": ...} frame a client receives.
+func (a *ACP) historyLocked(beforeID string, limit int) ([]byte, error) {
+	state := a.publishedMetadataLocked()
+	before := state.MessageCount
+	if beforeID != "" {
+		entry := a.messageIndex[beforeID]
+		if entry == nil {
+			return nil, fmt.Errorf("unknown chat message %q", beforeID)
+		}
+		before = min(entry.Value.(*acpMessagePosition).index, state.MessageCount)
+	}
+	if limit <= 0 {
+		limit = acpHistoryPage
+	}
+	start := max(0, before-limit)
+	messages := a.publishedMessagesLocked(start, before)
+	size := acpMessageBatchSize(messages, true)
+	start = before - size
+	return json.Marshal(map[string]ACPHistory{"history": {BeforeID: beforeID, Offset: start, Messages: messages[len(messages)-size:]}}, json.Deterministic(true))
+}
+
+// History returns a page of earlier messages as a client frame.
+func (a *ACP) History(beforeID string, limit int) ([]byte, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.historyLocked(beforeID, limit)
+}
+
+// Page returns the published state with Messages holding transcript messages
+// [after, after+limit) instead of the recent window. MessageOffset is the
+// clamped cursor, so each message's transcript index is MessageOffset plus its
+// position. A limit of 0 or less selects the default history page size.
+func (a *ACP) Page(after, limit int) ([]byte, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	state := a.publishedMetadataLocked()
+	if limit <= 0 {
+		limit = acpHistoryPage
+	}
+	start := min(max(after, 0), state.MessageCount)
+	end := start + min(limit, state.MessageCount-start)
+	messages := a.publishedMessagesLocked(start, end)
+	size := acpMessageBatchSize(messages, false)
+	state.MessageOffset = start
+	state.Messages = messages[:size]
+	return json.Marshal(state, json.Deterministic(true))
+}

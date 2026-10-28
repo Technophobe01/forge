@@ -1,7 +1,8 @@
+import { startTestTelemetry } from "../../testing/telemetry.js";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { Effect } from "effect";
 import type { ComponentProps } from "svelte";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vite-plus/test";
 import { makeAppRuntime, type OwnedAppRuntime } from "../../app/runtime.js";
 import type { GeneratedClient } from "../../api/generated-api.js";
 import type { IssueDetail, Label, QuickAction } from "../../api/types.js";
@@ -51,6 +52,8 @@ vi.mock("@kenn-io/kit-ui", async (importOriginal) => {
 
 import IssueDetailComponent from "./IssueDetail.svelte";
 import IssueDetailTestHarness from "./IssueDetailTestHarness.svelte";
+import { getCommentDraftKey, setCommentDraft } from "./comment-drafts.svelte.js";
+import { repositoryKeyFromWire } from "../../api/repository-key.js";
 
 let issueRuntime: OwnedAppRuntime | null = null;
 
@@ -114,6 +117,7 @@ function issueDetail(): IssueDetail {
       capabilities,
       provider: "github",
       platform_host: "github.com",
+      platform_repo_id: 1001,
       owner: "acme",
       name: "widget",
       repo_path: "acme/widget",
@@ -180,7 +184,9 @@ function renderIssueDetail(
   ),
   options: {
     staleRefreshing?: boolean;
+    defaultExecutionTarget?: string;
     detailLoading?: boolean;
+    detailFromCache?: boolean;
     detailSyncing?: boolean;
     deferRefresh?: boolean;
     refreshFailure?: string;
@@ -188,6 +194,7 @@ function renderIssueDetail(
     onOpenWorkspace?: (workspaceId: string) => void;
     runtimeClient?: GeneratedClient;
     quickActions?: QuickAction[];
+    detailProps?: Partial<ComponentProps<typeof IssueDetailComponent>>;
   } = {},
   apiClient: { GET: ReturnType<typeof vi.fn>; POST: ReturnType<typeof vi.fn> } = {
     GET: vi.fn(),
@@ -202,6 +209,7 @@ function renderIssueDetail(
     stopIssueDetailPolling: vi.fn(),
     getIssueDetail: () => detail,
     getIssueDetailEnvelopeTick: () => envelopeTick,
+    isIssueDetailFromCache: () => options.detailFromCache ?? false,
     isIssueDetailLoading: () => options.detailLoading ?? false,
     getIssueDetailError: () => null,
     isIssueStaleRefreshing: () => options.staleRefreshing ?? false,
@@ -224,6 +232,7 @@ function renderIssueDetail(
     toggleIssueStar: vi.fn(),
     setIssueState: vi.fn(),
     editIssueComment: vi.fn(),
+    submitIssueComment: vi.fn(),
     deleteIssueComment,
     setIssueLabels: vi.fn(),
     setIssueAssignees: vi.fn(),
@@ -244,6 +253,7 @@ function renderIssueDetail(
     repoPath: "acme/widget",
     inlineWorkspace: options.inlineWorkspace ?? null,
     onOpenWorkspace: options.onOpenWorkspace,
+    ...options.detailProps,
   };
   const result = render(IssueDetailTestHarness, {
     props: {
@@ -258,6 +268,7 @@ function renderIssueDetail(
           activity: { loadActivity: vi.fn() },
           detailActivityView: createDetailActivityViewStore(),
           settings: {
+            getWorkspaceSettings: () => ({ default_execution_target: options.defaultExecutionTarget ?? "" }),
             getLaunchTargets: () => launchTargets,
             getQuickActions: () => options.quickActions ?? [],
             getDetailSettings: () => ({ initial_timeline_entry_limit: 250 }),
@@ -295,6 +306,38 @@ function renderIssueDetail(
 }
 
 describe("IssueDetail activity view", () => {
+  it.each([false, true])("allows a cached issue draft only for the selected item (mismatch=%s)", async (mismatch) => {
+    const detail = issueDetail();
+    detail.repo.capabilities = { ...detail.repo.capabilities, comment_mutation: true };
+    detail.repo.operations = { add_comment: { available: true } };
+    const number = detail.issue.Number + (mismatch ? 1 : 0);
+    const draftKey = getCommentDraftKey("issue", {
+      provider: "github",
+      platformHost: "github.com",
+      owner: "acme",
+      name: "widget",
+      repoPath: "acme/widget",
+      number,
+      repositoryKey: repositoryKeyFromWire(detail.repo),
+    });
+    setCommentDraft(draftKey, "Draft while refreshing");
+    onTestFinished(() => setCommentDraft(draftKey, ""));
+    const { container, issuesStore } = renderIssueDetail(detail, undefined, {
+      detailFromCache: true,
+      detailLoading: true,
+      detailProps: { number },
+    });
+
+    await waitFor(() =>
+      expect(container.querySelector(".comment-editor-input")?.textContent).toBe("Draft while refreshing"),
+    );
+    expect(container.querySelector(".comment-editor-input")?.getAttribute("contenteditable")).toBe(String(!mismatch));
+    const submit = screen.getByRole("button", { name: "Comment", exact: true }) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    await fireEvent.click(submit);
+    expect(issuesStore.submitIssueComment).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
     localStorage.clear();
   });
@@ -446,6 +489,7 @@ describe("IssueDetail activity view", () => {
             activity: { loadActivity: vi.fn() },
             detailActivityView: createDetailActivityViewStore(),
             settings: {
+              getWorkspaceSettings: () => ({ default_execution_target: "" }),
               getLaunchTargets: () => launchTargets,
               getQuickActions: () => [],
               getDetailSettings: () => ({ initial_timeline_entry_limit: 250 }),
@@ -585,6 +629,92 @@ describe("IssueDetail inline workspace handoff", () => {
     itemType: "issue",
   };
 
+  it.each([
+    ["github.com", true, ""],
+    ["github.com", false, "Devbox is in maintenance"],
+    ["github.example.com", true, "Devboxes currently support only github.com"],
+  ])("checks the saved devbox before creating from %s (workspaceWrite=%s)", async (platformHost, available, reason) => {
+    const detail = issueDetail();
+    detail.platform_host = platformHost;
+    Object.assign(detail.repo, { Host: platformHost, PlatformHost: platformHost, platform_host: platformHost });
+    const snapshot = Promise.withResolvers<unknown>();
+    const apiClient = {
+      GET: vi.fn().mockImplementation(() =>
+        reason
+          ? Promise.resolve({
+              data: {
+                hosts: [
+                  {
+                    configKey: "devbox:compute-a",
+                    kind: "devbox",
+                    operationAvailability: { workspaceWrite: { available, unavailableReason: reason } },
+                  },
+                ],
+              },
+            })
+          : snapshot.promise,
+      ),
+      POST: vi.fn().mockResolvedValue({ data: { id: "ws-devbox", status: "provisioning" } }),
+    };
+    renderIssueDetail(
+      detail,
+      undefined,
+      {
+        defaultExecutionTarget: "devbox:compute-a",
+        detailProps: { platformHost },
+      },
+      apiClient,
+    );
+    const create = screen.getAllByRole("button", { name: "Create Workspace", exact: true })[0]!;
+    if (reason) {
+      await waitFor(() => expect(create.getAttribute("title")).toContain(reason));
+      expect((create as HTMLButtonElement).disabled).toBe(true);
+      await fireEvent.click(create);
+      expect(apiClient.POST).not.toHaveBeenCalled();
+    } else {
+      await waitFor(() => expect((create as HTMLButtonElement).disabled).toBe(false));
+      await fireEvent.click(create);
+      await waitFor(() =>
+        expect(apiClient.POST).toHaveBeenCalledWith(
+          "/devboxes/{connection_id}/workspaces",
+          expect.objectContaining({
+            params: { path: { connection_id: "compute-a" } },
+            body: expect.objectContaining({ platform_repo_id: 1001 }),
+          }),
+        ),
+      );
+    }
+    snapshot.resolve({ data: { hosts: [] } });
+  });
+
+  it("shows a quiet status hint after directory failure and still creates on the saved devbox", async () => {
+    const snapshot = Promise.withResolvers<unknown>();
+    const apiClient = {
+      GET: vi
+        .fn()
+        .mockImplementation((path: string) =>
+          path === "/snapshot" ? snapshot.promise : Promise.resolve({ data: {} }),
+        ),
+      POST: vi.fn().mockResolvedValue({ data: { id: "ws-devbox", status: "provisioning" } }),
+    };
+    renderIssueDetail(issueDetail(), undefined, { defaultExecutionTarget: "devbox:compute-a" }, apiClient);
+    const create = screen.getAllByRole("button", { name: "Create Workspace", exact: true })[0] as HTMLButtonElement;
+    await waitFor(() => expect(apiClient.GET).toHaveBeenCalledWith("/snapshot", expect.anything()));
+    snapshot.reject(new Error("directory unavailable"));
+    await waitFor(() => expect(create.title).toContain("Preferred devbox status unavailable."));
+    expect(document.getElementById(create.getAttribute("aria-describedby")!)?.textContent).toContain(
+      "Preferred devbox status unavailable.",
+    );
+    expect(create.disabled).toBe(false);
+    await fireEvent.click(create);
+    await waitFor(() =>
+      expect(apiClient.POST).toHaveBeenCalledWith(
+        "/devboxes/{connection_id}/workspaces",
+        expect.objectContaining({ params: { path: { connection_id: "compute-a" } } }),
+      ),
+    );
+  });
+
   function deferredWorkspaceApiClient() {
     let resolvePost!: (value: { data?: { id: string; status: string; created?: boolean } }) => void;
     const postPromise = new Promise<{ data?: { id: string; status: string; created?: boolean } }>((resolve) => {
@@ -618,25 +748,37 @@ describe("IssueDetail inline workspace handoff", () => {
     };
   }
 
-  it("creates an issue workspace through the app runtime", async () => {
+  it.each([
+    ["github.com", "/issues/{provider}/{owner}/{name}/{number}/workspace"],
+    ["github.example.com", "/host/{platform_host}/issues/{provider}/{owner}/{name}/{number}/workspace"],
+  ])("creates an issue workspace through the app runtime on %s", async (platformHost, path) => {
     const controller = createTestController("split");
     const { apiClient: runtimeClient, resolvePost } = deferredWorkspaceApiClient();
     const contextClient = {
       GET: vi.fn(),
       POST: vi.fn(async () => ({ error: { title: "legacy client used" } })),
     };
+    const detail = issueDetail();
+    detail.platform_host = platformHost;
+    Object.assign(detail.repo, { Host: platformHost, PlatformHost: platformHost, platform_host: platformHost });
     renderIssueDetail(
-      issueDetail(),
+      detail,
       undefined,
       {
         inlineWorkspace: controller,
         runtimeClient: runtimeClient as unknown as GeneratedClient,
+        detailProps: { platformHost },
       },
       contextClient,
     );
 
     await fireEvent.click(screen.getByRole("button", { name: "Create Workspace" }));
-    await waitFor(() => expect(runtimeClient.POST).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(runtimeClient.POST).toHaveBeenCalledWith(
+        path,
+        expect.objectContaining({ body: expect.objectContaining({ platform_repo_id: 1001 }) }),
+      ),
+    );
     resolvePost({ data: { id: "ws-runtime", status: "provisioning" } });
 
     await waitFor(() => expect(controller.recordCreated).toHaveBeenCalled());
@@ -678,7 +820,8 @@ describe("IssueDetail inline workspace handoff", () => {
     });
   });
 
-  it("keeps directory recovery errors in the conflict dialog", async () => {
+  it.each([false, true])("keeps directory recovery errors in the conflict dialog, launch=%s", async (launch) => {
+    const telemetry = vi.fn();
     const conflict = workspaceBranchConflict("kenn-forge/issue-7-original-title", true);
     const apiClient = {
       GET: vi.fn(),
@@ -694,29 +837,54 @@ describe("IssueDetail inline workspace handoff", () => {
         }),
     };
     renderIssueDetail(issueDetail(), undefined, {}, apiClient);
+    await startTestTelemetry(issueRuntime!, (event) => telemetry(event)).ready;
 
-    await fireEvent.click(screen.getByRole("button", { name: "Create Workspace" }));
+    if (launch) {
+      await fireEvent.click(screen.getByRole("button", { name: "Create Workspace options" }));
+      await fireEvent.click(screen.getByRole("menuitem", { name: "Codex" }));
+    } else await fireEvent.click(screen.getByRole("button", { name: "Create Workspace" }));
     await fireEvent.click(await screen.findByRole("button", { name: "Use Existing Directory" }));
 
     expect(await screen.findByRole("dialog", { name: "Existing Workspace Directory" })).toBeTruthy();
     expect(await screen.findByText("the expected Kenn Forge worktree directory does not exist")).toBeTruthy();
+    if (!launch) expect(telemetry).not.toHaveBeenCalled();
+    else
+      await waitFor(() =>
+        expect(telemetry).toHaveBeenCalledExactlyOnceWith({
+          event: "error_shown",
+          properties: { surface: "web", kind: "workspace_opened" },
+        }),
+      );
   });
 
-  it("explains when the existing branch is checked out elsewhere", async () => {
+  it.each([false, true])("explains when the existing branch is checked out elsewhere, launch=%s", async (launch) => {
+    const telemetry = vi.fn();
     const conflict = workspaceBranchConflict();
     const apiClient = {
       GET: vi.fn(),
       POST: vi.fn().mockResolvedValueOnce({ error: conflict }).mockResolvedValueOnce({ error: conflict }),
     };
     renderIssueDetail(issueDetail(), undefined, {}, apiClient);
+    await startTestTelemetry(issueRuntime!, (event) => telemetry(event)).ready;
 
-    await fireEvent.click(screen.getByRole("button", { name: "Create Workspace" }));
+    if (launch) {
+      await fireEvent.click(screen.getByRole("button", { name: "Create Workspace options" }));
+      await fireEvent.click(screen.getByRole("menuitem", { name: "Codex" }));
+    } else await fireEvent.click(screen.getByRole("button", { name: "Create Workspace" }));
     await fireEvent.click(await screen.findByRole("button", { name: "Use Existing Branch" }));
 
     expect(
       await screen.findByText("This branch is already checked out in another worktree. Create a new branch instead."),
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Use Existing Directory" })).toBeNull();
+    if (!launch) expect(telemetry).not.toHaveBeenCalled();
+    else
+      await waitFor(() =>
+        expect(telemetry).toHaveBeenCalledExactlyOnceWith({
+          event: "error_shown",
+          properties: { surface: "web", kind: "workspace_opened" },
+        }),
+      );
   });
 
   it("create with inline controller records the override and does not navigate", async () => {
@@ -804,6 +972,39 @@ describe("IssueDetail inline workspace handoff", () => {
     await vi.waitFor(() => expect(apiClient.POST).toHaveBeenCalled());
   });
 
+  it.each(["create", "agent", "quick action"])("reports rejected creation only for launches: %s", async (intent) => {
+    const apiClient = {
+      GET: vi.fn(),
+      POST: vi.fn().mockResolvedValue({ error: { status: 403, title: "Create denied" } }),
+    };
+    renderIssueDetail(
+      issueDetail(),
+      undefined,
+      { quickActions: [{ label: "Rebase", agent: "codex", prompt: "Rebase this change" }] },
+      apiClient,
+    );
+    const telemetry = vi.fn();
+    await startTestTelemetry(issueRuntime!, (event) => telemetry(event)).ready;
+    if (intent === "agent") {
+      await fireEvent.click(screen.getAllByRole("button", { name: "Create Workspace options" })[0]!);
+      await fireEvent.click(screen.getByRole("menuitem", { name: "Codex" }));
+    } else if (intent === "quick action") {
+      await fireEvent.click(screen.getByRole("button", { name: "Quick actions" }));
+      await fireEvent.click(screen.getByRole("menuitem", { name: /Rebase/ }));
+    } else await fireEvent.click(screen.getByRole("button", { name: "Create Workspace" }));
+    await waitFor(() =>
+      expect(getFlashes()).toEqual(expect.arrayContaining([expect.objectContaining({ message: "Create denied" })])),
+    );
+    if (intent === "create") expect(telemetry).not.toHaveBeenCalled();
+    else
+      await waitFor(() =>
+        expect(telemetry).toHaveBeenCalledExactlyOnceWith({
+          event: "error_shown",
+          properties: { surface: "web", kind: "workspace_opened" },
+        }),
+      );
+  });
+
   it("keeps the primary workspace create action launch-free", async () => {
     const controller = createTestController("split");
     const { apiClient, resolvePost } = deferredWorkspaceApiClient();
@@ -837,6 +1038,7 @@ describe("IssueDetail inline workspace handoff", () => {
 
   it("runs a quick action after creation and keeps it through a branch-conflict retry", async () => {
     const controller = createTestController("split");
+    const telemetry = vi.fn();
     const triage = { label: "Triage", agent: "codex", prompt: "/triage-pr\nquestion all assumptions" };
     const posts: Array<{ path: string; options: Record<string, unknown> | undefined }> = [];
     let creates = 0;
@@ -858,6 +1060,7 @@ describe("IssueDetail inline workspace handoff", () => {
       }),
     };
     renderIssueDetail(issueDetail(), undefined, { inlineWorkspace: controller, quickActions: [triage] }, apiClient);
+    startTestTelemetry(issueRuntime!, (event) => telemetry(event));
 
     await fireEvent.click(screen.getByRole("button", { name: "Quick actions" }));
     await fireEvent.click(screen.getByRole("menuitem", { name: /Triage/ }));
@@ -870,6 +1073,12 @@ describe("IssueDetail inline workspace handoff", () => {
       body: { target_key: "codex", message: "/triage-pr\nquestion all assumptions" },
     });
     await waitFor(() => expect(controller.recordCreated).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(telemetry).toHaveBeenCalledExactlyOnceWith({
+        event: "workspace_opened",
+        properties: { item_type: "issue", surface: "web" },
+      }),
+    );
     expect(discardWorkspaceLaunch("ws-existing", undefined)).toBeNull();
   });
 

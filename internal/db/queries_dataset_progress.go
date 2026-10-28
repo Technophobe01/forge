@@ -9,9 +9,11 @@ import (
 	"time"
 )
 
-const nextEvenScanGenerationSQL = "scan_generation + 2 - (scan_generation % 2)"
-const archiveLifecycleDetailsGeneration int64 = 1 << 34
-const maxScanPages = 10_000
+const (
+	nextEvenScanGenerationSQL               = "scan_generation + 2 - (scan_generation % 2)"
+	archiveLifecycleDetailsGeneration int64 = 1 << 34
+	maxScanPages                            = 10_000
+)
 
 const (
 	datasetErrorCodePageBound     = "page_bound"
@@ -274,13 +276,23 @@ func (d *DB) FailArchiveItemSync(
 		if retryAt != nil {
 			retry = formatDatasetProgressTime(*retryAt)
 		}
+		status, increment := ArchiveDatasetProgressFailed, 1
+		deferred := code == ArchiveErrorCodeBudgetExhausted
+		if deferred {
+			status, increment = ArchiveDatasetProgressPending, 0
+		}
+		// Waiting for capacity must not erase an earlier failure before recovery.
 		result, err := tx.ExecContext(ctx, `
 			UPDATE forge_archive_dataset_progress
-			SET status = 'failed', attempt_count = attempt_count + 1,
-				next_retry_at = ?, last_error_code = ?, last_error_detail = ?, updated_at = ?
+			SET status = CASE WHEN ? AND status = 'failed' THEN status ELSE ? END,
+				attempt_count = attempt_count + ?, next_retry_at = ?,
+				last_error_code = CASE WHEN ? AND status = 'failed' THEN last_error_code ELSE ? END,
+				last_error_detail = CASE WHEN ? AND status = 'failed' THEN last_error_detail ELSE ? END,
+				updated_at = ?
 			WHERE repo_id = ? AND item_type = ? AND item_number = ?
 			  AND status IN ('pending', 'running', 'failed')`,
-			retry, code, sanitizeArchiveErrorDetail(commit.ErrorDetail),
+			deferred, status, increment, retry, deferred, code,
+			deferred, sanitizeArchiveErrorDetail(commit.ErrorDetail),
 			formatDatasetProgressTime(commit.Now),
 			commit.RepoID, commit.ItemType, commit.ItemNumber,
 		)
@@ -300,6 +312,41 @@ func (d *DB) FailArchiveItemSync(
 	})
 }
 
+func domainRevisionTable(itemType ArchiveItemType) (string, error) {
+	switch itemType {
+	case ArchiveItemTypeMergeRequest:
+		return "forge_merge_requests", nil
+	case ArchiveItemTypeIssue:
+		return "forge_issues", nil
+	default:
+		return "", fmt.Errorf("read item revision: invalid item type %q", itemType)
+	}
+}
+
+// SnapshotRevisions captures parent revisions before a repository provider fetch.
+func (d *DB) SnapshotRevisions(ctx context.Context, repoID int64, itemType ArchiveItemType) (map[int]int64, error) {
+	table, err := domainRevisionTable(itemType)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := d.roQueryContext(ctx, fmt.Sprintf(
+		`SELECT number, snapshot_revision FROM %s WHERE repo_id = ?`, table), repoID)
+	if err != nil {
+		return nil, fmt.Errorf("read snapshot revisions: %w", err)
+	}
+	defer rows.Close()
+	revisions := make(map[int]int64)
+	for rows.Next() {
+		var number int
+		var revision int64
+		if err := rows.Scan(&number, &revision); err != nil {
+			return nil, fmt.Errorf("scan snapshot revision: %w", err)
+		}
+		revisions[number] = revision
+	}
+	return revisions, rows.Err()
+}
+
 func lookupDomainRevisionTx(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -307,14 +354,12 @@ func lookupDomainRevisionTx(
 	itemType ArchiveItemType,
 	itemNumber int,
 ) (int64, error) {
-	table := "forge_issues"
-	if itemType == ArchiveItemTypeMergeRequest {
-		table = "forge_merge_requests"
-	} else if itemType != ArchiveItemTypeIssue {
-		return 0, fmt.Errorf("read archive item revision: invalid item type %q", itemType)
+	table, err := domainRevisionTable(itemType)
+	if err != nil {
+		return 0, err
 	}
 	var revision int64
-	err := tx.QueryRowContext(ctx, fmt.Sprintf(
+	err = tx.QueryRowContext(ctx, fmt.Sprintf(
 		`SELECT snapshot_revision FROM %s WHERE repo_id = ? AND number = ?`, table),
 		repoID, itemNumber,
 	).Scan(&revision)

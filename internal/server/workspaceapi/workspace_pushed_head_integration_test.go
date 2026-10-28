@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/db"
@@ -18,17 +18,18 @@ import (
 	"go.kenn.io/forge/internal/providerplane"
 	"go.kenn.io/forge/internal/testutil"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/gitsafe"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	"go.kenn.io/forge/internal/testutil/workspacetest"
 	"go.kenn.io/forge/internal/workspace"
 	"go.kenn.io/forge/platform"
-	gitcmd "go.kenn.io/kit/git/cmd"
 )
 
 type pushedHeadProviderClient struct {
 	ghclient.Client
-	getPullRequest       func(context.Context, string, string, int) (*gh.PullRequest, error)
-	getRepository        func(context.Context, string, string) (*gh.Repository, error)
-	beforeCombinedStatus func()
-	ciCalls              atomic.Int64
+	getPullRequest func(context.Context, string, string, int) (*gh.PullRequest, error)
+	getRepository  func(context.Context, string, string) (*gh.Repository, error)
+	ciCalls        atomic.Int64
 }
 
 func (c *pushedHeadProviderClient) GetRepository(
@@ -38,6 +39,17 @@ func (c *pushedHeadProviderClient) GetRepository(
 		return c.getRepository(ctx, owner, name)
 	}
 	return c.Client.GetRepository(ctx, owner, name)
+}
+
+// GetRepositoryByID serves the widget fixture by its provider ID; the shared
+// fixture client only knows routes it has seeded items for.
+func (c *pushedHeadProviderClient) GetRepositoryByID(
+	ctx context.Context, owner string, id int64,
+) (*gh.Repository, error) {
+	if id == testutil.FixtureRepoID("acme", "widget") {
+		return c.GetRepository(ctx, "acme", "widget")
+	}
+	return c.Client.GetRepositoryByID(ctx, owner, id)
 }
 
 func (c *pushedHeadProviderClient) GetPullRequest(
@@ -50,9 +62,6 @@ func (c *pushedHeadProviderClient) GetCombinedStatus(
 	ctx context.Context, owner, name, ref string,
 ) (*gh.CombinedStatus, error) {
 	c.ciCalls.Add(1)
-	if c.beforeCombinedStatus != nil {
-		c.beforeCombinedStatus()
-	}
 	return c.Client.GetCombinedStatus(ctx, owner, name, ref)
 }
 
@@ -83,7 +92,7 @@ func newPushedHeadIntegrationFixture(
 	)
 	t.Cleanup(syncer.Stop)
 	fixture := &pushedHeadIntegrationFixture{database: database}
-	manager := workspace.NewManager(database, t.TempDir())
+	manager := workspacetest.NewManager(t, database, t.TempDir())
 	fixture.handler = New(Deps{
 		DB: database, Workspaces: manager, Syncer: syncer,
 		Broadcast: func(event Event) uint64 {
@@ -106,7 +115,7 @@ func newPushedHeadIntegrationFixture(
 		},
 	})
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Second)
 		defer cancel()
 		require.NoError(t, fixture.handler.Shutdown(ctx))
 	})
@@ -123,6 +132,7 @@ func newPushedHeadProvider(
 }
 
 func TestWorkspacePushedHeadPassRefreshesProviderAndPublishesWireEvents(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	var newHead string
@@ -169,6 +179,7 @@ func TestWorkspacePushedHeadPassRefreshesProviderAndPublishesWireEvents(t *testi
 }
 
 func TestWorkspacePushedHeadPassIgnoresLocalOnlyCommit(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	var detailSyncCalls atomic.Int64
@@ -201,6 +212,7 @@ func TestWorkspacePushedHeadPassIgnoresLocalOnlyCommit(t *testing.T) {
 }
 
 func TestWorkspacePushedHeadPassStopsAfterNonConvergingRefresh(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	providerHead := "e2e0000000000000000000000000000000000000"
@@ -237,6 +249,7 @@ func TestWorkspacePushedHeadPassStopsAfterNonConvergingRefresh(t *testing.T) {
 }
 
 func TestWorkspacePushedHeadPassIgnoresRemovedPullRequest(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	var detailSyncCalls atomic.Int64
 	provider := newPushedHeadProvider(func(
@@ -261,6 +274,7 @@ func TestWorkspacePushedHeadPassIgnoresRemovedPullRequest(t *testing.T) {
 }
 
 func TestWorkspacePushedHeadQueuedRefreshRechecksRemovedPullRequest(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	var detailSyncCalls atomic.Int64
 	provider := newPushedHeadProvider(func(
@@ -286,6 +300,7 @@ func TestWorkspacePushedHeadQueuedRefreshRechecksRemovedPullRequest(t *testing.T
 }
 
 func TestWorkspacePushedHeadQueuedCIRefreshRechecksRemovedPullRequest(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	provider := newPushedHeadProvider(func(
 		context.Context, string, string, int,
@@ -297,7 +312,7 @@ func TestWorkspacePushedHeadQueuedCIRefreshRechecksRemovedPullRequest(t *testing
 	repoID := seedPushedHeadIntegrationPR(t, fixture.database, headSHA)
 	insertPushedHeadIntegrationWorkspace(t, fixture.database, worktreePath)
 	require.NoError(fixture.database.UpdateMRCIStatusForHead(
-		t.Context(), repoID, 1, headSHA, "pending", `[]`, true,
+		t.Context(), repoID, 1, headSHA, "pending", `[]`, true, nil,
 	))
 	change := workspace.PushedHeadUpdate{
 		WorkspaceID: "ws-pr", RepoID: repoID, Provider: platform.KindGitHub,
@@ -314,50 +329,15 @@ func TestWorkspacePushedHeadQueuedCIRefreshRechecksRemovedPullRequest(t *testing
 	require.Len(fixture.events, 1, "removed pull must not publish CI refresh success")
 }
 
-func TestWorkspacePushedHeadQueuedCIRefreshRejectsRouteReuseDuringFetch(t *testing.T) {
-	require := require.New(t)
-	provider := newPushedHeadProvider(nil)
-	fixture := newPushedHeadIntegrationFixture(t, provider)
-	headSHA := "old-head"
-	repoID := seedPushedHeadIntegrationPR(t, fixture.database, headSHA)
-	require.NoError(fixture.database.UpdateMRCIStatusForHead(
-		t.Context(), repoID, 1, headSHA, "pending", `[]`, true,
-	))
-	change := workspace.PushedHeadUpdate{
-		WorkspaceID: "ws-pr", RepoID: repoID, Provider: platform.KindGitHub,
-		PlatformHost: "github.com", RepoPath: "acme/widget",
-		Owner: "acme", Name: "widget", Number: 1, NewSHA: headSHA,
-	}
-
-	fixture.handler.maybeEnqueuePushedHeadCIRefresh(t.Context(), change)
-	require.Len(fixture.jobs, 1)
-	provider.beforeCombinedStatus = func() {
-		replacementIdentity := db.GitHubRepoIdentity("github.com", "acme", "widget")
-		replacementIdentity.PlatformRepoID = "repo-acme-widget-replacement"
-		_, _, err := fixture.database.ReconcileRepositoryObservation(
-			context.Background(), replacementIdentity, time.Now().UTC().Add(time.Hour),
-		)
-		require.NoError(err)
-	}
-
-	fixture.jobs[0]()
-
-	require.Equal(int64(1), provider.ciCalls.Load())
-	stored, err := fixture.database.GetMergeRequestByRepoIDAndNumber(t.Context(), repoID, 1)
-	require.NoError(err)
-	require.NotNil(stored)
-	require.Equal("pending", stored.CIStatus)
-	require.True(stored.CIHadPending)
-}
-
 func TestLookupPushedHeadMRDoesNotFollowReusedRepositoryRoute(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	fixture := newPushedHeadIntegrationFixture(t, newPushedHeadProvider(nil))
 	repoID := seedPushedHeadIntegrationPR(t, fixture.database, "old-head")
 	replacementIdentity := db.GitHubRepoIdentity("github.com", "acme", "widget")
-	replacementIdentity.PlatformRepoID = "repo-acme-widget-replacement"
-	replacement, _, err := fixture.database.ReconcileRepositoryObservation(
-		t.Context(), replacementIdentity, time.Now().UTC().Add(time.Hour),
+	replacementIdentity.Key = platform.RepositoryIDKey(1002)
+	replacement, err := fixture.database.ObserveRepository(
+		t.Context(), replacementIdentity,
 	)
 	require.NoError(err)
 	require.NotNil(replacement)
@@ -372,6 +352,7 @@ func TestLookupPushedHeadMRDoesNotFollowReusedRepositoryRoute(t *testing.T) {
 }
 
 func TestWorkspacePushedHeadQueuedRefreshStopsWhenRouteIsReusedDuringSync(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	var detailSyncCalls atomic.Int64
 	provider := newPushedHeadProvider(func(
@@ -392,15 +373,16 @@ func TestWorkspacePushedHeadQueuedRefreshStopsWhenRouteIsReusedDuringSync(t *tes
 		ctx context.Context, owner, name string,
 	) (*gh.Repository, error) {
 		replacementIdentity := db.GitHubRepoIdentity("github.com", owner, name)
-		replacementIdentity.PlatformRepoID = "repo-acme-widget-replacement"
-		_, _, err := fixture.database.ReconcileRepositoryObservation(
-			ctx, replacementIdentity, time.Now().UTC().Add(time.Hour),
+		replacementIdentity.Key = platform.RepositoryIDKey(1002)
+		_, err := fixture.database.ObserveRepository(
+			ctx, replacementIdentity,
 		)
 		require.NoError(err)
 		allowed := true
-		nodeID := replacementIdentity.PlatformRepoID
+		repositoryID, ok := replacementIdentity.Key.ID()
+		require.True(ok)
 		return &gh.Repository{
-			Name: &name, NodeID: &nodeID, Owner: &gh.User{Login: &owner},
+			Name: &name, ID: &repositoryID, Owner: &gh.User{Login: &owner},
 			AllowSquashMerge: &allowed, AllowMergeCommit: &allowed,
 			AllowRebaseMerge: &allowed,
 		}, nil
@@ -444,9 +426,8 @@ func pushedHeadPullRequest(title, headSHA string) *gh.PullRequest {
 func seedPushedHeadIntegrationPR(t *testing.T, database *db.DB, oldHead string) int64 {
 	t.Helper()
 	identity := db.GitHubRepoIdentity("github.com", "acme", "widget")
-	identity.PlatformRepoID = "repo-acme-widget"
-	repoID, err := database.UpsertRepo(
-		t.Context(), identity,
+	repoID, err := reposeed.Seed(
+		t.Context(), database, identity,
 	)
 	require.NoError(t, err)
 	now := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
@@ -499,7 +480,7 @@ func gitSHA(t *testing.T, dir, ref string) string {
 
 func runGitOutput(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	output, err := gitcmd.New().Output(t.Context(), dir, args...)
+	output, err := gitsafe.Runner().Output(t.Context(), dir, args...)
 	require.NoError(t, err)
 	return strings.TrimSpace(string(output))
 }

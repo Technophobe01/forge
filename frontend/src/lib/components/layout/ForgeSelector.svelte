@@ -7,8 +7,14 @@
     loadSnapshotHosts,
     type HostSummary,
   } from "../../api/fleet-snapshot.js";
+  import {
+    fleetBrowserLoginFailureMessage,
+    resolveFleetHostDestination,
+  } from "../../api/fleet-browser-login.js";
   import { getAppRuntime } from "../../app/runtime-context.js";
   import type { AppExecution } from "../../app/runtime.js";
+  import { showFlash } from "../../stores/flash.svelte.js";
+  import { currentInAppPath, navigateToURL } from "../../utils/pageNavigation.js";
 
   interface Props {
     compact?: boolean;
@@ -19,22 +25,24 @@
   const runtime = getAppRuntime();
   let hosts = $state.raw<HostSummary[]>([]);
   let loadExecution: AppExecution<void, never> | undefined;
+  let refreshing = false;
   let selectorEl = $state<HTMLDetailsElement>();
   let selectorOpen = $state(false);
+  // The host whose sign-in link is being requested or opened. It stays set
+  // after navigation starts so a second click cannot mint another ticket.
+  let switchingNodeID = $state<string | null>(null);
 
-  const navigableHosts = $derived(hosts.filter((host) => Boolean(host.baseURL)));
+  const directoryHosts = $derived(hosts.filter((host) => host.kind === "self" || host.kind === "devbox" || Boolean(host.baseURL)));
   const orderedHosts = $derived.by(() =>
-    [...navigableHosts].sort((left, right) => {
-      if (left.federationRole !== right.federationRole) {
-        return left.federationRole === "hub" ? -1 : 1;
-      }
-      return hostName(left).localeCompare(hostName(right));
-    }),
+    [...directoryHosts].sort((left, right) =>
+      Number(right.federationRole === "hub") - Number(left.federationRole === "hub") ||
+      hostName(left).localeCompare(hostName(right)),
+    ),
   );
   const currentHost = $derived(
-    navigableHosts.find((host) => host.kind === "self") ?? navigableHosts[0],
+    directoryHosts.find((host) => host.kind === "self"),
   );
-  const showSelector = $derived(navigableHosts.length > 1 && currentHost !== undefined);
+  const showSelector = $derived(directoryHosts.length > 1 && currentHost !== undefined);
 
   function hostName(host: HostSummary): string {
     return host.name.trim() || host.nodeID;
@@ -57,7 +65,8 @@
   }
 
   function refresh(): void {
-    loadExecution?.interrupt();
+    if (refreshing) return;
+    refreshing = true;
     loadExecution = runtime.runCommand(
       loadSnapshotHosts().pipe(
         Effect.matchEffect({
@@ -66,6 +75,7 @@
             hosts = nextHosts;
           }),
         }),
+        Effect.ensuring(Effect.sync(() => { refreshing = false; })),
       ),
       {
         operation: "load Forge fleet directory",
@@ -73,6 +83,41 @@
         onFailure: () => {},
       },
     );
+  }
+
+  function isPlainPrimaryClick(event: MouseEvent): boolean {
+    return event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
+  }
+
+  // Plain clicks sign the browser into the destination Forge before opening
+  // it; modified and middle clicks keep the ordinary link behavior.
+  function handleHostClick(event: MouseEvent, host: HostSummary): void {
+    if (host.kind === "self" || !host.baseURL || event.defaultPrevented || !isPlainPrimaryClick(event)) return;
+    event.preventDefault();
+    if (switchingNodeID !== null) return;
+    switchingNodeID = host.nodeID;
+    runtime.runCommand(
+      resolveFleetHostDestination({ nodeID: host.nodeID, baseURL: host.baseURL }, currentInAppPath()).pipe(
+        Effect.matchEffect({
+          onFailure: (failure) =>
+            Effect.sync(() => {
+              switchingNodeID = null;
+              showFlash(fleetBrowserLoginFailureMessage(failure), { tone: "danger" });
+            }),
+          onSuccess: (url) => Effect.sync(() => navigateToURL(url)),
+        }),
+      ),
+      {
+        operation: "switch Forge fleet host",
+        safeContext: {},
+        onFailure: () => {},
+      },
+    );
+  }
+
+  // A page restored from the back/forward cache must accept clicks again.
+  function handlePageShow(event: PageTransitionEvent): void {
+    if (event.persisted) switchingNodeID = null;
   }
 
   function handleToggle(event: Event): void {
@@ -105,8 +150,23 @@
   });
 </script>
 
-<svelte:window onfocus={refresh} />
+<svelte:window onfocus={refresh} onpageshow={handlePageShow} />
 <svelte:document onvisibilitychange={handleVisibilityChange} />
+
+{#snippet hostRowContent(host: HostSummary, status: "online" | "degraded" | "offline", diagnostic: string)}
+  <StatusDot status={statusDot(status)} label={`${hostName(host)} is ${status}`} size={9} animated />
+  <span class="host-copy">
+    <span class="host-heading">
+      <strong>{hostName(host)}</strong>
+      {#if host.kind === "self"}<span class="host-label">Current</span>{/if}
+      <span class="host-label">
+        {host.kind === "devbox" ? "Devbox" : host.federationRole === "hub" ? "Hub" : "Spoke"}
+      </span>
+    </span>
+    <span class="host-status">{status}</span>
+    {#if diagnostic}<span class="host-diagnostic">{diagnostic}</span>{/if}
+  </span>
+{/snippet}
 
 {#if showSelector && currentHost}
   <details
@@ -130,25 +190,24 @@
       {#each orderedHosts as host (host.nodeID)}
         {@const status = hostStatus(host)}
         {@const diagnostic = hostDiagnostic(host)}
+        {@const navigable = host.kind !== "devbox" && Boolean(host.baseURL)}
         <li>
-          <a
-            href={host.baseURL}
-            aria-current={host.kind === "self" ? "page" : undefined}
-            title={diagnostic || `Open ${hostName(host)}`}
-          >
-            <StatusDot status={statusDot(status)} label={`${hostName(host)} is ${status}`} size={9} animated />
-            <span class="host-copy">
-              <span class="host-heading">
-                <strong>{hostName(host)}</strong>
-                {#if host.kind === "self"}<span class="host-label">Current</span>{/if}
-                <span class="host-label">
-                  {host.federationRole === "hub" ? "Hub" : "Spoke"}
-                </span>
-              </span>
-              <span class="host-status">{status}</span>
-              {#if diagnostic}<span class="host-diagnostic">{diagnostic}</span>{/if}
-            </span>
-          </a>
+          {#if navigable}
+            <a
+              class="host-row"
+              href={host.baseURL}
+              aria-current={host.kind === "self" ? "page" : undefined}
+              aria-busy={switchingNodeID === host.nodeID ? "true" : undefined}
+              title={diagnostic || `Open ${hostName(host)}`}
+              onclick={(event) => handleHostClick(event, host)}
+            >
+              {@render hostRowContent(host, status, diagnostic)}
+            </a>
+          {:else}
+            <div class="host-row" title={diagnostic || undefined}>
+              {@render hostRowContent(host, status, diagnostic)}
+            </div>
+          {/if}
         </li>
       {/each}
     </ul>
@@ -217,7 +276,7 @@
     list-style: none;
   }
 
-  li a {
+  .host-row {
     display: grid;
     grid-template-columns: auto minmax(0, 1fr);
     gap: var(--space-3);
@@ -231,6 +290,10 @@
   li a:focus-visible,
   li a[aria-current="page"] {
     background: var(--bg-hover);
+  }
+
+  li a[aria-busy="true"] {
+    cursor: progress;
   }
 
   .host-copy,

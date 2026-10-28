@@ -9,25 +9,29 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/federationauth"
 	"go.kenn.io/forge/internal/mcpserver"
 	"go.kenn.io/forge/internal/providerplane"
 	"go.kenn.io/forge/internal/server/httpapi"
-	"go.kenn.io/forge/internal/server/issueapi"
-	"go.kenn.io/forge/internal/server/pullapi"
+	"go.kenn.io/forge/internal/server/itemapi"
+	"go.kenn.io/forge/internal/server/routepolicy"
+	"go.kenn.io/forge/internal/server/spokeapi"
 	"go.kenn.io/forge/internal/server/workspaceapi"
 	"go.kenn.io/forge/internal/testutil"
 	"go.kenn.io/forge/internal/testutil/dbtest"
-	"go.kenn.io/forge/internal/workspace"
+	"go.kenn.io/forge/internal/testutil/federationtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/platform"
 )
 
@@ -46,26 +50,10 @@ func (f providerPlaneClientFunc) Do(
 	return f(ctx, scope, request)
 }
 
-type failingProviderResponseBody struct {
-	data []byte
-	err  error
-}
-
-func (b *failingProviderResponseBody) Read(p []byte) (int, error) {
-	if len(b.data) == 0 {
-		return 0, b.err
-	}
-	n := copy(p, b.data)
-	b.data = b.data[n:]
-	return n, nil
-}
-
-func (*failingProviderResponseBody) Close() error { return nil }
-
 func TestProviderProxyPreservesHubResponse(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 
 	hub := httptest.NewTLSServer(http.HandlerFunc(func(
 		w http.ResponseWriter, _ *http.Request,
@@ -82,7 +70,11 @@ func TestProviderProxyPreservesHubResponse(t *testing.T) {
 	t.Cleanup(hub.Close)
 
 	spoke := newProviderProxyTestServer(t, hub, hub.Client(), nil)
-	response, err := spoke.Client().Get(spoke.URL + "/api/v1/pulls")
+	responseReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, spoke.URL+"/api/v1/pulls", nil)
+	require.NoError(err)
+	httpClient := spoke.Client()
+	httpClient.Timeout = 5 * time.Second
+	response, err := httpClient.Do(responseReq)
 	require.NoError(err)
 	t.Cleanup(func() { require.NoError(response.Body.Close()) })
 	body, err := io.ReadAll(response.Body)
@@ -100,9 +92,9 @@ func TestProviderProxyPreservesHubResponse(t *testing.T) {
 func TestHubUnavailableDoesNotFallBackToLocalProviderHandler(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(err)
 	unreachable := "https://" + listener.Addr().String()
 	require.NoError(listener.Close())
@@ -117,7 +109,11 @@ func TestHubUnavailableDoesNotFallBackToLocalProviderHandler(t *testing.T) {
 	)
 	spoke.Config.Handler.(*providerDispatchTestHandler).hubURL = unreachable
 
-	response, err := spoke.Client().Get(spoke.URL + "/api/v1/pulls")
+	responseReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, spoke.URL+"/api/v1/pulls", nil)
+	require.NoError(err)
+	httpClient := spoke.Client()
+	httpClient.Timeout = 5 * time.Second
+	response, err := httpClient.Do(responseReq)
 	require.NoError(err)
 	defer response.Body.Close()
 	var problem httpapi.ProblemError
@@ -131,7 +127,7 @@ func TestHubUnavailableDoesNotFallBackToLocalProviderHandler(t *testing.T) {
 func TestNodeHEADProviderReadUsesHubGETOwnership(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 
 	var hubReads atomic.Int64
 	hub := httptest.NewTLSServer(http.HandlerFunc(func(
@@ -152,7 +148,7 @@ func TestNodeHEADProviderReadUsesHubGETOwnership(t *testing.T) {
 			w.Header().Set("X-Provider-Source", "spoke")
 		}),
 	)
-	request, err := http.NewRequest(http.MethodHead, spoke.URL+"/api/v1/pulls", nil)
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodHead, spoke.URL+"/api/v1/pulls", nil)
 	require.NoError(err)
 	response, err := spoke.Client().Do(request)
 	require.NoError(err)
@@ -165,6 +161,7 @@ func TestNodeHEADProviderReadUsesHubGETOwnership(t *testing.T) {
 }
 
 func TestNodeMarkdownImageUsesHubProviderReader(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	var hubReads atomic.Int64
@@ -186,10 +183,16 @@ func TestNodeMarkdownImageUsesHubProviderReader(t *testing.T) {
 			http.Error(w, "spoke provider reader unavailable", http.StatusServiceUnavailable)
 		}),
 	)
-	response, err := spoke.Client().Get(
-		spoke.URL + "/api/v1/repo/github/acme/widget/markdown-image?source=" +
+	responseReq, err := http.NewRequestWithContext(
+		t.Context(), http.MethodGet,
+		spoke.URL+"/api/v1/repo/github/acme/widget/markdown-image?source="+
 			url.QueryEscape("https://github.com/acme/widget/raw/main/image.png"),
+		nil,
 	)
+	require.NoError(err)
+	httpClient := spoke.Client()
+	httpClient.Timeout = 5 * time.Second
+	response, err := httpClient.Do(responseReq)
 	require.NoError(err)
 	defer response.Body.Close()
 	body, err := io.ReadAll(response.Body)
@@ -202,32 +205,8 @@ func TestNodeMarkdownImageUsesHubProviderReader(t *testing.T) {
 	assert.Zero(localReads.Load())
 }
 
-func TestProviderWriteTransportFailureReportsUnknownMutationOutcome(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	var dispatched atomic.Int64
-	proxy := newProviderProxy(providerPlaneClientFunc(func(
-		_ context.Context, scope federationauth.Scope, request *http.Request,
-	) (*http.Response, error) {
-		dispatched.Add(1)
-		assert.Equal(federationauth.ScopeProviderWrite, scope)
-		assert.Equal(http.MethodPut, request.Method)
-		return nil, providerplane.ErrHubUnavailable
-	}))
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPut, "/api/v1/settings", nil)
-	proxy.ServeHTTP(recorder, request, ProviderRouteRule{
-		Owner: ProviderHubOnly, PeerScope: federationauth.ScopeProviderWrite,
-	})
-
-	var problem httpapi.ProblemError
-	require.NoError(json.NewDecoder(recorder.Body).Decode(&problem))
-	assert.Equal(http.StatusBadGateway, recorder.Code)
-	assert.Equal(httpapi.CodeMutationOutcomeUnknown, problem.Code)
-	assert.Equal(int64(1), dispatched.Load())
-}
-
 func TestHubWorkflowMutationTransportFailureIsAmbiguous(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	var dispatched atomic.Int64
@@ -239,12 +218,12 @@ func TestHubWorkflowMutationTransportFailureIsAmbiguous(t *testing.T) {
 		assert.Equal(http.MethodPut, request.Method)
 		return nil, providerplane.ErrHubUnavailable
 	})
-	server := &Server{providerSource: &hubProviderSource{client: client}}
+	server := wiredServer(&Server{providerSource: &spokeapi.HubProviderSource{Client: client}})
 
 	_, err := server.MCPBackend().SetWorkflowState(
 		t.Context(), mcpserver.ItemIdentity{
 			Type: "pr", Provider: "github", PlatformHost: "github.com",
-			PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget", Number: 42,
+			RepoKey: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")), Owner: "acme", Name: "widget", Number: 42,
 		},
 		mcpserver.WorkflowUpdate{Status: "reviewing", ExpectedStatus: "new"},
 	)
@@ -256,153 +235,42 @@ func TestHubWorkflowMutationTransportFailureIsAmbiguous(t *testing.T) {
 	assert.Equal(int64(1), dispatched.Load())
 }
 
-func TestHubWorkspaceRefreshUsesProviderMutationBoundary(t *testing.T) {
-	var gotScope federationauth.Scope
-	var gotPath string
-	source := &hubProviderSource{client: providerPlaneClientFunc(func(
-		_ context.Context, scope federationauth.Scope, request *http.Request,
-	) (*http.Response, error) {
-		gotScope = scope
-		gotPath = request.URL.Path
-		return nil, providerplane.ErrHubUnavailable
-	})}
-
-	_, _ = source.RefreshWorkspaceLaunchSpec(t.Context(), db.WorkspaceLaunchSpec{
-		Repository: db.WorkspaceLaunchRepository{
-			Provider: "github", PlatformHost: "github.com",
-			Owner: "acme", Name: "widget",
-		},
-		ItemType: db.WorkspaceItemTypePullRequest, ItemNumber: 7,
-		ItemKey: "7", GitHeadRef: "feature/seven",
-	})
-
-	assert.Equal(t, federationauth.ScopeProviderWrite, gotScope)
-	assert.Equal(t, "/api/v1/federation/provider/workspace-launch-spec/refresh", gotPath)
-}
-
-func TestHubPullCandidatesUseProviderQualifiedRepositoryFilter(t *testing.T) {
+func TestHubWorkspaceAutoAssignmentPreservesRepositoryIdentity(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
-	row := pullapi.MergeRequestResponse{
-		Number: 7, State: db.MergeRequestStateOpen,
-		Repo: httpapi.RepoRefResponse{
-			Provider: "gitlab", PlatformHost: "gitlab.example.com",
-			RepoPath: "group/project", Owner: "group", Name: "project",
-		},
-		RepoOwner: "group", RepoName: "project", PlatformHost: "gitlab.example.com",
-	}
-	encoded, err := json.Marshal([]pullapi.MergeRequestResponse{row})
-	require.NoError(err)
-	var gotRepo string
-	source := &hubProviderSource{client: providerPlaneClientFunc(func(
+	source := &spokeapi.HubProviderSource{Client: providerPlaneClientFunc(func(
 		_ context.Context, scope federationauth.Scope, request *http.Request,
 	) (*http.Response, error) {
-		assert.Equal(federationauth.ScopeProviderRead, scope)
-		gotRepo = request.URL.Query().Get("repo")
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body:       io.NopCloser(bytes.NewReader(encoded)),
-			Request:    request,
-		}, nil
-	})}
-
-	candidates, err := source.ListOpenPullCandidates(t.Context(), workspace.Workspace{
-		Platform: "gitlab", PlatformHost: "gitlab.example.com",
-		RepoOwner: "group", RepoName: "project",
-	})
-
-	require.NoError(err)
-	assert.Equal("gitlab|gitlab.example.com/group/project", gotRepo)
-	require.Len(candidates, 1)
-	assert.Equal(7, candidates[0].Number)
-}
-
-func TestHubListFiltersForwardUnassignedAndPullLabel(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	seen := make(map[string]bool)
-	source := &hubProviderSource{client: providerPlaneClientFunc(func(
-		_ context.Context, scope federationauth.Scope, request *http.Request,
-	) (*http.Response, error) {
-		assert.Equal(federationauth.ScopeProviderRead, scope)
-		seen[request.URL.Path] = request.URL.Query().Get("unassigned") == "true"
-		if request.URL.Path == "/api/v1/pulls" {
-			assert.Equal("priority: high", request.URL.Query().Get("label"))
-		}
-		body := "[]"
-		if request.URL.Path == "/api/v1/activity" {
-			body = "{}"
-		}
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body:       io.NopCloser(bytes.NewBufferString(body)),
-			Request:    request,
-		}, nil
-	})}
-
-	_, err := source.ListPulls(t.Context(), pullapi.ListQuery{Unassigned: true, Label: "priority: high"})
-	require.NoError(err)
-	_, err = source.ListIssues(t.Context(), issueapi.ListQuery{Unassigned: true})
-	require.NoError(err)
-	_, err = source.ListActivity(t.Context(), &listActivityInput{Unassigned: true})
-	require.NoError(err)
-
-	assert.Equal(map[string]bool{
-		"/api/v1/pulls": true, "/api/v1/issues": true, "/api/v1/activity": true,
-	}, seen)
-}
-
-func TestHubUnassignedActivitySubjectFilterBatchesLargeSnapshots(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	const subjectCount = 11_000
-	var requestCount int
-	source := &hubProviderSource{client: providerPlaneClientFunc(func(
-		_ context.Context, scope federationauth.Scope, request *http.Request,
-	) (*http.Response, error) {
-		assert.Equal(federationauth.ScopeProviderRead, scope)
-		assert.Equal("/api/v1/federation/provider/activity/unassigned-subjects/query", request.URL.Path)
-		var body federationUnassignedActivitySubjectsRequest
-		require.NoError(json.NewDecoder(request.Body).Decode(&body))
-		assert.LessOrEqual(len(body.Subjects), 500)
-		requestCount++
-		encoded, err := json.Marshal(federationUnassignedActivitySubjectsResponse(body))
+		assert.Equal(federationauth.ScopeProviderWrite, scope)
+		assert.Equal(http.MethodPost, request.Method)
+		assert.Equal("/api/v1/federation/provider/workspace-auto-assign", request.URL.Path)
+		body, err := io.ReadAll(request.Body)
 		require.NoError(err)
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body:       io.NopCloser(bytes.NewReader(encoded)),
-			Request:    request,
-		}, nil
+		assert.JSONEq(`{"repository":{"provider":"github","platform_host":"github.com","owner":"acme","name":"widget"},"platform_repo_id":1001,"item_type":"pull_request","item_number":7}`, string(body))
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewBufferString(`{}`))}, nil
 	})}
 
-	subjects := make([]providerplane.ItemIdentity, subjectCount)
-	for i := range subjects {
-		subjects[i] = providerplane.ItemIdentity{
-			Repository: providerplane.RepositoryIdentity{
-				Provider: "github", PlatformHost: "github.com", PlatformRepoID: "repo-acme-widget",
-			},
-			ItemType: "pr", ItemNumber: i + 1,
-		}
-	}
+	err := source.AutoAssignWorkspaceItem(t.Context(), workspaceapi.ProviderWorkspaceItemRequest{
+		Repository: providerplane.RepositoryRoute{
+			Provider: "github", PlatformHost: "github.com", Owner: "acme", Name: "widget",
+		},
+		RepoKey: platform.RepositoryIDKey(1001), ItemType: db.WorkspaceItemTypePullRequest, ItemNumber: 7,
+	})
 
-	got, err := source.FilterUnassignedActivitySubjects(t.Context(), subjects)
 	require.NoError(err)
-	assert.Equal(22, requestCount)
-	assert.Equal(subjects, got)
 }
 
 func TestSpokeUnassignedActivityKeepsMatchingLocalWorkspaceSubject(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
-	srv, database := setupTestServer(t)
+	srv, database, _ := setupTestServer(t)
 	now := time.Now().UTC().Truncate(time.Second)
-	unassignedID := seedPR(t, database, "acme", "widget", 1)
-	assignedID := seedPR(t, database, "acme", "widget", 2)
+	unassignedID := serverfake.SeedPR(t, database, "acme", "widget", 1)
+	assignedID := serverfake.SeedPR(t, database, "acme", "widget", 2)
 	repo, err := database.GetRepoByIdentity(
-		t.Context(), verifiedGitHubRepoIdentity("github.com", "acme", "widget"),
+		t.Context(), serverfake.VerifiedGitHubRepoIdentity("github.com", "acme", "widget"),
 	)
 	require.NoError(err)
 	require.NotNil(repo)
@@ -420,7 +288,7 @@ func TestSpokeUnassignedActivityKeepsMatchingLocalWorkspaceSubject(t *testing.T)
 		snapshot.Subjects[key] = workspaceapi.SubjectActivity{
 			Subject: db.WorkspaceSubjectMetadata{
 				Key: key, Platform: repo.Platform, PlatformHost: repo.PlatformHost,
-				PlatformRepoID: repo.PlatformRepoID, RepoOwner: repo.Owner, RepoName: repo.Name,
+				RepoKey: repo.Key, RepoOwner: repo.Owner, RepoName: repo.Name,
 				RepoPath: repo.RepoPath, Title: "Local workspace", State: "open",
 				URL: "https://github.com/acme/widget/pull/1", Author: "author",
 			},
@@ -429,10 +297,20 @@ func TestSpokeUnassignedActivityKeepsMatchingLocalWorkspaceSubject(t *testing.T)
 		}
 	}
 
-	response, err := srv.overlayLocalActivityWorkspaceSnapshot(
+	combined, err := srv.activityapi.OverlayLocalActivityWorkspaceSnapshot(
 		t.Context(),
-		&listActivityInput{Unassigned: true},
-		activityResponse{UseWorkspaceActivityForRecency: true},
+		&itemapi.ListActivityInput{Unassigned: true, InvolvesMe: true},
+		itemapi.ActivityResponse{UseWorkspaceActivityForRecency: true},
+		snapshot,
+	)
+	require.NoError(err)
+	require.Len(combined.WorkspaceActivity, 1)
+	assert.Equal(1, combined.WorkspaceActivity[0].ItemNumber)
+
+	response, err := srv.activityapi.OverlayLocalActivityWorkspaceSnapshot(
+		t.Context(),
+		&itemapi.ListActivityInput{Unassigned: true},
+		itemapi.ActivityResponse{UseWorkspaceActivityForRecency: true},
 		snapshot,
 	)
 	require.NoError(err)
@@ -442,13 +320,14 @@ func TestSpokeUnassignedActivityKeepsMatchingLocalWorkspaceSubject(t *testing.T)
 }
 
 func TestSpokeUnassignedActivityUsesHubAssignmentWithoutLocalProviderRows(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
-	hub, hubDatabase := setupTestServer(t)
-	unassignedIssueID := seedIssue(t, hubDatabase, "acme", "widget", 7, "open")
-	assignedIssueID := seedIssue(t, hubDatabase, "acme", "widget", 8, "open")
+	hub, hubDatabase, _ := setupTestServer(t)
+	unassignedIssueID := serverfake.SeedIssue(t, hubDatabase, "acme", "widget", 7, "open")
+	assignedIssueID := serverfake.SeedIssue(t, hubDatabase, "acme", "widget", 8, "open")
 	hubRepo, err := hubDatabase.GetRepoByIdentity(
-		t.Context(), verifiedGitHubRepoIdentity("github.com", "acme", "widget"),
+		t.Context(), serverfake.VerifiedGitHubRepoIdentity("github.com", "acme", "widget"),
 	)
 	require.NoError(err)
 	require.NotNil(hubRepo)
@@ -459,12 +338,10 @@ func TestSpokeUnassignedActivityUsesHubAssignmentWithoutLocalProviderRows(t *tes
 		t.Context(), hubRepo.ID, assignedIssueID, []string{"reviewer"},
 	))
 
-	spoke, spokeDatabase := setupTestServer(t)
-	spokeRepoID, err := spokeDatabase.UpsertRepo(
-		t.Context(), verifiedGitHubRepoIdentity("github.com", "acme", "widget"),
-	)
+	spoke, spokeDatabase, _ := setupTestServer(t)
+	spokeRepoID, err := reposeed.Seed(t.Context(), spokeDatabase, serverfake.VerifiedGitHubRepoIdentity("github.com", "acme", "widget"))
 	require.NoError(err)
-	spoke.providerSource = &hubProviderSource{client: providerPlaneClientFunc(func(
+	spoke.providerSource = &spokeapi.HubProviderSource{Client: providerPlaneClientFunc(func(
 		_ context.Context, scope federationauth.Scope, request *http.Request,
 	) (*http.Response, error) {
 		assert.Equal(federationauth.ScopeProviderRead, scope)
@@ -488,25 +365,26 @@ func TestSpokeUnassignedActivityUsesHubAssignmentWithoutLocalProviderRows(t *tes
 		Subjects: map[db.WorkspaceSubjectKey]workspaceapi.SubjectActivity{},
 	}
 
-	response, err := spoke.overlayLocalActivityWorkspaceSnapshot(
+	response, err := spoke.activityapi.OverlayLocalActivityWorkspaceSnapshot(
 		t.Context(),
-		&listActivityInput{Unassigned: true},
-		activityResponse{Items: []activityItemResponse{
-			{
-				Repo: activityRepoRefResponse{
-					Provider: "github", PlatformHost: "github.com",
-					PlatformRepoID: "repo-acme-widget",
+		&itemapi.ListActivityInput{Unassigned: true},
+		itemapi.ActivityResponse{
+			Items: []itemapi.ActivityItemResponse{
+				{
+					Repo: itemapi.ActivityRepoRefResponse{
+						Provider: "github", PlatformHost: "github.com",
+						Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")),
+					},
+					ItemType: "issue", ItemNumber: 7,
 				},
-				ItemType: "issue", ItemNumber: 7,
-			},
-			{
-				Repo: activityRepoRefResponse{
-					Provider: "github", PlatformHost: "github.com",
-					PlatformRepoID: "repo-acme-widget",
+				{
+					Repo: itemapi.ActivityRepoRefResponse{
+						Provider: "github", PlatformHost: "github.com",
+						Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")),
+					},
+					ItemType: "issue", ItemNumber: 8,
 				},
-				ItemType: "issue", ItemNumber: 8,
 			},
-		},
 			UseWorkspaceActivityForRecency: true,
 		},
 		snapshot,
@@ -519,12 +397,75 @@ func TestSpokeUnassignedActivityUsesHubAssignmentWithoutLocalProviderRows(t *tes
 	require.Empty(response.WorkspaceActivity)
 }
 
+func TestSpokeHideDraftsUsesHubDraftStateForLocalWorkspaceSubjects(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
+	assert := assert.New(t)
+	require := require.New(t)
+	hub, hubDatabase, _ := setupTestServer(t)
+	serverfake.SeedPR(t, hubDatabase, "acme", "widget", 9, func(pr *db.MergeRequest) { pr.IsDraft = true })
+	serverfake.SeedPR(t, hubDatabase, "acme", "widget", 10)
+
+	spoke, spokeDatabase, _ := setupTestServer(t)
+	spokeRepoID, err := reposeed.Seed(t.Context(), spokeDatabase, serverfake.VerifiedGitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	spoke.providerSource = &spokeapi.HubProviderSource{Client: providerPlaneClientFunc(func(
+		_ context.Context, scope federationauth.Scope, request *http.Request,
+	) (*http.Response, error) {
+		assert.Equal(federationauth.ScopeProviderRead, scope)
+		request.Host = "127.0.0.1"
+		request.RemoteAddr = "127.0.0.1:1234"
+		recorder := httptest.NewRecorder()
+		hub.ServeHTTP(recorder, request)
+		assert.Equal(http.StatusOK, recorder.Code, recorder.Body.String())
+		return recorder.Result(), nil
+	})}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	snapshot := workspaceapi.WorkspaceSubjectSnapshot{
+		OwnReferences: map[db.WorkspaceSubjectKey]workspaceapi.WorkspaceRef{},
+		Subjects:      map[db.WorkspaceSubjectKey]workspaceapi.SubjectActivity{},
+	}
+	for _, number := range []int{9, 10} {
+		key := db.WorkspaceSubjectKey{
+			RepoID: spokeRepoID, ItemType: db.WorkspaceItemTypePullRequest, ItemNumber: number,
+		}
+		snapshot.Subjects[key] = workspaceapi.SubjectActivity{
+			Subject: db.WorkspaceSubjectMetadata{
+				Key: key, Platform: "github", PlatformHost: "github.com",
+				RepoKey:   platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")),
+				RepoOwner: "acme", RepoName: "widget", RepoPath: "acme/widget",
+			},
+			Workspace:  workspaceapi.WorkspaceRef{ID: "ws-" + strconv.Itoa(number), Status: "ready"},
+			ActivityAt: &now,
+		}
+	}
+
+	unfiltered, err := spoke.activityapi.OverlayLocalActivityWorkspaceSnapshot(
+		t.Context(),
+		&itemapi.ListActivityInput{},
+		itemapi.ActivityResponse{UseWorkspaceActivityForRecency: true},
+		snapshot,
+	)
+	require.NoError(err)
+	assert.Len(unfiltered.WorkspaceActivity, 2)
+
+	response, err := spoke.activityapi.OverlayLocalActivityWorkspaceSnapshot(
+		t.Context(),
+		&itemapi.ListActivityInput{HideDrafts: true},
+		itemapi.ActivityResponse{UseWorkspaceActivityForRecency: true},
+		snapshot,
+	)
+	require.NoError(err)
+	require.Len(response.WorkspaceActivity, 1)
+	assert.Equal(10, response.WorkspaceActivity[0].ItemNumber)
+}
+
 func TestNodeServerRoutesProviderReadsWithoutUsingLocalTables(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(err)
 	unreachable := "https://" + listener.Addr().String()
 	require.NoError(listener.Close())
@@ -553,7 +494,11 @@ func TestNodeServerRoutesProviderReadsWithoutUsingLocalTables(t *testing.T) {
 	spoke := httptest.NewServer(srv)
 	t.Cleanup(spoke.Close)
 
-	response, err := spoke.Client().Get(spoke.URL + "/api/v1/pulls")
+	responseReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, spoke.URL+"/api/v1/pulls", nil)
+	require.NoError(err)
+	spokeClient := spoke.Client()
+	spokeClient.Timeout = 5 * time.Second
+	response, err := spokeClient.Do(responseReq)
 	require.NoError(err)
 	defer response.Body.Close()
 	var problem httpapi.ProblemError
@@ -569,6 +514,7 @@ func TestNodeServerRoutesProviderReadsWithoutUsingLocalTables(t *testing.T) {
 }
 
 func TestNodeProviderRoutesStopWhenFleetIsDisabled(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	var hubReads atomic.Int64
@@ -600,11 +546,15 @@ func TestNodeProviderRoutesStopWhenFleetIsDisabled(t *testing.T) {
 		FederationCredentials: credentials, FederationHTTPClient: hub.Client(),
 		DisableWorkspaceBackgroundMonitors: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, srv) })
 	spoke := httptest.NewServer(srv)
 	t.Cleanup(spoke.Close)
 
-	response, err := spoke.Client().Get(spoke.URL + "/api/v1/pulls")
+	responseReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, spoke.URL+"/api/v1/pulls", nil)
+	require.NoError(err)
+	httpClient := spoke.Client()
+	httpClient.Timeout = 5 * time.Second
+	response, err := httpClient.Do(responseReq)
 	require.NoError(err)
 	require.NoError(response.Body.Close())
 	require.Equal(http.StatusOK, response.StatusCode)
@@ -613,7 +563,9 @@ func TestNodeProviderRoutesStopWhenFleetIsDisabled(t *testing.T) {
 	srv.cfgMu.Lock()
 	srv.cfg.Fleet.Enabled = false
 	srv.cfgMu.Unlock()
-	response, err = spoke.Client().Get(spoke.URL + "/api/v1/pulls")
+	responseReq, err = http.NewRequestWithContext(t.Context(), http.MethodGet, spoke.URL+"/api/v1/pulls", nil)
+	require.NoError(err)
+	response, err = httpClient.Do(responseReq)
 	require.NoError(err)
 	defer response.Body.Close()
 	var problem httpapi.ProblemError
@@ -631,132 +583,17 @@ func TestNodeProviderRoutesStopWhenFleetIsDisabled(t *testing.T) {
 	srv.cfgMu.Lock()
 	srv.cfg.Fleet.Enabled = true
 	srv.cfgMu.Unlock()
-	response, err = spoke.Client().Get(spoke.URL + "/api/v1/pulls")
+	responseReq, err = http.NewRequestWithContext(t.Context(), http.MethodGet, spoke.URL+"/api/v1/pulls", nil)
+	require.NoError(err)
+	response, err = httpClient.Do(responseReq)
 	require.NoError(err)
 	defer response.Body.Close()
 	assert.Equal(http.StatusOK, response.StatusCode)
 	assert.Equal(int64(2), hubReads.Load())
 }
 
-func TestNodeProviderFetchKeepsHubOrderAndAddsOnlyLocalWorkspace(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	hubDB := dbtest.Open(t)
-	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
-	pullID := seedPR(t, hubDB, "acme", "widget", 1,
-		withSeedPRTimes(base, base, base))
-	seedPR(t, hubDB, "acme", "widget", 2,
-		withSeedPRTimes(base.Add(time.Minute), base.Add(time.Minute), base.Add(time.Minute)))
-	require.NoError(hubDB.UpsertMREvents(t.Context(), []db.MREvent{{
-		MergeRequestID: pullID, EventType: "issue_comment", Author: "reviewer",
-		Body: "provider-owned activity", CreatedAt: base.Add(2 * time.Minute),
-		DedupeKey: "federated-provider-activity",
-	}}))
-	hubRepo, err := hubDB.GetRepoByIdentity(
-		t.Context(), verifiedGitHubRepoIdentity("github.com", "acme", "widget"),
-	)
-	require.NoError(err)
-	require.NotNil(hubRepo)
-
-	hubCredentials, err := federationauth.Open(t.TempDir() + "/hub-credentials.json")
-	require.NoError(err)
-	token, err := hubCredentials.MintInbound(
-		proxyTestNodeID, federationauth.SpokeToHubScopes(),
-	)
-	require.NoError(err)
-	hubServer := New(
-		hubDB, nil, nil, "/", nil,
-		ServerOptions{
-			DaemonAccess: DaemonAccessOptions{
-				Token: "hub-local-secret", RequireAPIAuth: true,
-			},
-			FederationSpokeID:                  proxyTestHubID,
-			FederationCredentials:              hubCredentials,
-			DisableWorkspaceBackgroundMonitors: true,
-		},
-	)
-	t.Cleanup(func() { gracefulShutdown(t, hubServer) })
-	hub := httptest.NewTLSServer(hubServer)
-	t.Cleanup(hub.Close)
-
-	nodeDB := dbtest.Open(t)
-	seedPR(t, nodeDB, "acme", "widget", 1)
-	seedWorkspace(
-		t, nodeDB, "ws-spoke-only", "acme", "widget",
-		db.WorkspaceItemTypePullRequest, 1,
-	)
-	spokeCredentials, err := federationauth.Open(t.TempDir() + "/spoke-credentials.json")
-	require.NoError(err)
-	require.NoError(spokeCredentials.StoreOutbound(
-		proxyTestHubID, token, federationauth.SpokeToHubScopes(),
-	))
-	nodeConfig := &config.Config{
-		Fleet: config.Fleet{
-			Enabled: true, Role: config.FleetRoleSpoke,
-			Hub: &config.FleetHub{
-				NodeID: proxyTestHubID, BaseURL: hub.URL,
-			},
-		},
-		Tmux: config.Tmux{Command: []string{"kenn-forge-no-such-tmux"}},
-	}
-	nodeServer := New(nodeDB, nil, nil, "/", nodeConfig, ServerOptions{
-		FederationSpokeID:                  proxyTestNodeID,
-		FederationSpokeActive:              true,
-		FederationCredentials:              spokeCredentials,
-		FederationHTTPClient:               hub.Client(),
-		DisableWorkspaceBackgroundMonitors: true,
-	})
-	t.Cleanup(func() { gracefulShutdown(t, nodeServer) })
-	spoke := httptest.NewServer(nodeServer)
-	t.Cleanup(spoke.Close)
-
-	response, err := spoke.Client().Get(spoke.URL + "/api/v1/pulls?state=open")
-	require.NoError(err)
-	defer response.Body.Close()
-	require.Equal(http.StatusOK, response.StatusCode)
-	var rows []pullapi.MergeRequestResponse
-	require.NoError(json.NewDecoder(response.Body).Decode(&rows))
-	require.Len(rows, 2)
-	assert.Equal([]int{2, 1}, []int{rows[0].Number, rows[1].Number})
-	assert.Nil(rows[0].Workspace)
-	require.NotNil(rows[1].Workspace)
-	assert.Equal("ws-spoke-only", rows[1].Workspace.ID)
-
-	activityURL := spoke.URL + "/api/v1/activity?projection=events&item_types=pr&since=" +
-		url.QueryEscape(base.Add(-time.Minute).Format(time.RFC3339))
-	activityHTTPResponse, err := spoke.Client().Get(activityURL)
-	require.NoError(err)
-	defer activityHTTPResponse.Body.Close()
-	require.Equal(http.StatusOK, activityHTTPResponse.StatusCode)
-	var activity activityResponse
-	require.NoError(json.NewDecoder(activityHTTPResponse.Body).Decode(&activity))
-	require.NotEmpty(activity.Items)
-	for _, item := range activity.Items {
-		assert.NotEmpty(item.Cursor)
-		if item.ItemNumber == 1 {
-			require.NotNil(item.Workspace)
-			assert.Equal("ws-spoke-only", item.Workspace.ID)
-		} else {
-			assert.Nil(item.Workspace)
-		}
-	}
-
-	mcpPulls, err := nodeServer.MCPBackend().ListPulls(
-		t.Context(), mcpserver.ItemListQuery{Repository: mcpserver.RepositoryIdentity{
-			Provider: "github", PlatformHost: "github.com",
-			PlatformRepoID: hubRepo.PlatformRepoID,
-			Owner:          "acme", Name: "widget",
-		}},
-	)
-	require.NoError(err)
-	require.Len(mcpPulls, 2)
-	assert.Equal([]int{2, 1}, []int{mcpPulls[0].Number, mcpPulls[1].Number})
-	assert.Nil(mcpPulls[0].Workspace)
-	require.NotNil(mcpPulls[1].Workspace)
-	assert.Equal("ws-spoke-only", mcpPulls[1].Workspace.ID)
-}
-
 func TestFederatedReviewDraftHasOneHubOwner(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	caps := platform.Capabilities{
@@ -767,7 +604,7 @@ func TestFederatedReviewDraftHasOneHubOwner(t *testing.T) {
 		ReviewDraftMutation:    true,
 		SupportedReviewActions: []platform.ReviewAction{platform.ReviewActionComment},
 	}
-	hubServer, hubDB, provider := setupGitLabCapabilityServerWithProvider(t, &caps)
+	hubServer, hubDB, provider, _ := setupGitLabCapabilityServerWithProvider(t, &caps)
 	hub := httptest.NewTLSServer(hubServer)
 	t.Cleanup(hub.Close)
 
@@ -821,7 +658,7 @@ func TestFederatedReviewDraftHasOneHubOwner(t *testing.T) {
 	})
 
 	require.Equal(http.StatusOK, published.Code, published.Body.String())
-	assert.Len(provider.publishedReviews, 1)
+	assert.Len(provider.PublishedReviews, 1)
 
 	repo, err := hubDB.GetRepoByIdentity(t.Context(), db.RepoIdentity{
 		Platform: "gitlab", PlatformHost: "gitlab.example.com", RepoPath: "group/project",
@@ -842,19 +679,20 @@ func TestFederatedReviewDraftHasOneHubOwner(t *testing.T) {
 }
 
 func TestFederatedWorkflowHasOneHubOwner(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	hubDB := dbtest.Open(t)
-	seedPR(t, hubDB, "acme", "widget", 42)
+	serverfake.SeedPR(t, hubDB, "acme", "widget", 42)
 	repo, err := hubDB.GetRepoByIdentity(
-		t.Context(), verifiedGitHubRepoIdentity("github.com", "acme", "widget"),
+		t.Context(), serverfake.VerifiedGitHubRepoIdentity("github.com", "acme", "widget"),
 	)
 	require.NoError(err)
 	require.NotNil(repo)
 	hubServer := New(hubDB, nil, nil, "/", nil, ServerOptions{
 		DisableWorkspaceBackgroundMonitors: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, hubServer) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, hubServer) })
 	hub := httptest.NewTLSServer(hubServer)
 	t.Cleanup(hub.Close)
 
@@ -866,7 +704,7 @@ func TestFederatedWorkflowHasOneHubOwner(t *testing.T) {
 	)
 	item := mcpserver.ItemIdentity{
 		Type: "pr", Provider: "github", PlatformHost: "github.com",
-		PlatformRepoID: repo.PlatformRepoID, Owner: "acme", Name: "widget", Number: 42,
+		RepoKey: repo.Key, Owner: "acme", Name: "widget", Number: 42,
 	}
 	mutation, err := nodeA.MCPBackend().SetWorkflowState(t.Context(), item, mcpserver.WorkflowUpdate{
 		Status: "reviewing", ExpectedStatus: "new", Source: "mcp", Actor: "spoke-a",
@@ -877,7 +715,7 @@ func TestFederatedWorkflowHasOneHubOwner(t *testing.T) {
 	page, err := nodeB.MCPBackend().ListWorkflowStates(t.Context(), mcpserver.WorkflowQuery{
 		Repository: mcpserver.RepositoryIdentity{
 			Provider: "github", PlatformHost: "github.com",
-			PlatformRepoID: repo.PlatformRepoID, Owner: "acme", Name: "widget",
+			Key: repo.Key, Owner: "acme", Name: "widget",
 		},
 		ItemTypes: []string{"pr"},
 	})
@@ -897,17 +735,7 @@ func newFederatedProviderNodeForTest(
 	httpClient *http.Client,
 ) (*Server, *db.DB) {
 	t.Helper()
-	credentials, err := federationauth.Open(t.TempDir() + "/credentials.json")
-	require.NoError(t, err)
-	require.NoError(t, credentials.StoreOutbound(
-		proxyTestHubID, "provider-spoke-secret", federationauth.SpokeToHubScopes(),
-	))
-	cfg := &config.Config{Fleet: config.Fleet{
-		Enabled: true, Role: config.FleetRoleSpoke,
-		Hub: &config.FleetHub{
-			NodeID: proxyTestHubID, BaseURL: hubURL,
-		},
-	}}
+	cfg, credentials := federationtest.ProviderSpoke(t, proxyTestHubID, hubURL, "provider-spoke-secret")
 	database := dbtest.Open(t)
 	server := New(database, nil, nil, "/", cfg, ServerOptions{
 		FederationSpokeID:                  nodeID,
@@ -916,14 +744,14 @@ func newFederatedProviderNodeForTest(
 		FederationHTTPClient:               httpClient,
 		DisableWorkspaceBackgroundMonitors: true,
 	})
-	t.Cleanup(func() { gracefulShutdown(t, server) })
+	t.Cleanup(func() { serverfake.GracefulShutdown(t, server) })
 	return server, database
 }
 
 func TestProviderProxyMapsHubTimeoutToUnavailable(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 
 	hub := httptest.NewTLSServer(http.HandlerFunc(func(
 		w http.ResponseWriter, r *http.Request,
@@ -935,7 +763,11 @@ func TestProviderProxyMapsHubTimeoutToUnavailable(t *testing.T) {
 	httpClient := hub.Client()
 	httpClient.Timeout = 25 * time.Millisecond
 	spoke := newProviderProxyTestServer(t, hub, httpClient, nil)
-	response, err := spoke.Client().Get(spoke.URL + "/api/v1/pulls")
+	responseReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, spoke.URL+"/api/v1/pulls", nil)
+	require.NoError(err)
+	spokeClient := spoke.Client()
+	spokeClient.Timeout = 5 * time.Second
+	response, err := spokeClient.Do(responseReq)
 	require.NoError(err)
 	defer response.Body.Close()
 	var problem httpapi.ProblemError
@@ -965,9 +797,9 @@ func (h *providerDispatchTestHandler) ServeHTTP(w http.ResponseWriter, r *http.R
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	proxy := newProviderProxy(client)
+	proxy := routepolicy.NewProviderProxy(client, r.Context())
 	rule, ok := providerRouteRuleForRequest(r.Method, r.URL.Path)
-	if ok && rule.Owner != NodeLocal {
+	if ok && rule.Owner != routepolicy.NodeLocal {
 		proxy.ServeHTTP(w, r, rule)
 		return
 	}
@@ -1005,7 +837,7 @@ func newProviderProxyTestServer(
 }
 
 func TestProviderProxyHonorsCallerCancellation(t *testing.T) {
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 
 	hub := httptest.NewTLSServer(http.HandlerFunc(func(
 		w http.ResponseWriter, r *http.Request,
@@ -1015,20 +847,23 @@ func TestProviderProxyHonorsCallerCancellation(t *testing.T) {
 	t.Cleanup(hub.Close)
 	spoke := newProviderProxyTestServer(t, hub, hub.Client(), nil)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	request, err := http.NewRequestWithContext(
 		ctx, http.MethodGet, spoke.URL+"/api/v1/pulls", nil,
 	)
 	require.NoError(t, err)
 	cancel()
-	_, err = spoke.Client().Do(request)
+	canceledResp, err := spoke.Client().Do(request)
+	if canceledResp != nil {
+		_ = canceledResp.Body.Close()
+	}
 	assert.ErrorIs(t, err, context.Canceled)
 }
 
 func TestProviderProxyRejectsOversizedHubResponse(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	runParallelServerTest(t)
+	serverfake.RunParallelServerTest(t)
 
 	hub := httptest.NewTLSServer(http.HandlerFunc(func(
 		w http.ResponseWriter, _ *http.Request,
@@ -1053,8 +888,8 @@ func TestProviderProxyRejectsOversizedHubResponse(t *testing.T) {
 		HTTPClient:  hub.Client(),
 	})
 	require.NoError(err)
-	proxy := newProviderProxy(client)
-	proxy.responseBodyLimit = 3
+	proxy := routepolicy.NewProviderProxy(client, t.Context())
+	proxy.ResponseBodyLimit = 3
 	rule, ok := providerRouteRuleForRequest(http.MethodGet, "/api/v1/pulls")
 	require.True(ok)
 	spoke := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1062,7 +897,7 @@ func TestProviderProxyRejectsOversizedHubResponse(t *testing.T) {
 	}))
 	t.Cleanup(spoke.Close)
 
-	request, err := http.NewRequest(http.MethodGet, spoke.URL+"/api/v1/pulls", nil)
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, spoke.URL+"/api/v1/pulls", nil)
 	require.NoError(err)
 	response, err := spoke.Client().Do(request)
 	require.NoError(err)
@@ -1074,47 +909,173 @@ func TestProviderProxyRejectsOversizedHubResponse(t *testing.T) {
 	assert.Equal(httpapi.CodeUpstreamError, problem.Code)
 }
 
-func TestProviderProxyReportsUnknownWriteOutcomeWhenResponseBufferingFails(t *testing.T) {
-	tests := []struct {
-		name  string
-		body  io.ReadCloser
-		limit int64
-	}{
-		{
-			name: "truncated",
-			body: &failingProviderResponseBody{
-				data: []byte(`{"ok":`), err: io.ErrUnexpectedEOF,
-			},
-			limit: 32,
-		},
-		{
-			name:  "oversized",
-			body:  io.NopCloser(bytes.NewBufferString("four")),
-			limit: 3,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			client := providerPlaneClientFunc(func(
-				context.Context, federationauth.Scope, *http.Request,
-			) (*http.Response, error) {
-				return &http.Response{
-					StatusCode: http.StatusOK, Body: test.body,
-				}, nil
-			})
-			proxy := newProviderProxy(client)
-			proxy.responseBodyLimit = test.limit
-			recorder := httptest.NewRecorder()
-			request := httptest.NewRequest(http.MethodPost, "/api/v1/provider-write", nil)
+func TestProviderProxyStreamsMarkdownMediaPastBodyLimit(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	serverfake.RunParallelServerTest(t)
 
-			proxy.ServeHTTP(recorder, request, ProviderRouteRule{
-				PeerScope: federationauth.ScopeProviderWrite,
-			})
+	media := strings.Repeat("v", 4096)
+	hub := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal("/api/v1/repo/github/acme/widget/markdown-media", r.URL.Path)
+		assert.Equal("bytes=0-", r.Header.Get("Range"))
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Content-Range", "bytes 0-4095/40000")
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.WriteString(w, media)
+	}))
+	t.Cleanup(hub.Close)
+	credentials, err := federationauth.Open(t.TempDir() + "/credentials.json")
+	require.NoError(err)
+	require.NoError(credentials.StoreOutbound(proxyTestHubID, "media-secret", federationauth.SpokeToHubScopes()))
+	client, err := providerplane.NewClient(providerplane.Options{
+		LocalNodeID: proxyTestNodeID,
+		Hub:         providerplane.Hub{NodeID: proxyTestHubID, BaseURL: hub.URL},
+		Credentials: credentials,
+		HTTPClient:  hub.Client(),
+	})
+	require.NoError(err)
+	proxy := routepolicy.NewProviderProxy(client, t.Context())
+	// A limit far below the body proves the streaming rule bypasses it.
+	proxy.ResponseBodyLimit = 3
+	rule, ok := providerRouteRuleForRequest(http.MethodGet, "/api/v1/repo/github/acme/widget/markdown-media")
+	require.True(ok)
+	require.True(rule.Streaming)
+	spoke := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxy.ServeHTTP(w, r, rule)
+	}))
+	t.Cleanup(spoke.Close)
 
-			var problem httpapi.ProblemError
-			require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &problem))
-			assert.Equal(t, http.StatusBadGateway, recorder.Code)
-			assert.Equal(t, httpapi.CodeMutationOutcomeUnknown, problem.Code)
-		})
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet,
+		spoke.URL+"/api/v1/repo/github/acme/widget/markdown-media?source=x", nil)
+	require.NoError(err)
+	request.Header.Set("Range", "bytes=0-")
+	response, err := spoke.Client().Do(request)
+	require.NoError(err)
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	require.NoError(err)
+
+	assert.Equal(http.StatusPartialContent, response.StatusCode)
+	assert.Equal("bytes 0-4095/40000", response.Header.Get("Content-Range"))
+	assert.Equal("bytes", response.Header.Get("Accept-Ranges"))
+	assert.Equal(media, string(body))
+}
+
+// newStreamingProxyTestServer proxies markdown media to hub through a spoke
+// whose streams end when stop does.
+func newStreamingProxyTestServer(
+	t *testing.T, stop context.Context, hub *httptest.Server,
+) *httptest.Server {
+	t.Helper()
+	credentials, err := federationauth.Open(t.TempDir() + "/credentials.json")
+	require.NoError(t, err)
+	require.NoError(t, credentials.StoreOutbound(proxyTestHubID, "media-secret", federationauth.SpokeToHubScopes()))
+	client, err := providerplane.NewClient(providerplane.Options{
+		LocalNodeID: proxyTestNodeID,
+		Hub:         providerplane.Hub{NodeID: proxyTestHubID, BaseURL: hub.URL},
+		Credentials: credentials,
+		HTTPClient:  hub.Client(),
+	})
+	require.NoError(t, err)
+	proxy := routepolicy.NewProviderProxy(client, stop)
+	rule, ok := providerRouteRuleForRequest(http.MethodGet, "/api/v1/repo/github/acme/widget/markdown-media")
+	require.True(t, ok)
+	spoke := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxy.ServeHTTP(w, r, rule)
+	}))
+	t.Cleanup(spoke.Close)
+	return spoke
+}
+
+// startedMediaHub sends the media headers and first bytes, then hands the
+// rest of the response to finish.
+func startedMediaHub(t *testing.T, finish func(*http.Request)) *httptest.Server {
+	t.Helper()
+	hub := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = io.WriteString(w, "partial")
+		_ = http.NewResponseController(w).Flush()
+		finish(r)
+	}))
+	t.Cleanup(hub.Close)
+	return hub
+}
+
+func getProxiedMedia(t *testing.T, spoke *httptest.Server) *http.Response {
+	t.Helper()
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet,
+		spoke.URL+"/api/v1/repo/github/acme/widget/markdown-media?source=x", nil)
+	require.NoError(t, err)
+	got := make(chan *http.Response, 1)
+	go func() {
+		response, err := spoke.Client().Do(request)
+		assert.NoError(t, err)
+		got <- response
+	}()
+	select {
+	case response := <-got:
+		require.NotNil(t, response)
+		t.Cleanup(func() { _ = response.Body.Close() })
+		return response
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "proxied media headers waited for the hub body")
+		return nil
 	}
+}
+
+func TestProviderProxySendsMediaHeadersBeforeHubBodyEnds(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
+	hub := startedMediaHub(t, func(r *http.Request) { <-r.Context().Done() })
+	spoke := newStreamingProxyTestServer(t, t.Context(), hub)
+
+	response := getProxiedMedia(t, spoke)
+
+	assert.Equal(t, http.StatusOK, response.StatusCode)
+	assert.Equal(t, "video/mp4", response.Header.Get("Content-Type"))
+}
+
+func TestProviderProxyAbortsMediaWhenHubFailsMidStream(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
+	hub := startedMediaHub(t, func(*http.Request) { panic(http.ErrAbortHandler) })
+	spoke := newStreamingProxyTestServer(t, t.Context(), hub)
+	response := getProxiedMedia(t, spoke)
+
+	_, err := io.ReadAll(response.Body)
+
+	// A clean end would let the browser cache a truncated video as whole.
+	require.Error(t, err)
+}
+
+func TestProviderProxyEndsMediaStreamWhenStopped(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
+	hub := startedMediaHub(t, func(r *http.Request) { <-r.Context().Done() })
+	stop, cancel := context.WithCancel(t.Context())
+	spoke := newStreamingProxyTestServer(t, stop, hub)
+	response := getProxiedMedia(t, spoke)
+
+	cancel()
+	_, err := io.ReadAll(response.Body)
+
+	require.Error(t, err)
+}
+
+func TestProviderProxyStopsWaitingOnHubMediaWhenStopped(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
+	waiting := make(chan struct{})
+	hub := httptest.NewTLSServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(waiting)
+		<-r.Context().Done()
+	}))
+	t.Cleanup(hub.Close)
+	stop, cancel := context.WithCancel(t.Context())
+	spoke := newStreamingProxyTestServer(t, stop, hub)
+	go func() {
+		<-waiting
+		cancel()
+	}()
+
+	response := getProxiedMedia(t, spoke)
+
+	assert.Equal(t, http.StatusServiceUnavailable, response.StatusCode)
 }

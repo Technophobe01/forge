@@ -7,10 +7,13 @@ import (
 
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/server/httpapi"
+	"go.kenn.io/forge/platform"
 )
 
-type setAssigneesOutput = httpapi.BodyOutput[httpapi.ItemAssigneesResponse]
-type setReviewersOutput = httpapi.BodyOutput[itemReviewersResponse]
+type (
+	setAssigneesOutput = httpapi.BodyOutput[httpapi.ItemAssigneesResponse]
+	setReviewersOutput = httpapi.BodyOutput[itemReviewersResponse]
+)
 
 type setPullAssigneesInput struct {
 	Provider     string `path:"provider"`
@@ -38,8 +41,9 @@ type itemReviewersResponse struct {
 	Reviewers []string `json:"reviewers"`
 }
 
-// setPullAssignees replaces the full assignee set on a pull request.
-func (s *Handler) setPullAssignees(
+// writePullAssignees replaces the full assignee set on a pull request.
+// Callers hold the item's assignees lock.
+func (s *Handler) writePullAssignees(
 	ctx context.Context,
 	input *setPullAssigneesInput,
 ) (*setAssigneesOutput, error) {
@@ -172,11 +176,11 @@ func (s *Handler) resolveUserMutationRequest(
 	if err != nil {
 		return nil, nil, providerRouteLookupError(err)
 	}
-	if !capabilityEnabled(s.capabilitiesForRepo(*repo), capability) {
-		return nil, nil, unsupportedCapabilityProblem(*repo, capability)
+	if !capabilityEnabled(s.capabilitiesForRepo(repo.Repo), capability) {
+		return nil, nil, unsupportedCapabilityProblem(repo.Repo, capability)
 	}
 	if s.syncer == nil {
-		return nil, nil, unsupportedCapabilityProblem(*repo, capability)
+		return nil, nil, unsupportedCapabilityProblem(repo.Repo, capability)
 	}
 	if raw == nil {
 		return nil, nil, httpapi.Validation(field, "value must be an array of usernames")
@@ -196,7 +200,7 @@ func (s *Handler) resolveUserMutationRequest(
 		seen[key] = struct{}{}
 		resolved = append(resolved, username)
 	}
-	return repo, resolved, nil
+	return repo.Row(), resolved, nil
 }
 
 // diffUserNames returns the entries of want that are absent from have,
@@ -221,4 +225,57 @@ func emptyIfNil(names []string) []string {
 		return []string{}
 	}
 	return names
+}
+
+type reviewerAccountsInput struct {
+	Provider     string `path:"provider"`
+	PlatformHost string
+	Owner        string `path:"owner"`
+	Name         string `path:"name"`
+	Number       int    `path:"number"`
+}
+type reviewerAccountsHostInput struct {
+	Provider     string `path:"provider"`
+	PlatformHost string `path:"platform_host"`
+	Owner        string `path:"owner"`
+	Name         string `path:"name"`
+	Number       int    `path:"number"`
+}
+type (
+	reviewerAccountsResponse = platform.ReviewerAccounts
+	reviewerAccountsOutput   = httpapi.BodyOutput[reviewerAccountsResponse]
+)
+
+func (s *Handler) getReviewerAccountsOnHost(ctx context.Context, input *reviewerAccountsHostInput) (*reviewerAccountsOutput, error) {
+	return s.getReviewerAccounts(ctx, &reviewerAccountsInput{Provider: input.Provider, PlatformHost: input.PlatformHost, Owner: input.Owner, Name: input.Name, Number: input.Number})
+}
+
+func (s *Handler) getReviewerAccounts(ctx context.Context, input *reviewerAccountsInput) (*reviewerAccountsOutput, error) {
+	repo, err := s.lookupRepoByProviderRoute(ctx, input.Provider, input.PlatformHost, input.Owner, input.Name)
+	if err != nil {
+		return nil, providerRouteLookupError(err)
+	}
+	if s.syncer == nil {
+		return nil, unsupportedCapabilityProblem(repo.Repo, capabilityReviewerMutation)
+	}
+	mutator, err := s.syncer.ReviewerMutator(repoProviderKind(repo.Repo), repoProviderHost(repo.Repo))
+	if err != nil {
+		return nil, unsupportedCapabilityProblem(repo.Repo, capabilityReviewerMutation)
+	}
+	directory, ok := mutator.(platform.ReviewerDirectory)
+	if !ok {
+		return nil, unsupportedCapabilityProblem(repo.Repo, capabilityReviewerMutation)
+	}
+	mr, err := s.visibleMergeRequest(ctx, repo.ID, input.Number)
+	if err != nil {
+		return nil, httpapi.Internal("get pull failed")
+	}
+	if mr == nil {
+		return nil, httpapi.NotFound(httpapi.CodePullNotFound, "pull not found", nil)
+	}
+	accounts, err := directory.ListReviewerAccounts(ctx, platformRepoRefFromDB(repo.Repo), input.Number)
+	if err != nil {
+		return nil, httpapi.ProviderCallProblemWithDetail(err, string(repoProviderKind(repo.Repo)), repoProviderHost(repo.Repo), "provider API error: "+err.Error())
+	}
+	return &reviewerAccountsOutput{Body: accounts}, nil
 }

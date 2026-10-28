@@ -201,10 +201,16 @@ async function mockDiffForAllPRsWithDelayedDiff(page: Page, fixture: DiffResult)
   return releaseDiff;
 }
 
-function issueDetailFixture(platformHost: string, issueNumber = 10, title = "Fix Safari layout issue"): unknown {
+function issueDetailFixture(
+  platformHost: string,
+  issueNumber = 10,
+  title = "Fix Safari layout issue",
+  fetchedAt = "2026-04-27T12:00:00Z",
+): unknown {
   const now = "2026-04-27T12:00:00Z";
   return {
     detail_loaded: true,
+    detail_fetched_at: fetchedAt,
     events: [],
     platform_host: platformHost,
     repo_owner: "acme",
@@ -632,6 +638,12 @@ test.describe("activity split view", () => {
     const detailGets = new Map<string, number>();
     const syncPosts = new Map<string, number>();
     const asyncSyncPosts = new Map<string, number>();
+    // Hold background sync acknowledgements until the assertions run. A
+    // stubbed sync never changes the detail, so once acknowledged the store
+    // polls for convergence on a fixed schedule, and on a slow runner those
+    // polls land inside the observation window. Convergence polling has its
+    // own unit coverage; this test watches foreground request fanout only.
+    const releaseAsyncSync = Promise.withResolvers<void>();
 
     await page.route(
       (url) => isPRRoute(url),
@@ -685,7 +697,8 @@ test.describe("activity split view", () => {
 
         const detailUrl = providerItemKey(new URL(route.request().url()));
         asyncSyncPosts.set(detailUrl, (asyncSyncPosts.get(detailUrl) ?? 0) + 1);
-        await route.fulfill({ status: 202, body: "" });
+        await releaseAsyncSync.promise;
+        await route.fulfill({ status: 202, body: "" }).catch(() => undefined);
       },
     );
 
@@ -721,6 +734,7 @@ test.describe("activity split view", () => {
     // Detail requests can still be in flight when the assertions finish.
     // Detach the interceptors before Playwright closes the page so Firefox
     // does not report route.fetch rejections after the test has ended.
+    releaseAsyncSync.resolve();
     await page.unrouteAll({ behavior: "ignoreErrors" });
   });
 
@@ -809,6 +823,7 @@ test.describe("activity split view", () => {
             "ghe.example.com",
             issueNumber,
             issueNumber === 10 ? "Fix Safari layout issue" : "Fix Firefox layout issue",
+            asyncSyncPosts.has(key) ? "2026-04-27T12:01:00Z" : undefined,
           ),
         ),
       });
@@ -830,7 +845,8 @@ test.describe("activity split view", () => {
     await expect(detail.locator(".issue-detail")).toBeVisible();
     await expect(detail.locator(".detail-title")).toHaveText("Fix Firefox layout issue");
 
-    await page.waitForTimeout(500);
+    await expect.poll(() => [...detailGets.values()]).toEqual([2, 2]);
+    await page.waitForTimeout(1_500);
     expect(maxCount(detailGets)).toBeLessThanOrEqual(2);
     expect(maxCount(syncPosts)).toBe(0);
     expect(maxCount(asyncSyncPosts)).toBeLessThanOrEqual(1);
@@ -1050,7 +1066,7 @@ test.describe("activity split view", () => {
 
     const rail = page.locator(".activity-pane");
     const detail = page.locator(".activity-detail");
-    const resizeHandle = page.locator(".activity-split-resize-handle");
+    const resizeHandle = page.locator(".activity-shell > .kit-split-resize-handle");
     const railBox = await rail.boundingBox();
     const detailBox = await detail.boundingBox();
     expect(railBox).not.toBeNull();
@@ -1086,7 +1102,7 @@ test.describe("activity split view", () => {
     await openActivityPRSplit(page);
 
     const rail = page.locator(".activity-pane");
-    const resizeHandle = page.locator(".activity-split-resize-handle");
+    const resizeHandle = page.locator(".activity-shell > .kit-split-resize-handle");
 
     const initialBox = await rail.boundingBox();
     expect(initialBox).not.toBeNull();
@@ -1136,7 +1152,7 @@ test.describe("activity split view", () => {
 
     const rail = page.locator(".activity-pane");
     const detail = page.locator(".activity-detail");
-    const resizeHandle = page.locator(".activity-split-resize-handle");
+    const resizeHandle = page.locator(".activity-shell > .kit-split-resize-handle");
     await expect(resizeHandle).toBeVisible();
 
     const handleBox = await resizeHandle.boundingBox();
@@ -1208,7 +1224,7 @@ test.describe("activity split view", () => {
     await collapseButton.click();
 
     await expect(detail).toBeVisible();
-    await expect(page.locator(".activity-split-resize-handle")).toBeHidden();
+    await expect(page.locator(".activity-shell > .kit-split-resize-handle")).toBeHidden();
     await expect(page.locator(".activity-collapsed-strip")).toBeVisible();
     await expect(page.locator("button[title='Expand Activity sidebar']")).toBeVisible();
     const collapsedBox = await rail.boundingBox();
@@ -1218,7 +1234,7 @@ test.describe("activity split view", () => {
     await page.locator("button[title='Expand Activity sidebar']").click();
 
     await expect(page.locator(".activity-collapsed-strip")).toBeHidden();
-    await expect(page.locator(".activity-split-resize-handle")).toBeVisible();
+    await expect(page.locator(".activity-shell > .kit-split-resize-handle")).toBeVisible();
     const expandedBox = await rail.boundingBox();
     expect(expandedBox).not.toBeNull();
     expect(Math.abs(expandedBox!.width - 360)).toBeLessThan(2);

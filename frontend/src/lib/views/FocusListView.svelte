@@ -160,18 +160,26 @@
 
   onDestroy(() => searchExecution?.interrupt());
 
+  function applySearch(value: string, submitted = false): void {
+    if (submitted) searchExecution?.interrupt();
+    const q = value.trim() || undefined;
+    if (listType === "mrs") pulls.setSearchQuery(q);
+    else issues.setIssueSearchQuery(q);
+    if (!submitted || q === undefined) return resetPageAndLoad();
+    pageLimit = 30;
+    paginationArmed = true;
+    if (listType === "mrs") pulls.loadPulls(repoParams, { submitted: true });
+    else issues.loadIssues(repoParams, { submitted: true });
+  }
+
   function onSearchInput(value: string): void {
     searchInput = value;
-
+    if (listType === "mrs") pulls.searchTextChanged();
+    else issues.searchTextChanged();
     searchExecution?.interrupt();
     searchExecution = runtime.runCommand(
       Effect.sleep("300 millis").pipe(
-        Effect.andThen(Effect.sync(() => {
-          const q = value.trim() === "" ? undefined : value.trim();
-          if (listType === "mrs") pulls.setSearchQuery(q);
-          else issues.setIssueSearchQuery(q);
-          resetPageAndLoad();
-        })),
+        Effect.andThen(Effect.sync(() => applySearch(value))),
       ),
       {
         operation: "debounce focus list search",
@@ -580,6 +588,7 @@
     {filtersExpanded}
     filterControl={!showRepoSelector && phonePresentation ? compactPhoneFilters : undefined}
     oninput={onSearchInput}
+    onsubmit={(value) => applySearch(value, true)}
     ontoggle={() => filtersExpanded = !filtersExpanded}
   />
 
@@ -823,8 +832,8 @@
   .group-header {
     font-size: var(--font-size-xs);
     font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+    text-transform: var(--label-transform, uppercase);
+    letter-spacing: var(--letter-spacing-label, 0.05em);
     color: var(--text-muted);
     padding: 6px 12px 4px;
     background: var(--bg-inset);
@@ -905,7 +914,7 @@
     --focus-mobile-space-xs: 6.5px;
     --focus-mobile-space-sm: 10px;
     --focus-mobile-space-md: 13px;
-    --focus-mobile-hit-target: 44px;
+    --focus-mobile-hit-target: 40px;
     --focus-mobile-radius-sm: 8.5px;
     --focus-mobile-radius-md: 12px;
     background: var(--bg-primary);

@@ -13,7 +13,14 @@ import (
 	gitenv "go.kenn.io/kit/git/env"
 )
 
-// RunIsolatedMain runs a package's tests with one portable, empty Git config.
+// SharedConfig is the global Git config every test shares. A push into a local
+// bare repository runs receive-pack without the pusher's -c options, and
+// receive-pack would otherwise start a detached `git maintenance run --auto`
+// that can outlive the test and race its temporary-directory cleanup.
+const SharedConfig = "[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n"
+
+// RunIsolatedMain runs a package's tests with one portable Git config that
+// carries only SharedConfig.
 // The setup is shared by the test binary so Git-heavy suites do not create a
 // new config directory for every test or command, which is costly on Windows.
 func RunIsolatedMain(m *testing.M) int {
@@ -34,11 +41,11 @@ func RunIsolatedMain(m *testing.M) int {
 func configureGitForTests(root string) error {
 	unsetInheritedGitEnv()
 
-	// Git for Windows cannot reliably use NUL as GIT_CONFIG_GLOBAL. A regular,
-	// empty file is a valid no-op config on every platform.
+	// Git for Windows cannot reliably use NUL as GIT_CONFIG_GLOBAL; a regular
+	// file works on every platform.
 	globalConfig := filepath.Join(root, "global.gitconfig")
-	if err := os.WriteFile(globalConfig, nil, 0o600); err != nil {
-		return fmt.Errorf("create empty global config: %w", err)
+	if err := os.WriteFile(globalConfig, []byte(SharedConfig), 0o600); err != nil {
+		return fmt.Errorf("create global config: %w", err)
 	}
 	xdgConfigHome := filepath.Join(root, "xdg")
 	if err := os.MkdirAll(xdgConfigHome, 0o755); err != nil {
@@ -71,13 +78,13 @@ func Runner() gitcmd.Runner {
 // MutableRunner returns a runner with a per-test writable global config. Use
 // it only when the behavior under test intentionally changes global config;
 // ordinary Git tests should use the package-shared Runner.
-func MutableRunner(t testing.TB) gitcmd.Runner {
-	t.Helper()
-	root := t.TempDir()
+func MutableRunner(tb testing.TB) gitcmd.Runner {
+	tb.Helper()
+	root := tb.TempDir()
 	globalConfig := filepath.Join(root, "global.gitconfig")
-	require.NoError(t, os.WriteFile(globalConfig, nil, 0o600))
+	require.NoError(tb, os.WriteFile(globalConfig, []byte(SharedConfig), 0o600))
 	xdgConfigHome := filepath.Join(root, "xdg")
-	require.NoError(t, os.Mkdir(xdgConfigHome, 0o755))
+	require.NoError(tb, os.Mkdir(xdgConfigHome, 0o755))
 
 	return gitcmd.Runner{
 		Env: replaceEnvValues(gitenv.StripAll(os.Environ()), map[string]string{
@@ -85,6 +92,25 @@ func MutableRunner(t testing.TB) gitcmd.Runner {
 			"GIT_CONFIG_NOSYSTEM": "1",
 			"GIT_TERMINAL_PROMPT": "0",
 			"HOME":                root,
+			"XDG_CONFIG_HOME":     xdgConfigHome,
+		}),
+		DisableSafeDirectoryForward: true,
+	}
+}
+
+// UserConfigRunner returns a runner that finds global Git config the way a
+// user's Git does, through HOME and XDG_CONFIG_HOME, for tests of default
+// config discovery. home and xdgConfigHome must be test-owned temporary
+// directories; system config stays disabled. Use MutableRunner when the
+// test only needs writable global config.
+func UserConfigRunner(tb testing.TB, home, xdgConfigHome string) gitcmd.Runner {
+	tb.Helper()
+	require.NotEmpty(tb, home, "UserConfigRunner needs a test-owned HOME")
+	return gitcmd.Runner{
+		Env: replaceEnvValues(gitenv.StripAll(os.Environ()), map[string]string{
+			"GIT_CONFIG_NOSYSTEM": "1",
+			"GIT_TERMINAL_PROMPT": "0",
+			"HOME":                home,
 			"XDG_CONFIG_HOME":     xdgConfigHome,
 		}),
 		DisableSafeDirectoryForward: true,

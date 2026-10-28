@@ -56,6 +56,7 @@ vi.mock("../context.js", () => ({
       isIssuesLoading: () => false,
       isIssueListCapped: () => issueListCapped.value,
       loadIssues,
+      searchTextChanged: vi.fn(),
       setHideBots: vi.fn(),
       setInvolvesMe: (value: boolean) => {
         setIssuesInvolvesMe(value);
@@ -85,6 +86,7 @@ vi.mock("../context.js", () => ({
       isLoading: () => false,
       isListCapped: () => pullListCapped.value,
       loadPulls,
+      searchTextChanged: vi.fn(),
       setFilterState: vi.fn(),
       setInvolvesMe: (value: boolean) => {
         setPullsInvolvesMe(value);
@@ -107,7 +109,7 @@ vi.mock("../context.js", () => ({
           owner: "acme",
           name: "api",
           repo_path: "acme/api",
-          platform_repo_id: "R_api",
+          platform_repo_id: 1101,
           is_glob: false,
           matched_repo_count: 1,
           hidden_from_ui: false,
@@ -120,7 +122,7 @@ vi.mock("../context.js", () => ({
             {
               provider: "github",
               platform_host: "github.com",
-              platform_repo_id: "R_api",
+              platform_repo_id: 1101,
               repo_path: "acme/api",
             },
           ],

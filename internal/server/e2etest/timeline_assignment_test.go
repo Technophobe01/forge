@@ -11,6 +11,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/db"
+	"go.kenn.io/forge/internal/testutil"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
+	"go.kenn.io/forge/platform"
 )
 
 type timelineDetailResponse struct {
@@ -24,6 +28,7 @@ type timelineDetailResponse struct {
 }
 
 func TestE2E_DetailTimelineReturnsAssignmentEvents(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -68,6 +73,7 @@ func TestE2E_DetailTimelineReturnsAssignmentEvents(t *testing.T) {
 }
 
 func TestE2E_DetailTimelineReturnsCommentDirectURLs(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -108,6 +114,7 @@ func TestE2E_DetailTimelineReturnsCommentDirectURLs(t *testing.T) {
 }
 
 func TestE2E_DetailTimelineReturnsForcePushCommitOrderingMetadata(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -160,8 +167,8 @@ func seedAssignmentTimelineItems(t *testing.T, database *db.DB) (int64, int64) {
 	t.Helper()
 	ctx := t.Context()
 	identity := db.GitHubRepoIdentity("github.com", "acme", "widget")
-	identity.PlatformRepoID = "repo-acme-widget"
-	repoID, err := database.UpsertRepo(ctx, identity)
+	identity.Key = platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget"))
+	repoID, err := reposeed.Seed(ctx, database, identity)
 	require.NoError(t, err)
 
 	now := time.Now().UTC().Truncate(time.Second)
@@ -206,7 +213,11 @@ func getTimelineDetail(
 	path string,
 ) timelineDetailResponse {
 	t.Helper()
-	resp, err := ts.Client().Get(ts.URL + path)
+	respReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+path, nil)
+	require.NoError(t, err)
+	httpClient := ts.Client()
+	httpClient.Timeout = 5 * time.Second
+	resp, err := httpClient.Do(respReq)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)

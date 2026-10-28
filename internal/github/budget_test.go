@@ -9,6 +9,8 @@ import (
 )
 
 func TestSyncBudgetBasics(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	b := NewSyncBudget(100)
 
@@ -29,6 +31,8 @@ func TestSyncBudgetBasics(t *testing.T) {
 }
 
 func TestSyncBudgetWorstCase(t *testing.T) {
+	t.Parallel()
+
 	b := NewSyncBudget(10)
 	b.Spend(5)
 	assert.Equal(t, 10, PRDetailWorstCase)
@@ -37,6 +41,8 @@ func TestSyncBudgetWorstCase(t *testing.T) {
 }
 
 func TestSyncBudgetEssentialReserve(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 
 	// A tenth of the limit is held back for essential spend.
@@ -52,7 +58,46 @@ func TestSyncBudgetEssentialReserve(t *testing.T) {
 	assert.False(ok, "essential spend must stop at the full limit")
 }
 
+func TestSyncBudgetSetLimitAppliesToCurrentWindow(t *testing.T) {
+	t.Parallel()
+
+	assert := assert.New(t)
+
+	b := NewSyncBudgetWithEssentialReserve(100)
+	_, ok := b.TrySpend(90)
+	assert.True(ok)
+	_, ok = b.TrySpendEssential(10)
+	assert.True(ok)
+	_, ok = b.TrySpendEssential(1)
+	assert.False(ok, "the original ceiling is exhausted")
+
+	b.SetLimit(200)
+	assert.Equal(200, b.Limit())
+	assert.Equal(100, b.Spent(), "raising the ceiling keeps spend already recorded")
+	assert.Equal(180, b.BackgroundLimit(), "the essential reserve resizes with the ceiling")
+	_, ok = b.TrySpend(80)
+	assert.True(ok, "a raised ceiling releases optional work in the same window")
+	_, ok = b.TrySpend(1)
+	assert.False(ok)
+
+	b.SetLimit(150)
+	assert.Equal(0, b.Remaining(), "a ceiling lowered below spend leaves nothing to spend")
+	_, ok = b.TrySpendEssential(1)
+	assert.False(ok)
+}
+
+func TestSyncBudgetSetLimitKeepsReserveDisabled(t *testing.T) {
+	t.Parallel()
+
+	b := NewSyncBudget(100)
+	b.SetLimit(200)
+	_, ok := b.TrySpend(200)
+	assert.True(t, ok, "budgets built without a reserve stay without one")
+}
+
 func TestSyncBudgetEssentialReserveBoundsArchiveSpend(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 
 	b := NewSyncBudgetWithEssentialReserve(100)
@@ -63,6 +108,8 @@ func TestSyncBudgetEssentialReserveBoundsArchiveSpend(t *testing.T) {
 }
 
 func TestSyncBudgetDefaultConstructorHasNoReserve(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 
 	b := NewSyncBudget(100)
@@ -71,6 +118,8 @@ func TestSyncBudgetDefaultConstructorHasNoReserve(t *testing.T) {
 }
 
 func TestArchiveLiveFloorReservesWorstCaseWireAttempts(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	assert.Equal(24, archiveLiveFloor(platform.KindGitHub))
 	assert.Equal(24, archiveLiveFloor(platform.KindGitLab))
@@ -79,6 +128,8 @@ func TestArchiveLiveFloorReservesWorstCaseWireAttempts(t *testing.T) {
 }
 
 func TestLocalArchiveSpendAvailablePreservesLiveFloor(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	budget := NewSyncBudget(50)
 
@@ -91,6 +142,8 @@ func TestLocalArchiveSpendAvailablePreservesLiveFloor(t *testing.T) {
 }
 
 func TestSyncBudgetArchiveAdmissionRampsTowardReset(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	budget := NewSyncBudget(100)
 	reset := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
@@ -124,6 +177,8 @@ func TestSyncBudgetArchiveAdmissionRampsTowardReset(t *testing.T) {
 }
 
 func TestSyncBudgetArchiveAdmissionPreservesLiveFloor(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	budget := NewSyncBudget(50)
 	reset := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
@@ -137,6 +192,8 @@ func TestSyncBudgetArchiveAdmissionPreservesLiveFloor(t *testing.T) {
 }
 
 func TestSyncBudgetArchiveAdmissionRequiresPlausibleReset(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	budget := NewSyncBudget(100)
 	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
@@ -150,6 +207,8 @@ func TestSyncBudgetArchiveAdmissionRequiresPlausibleReset(t *testing.T) {
 }
 
 func TestSyncBudgetResetClearsArchiveSpend(t *testing.T) {
+	t.Parallel()
+
 	budget := NewSyncBudget(100)
 	budget.SpendArchive(12)
 	budget.Reset()
@@ -159,6 +218,8 @@ func TestSyncBudgetResetClearsArchiveSpend(t *testing.T) {
 }
 
 func TestSyncBudgetRollsWindowWithoutProviderResponse(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	budget := NewSyncBudget(2)
 	clock := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
@@ -187,6 +248,8 @@ func TestSyncBudgetRollsWindowWithoutProviderResponse(t *testing.T) {
 }
 
 func TestSyncBudgetReportsOwnResetAt(t *testing.T) {
+	t.Parallel()
+
 	budget := NewSyncBudget(2)
 	clock := time.Date(2026, 8, 7, 12, 30, 0, 0, time.UTC)
 	budget.now = func() time.Time { return clock }
@@ -200,6 +263,8 @@ func TestSyncBudgetReportsOwnResetAt(t *testing.T) {
 }
 
 func TestSyncBudgetRollsArchiveSpendWithWindow(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	budget := NewSyncBudget(4)
 	clock := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
@@ -224,6 +289,8 @@ func TestSyncBudgetRollsArchiveSpendWithWindow(t *testing.T) {
 // window: the roll already cleared it, so refunding again would let the new
 // window spend past its ceiling.
 func TestSyncBudgetDropsRefundFromElapsedWindow(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	budget := NewSyncBudget(2)
 	clock := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
@@ -253,6 +320,8 @@ func TestSyncBudgetDropsRefundFromElapsedWindow(t *testing.T) {
 }
 
 func TestSyncBudgetDropsArchiveRefundFromElapsedWindow(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	budget := NewSyncBudget(4)
 	clock := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
@@ -274,6 +343,8 @@ func TestSyncBudgetDropsArchiveRefundFromElapsedWindow(t *testing.T) {
 // Reset starts a fresh window too, so an in-flight reservation from before a
 // provider-driven reset cannot credit the cleared window either.
 func TestSyncBudgetResetDropsInFlightRefund(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	budget := NewSyncBudget(2)
 
@@ -290,6 +361,8 @@ func TestSyncBudgetResetDropsInFlightRefund(t *testing.T) {
 // The archive reserve holds back a fifth of the provider limit for live and
 // essential work, never dropping below the global rate reserve buffer.
 func TestArchiveProviderReserveHoldsBackFifthOfLimit(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	assert.Equal(1000, ArchiveProviderReserve(5000))
 	assert.Equal(300, ArchiveProviderReserve(1500))

@@ -4,7 +4,10 @@
 import type { WorkspaceLaunchPullHeadRepoKind } from "./workspaceLaunchPullHeadRepoKind.ts";
 
 export interface WorkspaceLaunchPull {
+  base_branch?: string;
+  base_oid?: string;
   head_branch: string;
+  head_oid?: string;
   head_repo_clone_url: string;
   head_repo_kind: WorkspaceLaunchPullHeadRepoKind;
   /** @minimum 1 */

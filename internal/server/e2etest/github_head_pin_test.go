@@ -13,13 +13,15 @@ import (
 	"testing"
 	"time"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/db"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/testutil/servertest"
 	"go.kenn.io/forge/platform"
 )
@@ -30,12 +32,14 @@ import (
 func setupGitHubHeadPinServer(
 	t *testing.T, mock *mockGH,
 ) (*server.Server, *db.DB, int64) {
+	t.Helper()
 	return setupGitHubHeadPinServerWithDiff(t, mock, true)
 }
 
 func setupGitHubHeadPinServerWithoutReviewedDiff(
 	t *testing.T, mock *mockGH,
 ) (*server.Server, *db.DB, int64) {
+	t.Helper()
 	return setupGitHubHeadPinServerWithDiff(t, mock, false)
 }
 
@@ -48,13 +52,13 @@ func setupGitHubHeadPinServerWithDiff(
 	now := time.Now().UTC().Truncate(time.Second)
 
 	database := dbtest.Open(t)
-	repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
-		Platform:       "github",
-		PlatformHost:   "github.com",
-		PlatformRepoID: "1",
-		Owner:          "acme",
-		Name:           "widget",
-		RepoPath:       "acme/widget",
+	repoID, err := reposeed.Seed(ctx, database, db.RepoIdentity{
+		Platform:     "github",
+		PlatformHost: "github.com",
+		Key:          platform.RepositoryIDKey(1),
+		Owner:        "acme",
+		Name:         "widget",
+		RepoPath:     "acme/widget",
 	})
 	require.NoError(err)
 
@@ -146,6 +150,7 @@ func mergedHeadPinPullRequest() *gh.PullRequest {
 }
 
 func TestGitHubMergePassesReviewedHeadPinToProvider(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	var recordedPin atomic.Value
@@ -184,6 +189,7 @@ func TestGitHubMergePassesReviewedHeadPinToProvider(t *testing.T) {
 }
 
 func TestGitHubDetailExposesReviewedHeadOnlyWhenDiffIsCurrent(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	mock := &mockGH{}
@@ -213,6 +219,7 @@ func TestGitHubDetailExposesReviewedHeadOnlyWhenDiffIsCurrent(t *testing.T) {
 }
 
 func TestGitHubMergeRejectsMissingReviewedDiff(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	var providerCalled atomic.Bool
@@ -239,6 +246,7 @@ func TestGitHubMergeRejectsMissingReviewedDiff(t *testing.T) {
 }
 
 func TestGitHubMergeRejectsStaleReviewedDiff(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	var providerCalled atomic.Bool
@@ -266,6 +274,7 @@ func TestGitHubMergeRejectsStaleReviewedDiff(t *testing.T) {
 }
 
 func TestGitHubMergeRejectsMissingReviewedHeadPin(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	var providerCalled atomic.Bool
@@ -293,6 +302,7 @@ func TestGitHubMergeRejectsMissingReviewedHeadPin(t *testing.T) {
 }
 
 func TestGitHubMergeMovedHeadRejectionMapsToStaleState(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	mock := &mockGH{
@@ -320,6 +330,7 @@ func TestGitHubMergeMovedHeadRejectionMapsToStaleState(t *testing.T) {
 }
 
 func TestGitHubMergeGenericConflictKeepsConflictReason(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	mock := &mockGH{
@@ -347,6 +358,7 @@ func TestGitHubMergeGenericConflictKeepsConflictReason(t *testing.T) {
 }
 
 func TestGitHubApproveSubmitsReview(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	var providerCalled atomic.Bool
@@ -382,6 +394,7 @@ func TestGitHubApproveSubmitsReview(t *testing.T) {
 }
 
 func TestGitHubApproveOmittedHeadPinUsesStoredPlatformHead(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	var providerCalled atomic.Bool
@@ -418,6 +431,7 @@ func TestGitHubApproveOmittedHeadPinUsesStoredPlatformHead(t *testing.T) {
 }
 
 func TestGitHubReviewDraftApprovePublishesReview(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	var providerCalled atomic.Bool

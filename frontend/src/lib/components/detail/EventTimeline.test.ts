@@ -1676,17 +1676,20 @@ describe("EventTimeline", () => {
     expect(toggle?.getAttribute("aria-expanded")).toBe("true");
   });
 
-  it.each(["normal", "compact"] as const)(
-    "shows author and committer for rebased commits in %s view",
-    (activityViewMode) => {
+  it.each([
+    ["normal", "original-author", "rebase-committer", "original-author committed by rebase-committer"],
+    ["compact", "original-author", "rebase-committer", "original-author committed by rebase-committer"],
+  ] as const)(
+    "shows commit attribution in %s view for author %s and committer %s",
+    (activityViewMode, author, committer, attribution) => {
       const { container } = renderTimeline({
         props: {
           activityViewMode,
           events: [
             makeEvent({
               EventType: "commit",
-              Author: "rebase-committer",
-              MetadataJSON: '{"commit_author":"original-author"}',
+              Author: committer,
+              MetadataJSON: JSON.stringify({ commit_author: author }),
               Summary: "abcdef1234567890",
               Body: "feat: rewrite commit",
             }),
@@ -1694,7 +1697,7 @@ describe("EventTimeline", () => {
         },
       });
 
-      expect(container.textContent).toContain("original-author committed by rebase-committer");
+      expect(container.querySelector(".event-author")?.textContent?.trim()).toBe(attribution);
     },
   );
 
@@ -1961,6 +1964,55 @@ describe("EventTimeline", () => {
     expect(document.querySelector(".event-card--commit .event-time")?.textContent).toBe("4h ago");
   });
 
+  it.each([false, true])("replaces agent attribution with icons beside the author (markdown=%s)", async (markdown) => {
+    const body =
+      "fix: preserve selection\n\nKeep the selection.\n\nGenerated with Codex\nCo-authored-by: Codex <noreply@openai.com>\nCo-authored-by: Alex Morgan <alex@example.com>";
+    renderTimeline({
+      props: { events: [makeEvent({ EventType: "commit", Author: "alex", Summary: "abcdef1234567890", Body: body })] },
+      context: new Map([
+        [
+          STORES_KEY,
+          {
+            settings: {
+              getDetailSettings: () => ({
+                initial_timeline_entry_limit: 50,
+                collapse_single_line_breaks: false,
+                render_commit_messages_as_markdown: markdown,
+              }),
+            },
+          },
+        ],
+      ]),
+    });
+    const icon = screen.getByRole("img", { name: "Codex" });
+    expect(icon.closest(".event-author")?.textContent).toContain("alex");
+    expect(icon.parentElement?.title).toBe("Codex");
+    await waitFor(() => {
+      const details = document.querySelector(".commit-body-details");
+      expect(details?.textContent).toContain("Keep the selection.");
+      expect(details?.textContent).toContain("Co-authored-by: Alex Morgan");
+      expect(details?.textContent).not.toContain("Generated with Codex");
+      expect(details?.textContent).not.toContain("Co-authored-by: Codex");
+    });
+  });
+
+  it.each(["compact", "normal"] as const)(
+    "keeps agent icons visible with collapsed commit messages in %s mode",
+    (mode) => {
+      renderTimeline({
+        props: {
+          events: [
+            makeEvent({ EventType: "commit", Body: "fix: preserve selection\n\nGenerated with Pi", Author: "alex" }),
+          ],
+          activityViewMode: mode,
+          showCommitDetails: false,
+        },
+      });
+      expect(screen.getByRole("img", { name: "Pi" }).closest(".event-author")?.textContent).toContain("alex");
+      expect(document.querySelector(".commit-body-details")).toBeNull();
+    },
+  );
+
   it("renders commit bodies as markdown when the detail setting is on", async () => {
     renderTimeline({
       props: {
@@ -2148,7 +2200,8 @@ describe("EventTimeline", () => {
     expect(groupedText.indexOf("new C3 after rebase")).toBeLessThan(
       groupedText.indexOf("comment between commits and push"),
     );
-    expect(groupedText).toContain("old C3 before rebase");
+    expect(groupedText).toContain("2 commits replaced by a later force push");
+    expect(groupedText).not.toContain("old C3 before rebase");
     cleanup();
 
     const chronological = renderTimeline({
@@ -2199,6 +2252,63 @@ describe("EventTimeline", () => {
     expect(text).not.toContain("commit two obsolete");
     expect(text).not.toContain("commit one obsolete");
     expect(text).toContain("2 commits replaced by a later force push");
+  });
+
+  it("collapses obsolete commits in grouped order so the load-more count covers only visible entries", () => {
+    const oldHead = "5555555555555555555555555555555555555555";
+    const newHead = "8888888888888888888888888888888888888888";
+    const obsoleteCommits = [5, 4, 3, 2, 1].map((n) =>
+      makeEvent({
+        ID: n,
+        EventType: "commit",
+        Summary: String(n).repeat(40),
+        Body: `old commit ${n} before rebase`,
+        CreatedAt: `2024-06-01T10:0${n}:00Z`,
+        MetadataJSON: JSON.stringify({ commit_order_key: n, obsolete: true }),
+      }),
+    );
+    const events = [
+      makeEvent({
+        ID: 9,
+        EventType: "force_push",
+        Author: "alice",
+        Summary: "5555555 -> 8888888",
+        CreatedAt: "2024-06-01T12:00:00Z",
+        MetadataJSON: JSON.stringify({ before_sha: oldHead, after_sha: newHead }),
+      }),
+      makeEvent({
+        ID: 8,
+        EventType: "commit",
+        Summary: newHead,
+        Body: "new commit 8 after rebase",
+        CreatedAt: "2024-06-01T10:08:00Z",
+        MetadataJSON: JSON.stringify({ commit_order_key: 8 }),
+      }),
+      makeEvent({
+        ID: 7,
+        EventType: "commit",
+        Summary: "7777777777777777777777777777777777777777",
+        Body: "new commit 7 after rebase",
+        CreatedAt: "2024-06-01T10:07:00Z",
+        MetadataJSON: JSON.stringify({ commit_order_key: 7 }),
+      }),
+      ...obsoleteCommits,
+    ];
+
+    for (const activityViewMode of ["normal", "compact"] as const) {
+      renderTimeline({
+        props: { events, activityViewMode, initialEntryLimit: 2, itemIdentity: "github:acme/widget#42" },
+      });
+      expect(screen.getByRole("button", { name: "Show 2 more" })).toBeTruthy();
+      cleanup();
+
+      const { container } = renderTimeline({ props: { events, activityViewMode } });
+      const text = container.textContent ?? "";
+      expect(text).toContain("new commit 8 after rebase");
+      expect(text).toContain("5 commits replaced by a later force push");
+      expect(text).not.toContain("old commit 3 before rebase");
+      cleanup();
+    }
   });
 
   it("ignores the obsolete flag outside commit events and non-boolean values", () => {

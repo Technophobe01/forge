@@ -28,7 +28,10 @@ export default defineConfig({
         cache: false,
       },
       "frontend-lint": {
-        command: `${rootVP} lint frontend packages/github-app-ui '!frontend/dist/**' '!packages/github-app-ui/dist/**' '!frontend/test-results/**' '!packages/github-app-ui/test-results/**' '!frontend/src/lib/api/generated/**' '!frontend/src/lib/api/roborev/generated/**' --no-error-on-unmatched-pattern --threads=1`,
+        command: [
+          "node scripts/check-dev-auth-proxy.mjs",
+          `${rootVP} lint frontend packages/github-app-ui '!frontend/dist/**' '!packages/github-app-ui/dist/**' '!frontend/test-results/**' '!packages/github-app-ui/test-results/**' '!frontend/src/lib/api/generated/**' '!frontend/src/lib/api/roborev/generated/**' --no-error-on-unmatched-pattern --threads=1`,
+        ],
         cache: false,
       },
       "frontend-package-check": {
@@ -51,18 +54,22 @@ export default defineConfig({
       // package-local typechecks cheap without exposing per-package tasks.
       "svelte-check": {
         command: [
-          `(cd frontend && ${frontendVP} exec -- svelte-check --config ./vite.config.ts --tsconfig ./tsconfig.json --fail-on-warnings)`,
-          `(cd packages/github-app-ui && ${packageVP} exec -- svelte-check --config ./vite.config.ts --tsconfig ./tsconfig.json --fail-on-warnings)`,
+          `(cd frontend && ${frontendVP} exec -- svelte-check --config ./vite.config.ts --tsconfig ./tsconfig.json --fail-on-warnings --tsgo)`,
+          `(cd packages/github-app-ui && ${packageVP} exec -- svelte-check --config ./vite.config.ts --tsconfig ./tsconfig.json --fail-on-warnings --tsgo)`,
         ],
-        input: [
-          { auto: true },
-          "!node_modules/.vite-temp/**",
-          "!frontend/node_modules/.vite-temp/**",
-          "!packages/github-app-ui/node_modules/.vite-temp/**",
-          "!node_modules/.vite/task-cache/**",
-          "!frontend/node_modules/.vite/task-cache/**",
-          "!packages/github-app-ui/node_modules/.vite/task-cache/**",
-        ],
+        cache: {
+          input: [
+            { auto: true },
+            "!node_modules/.vite-temp/**",
+            "!frontend/node_modules/.vite-temp/**",
+            "!packages/github-app-ui/node_modules/.vite-temp/**",
+            "!node_modules/.vite/task-cache/**",
+            "!frontend/node_modules/.vite/task-cache/**",
+            "!packages/github-app-ui/node_modules/.vite/task-cache/**",
+            "!frontend/.svelte-check/**",
+            "!packages/github-app-ui/.svelte-check/**",
+          ],
+        },
       },
       "github-app-ui-package-check": {
         command: [

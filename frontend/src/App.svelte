@@ -1,21 +1,21 @@
 <script lang="ts">
+  import type { TabbedPanelLeaf } from "./lib/components/shared/tabbed-panel-layout.js";
   import { onDestroy, setContext, untrack } from "svelte";
   import { Effect } from "effect";
-  import type { Attachment } from "svelte/attachments";
+  import { reportScreen, visibleScreen } from "./lib/app/telemetry.js";
   import type { AppExecution, AppRuntime } from "./lib/app/runtime.js";
   import { setAppRuntime } from "./lib/app/runtime-context.js";
-  import { observeResize } from "./lib/browser/observers.js";
   import { createAppStores } from "./lib/app-stores.svelte.js";
   import PRListView from "./lib/views/PRListView.svelte";
   import IssueListView from "./lib/views/IssueListView.svelte";
   import ActivityFeedView from "./lib/views/ActivityFeedView.svelte";
   import MobileActivityView from "./lib/views/MobileActivityView.svelte";
-  import MobileModePicker from "./lib/components/mobile/MobileModePicker.svelte";
+  import MobileNavScope from "./lib/components/mobile/MobileNavScope.svelte";
+  import type { MobileNavMenuContext } from "./lib/components/mobile/mobile-nav-menu.js";
   import MobileWorkspaceList from "./lib/components/mobile/MobileWorkspaceList.svelte";
   import MobileWorkspaceTerminal from "./lib/components/mobile/MobileWorkspaceTerminal.svelte";
   import MobileWorkspaceItem from "./lib/components/mobile/MobileWorkspaceItem.svelte";
   import MobileDetailHeader from "./lib/components/mobile/MobileDetailHeader.svelte";
-  import ReviewsView from "./lib/views/ReviewsView.svelte";
   import FocusListView from "./lib/views/FocusListView.svelte";
   import { normalizeInteractiveRepoFilterSelection } from "./lib/utils/repo-filter-values.js";
   import type { NavigateCallback, StoreInstances } from "./lib/types.js";
@@ -42,7 +42,6 @@
   } from "./lib/context.js";
 
   import AppHeader from "./lib/components/layout/AppHeader.svelte";
-  import ForgeSelector from "./lib/components/layout/ForgeSelector.svelte";
   import StatusBar from "./lib/components/layout/StatusBar.svelte";
   import Palette from "./lib/components/keyboard/Palette.svelte";
   import Cheatsheet from "./lib/components/keyboard/Cheatsheet.svelte";
@@ -54,13 +53,10 @@
     isNewWorkspaceDialogOpen,
   } from "./lib/stores/new-workspace.svelte.js";
   import RepoSummaryPage from "./lib/components/repositories/RepoSummaryPage.svelte";
-  import ActionsPage from "./lib/components/actions/ActionsPage.svelte";
-  import SettingsPage from "./lib/components/settings/SettingsPage.svelte";
   import WorkspaceHost from "./lib/components/terminal/WorkspaceHost.svelte";
   import SessionTerminalPool from "./lib/components/terminal/SessionTerminalPool.svelte";
   import WorkspacePaneControls from "./lib/components/terminal/WorkspacePaneControls.svelte";
   import WorkspaceFirstRunPanel from "./lib/components/terminal/WorkspaceFirstRunPanel.svelte";
-  import DesignSystemPage from "./lib/components/design-system/DesignSystemPage.svelte";
   import OnboardingFlow from "./lib/components/onboarding/OnboardingFlow.svelte";
   import RepoBrowserFeature from "./lib/features/repo-browser/RepoBrowserFeature.svelte";
   import {
@@ -71,10 +67,11 @@
   } from "./lib/api/kata/integration.js";
   import { createDocsAPI } from "./lib/api/docs/api.js";
   import { FlashBanner, Spinner } from "@kenn-io/kit-ui";
-  import { MonitorIcon } from "./lib/icons.ts";
   import { showFlash } from "./lib/stores/flash.svelte.js";
   import { isSafeExternalHTTPURL } from "./lib/utils/safe-external-url.js";
   import { initItemRefHandler } from "./lib/utils/itemRefHandler.js";
+  import { initMarkdownVideoFallback } from "./lib/utils/markdown-video-fallback.js";
+  import { initMarkdownVideoToggle } from "./lib/utils/markdown-video-toggle.js";
   import { isPhoneLikeViewport as isPhoneLikePresentation } from "./lib/utils/phone-presentation.js";
   import { globalRepoForSelectedRoute } from "./lib/utils/repoSelectionSync.js";
   import { runAppStartup } from "./lib/utils/appStartup.js";
@@ -149,6 +146,7 @@
   import { registerPRDetailActions } from "./lib/stores/keyboard/pr-detail-actions.js";
   import type { PRDetailActionInput } from "./lib/components/detail/keyboard-actions.js";
   import type { Context } from "./lib/stores/keyboard/types.js";
+  import { repositoryKeyFromWire } from "./lib/api/repository-key.js";
 
   type DocsRouteState = {
     mode: "docs";
@@ -176,7 +174,6 @@
     onError: (message) => showFlash(message, { tone: "danger" }),
     onWarning: (message) => showFlash(message, { tone: "warning" }),
     onNotification: showFlash,
-    onNavigate: appNavigate,
     hostState: {
       getGlobalRepo: getNormalizedGlobalRepo,
       getGroupByRepo: () => stores?.grouping.getGroupByRepo() ?? true,
@@ -192,23 +189,18 @@
   stores = appComposition.stores;
   $effect(() => {
     if (!stores?.settings.getWorkspaceSettings().show_agent_status_in_lists) return;
-    const execution = appRuntime.runCommand(appComposition.listAgentStatusPolling, {
-      operation: "poll list agent status",
-      safeContext: {},
-      onFailure: () => {},
-    });
+    // The first poll runs synchronously here. Untracked, so store state it
+    // reads or writes cannot restart the poll and loop.
+    const execution = untrack(() =>
+      appRuntime.runCommand(appComposition.listAgentStatusPolling, {
+        operation: "poll list agent status",
+        safeContext: {},
+        onFailure: () => {},
+      }),
+    );
     return () => execution.interrupt();
   });
 
-  const roborevPollingExecution = appComposition.stores.roborevDaemon === undefined
-    ? undefined
-    : appRuntime.runCommand(appComposition.stores.roborevDaemon.pollingEffect, {
-        operation: "poll Roborev daemon health",
-        safeContext: {},
-        onFailure: (failure) => {
-          console.warn("Roborev daemon polling stopped unexpectedly:", failure);
-        },
-      });
   setContext(NAVIGATE_KEY, appNavigate);
   setContext(STORES_KEY, appComposition.stores);
   setContext(UI_CONFIG_KEY, { basePath: getBasePath() });
@@ -224,7 +216,6 @@
   let appReady = $state(false);
   let viewportWidth = $state(window.innerWidth);
   let renderedHeaderHeight = $state(0);
-  let renderedMobileHeaderHeight = $state(0);
   let hasCoarsePointer = $state(window.matchMedia("(pointer: coarse)").matches);
   let DocsFeature = $state<DocsFeatureComponent | null>(null);
   let docsLoading = $state(false);
@@ -238,30 +229,8 @@
     doc: null,
   });
   let cleanupFullAppShell: (() => void) | undefined;
-  const appIconSrc = `${getBasePath().replace(/\/$/, "")}/favicon.svg`;
+  const appIconSrc = __FORGE_APP_ICON__;
 
-  const trackMobileHeaderHeight: Attachment<HTMLElement> = (node) => {
-    const update = () => {
-      renderedMobileHeaderHeight = node.getBoundingClientRect().height;
-    };
-    const execution = appRuntime.runCommand(
-      Effect.scoped(
-        Effect.sync(update).pipe(
-          Effect.andThen(observeResize(node, update)),
-          Effect.andThen(Effect.never),
-        ),
-      ),
-      {
-        operation: "observe mobile application header",
-        safeContext: {},
-        onFailure: () => {},
-      },
-    );
-    return () => {
-      execution.interrupt();
-      renderedMobileHeaderHeight = 0;
-    };
-  };
   const docsAPI = createDocsAPI();
   const onboardingActive = $derived(
     appReady
@@ -272,6 +241,15 @@
         onboardingState,
       ),
   );
+
+  const telemetryScreen = $derived(visibleScreen(getRoute(), appReady, onboardingActive));
+  function reportVisibleScreen(): void {
+    if (telemetryScreen === null) return;
+    reportScreen(appRuntime, telemetryScreen);
+  }
+  $effect(() => {
+    if (telemetryScreen !== null) untrack(reportVisibleScreen);
+  });
 
   function startOnboarding(): void {
     if (onboardingState === "active") return;
@@ -473,12 +451,20 @@
     initSidebar();
     const appEl = document.getElementById("app")!;
     const cleanupContainer = initContainerObserver(runtime, appEl);
-    const cleanupItemRefs = initItemRefHandler(appRuntime, handleItemReference);
+    const cleanupItemRefs = initItemRefHandler(appRuntime, handleItemReference, document, () =>
+      startupStores.settings.getConfiguredRepos().map(repo => ({
+        provider: repo.provider,
+        platformHost: repo.platform_host,
+      }))
+    );
+    const cleanupVideoFallback = initMarkdownVideoFallback(document);
+    const cleanupVideoToggle = initMarkdownVideoToggle(document);
     const cancelStartup = runAppStartup(runtime, {
       stores: startupStores,
       beforeInitialLoad: () => syncGlobalRepoWithRoute(startupStores),
       loadInitialLists: !shouldDeferInitialListsToActiveView(),
       onReady: () => {
+        startupStores.workspaceItemSearch.ensureLoaded();
         appReady = true;
       },
     });
@@ -487,6 +473,8 @@
       cleanupTheme();
       cleanupContainer();
       cleanupItemRefs();
+      cleanupVideoFallback();
+      cleanupVideoToggle();
     };
   }
 
@@ -588,6 +576,7 @@
     "mobile-pulls",
     "pulls",
     "repos",
+    "worklists",
   ]);
 
   function providerUnavailable(): boolean {
@@ -633,12 +622,14 @@
   function flashTopOffset(): string {
     if (onboardingActive) return "0";
     if (shouldUseFocusPresentation() && !useFocusLayoutClass()) return "0";
+    // The phone shell has no application header; each screen's first row
+    // starts below the device safe area.
     if (
       isMobilePage(getPage())
       || shouldUseResponsiveMobileActivityPresentation()
       || shouldUseFocusPresentation()
     ) {
-      return renderedMobileHeaderHeight > 0 ? `${renderedMobileHeaderHeight}px` : "0";
+      return "env(safe-area-inset-top, 0px)";
     }
     return renderedHeaderHeight > 0 ? `${renderedHeaderHeight}px` : "var(--header-height)";
   }
@@ -724,6 +715,15 @@
 
   function navigateMobile(path: string): void {
     navigate(path === "/m/workspaces" ? path : `${path}${window.location.search}`);
+  }
+
+  function mobileNav(page: () => Page): MobileNavMenuContext {
+    return {
+      page,
+      isModeVisible,
+      onNavigate: navigateMobile,
+      onDesktopView: useDesktopView,
+    };
   }
 
   type MobileWorkspaceOrigin = "list" | "terminal" | "direct";
@@ -829,9 +829,7 @@
   }
 
   onDestroy(() => {
-    stores?.roborevJobs?.dispose();
     stopFullAppShell();
-    roborevPollingExecution?.interrupt();
   });
 
   $effect(() => {
@@ -880,6 +878,8 @@
         commitItem = nextCommit;
       }
     }
+
+    if (route.page !== "pulls") stores.pulls.clearSelection();
 
     if (route.page === "pulls") {
       if (
@@ -993,6 +993,7 @@
       itemType,
       provider: item.repo.provider,
       platformHost: item.repo.platform_host,
+      repositoryKey: repositoryKeyFromWire(item.repo),
       repoPath: item.repo.repo_path,
       owner: item.repo.owner,
       name: item.repo.name,
@@ -1114,6 +1115,7 @@
   // is intentionally NOT wired (see pr-detail-actions.ts).
   function buildPRDetailInput(ctx: Context): PRDetailActionInput | null {
     if (!stores) return null;
+    if (stores.detail.isDetailFromCache()) return null;
     if (ctx.selectedPR === null) return null;
     const detail = stores.detail.getDetail();
     if (detail === null) return null;
@@ -1192,6 +1194,7 @@
         appStores.detail.loadDetail(sel.owner, sel.name, sel.number, {
           provider: sel.provider,
           platformHost: sel.platformHost,
+          repositoryKey: repositoryKeyFromWire(detail.repo),
           repoPath: sel.repoPath,
         });
       },
@@ -1303,30 +1306,6 @@
   </svelte:element>
 {/snippet}
 
-{#snippet mobileTopBar(pickerPage: Page)}
-      <header class="mobile-topbar" {@attach trackMobileHeaderHeight}>
-        <span class="mobile-brand">
-          <img class="mobile-app-icon" src={appIconSrc} alt="" aria-hidden="true" />
-          <ForgeSelector compact fallbackLabel="kenn-forge" />
-        </span>
-
-        <MobileModePicker
-          page={pickerPage}
-          {isModeVisible}
-          onNavigate={navigateMobile}
-        />
-
-        <button
-          class="mobile-desktop-link"
-          type="button"
-          aria-label="Open desktop view"
-          title="Open desktop view"
-          onclick={useDesktopView}
-        >
-          <MonitorIcon size="18" strokeWidth="1.75" aria-hidden="true" />
-        </button>
-      </header>
-{/snippet}
 
 <!-- Mounted once above the focus/full-shell branching so flashes raised
        through the shared store stay visible in every presentation, not just
@@ -1343,7 +1322,7 @@
   {:else if shouldUseFocusPresentation() && useFocusLayoutClass()}
     {@const detailItem = phoneDetailItem()}
     <section class="mobile-shell" aria-label="Phone view">
-      {@render mobileTopBar(mobileModePickerPage())}
+      <MobileNavScope nav={mobileNav(mobileModePickerPage)}>
       <main class="mobile-main">
         {#if detailItem}
           <MobileDetailHeader
@@ -1355,12 +1334,13 @@
         {/if}
         {@render focusPresentation(true)}
       </main>
+      </MobileNavScope>
     </section>
   {:else if shouldUseFocusPresentation()}
     {@render focusPresentation(false)}
   {:else if isMobilePage(getPage()) || shouldUseResponsiveMobileActivityPresentation()}
     <section class="mobile-shell" aria-label="Phone view">
-      {@render mobileTopBar(getPage())}
+      <MobileNavScope nav={mobileNav(getPage)}>
 
       <main class="mobile-main">
         {#if !appReady}
@@ -1433,6 +1413,7 @@
           {/if}
         {/if}
       </main>
+      </MobileNavScope>
       <SessionTerminalPool />
     </section>
   {:else}
@@ -1440,7 +1421,16 @@
 
     <main class="app-main">
       {#if getPage() === "design-system"}
-        <DesignSystemPage />
+        {#await import("./lib/components/design-system/DesignSystemPage.svelte")}
+          <div class="loading-state" role="status"><Spinner size={18} />Loading design system</div>
+        {:then { default: DesignSystemPage }}
+          <DesignSystemPage />
+        {:catch}
+          <div class="loading-state" role="alert">
+            <span>Could not load design system.</span>
+            <button type="button" onclick={() => window.location.reload()}>Reload</button>
+          </div>
+        {/await}
       {:else if !appReady}
         <div class="loading-state">
           <Spinner size={18} />
@@ -1451,7 +1441,16 @@
           {@render providerUnavailableState()}
         {/if}
         {#if getPage() === "settings"}
-        <SettingsPage />
+        {#await import("./lib/components/settings/SettingsPage.svelte")}
+          <div class="loading-state" role="status"><Spinner size={18} />Loading settings</div>
+        {:then { default: SettingsPage }}
+          <SettingsPage />
+        {:catch}
+          <div class="loading-state" role="alert">
+            <span>Could not load settings.</span>
+            <button type="button" onclick={() => window.location.reload()}>Reload</button>
+          </div>
+        {/await}
         {:else if getPage() === "activity"}
         <!-- Desktop shell only: focus-presentation and mobile branches of
              this view get no controller (structural eligibility). -->
@@ -1468,12 +1467,55 @@
           inlineWorkspace={getInlineWorkspaceController("activity")}
           {workspacePaneControls}
         />
+      {:else if getPage() === "worklists"}
+        {@const route = getRoute()}
+        {#if route.page === "worklists" && route.importFragment !== undefined}
+          {#await import("./lib/views/WorklistImportView.svelte")}
+            <div class="loading-state" role="status"><Spinner size={18} />Loading worklists</div>
+          {:then { default: WorklistImportView }}
+            <WorklistImportView fragment={route.importFragment} />
+          {:catch}
+            <div class="loading-state" role="alert">
+              <span>Could not load worklists.</span>
+              <button type="button" onclick={() => window.location.reload()}>Reload</button>
+            </div>
+          {/await}
+        {:else if route.page === "worklists"}
+          {#await import("./lib/views/WorklistView.svelte")}
+            <div class="loading-state" role="status"><Spinner size={18} />Loading worklists</div>
+          {:then { default: WorklistView }}
+            <WorklistView
+              worklistId={route.worklistId}
+              selected={route.selected}
+              isSidebarCollapsed={isSidebarCollapsed()}
+              sidebarWidth={getSidebarWidth()}
+              sidebarOverlay={isNarrow()}
+              onSidebarResize={handleSidebarResize}
+              inlineWorkspace={getInlineWorkspaceController("worklists")}
+              {workspacePaneControls}
+            />
+          {:catch}
+            <div class="loading-state" role="alert">
+              <span>Could not load worklists.</span>
+              <button type="button" onclick={() => window.location.reload()}>Reload</button>
+            </div>
+          {/await}
+        {/if}
       {:else if getPage() === "repos"}
         <RepoSummaryPage />
       {:else if getPage() === "actions"
         && stores.settings.isSettingsLoaded()
         && stores.settings.isModeVisible("actions")}
-        <ActionsPage />
+        {#await import("./lib/components/actions/ActionsPage.svelte")}
+          <div class="loading-state" role="status"><Spinner size={18} />Loading Actions</div>
+        {:then { default: ActionsPage }}
+          <ActionsPage />
+        {:catch}
+          <div class="loading-state" role="alert">
+            <span>Could not load Actions.</span>
+            <button type="button" onclick={() => window.location.reload()}>Reload</button>
+          </div>
+        {/await}
       {:else if getPage() === "repo-browser"}
         {@const route = getRoute()}
         {#if route.page === "repo-browser"}
@@ -1527,13 +1569,6 @@
           inlineWorkspace={getInlineWorkspaceController("issues")}
           {workspacePaneControls}
         />
-      {:else if getPage() === "reviews"}
-        {@const route = getRoute()}
-        {#if route.page === "reviews" && route.jobId != null}
-          <ReviewsView jobId={route.jobId} />
-        {:else}
-          <ReviewsView />
-        {/if}
       {:else if getPage() === "project-intake"}
         {@const route = getRoute()}
         {#if route.page === "project-intake"}
@@ -1628,8 +1663,8 @@
   </section>
 {/snippet}
 
-{#snippet workspacePaneControls(showStripActions: boolean)}
-  <WorkspacePaneControls {showStripActions} />
+{#snippet workspacePaneControls(leaf: TabbedPanelLeaf)}
+  <WorkspacePaneControls showStripActions={leaf.tabs.includes("workspace")} {leaf} />
 {/snippet}
 
 <style>
@@ -1643,57 +1678,14 @@
     --mobile-chrome-space-xs: 6.5px;
     --mobile-chrome-space-sm: 10px;
     --mobile-chrome-space-md: 13px;
-    --mobile-chrome-hit-target: 45.5px;
     container-type: inline-size;
     flex: 1;
     min-height: 0;
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    padding-top: env(safe-area-inset-top);
     background: var(--bg-primary);
-  }
-
-  .mobile-topbar {
-    min-height: calc(var(--mobile-chrome-hit-target) + var(--mobile-chrome-space-xs));
-    flex-shrink: 0;
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto;
-    align-items: center;
-    gap: var(--mobile-chrome-space-sm);
-    padding:
-      max(var(--mobile-chrome-space-sm), env(safe-area-inset-top))
-      var(--mobile-chrome-space-sm)
-      var(--mobile-chrome-space-sm);
-    border-bottom: thin solid var(--border-default);
-    background: var(--bg-surface);
-  }
-
-  .mobile-brand {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--mobile-chrome-space-xs);
-    min-width: 0;
-  }
-
-  .mobile-app-icon {
-    display: block;
-    width: 19px;
-    height: 19px;
-    flex: 0 0 auto;
-  }
-
-  .mobile-desktop-link {
-    width: var(--mobile-chrome-hit-target);
-    min-width: var(--mobile-chrome-hit-target);
-    min-height: var(--mobile-chrome-hit-target);
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0;
-    border: thin solid var(--border-default);
-    border-radius: var(--radius-sm);
-    color: var(--text-secondary);
-    background: var(--bg-surface);
   }
 
   .mobile-main {
@@ -1753,7 +1745,8 @@
     --focus-detail-space-xs: 6px;
     --focus-detail-space-sm: 9px;
     --focus-detail-space-md: 12px;
-    --focus-detail-hit-target: 49px;
+    --focus-detail-hit-target: 38px;
+    --focus-detail-chip-height: 32px;
     --detail-mobile-type-xs: var(--focus-detail-type-xs);
     --detail-mobile-type-sm: var(--focus-detail-type-sm);
     --detail-mobile-type-body: var(--focus-detail-type-body);
@@ -1852,13 +1845,17 @@
 
   .focus-layout--phone :global(.inset-box),
   .focus-layout--phone :global(.markdown-body),
-  .focus-layout--phone :global(.comment-editor-input),
-  .focus-layout--phone :global(.body-edit-textarea),
-  .focus-layout--phone :global(.title-edit-input),
   .focus-layout--phone :global(.add-description-btn),
   .focus-layout--phone :global(.detail-load-error) {
+    font-size: var(--font-size-phone-prose);
+    line-height: 1.5;
+  }
+
+  .focus-layout--phone :global(.comment-editor-input),
+  .focus-layout--phone :global(.body-edit-textarea),
+  .focus-layout--phone :global(.title-edit-input) {
     font-size: var(--font-size-md);
-    line-height: 1.58;
+    line-height: 1.5;
   }
 
   .focus-layout--phone :global(.inset-box) {
@@ -1913,7 +1910,7 @@
   .focus-layout--phone :global(.chips-row .kit-chip),
   .focus-layout--phone :global(.chips-row .kit-button),
   .focus-layout--phone :global(.chips-row .diff-summary-trigger) {
-    min-height: var(--detail-mobile-hit-target, 37px);
+    min-height: var(--focus-detail-chip-height);
     min-width: 0;
     padding: 0 12px;
     border-radius: var(--radius-sm);

@@ -1,4 +1,5 @@
 import type {
+  Acp,
   Activity,
   ActivityAuthorsResponse as GeneratedActivityAuthorsResponse,
   ActivityItemResponse,
@@ -53,6 +54,7 @@ import type {
   RepoLabelsResponse as GeneratedRepoLabelsResponse,
   RepoOperations as GeneratedRepoOperations,
   RepoPreset as GeneratedRepoPreset,
+  RepoCatalogResponse,
   RepoResponse,
   RepoSummaryAuthorResponse,
   RepoSummaryCommitPointResponse as GeneratedRepoSummaryCommitPointResponse,
@@ -63,6 +65,7 @@ import type {
   SessionInfo,
   SettingsResponse as GeneratedSettingsResponse,
   StarredRequest as GeneratedStarredRequest,
+  SyncSettingsResponse,
   SyncStatus as GeneratedSyncStatus,
   Terminal,
   UpdateFleetSettingsInputBody,
@@ -77,6 +80,7 @@ import type {
 } from "./generated/models/index.js";
 
 export type Repo = RepoResponse;
+export type RepoCatalog = RepoCatalogResponse;
 export type RepoSummary = RepoSummaryResponse;
 export type RepoSummaryAuthor = RepoSummaryAuthorResponse;
 export type RepoSummaryIssue = RepoSummaryIssueResponse;
@@ -139,8 +143,12 @@ export type ActivitySettings = Activity;
 export type IssueSettings = Issues;
 export type PullRequestSettings = PullRequests;
 export type DetailSettings = Detail;
+export type SyncSettings = SyncSettingsResponse;
 export type TerminalSettings = Terminal;
+export type ACPSettings = Acp;
 export type ModeVisibility = GeneratedModeVisibility;
+
+export const DEFAULT_ACP_SETTINGS: ACPSettings = { font_family: "", font_size: 13 };
 
 export const DEFAULT_TERMINAL_SETTINGS: TerminalSettings = {
   font_family: "",
@@ -153,7 +161,7 @@ export const DEFAULT_TERMINAL_SETTINGS: TerminalSettings = {
   hide_tmux_status: false,
   graphics: true,
   tmux_mouse: true,
-  retained_sessions: 10,
+  retained_sessions: 50,
 };
 
 export const DEFAULT_MODE_VISIBILITY: ModeVisibility = {
@@ -163,7 +171,6 @@ export const DEFAULT_MODE_VISIBILITY: ModeVisibility = {
   actions: false,
   pulls: true,
   issues: true,
-  reviews: true,
   workspaces: true,
 };
 
@@ -222,6 +229,10 @@ export type FilesResult = Omit<FilesResponseWire, "files"> & {
 };
 
 export interface CommitInfo {
+  stats?: { additions: number; deletions: number };
+  author_email?: string;
+  committer_name?: string;
+  committer_email?: string;
   sha: string;
   message: string;
   author_name: string;

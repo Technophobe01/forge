@@ -5,12 +5,13 @@ import (
 	"sync/atomic"
 	"testing"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestFixtureClientPullRequestsAreReturnedAsCopies(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	client := NewFixtureClient()
@@ -52,6 +53,7 @@ func TestFixtureClientPullRequestsAreReturnedAsCopies(t *testing.T) {
 }
 
 func TestFixtureClientCreateReviewWithCommentsRecordsReview(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	client := NewFixtureClient()
@@ -85,6 +87,7 @@ func TestFixtureClientCreateReviewWithCommentsRecordsReview(t *testing.T) {
 }
 
 func TestFixtureClientCheckRunsConcurrentStatusUpdates(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	client := NewFixtureClient()
@@ -141,6 +144,7 @@ func TestFixtureClientCheckRunsConcurrentStatusUpdates(t *testing.T) {
 }
 
 func TestFixtureClientWorkflowRunsConcurrentAccess(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	client := NewFixtureClient()

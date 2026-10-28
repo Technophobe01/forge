@@ -7,8 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,6 +15,8 @@ import (
 	"go.kenn.io/forge/internal/apiclient/generated"
 	"go.kenn.io/forge/internal/archive/report"
 	"go.kenn.io/forge/internal/config"
+	"go.kenn.io/forge/internal/daemonclient"
+	"go.kenn.io/kit/atomicfile"
 )
 
 type archiveStringList []string
@@ -256,7 +256,7 @@ func runArchiveReport(opts archiveReportOptions, daysSet bool, stdout io.Writer,
 }
 
 func newArchiveDaemonClient(flags *archiveDaemonFlags) (*apiclient.Client, error) {
-	daemon, err := discoverDaemonHTTP(flags.configPath, flags.timeout)
+	daemon, err := daemonclient.Discover(flags.configPath, flags.timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -502,29 +502,11 @@ func writeArchiveJSON(output io.Writer, value any) error {
 	return err
 }
 
-func writeArchiveOutput(path string, contents string) (err error) {
-	dir := filepath.Dir(path)
-	temp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return fmt.Errorf("create archive output temp file: %w", err)
-	}
-	tempPath := temp.Name()
-	defer func() {
-		_ = temp.Close()
-		if err != nil {
-			_ = os.Remove(tempPath)
-		}
-	}()
-	if _, err = io.WriteString(temp, contents); err != nil {
-		return fmt.Errorf("write archive output temp file: %w", err)
-	}
-	if err = temp.Sync(); err != nil {
-		return fmt.Errorf("sync archive output temp file: %w", err)
-	}
-	if err = temp.Close(); err != nil {
-		return fmt.Errorf("close archive output temp file: %w", err)
-	}
-	if err = os.Rename(tempPath, path); err != nil {
+func writeArchiveOutput(path string, contents string) error {
+	// ErrPublished means the output is already in place and only a later
+	// directory fsync failed.
+	err := atomicfile.WriteFile(path, []byte(contents))
+	if err != nil && !errors.Is(err, atomicfile.ErrPublished) {
 		return fmt.Errorf("replace archive output: %w", err)
 	}
 	return nil
@@ -550,6 +532,6 @@ func archiveProblemReason(problem *generated.ProblemError) string {
 	if problem.Details == nil {
 		return ""
 	}
-	reason, _ := (problem.Details)["reason"].(string)
+	reason, _ := problem.Details["reason"].(string)
 	return reason
 }

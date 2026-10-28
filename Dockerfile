@@ -1,84 +1,76 @@
 # syntax=docker/dockerfile:1
 #
-# Production image for the Kenn Forge maintainer console (formerly middleman).
-# The image keeps the middleman name and MIDDLEMAN_* settings that deployments
-# use; docker-entrypoint.sh translates them for kenn-forge.
+# Production image for the Kenn Forge maintainer console (formerly middleman),
+# as Technophobe01 deploys it: upstream's frontend and Go build stages as they
+# are (pinned Bun and Node, patched CA certificates, Go 1.27.3), plus the
+# fleet-hub conversion helper, and a runtime stage that keeps the middleman
+# image's contract: the MIDDLEMAN_* settings docker-entrypoint.sh translates,
+# uid 10001 owning the existing /data volumes, and socat bridging the external
+# port to kenn-forge's loopback listener.
 #
-# Multi-stage:
-#   1. frontend — build the embedded Svelte SPA + GitHub App UI with Bun/Vite+
-#   2. build    — compile the Go server (pure Go, no CGO) with the dist embedded
-#   3. runtime  — minimal Debian slim with just the binary + curl for healthcheck
-#
-# Build:  docker build -t ghcr.io/technophobe01/middleman:latest .
-# Run:    docker run -p 8091:8091 -v middleman-data:/data ghcr.io/technophobe01/middleman:latest
-
-# ---- Stage 1: frontends -----------------------------------------------------
-FROM node:24-bookworm AS frontend
-WORKDIR /app
-
-# Bun for workspace dependency installation (pinned to match frontend tooling),
-# plus make to drive the project's own frontend build targets.
-ARG BUN_VERSION=1.4.0
-ARG TARGETARCH
-RUN apt-get update \
- && apt-get install -y --no-install-recommends make unzip curl ca-certificates \
- && rm -rf /var/lib/apt/lists/* \
- && case "${TARGETARCH:-amd64}" in \
-      amd64) BUN_ARCH=x64 ;; \
-      arm64) BUN_ARCH=aarch64 ;; \
-      *) echo "unsupported arch: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac \
- && curl -fsSL -o /tmp/bun.zip "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-${BUN_ARCH}.zip" \
- && unzip -q /tmp/bun.zip -d /tmp/bun \
- && mv /tmp/bun/bun-linux-${BUN_ARCH}/bun /usr/local/bin/bun \
- && chmod +x /usr/local/bin/bun \
- && rm -rf /tmp/bun /tmp/bun.zip
-
-COPY . .
-# `make frontend` / `githubapp-frontend` run `bun install`, build with Vite+, and
-# copy dist into internal/web/dist and internal/githubapp/ui/dist (the go:embed dirs).
-RUN make frontend githubapp-frontend
-
-# ---- Stage 2: Go build ------------------------------------------------------
-FROM golang:1.27.0-bookworm AS build
+# Build:  docker build --build-arg VERSION=<forge tag> -t ghcr.io/technophobe01/middleman:latest .
+ARG BUN_IMAGE=oven/bun:1.4.4@sha256:1d22548f177f4ff38e0c15baa3c2c46c6c2060ba2d1bc573bb4720b407548f1d
+FROM --platform=$BUILDPLATFORM ${BUN_IMAGE} AS bun
+FROM --platform=$BUILDPLATFORM node:24.22.1-bookworm-slim AS frontend
 WORKDIR /src
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
+ENV UV_THREADPOOL_SIZE=2 RAYON_NUM_THREADS=2
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419~deb12u2 \
+    && rm -rf /var/lib/apt/lists/*
+COPY . .
+RUN bun install --frozen-lockfile \
+    && node scripts/build-frontend.mjs \
+    && cd packages/github-app-ui && node ../../node_modules/vite-plus/bin/vp build --logLevel warn
 
-ARG VERSION=docker
-ARG COMMIT=unknown
-ARG BUILD_DATE=
-
+FROM --platform=$BUILDPLATFORM golang:1.27.3-bookworm AS build
+WORKDIR /src
+# "|" falls back to the source repo on any proxy error, including HTTP/2 stream resets mid-download.
+ENV CGO_ENABLED=0 GOFLAGS=-p=2 GOMAXPROCS=2 GOPROXY="https://proxy.golang.org|direct"
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-# Bring in the built frontends (overwrite any stub/empty dist in the context).
-COPY --from=frontend /app/internal/web/dist ./internal/web/dist
-COPY --from=frontend /app/internal/githubapp/ui/dist ./internal/githubapp/ui/dist
-
-# Pure Go (modernc.org/sqlite) — no CGO. -buildvcs=false so a missing .git is fine.
-RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false \
-      -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}" \
-      -o /out/kenn-forge ./cmd/kenn-forge
+COPY --from=frontend /src/frontend/dist ./internal/web/dist
+COPY --from=frontend /src/packages/github-app-ui/dist ./internal/githubapp/ui/dist
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+ARG REVISION=unknown
+ARG BUILD_DATE=unknown
+RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
+    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${REVISION} -X main.buildDate=${BUILD_DATE}" \
+    -o /out/kenn-forge ./cmd/kenn-forge
 # The entrypoint's fleet-hub conversion (MIDDLEMAN_FLEET_ORIGIN).
-RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "-s -w" \
-      -o /out/kenn-forge-fleet-hub ./docker/fleethub
+RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" \
+    -o /out/kenn-forge-fleet-hub ./docker/fleethub
 
-# ---- Stage 3: runtime -------------------------------------------------------
 FROM debian:bookworm-slim
-# git/openssh-client: kenn-forge shells out to git for issue workspaces, branch
-# activity, and docs publish (and SSH-backed remotes). socat bridges
-# 0.0.0.0:<port> -> kenn-forge's loopback listener (it binds loopback-only by
-# design); curl is for the healthcheck.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl socat git openssh-client \
- && rm -rf /var/lib/apt/lists/*
+# git/openssh-client/tmux: kenn-forge shells out to git and runs workspace
+# sessions; socat bridges 0.0.0.0:<port> to kenn-forge's loopback listener; curl
+# is for the healthcheck. The ca-certificates floor is upstream's: images built
+# before it trust the compromised eMudhra roots.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl socat git openssh-client tmux \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419~deb12u2 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/kenn-forge /usr/local/bin/kenn-forge
 COPY --from=build /out/kenn-forge-fleet-hub /usr/local/bin/kenn-forge-fleet-hub
+COPY LICENSE /usr/share/doc/kenn-forge/LICENSE
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
+ARG VERSION=dev
+ARG REVISION=unknown
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.source="https://github.com/Technophobe01/forge" \
+    org.opencontainers.image.version=$VERSION \
+    org.opencontainers.image.revision=$REVISION \
+    org.opencontainers.image.created=$BUILD_DATE
+
 # Run as a non-root user; the named /data volume inherits this ownership. The
-# uid stays 10001 so volumes created by the middleman image remain writable.
+# uid stays 10001, not upstream's 1000, so volumes created by the middleman
+# image remain writable.
 RUN useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin forge \
  && mkdir -p /data && chown forge:forge /data
 USER forge

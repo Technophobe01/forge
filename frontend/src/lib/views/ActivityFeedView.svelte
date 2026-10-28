@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
-  import type { ActivityItem } from "../api/types.js";
+  import type { ActivityItem, ActivitySubject, WorkspaceActivitySubject } from "../api/types.js";
   import { getStackDepth } from "../stores/keyboard/modal-stack.svelte.js";
   import ActivityFeed from "../components/ActivityFeed.svelte";
   import CommitDiffPanel from "../components/CommitDiffPanel.svelte";
@@ -9,7 +9,7 @@
   import { buildRoutedItemRoute, type PullRequestRouteRef } from "../routes.js";
   import IssueDetail from "../components/detail/IssueDetail.svelte";
   import PullDetailPane from "../components/detail/PullDetailPane.svelte";
-  import { issueDetailMatchesRef, pullDetailMatchesRef } from "../components/detail/detail-match.js";
+  import { issueDetailMatchesRef, pullDetailMatchesRef, repoIdentityMatches } from "../components/detail/detail-match.js";
   import DetailPaneLayout from "../components/shared/DetailPaneLayout.svelte";
   import type { TabbedPanelLeaf } from "../components/shared/tabbed-panel-layout.js";
   import { getPaneLayoutStore, type PaneTabSpec } from "../stores/paneLayout.svelte.js";
@@ -18,6 +18,7 @@
   import { useItemWorkspaceClaim } from "../item-workspace-claim.svelte.js";
   import type { ActivityCommitSelection } from "../utils/activitySelection.js";
   import type { InlineWorkspaceController, WorkspaceItemIdentity } from "../workspace-inline.js";
+  import { repositoryKeyFromWire, type RepositoryKey } from "../api/repository-key.js";
 
   type ActivityDetailTab = "conversation" | "files";
 
@@ -30,6 +31,7 @@
     itemType: "pr" | "issue";
     provider: string;
     platformHost?: string | undefined;
+    repositoryKey?: RepositoryKey | undefined;
     repoPath: string;
     owner: string;
     name: string;
@@ -54,7 +56,7 @@
      * the workspace pane or one of its promoted sessions. Supplied by the app
      * shell: the controls live in `frontend/`, next to the state they act on.
      */
-    workspacePaneControls?: Snippet<[boolean]> | undefined;
+    workspacePaneControls?: Snippet<[TabbedPanelLeaf]> | undefined;
   }
 
   let {
@@ -72,7 +74,7 @@
     workspacePaneControls = undefined,
   }: Props = $props();
 
-  const { detail: detailStore, issues: issuesStore } = getStores();
+  const { detail: detailStore, issues: issuesStore, activity } = getStores();
   const paneLayout = getPaneLayoutStore("activity");
 
   const ACTIVITY_PANE_WIDTH_KEY = "kenn-forge-activity-pane-width";
@@ -154,10 +156,32 @@
   const controlled = $derived(
     controlledDrawer !== undefined || onCloseDrawer !== undefined,
   );
-  const activeDrawer = $derived(
-    controlled ? (controlledDrawer ?? null) : internalDrawer,
-  );
+  let retainedSelectionIdentity = $state.raw<{ route: string; repositoryKey: RepositoryKey } | null>(null);
+  const activeDrawer = $derived.by(() => {
+    const selection = controlled ? (controlledDrawer ?? null) : internalDrawer;
+    if (!selection || selection.repositoryKey) return selection;
+    // URL selections omit repository identity. Recover it from the retained
+    // feed so a known item can render its cached detail before revalidation.
+    const matches = (item: ActivityItem | ActivitySubject | WorkspaceActivitySubject) =>
+      item.item_type === selection.itemType && item.item_number === selection.number && repoIdentityMatches(item, selection);
+    const item = activity.getItemActivity().find(matches)
+      ?? activity.getActivityItems().find(matches)
+      ?? activity.getWorkspaceActivity().find(matches);
+    const retainedKey = retainedSelectionIdentity?.route === buildRoutedItemRoute(selection)
+      ? retainedSelectionIdentity.repositoryKey
+      : undefined;
+    return { ...selection, repositoryKey: repositoryKeyFromWire(item?.repo) ?? retainedKey };
+  });
   const selectedItemRoute = $derived(activeDrawer ? buildRoutedItemRoute(activeDrawer) : null);
+  $effect(() => {
+    const repositoryKey = activeDrawer?.repositoryKey;
+    if (!selectedItemRoute || !repositoryKey) {
+      retainedSelectionIdentity = null;
+    } else if (retainedSelectionIdentity?.route !== selectedItemRoute || retainedSelectionIdentity.repositoryKey !== repositoryKey) {
+      // Filtering a row out does not change the still-open detail's identity.
+      retainedSelectionIdentity = { route: selectedItemRoute, repositoryKey };
+    }
+  });
   let lastSelectionRevealKey = 0;
 
   function revealSelectedActivityRow(container: HTMLElement): (() => void) | undefined {
@@ -209,6 +233,7 @@
           number: activeDrawer.number,
           provider: activeDrawer.provider,
           platformHost: activeDrawer.platformHost,
+          repositoryKey: activeDrawer.repositoryKey,
           repoPath: activeDrawer.repoPath,
         }
       : null,
@@ -221,6 +246,7 @@
           number: activeDrawer.number,
           provider: activeDrawer.provider,
           platformHost: activeDrawer.platformHost,
+          repositoryKey: activeDrawer.repositoryKey,
           repoPath: activeDrawer.repoPath,
         }
       : null,
@@ -268,6 +294,7 @@
         sync: false,
         provider: ref.provider,
         platformHost: ref.platformHost,
+        repositoryKey: ref.repositoryKey,
         repoPath: ref.repoPath,
       });
       return;
@@ -278,6 +305,7 @@
         sync: false,
         provider: ref.provider,
         platformHost: ref.platformHost,
+        repositoryKey: ref.repositoryKey,
         repoPath: ref.repoPath,
       });
     }
@@ -399,6 +427,7 @@
       itemType,
       provider: item.repo.provider,
       platformHost: item.repo.platform_host,
+      repositoryKey: repositoryKeyFromWire(item.repo),
       repoPath: item.repo.repo_path,
       owner: item.repo.owner,
       name: item.repo.name,
@@ -538,7 +567,6 @@
 
   {#if hasActiveDetail && !activityPaneCollapsed}
     <SplitResizeHandle
-      class="activity-split-resize-handle"
       ariaLabel="Resize Activity rail"
       orientation="horizontal"
       ariaValueMin={minActivityPaneWidth}
@@ -624,6 +652,7 @@
               number={drawerIssueSelection.number}
               provider={drawerIssueSelection.provider}
               platformHost={drawerIssueSelection.platformHost}
+              repositoryKey={drawerIssueSelection.repositoryKey}
               repoPath={drawerIssueSelection.repoPath}
               autoSync="background"
               hideStaleWhileLoading={true}
@@ -645,7 +674,7 @@
      panes would be a control with no subject. -->
 {#snippet workspaceLeafExtras(leaf: TabbedPanelLeaf)}
   {#if leaf.tabs.some((tabKey) => tabKey === "workspace" || isSessionPaneKey(tabKey))}
-    {@render workspacePaneControls?.(leaf.tabs.includes("workspace"))}
+    {@render workspacePaneControls?.(leaf)}
   {/if}
 {/snippet}
 
@@ -669,12 +698,14 @@
   .activity-shell--split .activity-pane {
     width: var(--activity-pane-width, 360px);
     flex: 0 0 var(--activity-pane-width, 360px);
-    border-right: 1px solid var(--border-default);
   }
 
+  /* An expanded rail is divided by the resize handle; the collapsed strip has
+     no handle, so it draws its own edge. */
   .activity-shell--split .activity-pane--collapsed {
     width: 28px;
     flex-basis: 28px;
+    border-right: 1px solid var(--border-default);
   }
 
   .activity-feed-wrap {
@@ -742,7 +773,7 @@
       display: none;
     }
 
-    .activity-shell--split :global(.activity-split-resize-handle) {
+    .activity-shell--split > :global(.kit-split-resize-handle) {
       display: none;
     }
   }

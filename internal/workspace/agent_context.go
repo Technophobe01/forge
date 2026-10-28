@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"unicode"
 
 	"go.kenn.io/forge/internal/db"
+	"go.kenn.io/kit/atomicfile"
 )
 
 const (
@@ -204,6 +206,7 @@ func RenderAgentContext(ctx AgentContext) string {
 		writeMarkdownLine(&b, "Associated PR", itemNumberLabel(ctx.AssociatedPR.Number))
 		writeMarkdownLine(&b, "Associated PR URL", ctx.AssociatedPR.URL)
 	}
+	b.WriteString("\n## Workspace Targets\nWhen Forge MCP is available, register PRs and issues you create or work on with kenn_forge_add_workspace_target. Use the Workspace ID above, the verified repository and item identity from Forge reads, and the canonical URL. Register every PR in a stack. When kenn_forge_add_workspace_kata_target is available, link Kata tasks by daemon, project and issue identity. Repeating a link is safe. Before finishing, call kenn_forge_list_workspace_targets and register missing targets. Report failed registrations and do not register unrelated background references. Tracking does not change the workspace owner or Git push destination.\n")
 	return b.String()
 }
 
@@ -227,6 +230,11 @@ func (m *Manager) PrepareAgentLaunchContext(
 	}
 	if summary == nil {
 		return ErrWorkspaceNotFound
+	}
+	// Pick up exclusion rules the user added since the workspace was set up.
+	// A stale exclude file is cosmetic, so it must not block the launch.
+	if err := refreshManagedCloneExclude(ctx, summary.WorktreePath); err != nil {
+		slog.Warn("refresh workspace exclude file", "workspace_id", workspace.ID, "err", err)
 	}
 
 	relPath := agentContextRelPath(opts.TargetKey)
@@ -409,7 +417,10 @@ func writeGeneratedFileAtomic(worktreePath, relPath string, content []byte) erro
 	if err := os.Chmod(tmpPath, 0o644); err != nil {
 		return fmt.Errorf("chmod generated context temp file: %w", err)
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
+	// Running agents may be reading this file. On Windows, os.Rename fails
+	// with Access is denied while any reader has it open, even one that
+	// allows deletion (Node, Rust, os.Root); Replace succeeds there.
+	if err := atomicfile.Replace(tmpPath, path); err != nil {
 		return fmt.Errorf("install generated context file: %w", err)
 	}
 	return nil

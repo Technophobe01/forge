@@ -8,30 +8,33 @@ import (
 type Kind string
 
 const (
-	KindGitHub  Kind = "github"
-	KindGitLab  Kind = "gitlab"
-	KindForgejo Kind = "forgejo"
-	KindGitea   Kind = "gitea"
+	KindGitHub    Kind = "github"
+	KindGitLab    Kind = "gitlab"
+	KindForgejo   Kind = "forgejo"
+	KindGitea     Kind = "gitea"
+	KindBitbucket Kind = "bitbucket"
 )
 
 const (
-	DefaultGitHubHost  = "github.com"
-	DefaultGitLabHost  = "gitlab.com"
-	DefaultForgejoHost = "codeberg.org"
-	DefaultGiteaHost   = "gitea.com"
+	DefaultGitHubHost    = "github.com"
+	DefaultGitLabHost    = "gitlab.com"
+	DefaultForgejoHost   = "codeberg.org"
+	DefaultGiteaHost     = "gitea.com"
+	DefaultBitbucketHost = "bitbucket.org"
 )
 
 type RepoRef struct {
-	Platform           Kind
-	Host               string
-	Owner              string
-	Name               string
-	RepoPath           string
-	PlatformID         int64
-	PlatformExternalID string
-	WebURL             string
-	CloneURL           string
-	DefaultBranch      string
+	Platform Kind
+	Host     string
+	Owner    string
+	Name     string
+	RepoPath string
+	// Key is the provider's stable repository key; zero until the provider
+	// has resolved the reference.
+	Key           RepositoryKey
+	WebURL        string
+	CloneURL      string
+	DefaultBranch string
 }
 
 func (r RepoRef) DisplayName() string {
@@ -53,20 +56,18 @@ type RepositoryFeatures struct {
 }
 
 type Repository struct {
-	Ref                RepoRef
-	PlatformID         int64
-	PlatformExternalID string
-	Description        string
-	Private            bool
-	Archived           bool
-	Features           RepositoryFeatures
-	MergeSettings      *RepositoryMergeSettings
-	ViewerCanMerge     *bool
-	DefaultBranch      string
-	WebURL             string
-	CloneURL           string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	Ref            RepoRef
+	Description    string
+	Private        bool
+	Archived       bool
+	Features       RepositoryFeatures
+	MergeSettings  *RepositoryMergeSettings
+	ViewerCanMerge *bool
+	DefaultBranch  string
+	WebURL         string
+	CloneURL       string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 func (r Repository) FeatureEnabled(feature string) (bool, bool) {
@@ -99,6 +100,7 @@ type MergeRequest struct {
 	URL                string
 	Title              string
 	Author             string
+	AuthorAssociation  *string
 	AuthorDisplayName  string
 	State              string
 	IsDraft            bool
@@ -152,6 +154,7 @@ type Issue struct {
 	URL                string
 	Title              string
 	Author             string
+	AuthorAssociation  *string
 	State              string
 	Body               string
 	CommentCount       int
@@ -180,6 +183,7 @@ type MergeRequestEvent struct {
 	MergeRequestNumber int
 	EventType          string
 	Author             string
+	AuthorAssociation  *string
 	Summary            string
 	Body               string
 	MetadataJSON       string
@@ -276,9 +280,15 @@ type CICheck struct {
 }
 
 type MergeResult struct {
-	Merged  bool
-	SHA     string
-	Message string
+	Merged bool
+	// Queued reports that the provider accepted the merge request into its
+	// merge queue instead of merging it; the queue merges it later.
+	Queued bool
+	// AlreadyQueued reports that the merge request was already in the merge
+	// queue, so the request started no new queue attempt.
+	AlreadyQueued bool
+	SHA           string
+	Message       string
 }
 
 type ReviewAction string
@@ -352,6 +362,7 @@ type MergeRequestReviewThread struct {
 	ProviderCommentID  string
 	Body               string
 	AuthorLogin        string
+	AuthorAssociation  *string
 	DirectURL          string
 	Range              DiffReviewLineRange
 	Resolved           bool
@@ -411,7 +422,7 @@ func (c ArchiveCapabilities) HasHistoricalInventory() bool {
 }
 
 func (c ArchiveCapabilities) Support(capability ArchiveCapability) (ArchiveCapabilitySupport, error) {
-	supported := false
+	var supported bool
 	switch capability {
 	case ArchiveCapabilityHistoricalIssues:
 		supported = c.HistoricalIssues
@@ -610,6 +621,7 @@ type Capabilities struct {
 	ReadCI                bool
 	ReadLabels            bool
 	ReadMarkdownImages    bool
+	ReadMarkdownMedia     bool
 	ReadAuthenticatedUser bool
 	ReadNotifications     bool
 	ReadWorkflows         bool
@@ -622,8 +634,10 @@ type Capabilities struct {
 	// provider that could change state but not content (or vice
 	// versa) must split this capability rather than half-implement
 	// it.
-	StateMutation               bool
-	MergeMutation               bool
+	StateMutation bool
+	MergeMutation bool
+	// MergeQueueMutation means the provider implements MergeQueueMutator.
+	MergeQueueMutation          bool
 	ReviewMutation              bool
 	WorkflowApproval            bool
 	WorkflowDispatch            bool

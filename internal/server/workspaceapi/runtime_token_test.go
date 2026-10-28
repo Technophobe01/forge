@@ -20,19 +20,20 @@ import (
 	"go.kenn.io/forge/internal/db"
 	ptyownerruntime "go.kenn.io/forge/internal/ptyowner/runtime"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/gitsafe"
+	"go.kenn.io/forge/internal/testutil/workspacetest"
 	"go.kenn.io/forge/internal/tokenauth"
-	"go.kenn.io/forge/internal/workspace"
 	"go.kenn.io/forge/internal/workspace/localruntime"
 	"go.kenn.io/forge/platform"
-	gitcmd "go.kenn.io/kit/git/cmd"
 )
 
 func TestWorkspaceRuntimeLaunchMissingTokenReturnsBadRequestE2E(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
 	database := dbtest.Open(t)
-	manager := workspace.NewManager(database, filepath.Join(dir, "worktrees"))
+	manager := workspacetest.NewManager(t, database, filepath.Join(dir, "worktrees"))
 	runtime := localruntime.NewManager(localruntime.Options{
 		Targets: []localruntime.LaunchTarget{{
 			Key:       "tokenfail",
@@ -46,7 +47,7 @@ func TestWorkspaceRuntimeLaunchMissingTokenReturnsBadRequestE2E(t *testing.T) {
 	h := New(Deps{DB: database, Workspaces: manager, Runtime: runtime})
 	h.Start(t.Context(), true)
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Second)
 		defer cancel()
 		require.NoError(h.Shutdown(ctx))
 	})
@@ -56,7 +57,7 @@ func TestWorkspaceRuntimeLaunchMissingTokenReturnsBadRequestE2E(t *testing.T) {
 	api := humago.NewWithPrefix(mux, "/api/v1", huma.DefaultConfig("workspace test", "1"))
 	h.Register(api)
 	body := bytes.NewBufferString(`{"target_key":"tokenfail"}`)
-	req := httptest.NewRequest(
+	req := httptest.NewRequestWithContext(t.Context(),
 		http.MethodPost,
 		"/api/v1/workspaces/ws-runtime-token/runtime/sessions",
 		body,
@@ -75,7 +76,7 @@ func TestWorkspaceRuntimeLaunchMissingTokenReturnsBadRequestE2E(t *testing.T) {
 
 type missingTokenRuntimePtyOwner struct{}
 
-func (missingTokenRuntimePtyOwner) HasState(string) bool { return false }
+func (missingTokenRuntimePtyOwner) Gone(context.Context, string) bool { return false }
 
 func (missingTokenRuntimePtyOwner) Attach(context.Context, string) (ptyownerruntime.PTY, error) {
 	return nil, errors.New("unexpected attach")
@@ -118,6 +119,6 @@ func seedReadyWorkspaceForRuntimeTokenTest(
 
 func runTokenRuntimeTestGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	out, stderr, err := gitcmd.New().Run(t.Context(), dir, nil, args...)
+	out, stderr, err := gitsafe.Runner().Run(t.Context(), dir, nil, args...)
 	require.NoError(t, err, "git %v failed: %s%s", args, out, stderr)
 }

@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -29,8 +30,9 @@ type setWorkflowOutput struct {
 func (s *Server) registerWorkflowTools() {
 	mcp.AddTool(s.mcp, &mcp.Tool{
 		Name: "kenn_forge_set_item_workflow_state",
+		Meta: mcp.Meta{"ui": map[string]any{"visibility": []string{"model"}}},
 		Description: "Set kenn-forge-local workflow state for one cached PR or issue. " +
-			"This is the only MCP write tool and never calls provider APIs.",
+			"Never calls provider APIs.",
 	}, wrapTool(s.setItemWorkflowState))
 }
 
@@ -38,12 +40,13 @@ func (s *Server) setItemWorkflowState(
 	ctx context.Context,
 	in setWorkflowInput,
 ) (setWorkflowOutput, error) {
-	if err := validateItemRef(in.Item); err != nil {
+	item, err := in.Item.itemIdentity()
+	if err != nil {
 		return setWorkflowOutput{}, err
 	}
 	status := strings.TrimSpace(in.Status)
 	if status == "" {
-		return setWorkflowOutput{}, fmt.Errorf("status is required")
+		return setWorkflowOutput{}, errors.New("status is required")
 	}
 	if _, err := workflowStateSet([]string{status}); err != nil {
 		return setWorkflowOutput{}, err
@@ -66,7 +69,7 @@ func (s *Server) setItemWorkflowState(
 			Message: "force cannot be true when expected_status is provided",
 		}
 	}
-	mutation, err := s.backend.SetWorkflowState(ctx, itemIdentity(in.Item), WorkflowUpdate{
+	mutation, err := s.backend.SetWorkflowState(ctx, item, WorkflowUpdate{
 		Status: status, ExpectedStatus: expected, Force: in.Force, Source: "mcp",
 		Actor: in.Actor, Reason: in.Reason,
 	})

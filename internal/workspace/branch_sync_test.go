@@ -24,7 +24,7 @@ import (
 // separately by TestPushWorktreeBranchUsesAuthenticatedRunnerAndMutationAuth.
 func branchSyncTestManager(t *testing.T) *Manager {
 	t.Helper()
-	return NewManager(nil, t.TempDir())
+	return newWorkspaceTestManager(t, nil, t.TempDir())
 }
 
 func TestPushWorktreeBranchPushesAheadCommitsAndRunsHooks(t *testing.T) {
@@ -56,6 +56,8 @@ func TestPushWorktreeBranchPushesAheadCommitsAndRunsHooks(t *testing.T) {
 func TestPushWorktreeBranchCreatesMissingRemoteBranch(t *testing.T) {
 	require := require.New(t)
 	work := gitfixture.DivergenceWorktree(t)
+	// Managed base checkouts can fetch only main; the push must still track feature.
+	runWorkspaceTestGit(t, work, "config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main")
 	remote := filepath.Join(filepath.Dir(work), "remote.git")
 	runWorkspaceTestGit(t, filepath.Dir(work), "--git-dir", remote, "branch", "-D", "feature")
 	runWorkspaceTestGit(t, work, "update-ref", "-d", "refs/remotes/origin/feature")
@@ -86,6 +88,7 @@ exec "${KENN_FORGE_TEST_REAL_GIT:?}" "$@"
 	)))
 	localCommit := strings.TrimSpace(string(runWorkspaceTestGit(t, work, "rev-parse", "HEAD")))
 	require.Equal(localCommit, remoteCommit)
+	require.Equal(localCommit, gitfixture.SHA(t, work, "refs/remotes/origin/feature"))
 }
 
 func TestPushWorktreeBranchRecreatesRemoteBranchWithStaleTrackingRef(t *testing.T) {
@@ -296,8 +299,11 @@ set -eu
 real="${KENN_FORGE_TEST_REAL_GIT:?}"
 capture="${KENN_FORGE_TEST_GIT_CAPTURE:?}"
 op="${1:-}"
+if [ "$op" = "-c" ]; then
+	op="${3:-}"
+fi
 case "$op" in
-push|fetch)
+push|fetch|ls-remote)
 	helper=""
 	i=0
 	count="${GIT_CONFIG_COUNT:-0}"
@@ -348,7 +354,7 @@ exec "$real" "$@"
 			},
 		},
 	)
-	mgr := NewManager(nil, t.TempDir())
+	mgr := newWorkspaceTestManager(t, nil, t.TempDir())
 	mgr.SetClones(gitclone.New(
 		t.TempDir(), gitclone.HostSources{"github.com": source},
 	))
@@ -358,59 +364,14 @@ exec "$real" "$@"
 	data, err := os.ReadFile(capturePath)
 	require.NoError(err)
 	ops := strings.Split(strings.TrimSpace(string(data)), "\n")
-	// The push must carry the user's PAT, never the app installation token,
-	// so the pushed commits stay attributed to the user rather than the bot.
-	assert.Contains(ops, "push:pat-token")
-	assert.NotContains(ops, "push:app-token")
-	// Reads (the upstream refresh fetches) prefer the app installation token.
-	assert.Contains(ops, "fetch:app-token")
-	assert.NotContains(ops, "fetch:pat-token")
+	// Each network command resolves credentials, so avoid another fetch after push.
+	// Reads prefer the App; the push must stay on the user's mutation credential.
+	assert.Equal([]string{"ls-remote:app-token", "fetch:app-token", "push:pat-token"}, ops)
 
 	div, ok, err := WorktreeDivergence(t.Context(), work)
 	require.NoError(err)
 	require.True(ok)
 	assert.Equal(Divergence{}, div)
-}
-
-func seedAmbiguousBranchSyncRoute(t *testing.T, d *db.DB) {
-	t.Helper()
-	now := time.Now().UTC()
-	_, _, err := d.ReconcileRepositoryObservation(t.Context(), db.RepoIdentity{
-		Platform: "github", PlatformHost: "github.com", PlatformRepoID: "repo-old",
-		Owner: "acme", Name: "widget", RepoPath: "acme/widget",
-	}, now)
-	require.NoError(t, err)
-	_, _, err = d.ReconcileRepositoryObservation(t.Context(), db.RepoIdentity{
-		Platform: "github", PlatformHost: "github.com", PlatformRepoID: "repo-new",
-		Owner: "acme", Name: "widget", RepoPath: "acme/widget",
-	}, now.Add(time.Hour))
-	require.NoError(t, err)
-}
-
-func TestPushWorktreeBranchRejectsAmbiguousRoute(t *testing.T) {
-	require := require.New(t)
-	d := openTestDB(t)
-	seedAmbiguousBranchSyncRoute(t, d)
-	mgr := NewManager(d, t.TempDir())
-
-	err := mgr.PushWorktreeBranch(
-		t.Context(), "", "github", "github.com", "acme", "widget", t.TempDir(),
-	)
-	require.ErrorContains(err, "historical occupants",
-		"push must fail closed on a route with contested history")
-}
-
-func TestPullWorktreeBranchRejectsAmbiguousRoute(t *testing.T) {
-	require := require.New(t)
-	d := openTestDB(t)
-	seedAmbiguousBranchSyncRoute(t, d)
-	mgr := NewManager(d, t.TempDir())
-
-	err := mgr.PullWorktreeBranch(
-		t.Context(), "", "github", "github.com", "acme", "widget", t.TempDir(),
-	)
-	require.ErrorContains(err, "historical occupants",
-		"pull must fail closed on a route with contested history")
 }
 
 func TestLaunchSpecBranchSyncRefreshesExpiredLeaseBeforeGit(t *testing.T) {
@@ -429,7 +390,7 @@ func TestLaunchSpecBranchSyncRefreshesExpiredLeaseBeforeGit(t *testing.T) {
 	}
 	require.NoError(database.InsertWorkspace(t.Context(), workspace))
 	require.NoError(database.PutWorkspaceLaunchSpec(t.Context(), workspace.ID, spec))
-	manager := NewManager(database, t.TempDir())
+	manager := newWorkspaceTestManager(t, database, t.TempDir())
 	manager.SetNow(func() time.Time { return spec.SourceVisibleUntil })
 	manager.SetLaunchSpecResolver(unavailableLaunchSpecResolver{})
 
@@ -448,15 +409,14 @@ func TestLaunchSpecBranchSyncUsesRefreshedRepositoryRoute(t *testing.T) {
 	work := gitfixture.DivergenceWorktree(t)
 	database := openTestDB(t)
 	original := launchSpecForTest()
-	_, accepted, err := database.ReconcileRepositoryObservation(
+	_, err := database.ObserveRepository(
 		t.Context(), db.RepoIdentity{
 			Platform: original.Repository.Provider, PlatformHost: original.Repository.PlatformHost,
-			PlatformRepoID: original.Repository.PlatformRepoID,
-			Owner:          original.Repository.Owner, Name: original.Repository.Name,
-		}, original.IssuedAt,
+			Key:   original.Repository.Key,
+			Owner: original.Repository.Owner, Name: original.Repository.Name,
+		},
 	)
 	require.NoError(err)
-	require.True(accepted)
 	workspace := &db.Workspace{
 		ID: "ws-renamed-branch-sync", Platform: original.Repository.Provider,
 		PlatformHost: original.Repository.PlatformHost,
@@ -475,16 +435,15 @@ func TestLaunchSpecBranchSyncUsesRefreshedRepositoryRoute(t *testing.T) {
 	renamed.Repository.CloneURL = "https://github.com/acme-renamed/widget-renamed.git"
 	renamed.IssuedAt = original.SourceVisibleUntil
 	renamed.SourceVisibleUntil = renamed.IssuedAt.Add(WorkspaceLaunchSpecVisibilityLease)
-	_, accepted, err = database.ReconcileRepositoryObservation(
+	_, err = database.ObserveRepository(
 		t.Context(), db.RepoIdentity{
 			Platform: renamed.Repository.Provider, PlatformHost: renamed.Repository.PlatformHost,
-			PlatformRepoID: renamed.Repository.PlatformRepoID,
-			Owner:          renamed.Repository.Owner, Name: renamed.Repository.Name,
-		}, renamed.IssuedAt,
+			Key:   renamed.Repository.Key,
+			Owner: renamed.Repository.Owner, Name: renamed.Repository.Name,
+		},
 	)
 	require.NoError(err)
-	require.True(accepted)
-	manager := NewManager(database, t.TempDir())
+	manager := newWorkspaceTestManager(t, database, t.TempDir())
 	manager.SetNow(func() time.Time { return renamed.IssuedAt })
 	manager.SetLaunchSpecResolver(&staticLaunchSpecResolver{spec: renamed})
 
@@ -494,7 +453,6 @@ func TestLaunchSpecBranchSyncUsesRefreshedRepositoryRoute(t *testing.T) {
 	)
 
 	require.ErrorIs(err, ErrWorktreeInSync)
-	assert.NotContains(err.Error(), "historical occupants")
 	persisted, readErr := database.GetWorkspace(t.Context(), workspace.ID)
 	require.NoError(readErr)
 	require.NotNil(persisted)
@@ -524,7 +482,7 @@ func TestProviderBackedBranchSyncDoesNotFallBackToAnonymousGit(t *testing.T) {
 	}
 	require.NoError(database.InsertWorkspace(t.Context(), workspace))
 	require.NoError(database.PutWorkspaceLaunchSpec(t.Context(), workspace.ID, spec))
-	manager := NewManager(database, t.TempDir())
+	manager := newWorkspaceTestManager(t, database, t.TempDir())
 	manager.SetNow(func() time.Time { return spec.IssuedAt })
 	manager.SetClones(gitclone.New(t.TempDir(), nil))
 	manager.SetRequireProviderCredential(true)

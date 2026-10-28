@@ -3,14 +3,15 @@ package apitest
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"go.kenn.io/forge/internal/platformdb"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.kenn.io/forge/internal/platformdb"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,16 +22,20 @@ import (
 	"go.kenn.io/forge/internal/db"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
+	"go.kenn.io/forge/internal/server/authapi"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/platform"
 )
 
 func TestAPIArchiveRoutesRemainRegisteredWithoutController(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, _ := setupTestServer(t)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/archive/status", http.NoBody)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/archive/status", http.NoBody)
 	req.Host = "forge.test"
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
@@ -42,6 +47,7 @@ func TestAPIArchiveRoutesRemainRegisteredWithoutController(t *testing.T) {
 }
 
 func TestAPIArchiveStartPauseStatusAndReport(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, database, provider, wakeCount, ref := setupArchiveTestServer(t, nil)
@@ -128,12 +134,12 @@ func TestAPIArchiveStartPauseStatusAndReport(t *testing.T) {
 		reportResponse.JSON200.Repositories[0].Coverage.MergeRequests)
 	require.NotNil(reportResponse.JSON200.Activity)
 	require.Len(reportResponse.JSON200.Activity, 3)
-	assert.Equal("issue-7", (reportResponse.JSON200.Activity)[0].ProviderExternalID)
+	assert.Equal("issue-7", reportResponse.JSON200.Activity[0].ProviderExternalID)
 	assert.Equal(generated.ArchiveReportActivityResponseKindIssueClosed,
-		(reportResponse.JSON200.Activity)[1].Kind)
-	require.NotNil((reportResponse.JSON200.Activity)[1].Actor)
-	assert.Equal("closer", *(reportResponse.JSON200.Activity)[1].Actor)
-	merged := (reportResponse.JSON200.Activity)[2]
+		reportResponse.JSON200.Activity[1].Kind)
+	require.NotNil(reportResponse.JSON200.Activity[1].Actor)
+	assert.Equal("closer", *reportResponse.JSON200.Activity[1].Actor)
+	merged := reportResponse.JSON200.Activity[2]
 	assert.Equal(generated.ArchiveReportActivityResponseKindMergeRequestMerged, merged.Kind)
 	require.NotNil(merged.Actor)
 	assert.Equal("merger", *merged.Actor)
@@ -189,6 +195,7 @@ func TestAPIArchiveStartPauseStatusAndReport(t *testing.T) {
 }
 
 func TestAPIArchiveReportExcludesOnlyRemovedUpstreamParents(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	srv, database, provider, _, ref := setupArchiveTestServer(t, nil)
 	client := setupTestClient(t, srv)
@@ -206,8 +213,8 @@ func TestAPIArchiveReportExcludesOnlyRemovedUpstreamParents(t *testing.T) {
 				state, body, created_at, updated_at, last_activity_at
 			) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', 'body', ?, ?, ?)`,
 			repo.ID, number, externalID, number,
-			"https://github.test/owner/repo/issues/"+fmt.Sprint(number),
-			"Synthetic issue "+fmt.Sprint(number), "issue-author", now, now, now,
+			"https://github.test/owner/repo/issues/"+strconv.Itoa(number),
+			"Synthetic issue "+strconv.Itoa(number), "issue-author", now, now, now,
 		)
 		require.NoError(insertErr)
 		id, insertErr := result.LastInsertId()
@@ -225,8 +232,8 @@ func TestAPIArchiveReportExcludesOnlyRemovedUpstreamParents(t *testing.T) {
 	insertMR := func(number int, externalID, lifecycle string) int64 {
 		id, insertErr := database.UpsertMergeRequest(ctx, &db.MergeRequest{
 			RepoID: repo.ID, PlatformID: int64(number), PlatformExternalID: externalID,
-			Number: number, URL: "https://github.test/owner/repo/pull/" + fmt.Sprint(number),
-			Title: "Synthetic merge request " + fmt.Sprint(number), Author: "pr-author",
+			Number: number, URL: "https://github.test/owner/repo/pull/" + strconv.Itoa(number),
+			Title: "Synthetic merge request " + strconv.Itoa(number), Author: "pr-author",
 			State: db.MergeRequestStateOpen, Body: "body",
 			CreatedAt: now, UpdatedAt: now, LastActivityAt: now,
 		})
@@ -290,6 +297,7 @@ func TestAPIArchiveReportExcludesOnlyRemovedUpstreamParents(t *testing.T) {
 }
 
 func TestAPIArchiveValidationAndLimitProblemDetails(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, database, _, _, ref := setupArchiveTestServer(t, nil)
@@ -373,11 +381,12 @@ func TestAPIArchiveValidationAndLimitProblemDetails(t *testing.T) {
 }
 
 func TestAPIArchiveRoutesObeyHostAuthAndCSRFGuards(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, _, _, _, _ := setupArchiveTestServer(t, nil)
 
-	crossSite := httptest.NewRequest(
+	crossSite := httptest.NewRequestWithContext(t.Context(),
 		http.MethodPost, "/api/v1/archive/start", strings.NewReader(`{"all":true}`),
 	)
 	crossSite.Host = "forge.test"
@@ -387,7 +396,7 @@ func TestAPIArchiveRoutesObeyHostAuthAndCSRFGuards(t *testing.T) {
 	srv.ServeHTTP(crossSiteRecorder, crossSite)
 	assert.Equal(http.StatusForbidden, crossSiteRecorder.Code)
 
-	badHost := httptest.NewRequest(http.MethodGet, "/api/v1/archive/status", http.NoBody)
+	badHost := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/archive/status", http.NoBody)
 	badHost.Host = "attacker.example"
 	badHostRecorder := httptest.NewRecorder()
 	srv.ServeHTTP(badHostRecorder, badHost)
@@ -397,13 +406,13 @@ func TestAPIArchiveRoutesObeyHostAuthAndCSRFGuards(t *testing.T) {
 	syncer := ghclient.NewSyncer(nil, database, nil, nil, time.Minute, nil, nil)
 	t.Cleanup(syncer.Stop)
 	authServer := server.New(database, syncer, nil, "/", nil, server.ServerOptions{
-		DaemonAccess: server.DaemonAccessOptions{
+		DaemonAccess: authapi.DaemonAccessOptions{
 			Token: "archive-test-token", RequireAPIAuth: true,
 		},
 		Archive: archiveStatusController{},
 	})
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
 		defer cancel()
 		require.NoError(authServer.Shutdown(ctx))
 	})
@@ -441,6 +450,7 @@ func (p *archiveAPITestProvider) ListIssuesPage(context.Context, platform.RepoRe
 	p.pageCall()
 	return platform.Page[platform.Issue]{Exhausted: true}, nil
 }
+
 func (p *archiveAPITestProvider) ListMergeRequestsPage(context.Context, platform.RepoRef, platform.ItemPageQuery) (platform.Page[platform.MergeRequest], error) {
 	p.pageCall()
 	return platform.Page[platform.MergeRequest]{Exhausted: true}, nil
@@ -475,9 +485,9 @@ func setupArchiveTestServer(
 	database := dbtest.Open(t)
 	ref := platform.RepoRef{
 		Platform: platform.KindGitHub, Host: "github.test", Owner: "owner",
-		Name: "repo", RepoPath: "owner/repo", PlatformExternalID: "repo-owner-repo",
+		Name: "repo", RepoPath: "owner/repo", Key: platform.RepositoryIDKey(1001),
 	}
-	_, err := database.UpsertRepo(t.Context(), platformdb.DBRepoIdentity(ref))
+	_, err := reposeed.Seed(t.Context(), database, platformdb.DBRepoIdentity(ref))
 	require.NoError(t, err)
 	provider := &archiveAPITestProvider{}
 	wakeCount := &atomic.Int32{}
@@ -497,7 +507,7 @@ func setupArchiveTestServer(
 	t.Cleanup(syncer.Stop)
 	srv := server.New(database, syncer, nil, "/", nil, server.ServerOptions{Archive: controller})
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
 		defer cancel()
 		require.NoError(t, srv.Shutdown(ctx))
 	})
@@ -512,6 +522,7 @@ func archiveGeneratedRef(ref platform.RepoRef) generated.ArchiveRepositoryRef {
 }
 
 func TestAPIArchivePacingReportsProviderHeadroom(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	database := dbtest.Open(t)
@@ -527,12 +538,12 @@ func TestAPIArchivePacingReportsProviderHeadroom(t *testing.T) {
 	syncer.SetQuotaRegistry(registry)
 	srv := server.New(database, syncer, nil, "/", nil, server.ServerOptions{})
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
 		defer cancel()
 		require.NoError(srv.Shutdown(ctx))
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/archive/pacing", http.NoBody)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/archive/pacing", http.NoBody)
 	req.Host = "forge.test"
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
@@ -567,18 +578,19 @@ func TestAPIArchivePacingReportsProviderHeadroom(t *testing.T) {
 }
 
 func TestAPIArchivePacingEmptyWithoutKnownPools(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	database := dbtest.Open(t)
 	syncer := ghclient.NewSyncer(nil, database, nil, nil, time.Minute, nil, nil)
 	t.Cleanup(syncer.Stop)
 	srv := server.New(database, syncer, nil, "/", nil, server.ServerOptions{})
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
 		defer cancel()
 		require.NoError(srv.Shutdown(ctx))
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/archive/pacing", http.NoBody)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/archive/pacing", http.NoBody)
 	req.Host = "forge.test"
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
@@ -593,6 +605,7 @@ func TestAPIArchivePacingEmptyWithoutKnownPools(t *testing.T) {
 // exactly the identities archive admission defers as "provider quota
 // unknown", and omitting them would hide why hydration is blocked.
 func TestAPIArchivePacingReportsPartiallyKnownCredentials(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	database := dbtest.Open(t)
@@ -606,12 +619,12 @@ func TestAPIArchivePacingReportsPartiallyKnownCredentials(t *testing.T) {
 	syncer.SetQuotaRegistry(registry)
 	srv := server.New(database, syncer, nil, "/", nil, server.ServerOptions{})
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
 		defer cancel()
 		require.NoError(srv.Shutdown(ctx))
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/archive/pacing", http.NoBody)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/archive/pacing", http.NoBody)
 	req.Host = "forge.test"
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
@@ -634,6 +647,7 @@ func TestAPIArchivePacingReportsPartiallyKnownCredentials(t *testing.T) {
 // per-pool headroom: a large pool at its own limit/5 floor zeroes archive
 // availability even though the smallest pool still has headroom.
 func TestAPIArchivePacingUsesPerPoolReserves(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	database := dbtest.Open(t)
@@ -649,12 +663,12 @@ func TestAPIArchivePacingUsesPerPoolReserves(t *testing.T) {
 	syncer.SetQuotaRegistry(registry)
 	srv := server.New(database, syncer, nil, "/", nil, server.ServerOptions{})
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
 		defer cancel()
 		require.NoError(srv.Shutdown(ctx))
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/archive/pacing", http.NoBody)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/archive/pacing", http.NoBody)
 	req.Host = "forge.test"
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
@@ -682,4 +696,103 @@ func requireEnsureConfigured(t *testing.T, s *archive.Service, refs []platform.R
 	t.Helper()
 	_, err := s.EnsureConfigured(t.Context(), refs)
 	require.NoError(t, err)
+}
+
+func TestAPIArchiveSnapshotReadsCache(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, database, provider, _, ref := setupArchiveTestServer(t, nil)
+	client := setupTestClient(t, srv)
+	repo, err := database.GetRepoByIdentity(t.Context(), platformdb.DBRepoIdentity(ref))
+	require.NoError(err)
+	require.NotNil(repo)
+	now := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	mrID, err := database.UpsertMergeRequest(t.Context(), &db.MergeRequest{RepoID: repo.ID, Number: 1, Title: "Open repair", State: db.MergeRequestStateOpen, CreatedAt: now.Add(-90 * 24 * time.Hour), UpdatedAt: now, DetailFetchedAt: &now})
+	require.NoError(err)
+	query := generated.GetArchiveSnapshotQuery{Start: "2026-09-13T12:00:00Z", End: "2026-09-20T12:00:00Z", Repo: []string{string(ref.Platform) + "|" + ref.Host + "/" + ref.RepoPath}}
+	response, err := client.HTTP.GetArchiveSnapshotWithResponse(t.Context(), &generated.GetArchiveSnapshotRequestOptions{Query: &query})
+	require.NoError(err)
+	require.NotNil(response.JSON200)
+	assert.Equal("kenn-forge-archive-snapshot/1", response.JSON200.Schema1)
+	require.Len(response.JSON200.PullRequests, 1)
+	assert.Equal("Open repair", response.JSON200.PullRequests[0].Title)
+	var payload struct {
+		PullRequests []map[string]any `json:"pull_requests"`
+	}
+	require.NoError(json.Unmarshal(response.Body, &payload))
+	require.Len(payload.PullRequests, 1)
+	assert.Equal("2026-09-20T12:00:00Z", payload.PullRequests[0]["detail_fetched_at"])
+	require.Len(response.JSON200.Repositories, 1)
+	assert.NotNil(response.JSON200.Repositories[0].Coverage)
+
+	_, err = database.WriteDB().ExecContext(t.Context(), `DELETE FROM forge_archive_repos WHERE repo_id=?`, repo.ID)
+	require.NoError(err)
+	unknown, err := client.HTTP.GetArchiveSnapshotWithResponse(t.Context(), &generated.GetArchiveSnapshotRequestOptions{Query: &query})
+	require.NoError(err)
+	require.NotNil(unknown.JSON200)
+	require.Len(unknown.JSON200.Repositories, 1)
+	assert.Nil(unknown.JSON200.Repositories[0].Coverage, "missing archive state must remain unknown to API clients")
+
+	outside := ref
+	outside.Name = "not-configured"
+	outside.RepoPath = "owner/not-configured"
+	outside.Key = platform.RepositoryIDKey(2002)
+	_, err = reposeed.Seed(t.Context(), database, platformdb.DBRepoIdentity(outside))
+	require.NoError(err)
+	query.Repo = []string{string(outside.Platform) + "|" + outside.Host + "/" + outside.RepoPath}
+	rejected, err := client.HTTP.GetArchiveSnapshotWithResponse(t.Context(), &generated.GetArchiveSnapshotRequestOptions{Query: &query})
+	require.Error(err)
+	require.NotNil(rejected.Error)
+	assert.Equal(generated.ProblemErrorCodeValidationError, rejected.Error.Code)
+
+	_, err = database.WriteDB().ExecContext(t.Context(), `
+ WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM sequence WHERE n<10001)
+ INSERT INTO forge_mr_events (merge_request_id,event_type,dedupe_key,created_at)
+ SELECT ?, 'review', 'review-' || n, ? FROM sequence`, mrID, now)
+	require.NoError(err)
+	query.Repo = nil
+	oversized, err := client.HTTP.GetArchiveSnapshotWithResponse(t.Context(), &generated.GetArchiveSnapshotRequestOptions{Query: &query})
+	require.Error(err)
+	require.NotNil(oversized.Error)
+	assert.Equal(generated.ProblemErrorCodePayloadTooLarge, oversized.Error.Code)
+	assert.Zero(provider.calls.Load())
+}
+
+func TestAPIArchiveSnapshotOpenIssueScope(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, database, provider, _, ref := setupArchiveTestServer(t, nil)
+	client := setupTestClient(t, srv)
+	repo, err := database.GetRepoByIdentity(t.Context(), platformdb.DBRepoIdentity(ref))
+	require.NoError(err)
+	require.NotNil(repo)
+	old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	_, err = database.UpsertIssue(t.Context(), &db.Issue{
+		RepoID: repo.ID, PlatformID: 1, Number: 1, Title: "Unresolved repair",
+		State: "open", CreatedAt: old, UpdatedAt: old,
+	})
+	require.NoError(err)
+	query := generated.GetArchiveSnapshotQuery{Start: "2026-09-13T12:00:00Z", End: "2026-09-20T12:00:00Z"}
+	windowed, err := client.HTTP.GetArchiveSnapshotWithResponse(t.Context(), &generated.GetArchiveSnapshotRequestOptions{Query: &query})
+	require.NoError(err)
+	require.NotNil(windowed.JSON200)
+	assert.Empty(windowed.JSON200.Issues)
+	assert.Nil(windowed.JSON200.IssueScope)
+	scope := generated.GetArchiveSnapshotQueryIssueScopeOpen
+	query.IssueScope = &scope
+	open, err := client.HTTP.GetArchiveSnapshotWithResponse(t.Context(), &generated.GetArchiveSnapshotRequestOptions{Query: &query})
+	require.NoError(err)
+	require.NotNil(open.JSON200)
+	require.NotNil(open.JSON200.IssueScope)
+	assert.Equal(generated.ArchiveSnapshotIssueScopeOpen, *open.JSON200.IssueScope)
+	require.Len(open.JSON200.Issues, 1)
+	assert.Equal("Unresolved repair", open.JSON200.Issues[0].Title)
+	scope = "unsupported"
+	rejected, err := client.HTTP.GetArchiveSnapshotWithResponse(t.Context(), &generated.GetArchiveSnapshotRequestOptions{Query: &query})
+	require.Error(err)
+	require.NotNil(rejected.Error)
+	assert.Equal(generated.ProblemErrorCodeValidationError, rejected.Error.Code)
+	assert.Zero(provider.calls.Load())
 }

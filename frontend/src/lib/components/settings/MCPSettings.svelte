@@ -135,7 +135,9 @@
         disabled={saving}
         aria-invalid={!portValid}
       />
-      <span class="field-help">Leave blank to use the Forge backend port plus one.</span>
+      <span class="field-help">
+        Blank uses the default: Forge's own port, or port + 1 if enabled is set in the config file.
+      </span>
     </label>
 
     <label class="field">

@@ -14,6 +14,8 @@ import type {
   DiffResponse,
   FilePreviewResponse,
   FilesResponse,
+  GetWorkspaceChatParams,
+  GetWorkspaceChatPathParameters,
   GetWorkspaceCommitsPathParameters,
   GetWorkspaceDiffParams,
   GetWorkspaceDiffPathParameters,
@@ -22,34 +24,48 @@ import type {
   GetWorkspaceFilesParams,
   GetWorkspaceFilesPathParameters,
   GetWorkspacePathParameters,
+  GetWorkspaceRuntimeParams,
   GetWorkspaceRuntimePathParameters,
   GetWorkspaceRuntimeSessionAttachSpecPathParameters,
   GetWorkspaceRuntimeSessionInitialMessagePathParameters,
+  GetWorkspaceViewStatePathParameters,
   LaunchWorkspaceAgentHandoffInputBody,
   LaunchWorkspaceAgentHandoffPathParameters,
   LaunchWorkspaceRuntimeSessionInputBody,
   LaunchWorkspaceRuntimeSessionPathParameters,
   ListWorkspaceAgentSessionsOutputBody,
   ListWorkspaceAgentSessionsPathParameters,
+  ListWorkspaceTargetsPathParameters,
   ListWorkspacesOutputBody,
   PullWorkspaceBranchPathParameters,
   PushWorkspaceBranchPathParameters,
   RefreshWorkspacePathParameters,
   RenameWorkspaceRuntimeSessionInputBody,
   RenameWorkspaceRuntimeSessionPathParameters,
+  RestoreWorkspaceChatOutputBody,
+  RestoreWorkspaceChatPathParameters,
   RetryWorkspacePathParameters,
   RevealWorkspacePathParameters,
+  RunWorkspaceChatCommandOutputBody,
+  RunWorkspaceChatCommandPathParameters,
   RuntimeAttachSpecResponse,
   SessionInfo,
   StopWorkspaceRuntimeSessionPathParameters,
   SubmitInitialMessageInputBody,
   SubmitWorkspaceRuntimeSessionInitialMessagePathParameters,
+  UpdateWorkspaceTargetPathParameters,
+  UpdateWorkspaceViewStatePathParameters,
   WatchWorkspaceDiffParams,
   WatchWorkspaceDiffPathParameters,
   WorkspaceAgentHandoffResponse,
+  WorkspaceChat,
+  WorkspaceChatCommand,
   WorkspaceDiffWatchResponse,
   WorkspaceResponse,
   WorkspaceRuntimeResponse,
+  WorkspaceTargetSelection,
+  WorkspaceTargetsResponse,
+  WorkspaceViewState,
 } from "../models";
 
 import { orvalFetch } from "../../runtime.ts";
@@ -91,8 +107,16 @@ export const createRepoWorkspaceOnHost = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<WorkspaceResponse>(getCreateRepoWorkspaceOnHostUrl({ platformHost, provider, owner, name }), {
     ...options,
@@ -117,8 +141,16 @@ export const createRepoWorkspace = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<WorkspaceResponse>(getCreateRepoWorkspaceUrl({ provider, owner, name }), {
     ...options,
@@ -156,8 +188,16 @@ export const createWorkspace = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<WorkspaceResponse>(getCreateWorkspaceUrl(), {
     ...options,
@@ -459,8 +499,23 @@ export const revealWorkspace = async (
   });
 };
 
-export const getGetWorkspaceRuntimeUrl = ({ id }: GetWorkspaceRuntimePathParameters) => {
-  return `/workspaces/${encodeURIComponent(String(id))}/runtime`;
+export const getGetWorkspaceRuntimeUrl = (
+  { id }: GetWorkspaceRuntimePathParameters,
+  params?: GetWorkspaceRuntimeParams,
+) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? "null" : String(value));
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0
+    ? `/workspaces/${encodeURIComponent(String(id))}/runtime?${stringifiedParams}`
+    : `/workspaces/${encodeURIComponent(String(id))}/runtime`;
 };
 
 /**
@@ -468,9 +523,10 @@ export const getGetWorkspaceRuntimeUrl = ({ id }: GetWorkspaceRuntimePathParamet
  */
 export const getWorkspaceRuntime = async (
   { id }: GetWorkspaceRuntimePathParameters,
+  params?: GetWorkspaceRuntimeParams,
   options?: Parameters<typeof orvalFetch>[1],
 ): Promise<WorkspaceRuntimeResponse> => {
-  return orvalFetch<WorkspaceRuntimeResponse>(getGetWorkspaceRuntimeUrl({ id }), {
+  return orvalFetch<WorkspaceRuntimeResponse>(getGetWorkspaceRuntimeUrl({ id }, params), {
     ...options,
     method: "GET",
   });
@@ -492,8 +548,16 @@ export const launchWorkspaceAgentHandoff = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<WorkspaceAgentHandoffResponse>(getLaunchWorkspaceAgentHandoffUrl({ id }), {
     ...options,
@@ -518,8 +582,16 @@ export const launchWorkspaceRuntimeSession = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<SessionInfo>(getLaunchWorkspaceRuntimeSessionUrl({ id }), {
     ...options,
@@ -564,8 +636,16 @@ export const renameWorkspaceRuntimeSession = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<SessionInfo>(getRenameWorkspaceRuntimeSessionUrl({ id, sessionKey }), {
     ...options,
@@ -592,6 +672,90 @@ export const getWorkspaceRuntimeSessionAttachSpec = async (
   return orvalFetch<RuntimeAttachSpecResponse>(getGetWorkspaceRuntimeSessionAttachSpecUrl({ id, sessionKey }), {
     ...options,
     method: "GET",
+  });
+};
+
+export const getGetWorkspaceChatUrl = (
+  { id, sessionKey }: GetWorkspaceChatPathParameters,
+  params?: GetWorkspaceChatParams,
+) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? "null" : String(value));
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0
+    ? `/workspaces/${encodeURIComponent(String(id))}/runtime/sessions/${encodeURIComponent(String(sessionKey))}/chat?${stringifiedParams}`
+    : `/workspaces/${encodeURIComponent(String(id))}/runtime/sessions/${encodeURIComponent(String(sessionKey))}/chat`;
+};
+
+/**
+ * @summary Get workspace chat
+ */
+export const getWorkspaceChat = async (
+  { id, sessionKey }: GetWorkspaceChatPathParameters,
+  params?: GetWorkspaceChatParams,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<WorkspaceChat> => {
+  return orvalFetch<WorkspaceChat>(getGetWorkspaceChatUrl({ id, sessionKey }, params), {
+    ...options,
+    method: "GET",
+  });
+};
+
+export const getRunWorkspaceChatCommandUrl = ({ id, sessionKey }: RunWorkspaceChatCommandPathParameters) => {
+  return `/workspaces/${encodeURIComponent(String(id))}/runtime/sessions/${encodeURIComponent(String(sessionKey))}/chat/commands`;
+};
+
+/**
+ * @summary Run workspace chat command
+ */
+export const runWorkspaceChatCommand = async (
+  { id, sessionKey }: RunWorkspaceChatCommandPathParameters,
+  workspaceChatCommand: NonReadonly<WorkspaceChatCommand>,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<RunWorkspaceChatCommandOutputBody> => {
+  const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+  return orvalFetch<RunWorkspaceChatCommandOutputBody>(getRunWorkspaceChatCommandUrl({ id, sessionKey }), {
+    ...options,
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
+    body: JSON.stringify(workspaceChatCommand),
+  });
+};
+
+export const getRestoreWorkspaceChatUrl = ({ id, sessionKey }: RestoreWorkspaceChatPathParameters) => {
+  return `/workspaces/${encodeURIComponent(String(id))}/runtime/sessions/${encodeURIComponent(String(sessionKey))}/chat/restore`;
+};
+
+/**
+ * @summary Restore supervised workspace chat
+ */
+export const restoreWorkspaceChat = async (
+  { id, sessionKey }: RestoreWorkspaceChatPathParameters,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<RestoreWorkspaceChatOutputBody> => {
+  return orvalFetch<RestoreWorkspaceChatOutputBody>(getRestoreWorkspaceChatUrl({ id, sessionKey }), {
+    ...options,
+    method: "POST",
   });
 };
 
@@ -636,8 +800,16 @@ export const submitWorkspaceRuntimeSessionInitialMessage = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<AgentInitialMessageStatusResponse>(
     getSubmitWorkspaceRuntimeSessionInitialMessageUrl({ id, sessionKey }),
@@ -648,4 +820,106 @@ export const submitWorkspaceRuntimeSessionInitialMessage = async (
       body: JSON.stringify(submitInitialMessageInputBody),
     },
   );
+};
+
+export const getListWorkspaceTargetsUrl = ({ id }: ListWorkspaceTargetsPathParameters) => {
+  return `/workspaces/${encodeURIComponent(String(id))}/targets`;
+};
+
+/**
+ * @summary List workspace targets
+ */
+export const listWorkspaceTargets = async (
+  { id }: ListWorkspaceTargetsPathParameters,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<WorkspaceTargetsResponse> => {
+  return orvalFetch<WorkspaceTargetsResponse>(getListWorkspaceTargetsUrl({ id }), {
+    ...options,
+    method: "GET",
+  });
+};
+
+export const getUpdateWorkspaceTargetUrl = ({ id }: UpdateWorkspaceTargetPathParameters) => {
+  return `/workspaces/${encodeURIComponent(String(id))}/targets`;
+};
+
+/**
+ * @summary Track or hide a workspace target
+ */
+export const updateWorkspaceTarget = async (
+  { id }: UpdateWorkspaceTargetPathParameters,
+  workspaceTargetSelection: NonReadonly<WorkspaceTargetSelection>,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<void> => {
+  const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+  return orvalFetch<void>(getUpdateWorkspaceTargetUrl({ id }), {
+    ...options,
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
+    body: JSON.stringify(workspaceTargetSelection),
+  });
+};
+
+export const getGetWorkspaceViewStateUrl = ({ id }: GetWorkspaceViewStatePathParameters) => {
+  return `/workspaces/${encodeURIComponent(String(id))}/view-state`;
+};
+
+/**
+ * @summary Get workspace view state
+ */
+export const getWorkspaceViewState = async (
+  { id }: GetWorkspaceViewStatePathParameters,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<WorkspaceViewState> => {
+  return orvalFetch<WorkspaceViewState>(getGetWorkspaceViewStateUrl({ id }), {
+    ...options,
+    method: "GET",
+  });
+};
+
+export const getUpdateWorkspaceViewStateUrl = ({ id }: UpdateWorkspaceViewStatePathParameters) => {
+  return `/workspaces/${encodeURIComponent(String(id))}/view-state`;
+};
+
+/**
+ * @summary Update workspace view state
+ */
+export const updateWorkspaceViewState = async (
+  { id }: UpdateWorkspaceViewStatePathParameters,
+  workspaceViewState: NonReadonly<WorkspaceViewState>,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<WorkspaceViewState> => {
+  const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+  return orvalFetch<WorkspaceViewState>(getUpdateWorkspaceViewStateUrl({ id }), {
+    ...options,
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
+    body: JSON.stringify(workspaceViewState),
+  });
 };

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import QuerySearchInput from "../shared/QuerySearchInput.svelte";
+  import ChevronDownIcon from "@lucide/svelte/icons/chevron-down";
   import { Effect } from "effect";
   import { pollWhileVisible } from "../../effect/poll-while-visible.js";
   import { onDestroy, untrack } from "svelte";
@@ -10,24 +12,35 @@
     Chip,
     FilterDropdown,
     ScrollBox,
-    SearchInput,
     SidebarToggle,
     StatusDot,
   } from "@kenn-io/kit-ui";
   import DiffSidebar from "../diff/DiffSidebar.svelte";
   import GroupedSidebarSection from "../shared/GroupedSidebarSection.svelte";
   import PullItem from "./PullItem.svelte";
+  import ItemActionsMenu from "./ItemActionsMenu.svelte";
+  import type { MenuAnchorPoint } from "@kenn-io/kit-ui";
+  import type { ListItemTarget } from "../../stores/item-actions.js";
+  import { createRangeSelection } from "../../utils/range-selection.svelte.js";
   import type { KanbanStatus, PullRequest } from "../../api/types.js";
+  import type { PullSidebarRow } from "../../utils/pull-stack-tree.js";
   import type { GroupingMode } from "../../stores/grouping.svelte.js";
   import type { PullAttributeFilter } from "../../stores/pulls.svelte.js";
   import { createRepoLabelFormatter } from "../../utils/repo-label.js";
+  import {
+    INITIAL_RENDER_BUDGET,
+    RENDER_BUDGET_STEP,
+    applyGroupRenderBudget,
+    effectiveRenderBudget,
+    revealWhenNear,
+  } from "../../utils/render-budget.js";
   import {
     buildPullRequestFilesRoute,
     buildPullRequestRoute,
     type PullRequestRouteRef,
   } from "../../routes.js";
 
-  const { pulls, sync, grouping, collapsedRepos, settings, activity } = getStores();
+  const { pulls, sync, grouping, collapsedRepos, settings, activity, detail } = getStores();
   const runtime = getAppRuntime();
   const navigate = getNavigate();
   const hostState = getHostState();
@@ -51,6 +64,7 @@
     { value: "draft", label: "Draft" },
     { value: "ready", label: "Ready for review" },
     { value: "merge_conflicts", label: "Merge conflicts" },
+    { value: "passed_ci", label: "Passing CI" },
     { value: "failed_ci", label: "Failed CI" },
   ];
   const kanbanFilterOptions: {
@@ -90,7 +104,7 @@
 
   let searchInput = $state(pulls.getSearchQuery() ?? "");
   let searchExecution: AppExecution<void, never> | null = null;
-  const visiblePulls = $derived(pulls.getDisplayOrderPRs());
+  const visiblePulls = $derived(pulls.getFilteredPulls());
   const repoLabelFormatter = $derived(
     createRepoLabelFormatter(
       visiblePulls.map((pr) => ({
@@ -119,15 +133,20 @@
 
   onDestroy(() => searchExecution?.interrupt());
 
+  function applySearch(value: string, submitted = false): void {
+    if (submitted) searchExecution?.interrupt();
+    pulls.setSearchQuery(value.trim() === "" ? undefined : value.trim());
+    pulls.loadPulls(undefined, { submitted: submitted && value.trim() !== "" });
+  }
+
   function onSearchInput(value: string): void {
     searchInput = value;
-
+    pulls.searchTextChanged();
     searchExecution?.interrupt();
     searchExecution = runtime.runCommand(
       Effect.sleep("300 millis").pipe(
         Effect.andThen(Effect.sync(() => {
-          pulls.setSearchQuery(value.trim() === "" ? undefined : value.trim());
-          pulls.loadPulls();
+          applySearch(value);
         })),
       ),
       { operation: "debounce pull request sidebar search", safeContext: {}, onFailure: () => {} },
@@ -159,6 +178,7 @@
   function resetCompactView(): void {
     pulls.clearLocalFilters();
     grouping.setGroupingMode("byRepo");
+    pulls.setStackTree(false);
     grouping.setHideOrgName(false);
     if (pulls.getFilterState() !== "open") {
       pulls.setFilterState("open");
@@ -168,6 +188,7 @@
 
   function clearLocalViewFilters(): void {
     pulls.clearLocalFilters();
+    pulls.setStackTree(false);
     pulls.loadPulls();
     grouping.setHideOrgName(false);
   }
@@ -241,8 +262,14 @@
       ],
     },
     {
-      title: "Visibility",
+      title: "View",
       items: [
+        {
+          id: "stack-tree",
+          label: "Stack tree",
+          active: pulls.getStackTree(),
+          onSelect: () => pulls.setStackTree(!pulls.getStackTree()),
+        },
         {
           id: "hide-org-name",
           label: "Hide org name",
@@ -260,7 +287,8 @@
     pulls.getFilterState() !== "open"
       || groupingMode !== "byRepo"
       || pulls.getLocalFilterCount() > 0
-      || grouping.getHideOrgName(),
+      || grouping.getHideOrgName()
+      || pulls.getStackTree(),
   );
   const localViewFilterCount = $derived(
     pulls.getLocalFilterCount() + Number(grouping.getHideOrgName()),
@@ -372,7 +400,8 @@
   const selectedVisiblePR = $derived.by(() => {
     const sel = pulls.getSelectedPR();
     if (sel === null) return null;
-    const pr = visiblePulls.find((p) => pullMatchesSelection(p, sel));
+    const items = selectedPRGroup?.items ?? visiblePulls;
+    const pr = pulls.getSidebarRows(items).find((row) => pullMatchesSelection(row.pr, sel))?.pr;
     if (!pr) return null;
     // Collapsed grouped modes hide the selected PR row, so the files tab
     // renders the fallback file list instead of losing the diff sidebar.
@@ -401,6 +430,123 @@
       && selectedVisiblePR === null,
   );
 
+  // Mount rows progressively: large result sets (thousands of closed PRs)
+  // otherwise block the main thread for seconds on every filter change.
+  // The budget resets whenever the query or grouping changes.
+  const renderViewKey = $derived(JSON.stringify([
+    pulls.getFilterState(),
+    pulls.getSearchQuery(),
+    pulls.getFilterStarred(),
+    pulls.getInvolvesMe(),
+    pulls.getUnassigned(),
+    pulls.getAttributeFilters(),
+    pulls.getKanbanStatusFilters(),
+    groupingMode,
+    pulls.getStackTree(),
+  ]));
+  let renderBudget = $derived.by(() => {
+    void renderViewKey;
+    return INITIAL_RENDER_BUDGET;
+  });
+
+  function isGroupCollapsed(group: PullGroup): boolean {
+    const hasSelectedPR = keepSelectedGroupExpanded && selectedPRGroup?.key === group.key;
+    return collapsedRepos.isCollapsed("pulls", group.collapseKey) && !hasSelectedPR;
+  }
+
+  const displayGroups = $derived(
+    groupedPulls?.map((group) => ({
+      ...group,
+      items: pulls.getSidebarRows(group.items),
+      count: group.items.length,
+      collapsed: isGroupCollapsed(group),
+    })) ?? null,
+  );
+
+  const flatRows = $derived(pulls.getSidebarRows(visiblePulls));
+
+  const selectedDisplayIndex = $derived.by(() => {
+    const sel = pulls.getSelectedPR();
+    if (sel === null) return -1;
+    const ordered = displayGroups === null
+      ? flatRows
+      : displayGroups.flatMap((group) => (group.collapsed ? [] : group.items));
+    return ordered.findIndex((row) => pullMatchesSelection(row.pr, sel));
+  });
+
+  const mountBudget = $derived(effectiveRenderBudget(renderBudget, selectedDisplayIndex));
+  const renderedGroups = $derived(
+    displayGroups === null ? null : applyGroupRenderBudget(displayGroups, mountBudget),
+  );
+  const renderedFlatRows = $derived(flatRows.slice(0, mountBudget));
+  const hasUnmountedRows = $derived(
+    renderedGroups === null ? flatRows.length > mountBudget : renderedGroups.truncated,
+  );
+
+  function revealMoreRows(): void {
+    renderBudget = mountBudget + RENDER_BUDGET_STEP;
+  }
+
+  // On-screen order: rows in collapsed groups or not yet mounted are not
+  // selectable, so a range never reaches PRs the user cannot see.
+  const renderedPulls = $derived(
+    renderedGroups === null
+      ? renderedFlatRows.map((row) => row.pr)
+      : renderedGroups.groups.flatMap((group) => (group.collapsed ? [] : group.items.map((row) => row.pr))),
+  );
+  const pullSelection = createRangeSelection<PullRequest>({
+    rows: () => renderedPulls,
+    key: (pr) => String(pr.ID),
+    openedKey: () => {
+      const opened = renderedPulls.find((pr) => isSelected(routeRefForPull(pr)));
+      return opened ? String(opened.ID) : null;
+    },
+  });
+  let contextMenu = $state.raw<{
+    targets: ListItemTarget[];
+    anchor: MenuAnchorPoint;
+    row: HTMLElement | undefined;
+  } | null>(null);
+  let contextMenuOpen = $state(false);
+
+  function handleRowClick(event: MouseEvent, pr: PullRequest): void {
+    if (pullSelection.activate(event, pr)) handleSelect(routeRefForPull(pr));
+  }
+
+  function openContextMenu(event: MouseEvent, pr: PullRequest): void {
+    event.preventDefault();
+    // Right-clicking outside the selection acts on that PR alone.
+    const multi = pullSelection.selected.length > 1 && pullSelection.has(pr);
+    if (!multi) pullSelection.clear();
+    contextMenu = {
+      targets: (multi ? pullSelection.selected : [pr]).map((item) => ({ kind: "pull", item })),
+      anchor: { x: event.clientX, y: event.clientY },
+      row: event.currentTarget instanceof HTMLElement ? event.currentTarget : undefined,
+    };
+    contextMenuOpen = true;
+  }
+
+  // Menu actions change items on the provider; the open PR reloads too, in
+  // case it was one of them.
+  function reloadAfterItemAction(): void {
+    pulls.loadPulls();
+    const sel = pulls.getSelectedPR();
+    if (sel) {
+      detail.refreshDetailOnly(sel.owner, sel.name, sel.number, {
+        provider: sel.provider,
+        platformHost: sel.platformHost,
+        repoPath: sel.repoPath,
+      });
+    }
+  }
+
+  function clearSelectionOnEscape(event: KeyboardEvent): void {
+    if (event.key === "Escape" && pullSelection.active) {
+      event.preventDefault();
+      pullSelection.clear();
+    }
+  }
+
   const isSelectedActiveWorktree = $derived.by(() => {
     const key = activeWorktreeKey;
     const pr = selectedVisiblePR;
@@ -409,7 +555,69 @@
   });
 </script>
 
-<div class="pull-list">
+{#snippet pullRows(rows: PullSidebarRow[], showRepo: boolean)}
+  {#each rows as row (row.pr.ID)}
+    {@const pr = row.pr}
+    {@const prRef = routeRefForPull(pr)}
+    {@const prSelected = isSelected(prRef)}
+    <div
+      class="stack-row"
+      class:stack-row--member={row.depth > 0}
+      class:stack-row--root={row.memberCount > 0}
+    >
+      <div class="stack-row-content">
+        {#if row.memberCount > 0 && pr.stack && (pr.stack.position > 1 || row.memberCount < pr.stack.size)}
+          <span class="stack-context">{row.memberCount} of {pr.stack.size} PRs in this view{pr.stack.position > 1 ? ` · starts at ${pr.stack.position}/${pr.stack.size}` : ""}</span>
+        {/if}
+        <PullItem
+          {pr}
+          repoLabel={repoLabelFormatter.format({
+            provider: pr.repo.provider,
+            platformHost: pr.repo.platform_host,
+            owner: pr.repo.owner,
+            name: pr.repo.name,
+            repoPath: pr.repo.repo_path,
+          })}
+          {showRepo}
+          selected={prSelected}
+          multiSelected={pullSelection.has(pr)}
+          onclick={(event) => handleRowClick(event, pr)}
+          oncontextmenu={(event) => openContextMenu(event, pr)}
+        />
+        {#if showSelectedDiffSidebar && prSelected && _getDetailTab() === "files"}
+          <div class="diff-files-wrap">
+            <DiffSidebar showCommits={false} />
+          </div>
+        {/if}
+      </div>
+      {#if row.memberCount > 0}
+        {@const countLabel = row.memberCount === pr.stack?.size
+          ? `${row.memberCount} PRs in stack`
+          : `${row.memberCount} of ${pr.stack?.size} PRs in this view`}
+        <div class="stack-control">
+          {#if row.memberCount > 1}
+            <button
+              type="button"
+              class="stack-toggle"
+              aria-expanded={row.expanded}
+              aria-label={`${row.expanded ? "Collapse" : "Expand"} stack at #${pr.Number}: ${countLabel}`}
+              title={countLabel}
+              onclick={() => pulls.toggleStack(row.stackKey, row.expanded)}
+            >
+              <span>{row.memberCount}</span>
+              <ChevronDownIcon size={12} class={row.expanded ? "" : "stack-chevron--collapsed"} aria-hidden="true" />
+            </button>
+          {:else}
+            <span class="stack-partial" title={countLabel} aria-label={countLabel}>1/{pr.stack?.size}</span>
+          {/if}
+        </div>
+      {/if}
+    </div>
+  {/each}
+{/snippet}
+
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="pull-list" onkeydown={clearSelectionOnEscape}>
   <div class="filter-bar" class:filter-bar--compact={useCompactFilters}>
     <Chip size="xs" tone="muted" uppercase={false} class="list-count-chip">
       {visiblePulls.length} PRs
@@ -451,7 +659,7 @@
       <FilterDropdown
         label="PR filters"
         title="PR filters"
-        active={localViewFilterCount > 0}
+        active={localViewFilterCount > 0 || pulls.getStackTree()}
         badgeCount={localViewFilterCount}
         sections={localFilterSections}
         resetLabel="Clear filters"
@@ -468,13 +676,14 @@
   </div>
   <div class="search-bar">
     <div class="search-wrap">
-      <SearchInput
+      <QuerySearchInput
         bind:value={searchInput}
         size="sm"
         block
         placeholder="Search PRs..."
         ariaLabel="Search PRs"
         oninput={onSearchInput}
+        onsubmit={(value) => applySearch(value, true)}
       />
     </div>
     <button
@@ -528,64 +737,24 @@
     {:else if visiblePulls.length === 0}
       <p class="state-message">No pull requests found.</p>
     {:else}
-      {#if groupedPulls !== null}
-        {#each groupedPulls as group (group.key)}
-          {@const userCollapsed = collapsedRepos.isCollapsed("pulls", group.collapseKey)}
-          {@const hasSelectedPR = keepSelectedGroupExpanded && selectedPRGroup?.key === group.key}
-          {@const collapsed = userCollapsed && !hasSelectedPR}
+      {#if renderedGroups !== null}
+        {#each renderedGroups.groups as group (group.key)}
           <GroupedSidebarSection
             label={group.label}
-            count={group.items.length}
-            {collapsed}
+            count={group.count}
+            collapsed={group.collapsed}
             onclick={() => collapsedRepos.toggle("pulls", group.collapseKey)}
           >
-              {#each group.items as pr (pr.ID)}
-                {@const prRef = routeRefForPull(pr)}
-                {@const prSelected = isSelected(prRef)}
-                <PullItem
-                  {pr}
-                  repoLabel={repoLabelFormatter.format({
-                    provider: pr.repo.provider,
-                    platformHost: pr.repo.platform_host,
-                    owner: pr.repo.owner,
-                    name: pr.repo.name,
-                    repoPath: pr.repo.repo_path,
-                  })}
-                  showRepo={group.showRepo}
-                  selected={prSelected}
-                  onclick={() => handleSelect(prRef)}
-                />
-                {#if showSelectedDiffSidebar && prSelected && _getDetailTab() === "files"}
-                  <div class="diff-files-wrap">
-                    <DiffSidebar showCommits={false} />
-                  </div>
-                {/if}
-              {/each}
+            {@render pullRows(group.items, group.showRepo)}
           </GroupedSidebarSection>
         {/each}
       {:else}
-        {#each visiblePulls as pr (pr.ID)}
-          {@const prRef = routeRefForPull(pr)}
-          {@const prSelected = isSelected(prRef)}
-          <PullItem
-            {pr}
-            repoLabel={repoLabelFormatter.format({
-              provider: pr.repo.provider,
-              platformHost: pr.repo.platform_host,
-              owner: pr.repo.owner,
-              name: pr.repo.name,
-              repoPath: pr.repo.repo_path,
-            })}
-            showRepo={true}
-            selected={prSelected}
-            onclick={() => handleSelect(prRef)}
-          />
-          {#if showSelectedDiffSidebar && prSelected && _getDetailTab() === "files"}
-            <div class="diff-files-wrap">
-              <DiffSidebar showCommits={false} />
-            </div>
-          {/if}
-        {/each}
+        {@render pullRows(renderedFlatRows, true)}
+      {/if}
+      {#if hasUnmountedRows}
+        {#key mountBudget}
+          <div class="render-sentinel" aria-hidden="true" {@attach revealWhenNear(revealMoreRows)}></div>
+        {/key}
       {/if}
     {/if}
   </ScrollBox>
@@ -603,7 +772,91 @@
   </div>
 </div>
 
+<ItemActionsMenu
+  bind:open={contextMenuOpen}
+  anchor={contextMenu?.anchor}
+  returnFocus={contextMenu?.row}
+  targets={contextMenu?.targets ?? []}
+  onChanged={reloadAfterItemAction}
+  selectionActive={pullSelection.active}
+  onClearSelection={() => pullSelection.clear()}
+/>
+
 <style>
+  .stack-row {
+    display: flex;
+    min-width: 0;
+  }
+
+  .stack-row-content {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .stack-row--root,
+  .stack-row--member {
+    --sidebar-row-bg: color-mix(in srgb, var(--accent-blue) 6%, var(--bg-surface));
+    background: var(--sidebar-row-bg);
+  }
+
+  .stack-row--root {
+    margin-top: var(--space-1);
+    border-top: 1px solid var(--sidebar-list-border-muted, var(--border-muted));
+  }
+
+  .stack-row--member {
+    padding-left: var(--space-4);
+  }
+
+  .stack-control {
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    width: 44px;
+    flex-shrink: 0;
+    padding-top: var(--space-1);
+  }
+
+  .stack-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-1);
+    width: 40px;
+    min-height: 40px;
+    color: var(--text-secondary);
+    font-size: var(--font-size-2xs);
+    font-variant-numeric: tabular-nums;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+  }
+
+  .stack-toggle:hover {
+    background: var(--bg-surface-hover);
+    color: var(--text-primary);
+  }
+
+  .stack-toggle:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: -2px;
+  }
+
+  .stack-toggle :global(.stack-chevron--collapsed) {
+    transform: rotate(-90deg);
+  }
+
+  .stack-partial {
+    color: var(--text-muted);
+    font-size: var(--font-size-2xs);
+  }
+
+  .stack-context {
+    display: block;
+    padding: 6px 12px 0;
+    color: var(--text-muted);
+    font-size: var(--font-size-2xs);
+  }
+
   .pull-list {
     display: flex;
     flex-direction: column;
@@ -738,7 +991,7 @@
 
   .state-toggle {
     display: flex;
-    gap: 2px;
+    gap: var(--space-1);
     background: var(--bg-inset);
     border-radius: 6px;
     padding: 2px;
@@ -815,7 +1068,7 @@
   }
   .group-toggle {
     display: flex;
-    gap: 2px;
+    gap: var(--space-1);
     background: var(--bg-inset);
     border-radius: 6px;
     padding: 2px;
@@ -880,6 +1133,10 @@
     .filter-bar--compact .compact-filter-menu {
       animation: none;
     }
+  }
+
+  .render-sentinel {
+    height: 1px;
   }
 
   .diff-files-wrap {

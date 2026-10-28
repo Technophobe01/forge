@@ -1,6 +1,7 @@
 import type { ActivityItem } from "../api/types.js";
 import { repoIdentityKey } from "../utils/repo-label.js";
 import type { RepoLabelIdentity } from "../utils/repo-label.js";
+import { repositoryKeyFromWire } from "../api/repository-key.js";
 
 export interface CollapsedActivityRun {
   kind: "collapsed";
@@ -94,18 +95,18 @@ function repoKeyForItem(item: ActivityItem): string {
   return activityRepoKey({
     provider: item.repo?.provider ?? "",
     platformHost: item.platform_host ?? item.repo?.platform_host ?? "",
-    platformRepoId: item.repo?.platform_repo_id,
+    repositoryKey: repositoryKeyFromWire(item.repo),
     owner: item.repo_owner,
     name: item.repo_name,
   });
 }
 
-function activityRunAuthor(item: ActivityItem): string {
-  return item.author_name || item.author;
+export function activityAuthor(item: ActivityItem): string {
+  return item.commit_author || item.author_name || item.author;
 }
 
 function activityRunGroupKey(item: ActivityItem, options: Required<CollapseActivityRunsOptions>): string | null {
-  const author = activityRunAuthor(item);
+  const author = activityAuthor(item);
   if (item.activity_type === "commit") {
     if (!options.rollUpCommits) return null;
     return ["item", item.activity_type, repoKeyForItem(item), item.item_type, item.item_number, author].join("|");
@@ -159,7 +160,7 @@ export function collapseActivityRuns(items: ActivityItem[], options: CollapseAct
       result.push({
         kind: "collapsed",
         id: `collapsed-${latest.id}-${count}`,
-        author: activityRunAuthor(item),
+        author: activityAuthor(item),
         count,
         earliest: earliest.created_at,
         latest: latest.created_at,

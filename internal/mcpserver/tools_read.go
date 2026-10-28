@@ -18,16 +18,17 @@ type listReposInput struct {
 }
 
 type repoRow struct {
-	Provider            string `json:"provider"`
-	PlatformHost        string `json:"platform_host"`
-	PlatformRepoID      string `json:"platform_repo_id"`
-	Owner               string `json:"owner"`
-	Name                string `json:"name"`
-	RepoPath            string `json:"repo_path"`
-	OpenPRCount         int    `json:"open_pr_count"`
-	OpenIssueCount      int    `json:"open_issue_count"`
-	LastSyncCompletedAt string `json:"last_sync_completed_at,omitempty"`
-	LastSyncError       string `json:"last_sync_error,omitempty"`
+	Provider                string `json:"provider"`
+	PlatformHost            string `json:"platform_host"`
+	PlatformRepoID          int64  `json:"platform_repo_id"`
+	BitbucketRepositoryUUID string `json:"bitbucket_repository_uuid,omitempty" jsonschema:"Bitbucket Cloud repository UUID; set instead of a nonzero platform_repo_id for Bitbucket Cloud repositories"`
+	Owner                   string `json:"owner"`
+	Name                    string `json:"name"`
+	RepoPath                string `json:"repo_path"`
+	OpenPRCount             int    `json:"open_pr_count"`
+	OpenIssueCount          int    `json:"open_issue_count"`
+	LastSyncCompletedAt     string `json:"last_sync_completed_at,omitempty"`
+	LastSyncError           string `json:"last_sync_error,omitempty"`
 }
 
 type listReposOutput struct {
@@ -50,6 +51,7 @@ type activityRow struct {
 	Item         itemRef       `json:"item"`
 	Workspace    *WorkspaceRef `json:"workspace,omitempty"`
 	Author       string        `json:"author"`
+	CommitAuthor string        `json:"commit_author,omitempty"`
 	ItemAuthor   string        `json:"item_author,omitempty"`
 	CreatedAt    string        `json:"created_at"`
 	BodyPreview  string        `json:"body_preview,omitempty"`
@@ -73,6 +75,8 @@ type searchResult struct {
 	Item           itemRef `json:"item"`
 	WorkflowStatus string  `json:"workflow_status"`
 	LastActivityAt string  `json:"last_activity_at"`
+	// key orders results; it is not part of the tool output.
+	key candidateKey
 }
 
 type searchItemsOutput struct {
@@ -158,17 +162,19 @@ func (s *Server) listRepos(ctx context.Context, in listReposInput) (listReposOut
 	out := listReposOutput{Repos: make([]repoRow, 0, len(rows))}
 	for _, row := range rows {
 		repo := row.Repository
+		platformRepoID, repositoryUUID := repositoryKeyFields(repo.Key)
 		out.Repos = append(out.Repos, repoRow{
-			Provider:            repo.Provider,
-			PlatformHost:        repo.PlatformHost,
-			PlatformRepoID:      repo.PlatformRepoID,
-			Owner:               repo.Owner,
-			Name:                repo.Name,
-			RepoPath:            repositoryPath(repo),
-			OpenPRCount:         row.OpenPRCount,
-			OpenIssueCount:      row.OpenIssueCount,
-			LastSyncCompletedAt: row.LastSyncCompletedAt,
-			LastSyncError:       row.LastSyncError,
+			Provider:                repo.Provider,
+			PlatformHost:            repo.PlatformHost,
+			PlatformRepoID:          platformRepoID,
+			BitbucketRepositoryUUID: repositoryUUID,
+			Owner:                   repo.Owner,
+			Name:                    repo.Name,
+			RepoPath:                repositoryPath(repo),
+			OpenPRCount:             row.OpenPRCount,
+			OpenIssueCount:          row.OpenIssueCount,
+			LastSyncCompletedAt:     row.LastSyncCompletedAt,
+			LastSyncError:           row.LastSyncError,
 		})
 	}
 	return out, nil
@@ -201,6 +207,7 @@ func (s *Server) listActivity(ctx context.Context, in listActivityInput) (listAc
 			Item:         item.itemRef(),
 			Workspace:    item.Workspace,
 			Author:       item.Author,
+			CommitAuthor: item.CommitAuthor,
 			ItemAuthor:   item.ItemAuthor,
 			CreatedAt:    item.CreatedAt,
 			BodyPreview:  item.BodyPreview,
@@ -212,14 +219,14 @@ func (s *Server) listActivity(ctx context.Context, in listActivityInput) (listAc
 
 func (s *Server) searchItems(ctx context.Context, in searchItemsInput) (searchItemsOutput, error) {
 	if strings.TrimSpace(in.Query) == "" {
-		return searchItemsOutput{}, fmt.Errorf("query is required")
+		return searchItemsOutput{}, errors.New("query is required")
 	}
 	state := strings.TrimSpace(in.State)
 	if state == "" {
 		state = "open"
 	}
 	if state != "open" && state != "closed" && state != "merged" && state != "all" {
-		return searchItemsOutput{}, fmt.Errorf("state must be open, closed, merged, or all")
+		return searchItemsOutput{}, errors.New("state must be open, closed, merged, or all")
 	}
 	limit := clampLimit(in.Limit, 25, 100)
 	repo, err := in.Repo.repositoryIdentity()
@@ -283,6 +290,7 @@ func (s *Server) searchPulls(
 				Item:           row.itemRef(),
 				WorkflowStatus: workflowStatusOrNew(row.WorkflowStatus),
 				LastActivityAt: formatMCPTime(row.LastActivityAt),
+				key:            row.itemKey(),
 			})
 			if len(out) > limit {
 				return out, true, nil
@@ -332,6 +340,7 @@ func (s *Server) searchIssues(
 			Item:           row.itemRef(),
 			WorkflowStatus: workflowStatusOrNew(row.WorkflowStatus),
 			LastActivityAt: formatMCPTime(row.LastActivityAt),
+			key:            row.itemKey(),
 		})
 	}
 	return out, len(out) > limit, nil
@@ -349,7 +358,7 @@ func itemTypeSelection(values []string) (bool, bool, error) {
 		case "issue":
 			includeIssue = true
 		default:
-			return false, false, fmt.Errorf("item_types must contain only pr or issue")
+			return false, false, errors.New("item_types must contain only pr or issue")
 		}
 	}
 	return includePR, includeIssue, nil
@@ -365,19 +374,8 @@ func sortSearchResults(results []searchResult) {
 		if results[i].LastActivityAt != results[j].LastActivityAt {
 			return results[i].LastActivityAt > results[j].LastActivityAt
 		}
-		return itemSortKey(results[i].Item) < itemSortKey(results[j].Item)
+		return results[i].key.sortKey() < results[j].key.sortKey()
 	})
-}
-
-func itemSortKey(item itemRef) string {
-	return strings.Join([]string{
-		item.Provider,
-		item.PlatformHost,
-		item.PlatformRepoID,
-		item.RepoPath,
-		item.Type,
-		fmt.Sprintf("%08d", item.Number),
-	}, "\x1f")
 }
 
 func sinceToRFC3339(raw string) string {
@@ -387,12 +385,12 @@ func sinceToRFC3339(raw string) string {
 	return raw
 }
 
-func clampLimit(value int, def int, max int) int {
+func clampLimit(value int, def int, limit int) int {
 	if value <= 0 {
 		return def
 	}
-	if value > max {
-		return max
+	if value > limit {
+		return limit
 	}
 	return value
 }

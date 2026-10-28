@@ -6,26 +6,64 @@ fixtures, or changing shell-script coverage.
 - Pass `-shuffle=on` when invoking `go test` directly; `make test` and
   `make test-short` already include it. Do not pass redundant `-count=1`; use
   `-count=N` only when `N > 1` for repeated runs.
-- Before pushing Go changes, run `make nilaway` as well as `make lint-check`;
-  passing golangci-lint alone does not cover CI's Go analysis checks
-  (`.github/workflows/ci.yml::lint`).
-- Routine local Go lanes and hooks bound package/processor concurrency and share
-  Go caches; `GO_TEST_P=` intentionally restores native package concurrency.
-  (`scripts/run-hook-go.sh`, `prek.toml`)
+- Before pushing Go changes, run `make nilaway`, `make fmt-check`, and
+  `make lint-check`. Lint uses kit's shared policy through `./custom-gcl`;
+  `golangci-lint run` does not apply v2 formatters, so formatter drift is a
+  separate gate (`.github/workflows/ci.yml::lint`, `Makefile::fmt-check`).
+- `t.Context()` is already canceled inside `t.Cleanup`; shutdown helpers use
+  `context.WithoutCancel(t.Context())` or `context.Background()`
+  (`internal/testutil/servertest/servertest.go::registerCleanup`).
+  Unix-socket fixtures keep a short `/tmp` root rather than `t.TempDir()`.
+- Clone fetches outlive the workspace setup that started them, and server
+  shutdown does not wait for them; fixtures that own a `gitclone.Manager`
+  register `t.Cleanup(clones.Wait)` so TempDir removal never races a fetch
+  (`internal/server/workspacetest/fixtures_test.go::setupWorkspaceServerFixtureWithTmuxInjection`).
+- Direct Make test lanes bound package concurrency (`GO_TEST_P=` restores
+  native concurrency). Go hooks run uncapped and the read-only Go consumers run
+  concurrently; `KENN_FORGE_HOOK_GO_CONCURRENCY`
+  opts into a cap (`scripts/run-hook-go.sh`, `prek.toml`).
+- `internal/server` black-box tests live in sibling test-only packages
+  (`accesstest`, `pulltest`, ...), so they build and lint in parallel instead of
+  inside the package's single test unit. Put new tests that need only the
+  exported API there; whole-server tests go in the `*servertest` packages.
+  Tests keep the dependencies they pass to `server.New` (for example the
+  syncer) instead of reading them back from `Server` fields. Shared helpers
+  live once: root-independent mocks and seeders in `internal/testutil/serverfake`
+  (root tests import it too), server-building fixtures in
+  `internal/testutil/servertest`; never copy helpers into each test package.
 - CI bounds Go package/test fan-out with `-p` and `-parallel`; do not cap
   `GOMAXPROCS` globally, because test-launched servers inherit that CPU limit.
 - Do not overlap frontend/e2e asset builds with Go compilation; replacing embedded
   assets mid-compile causes missing-file build failures (`internal/web/embed.go:9`).
-- Vite dev/build owns frontend API client and schema-constraint generation together;
-  Make and Air must not generate TypeScript independently
-  (`frontend/scripts/generate-api-client.mjs::frontendApiClient`).
+- Mock Playwright tests use built assets; serving the development module graph
+  makes concurrent navigation compete with module loading (`frontend/playwright.config.ts`).
+- Frontend API client and schema-constraint generation have one generator shared
+  by the Vite plugin and `make api-generate`; hooks must not run a full `vp build`
+  to trigger it (`frontend/scripts/generate-api-client.mjs::generateClient`).
+- `make api-generate` skips a client generator only when its inputs and its
+  generated output both match the last successful run; list every generator
+  input and output path (`scripts/cached-generate.sh`).
+- Go static-analysis targets run with `-trimpath` so fresh worktrees reuse cached
+  export data; tests keep real paths for `runtime.Caller` fixtures
+  (`Makefile::GO_ANALYSIS_ENV`). Run standalone analyzers such as NilAway as
+  `go vet -vettool` so results are cached per package (`Makefile::nilaway`).
 - Reduce scanner pressure at source, not by redirecting `GOTMPDIR`.
+- Commit hooks run only formatters, generators, and checks scoped to the change
+  or a few seconds long; whole-repo lint, type checks, contract checks, and
+  script tests run at pre-push (`prek.toml`). The Go formatter hook formats
+  only staged files; CI's `make fmt-check` covers the whole repo.
 - Repository-wide Go tests do not run from Git hooks. Any future fast hook
   lane must select a small set of packages rather than require per-test opt-outs.
 - `-short` must skip tests that build and launch real kenn-forge daemons or run
   load-sensitive sync E2Es; those flows belong in full Go lanes (`cmd/kenn-forge/lock_e2e_test.go::buildForgeWithLDFlags`, `internal/server/e2etest/sync_cooldown_test.go::TestTriggerSyncE2EPrioritizesNonDefaultHostFilter`).
 - Race tests must synchronize at the narrow boundary under test; do not put a short
   wall-clock deadline around an entire sync pipeline (`internal/github/sync_test.go::TestResolveDisplayNameDedupsConcurrentLookups`).
+- Eventual-poll callbacks can outlive their test; return errors to the test goroutine
+  or use `CollectT` assertions so late failures cannot panic the whole package
+  (`internal/server/tmux_wrapper_test.go::TestWorkspaceSetupResourceExhaustionGetsHelpfulErrorViaAPI`).
+- Real CLI confirmation prompts may render before their input guard settles; wait
+  for a stable selection before submitting the test's explicit decision
+  (`internal/workspace/localruntime/agent_initial_message_test.go::TestClaudeInitialMessageWaitsForTrustWithRealCLI`).
 - Filesystem writes are not a deterministic event burst under load. Test debounce timing
   with controlled event channels and `synctest`; keep real filesystem tests for delivery
   (`internal/configwatch/watcher_test.go::TestWatcher_DebouncesBurst`).
@@ -33,8 +71,15 @@ fixtures, or changing shell-script coverage.
   can reject path bytes that Git preserves (`landedwork/range_test.go::TestRebaseFileChanges`).
 - Publish fixture output atomically when file existence signals readiness; creation precedes
   completed writes (`internal/server/workspaceapi/agent_resume_test.go::TestRestoreRuntimeSessionsResumesSavedConversationAfterTmuxLoss`).
-- Pre-commit runs frontend core checks without full-project Effect diagnostics;
+- Pre-push runs frontend core checks without full-project Effect diagnostics;
   explicit frontend checks and CI retain Effect coverage (`Makefile::frontend-check-no-deps`).
+- `svelte-check` runs with `--tsgo`, which only sees Svelte types that ship
+  declarations; source-consumed Svelte dependencies must publish `.d.ts` files
+  (`vite.config.ts::svelte-check`).
+- Hook `files` patterns mirror what each checker reads (e.g. huma-route-check
+  skips test files); do not use `always_run` for whole-module checks (`prek.toml`).
+- API generation runs for every non-test Go change because schema types cross
+  package boundaries (`prek.toml`).
 - Package-local `svelte-check` tasks must pass that package's Vite config explicitly;
   implicit discovery can load the root non-Svelte task config (`vite.config.ts:56`).
 - Do not use `-v` unless the user requests it or a particular failure genuinely
@@ -44,8 +89,7 @@ fixtures, or changing shell-script coverage.
   `t.Errorf`, `t.Fail`, or `t.FailNow`.
 - Import `github.com/stretchr/testify/assert` without an alias. When a test has
   more than three assertions, create `assert := assert.New(t)` and use the
-  helper methods thereafter. CI enforces this through `guardrail-check`
-  (`Makefile::guardrail-check`).
+  helper methods thereafter. Kit `testifyhelper` enforces this.
 - Prefer the generated Go API client for integration-style API tests.
 - Verify generated-client migrations without `-short`; shared workspace fixtures skip
   error-path coverage in short mode (`internal/server/workspacetest/fixtures_test.go::setupWorkspaceServerFixtureWithTmuxInjection`).
@@ -57,15 +101,39 @@ fixtures, or changing shell-script coverage.
 - Fixed historical timestamps must use an explicit query window or controlled
   clock; rolling defaults otherwise make fixtures expire with wall time
   (`internal/server/e2etest/notifications_test.go::TestNotificationSyncReconcilesReusedRouteE2E`).
+- Config path assertions must expect physical directory identity; macOS temporary
+  parents can be symlink aliases (`internal/config/runtime_overrides_test.go::TestRuntimeEnvironmentOverlayAndSave`).
+- Base terminal tests inherit the user's login shell; run POSIX expansions through
+  an explicit `/bin/sh -c` (`internal/server/workspacetest/tmux_server_env_test.go::TestWorkspaceTmuxServerEnvironmentExcludesTokensE2E`).
 - Shell-script tests must execute the script against controlled inputs and
   assert observable output, side effects, or exit status. Do not grep scripts,
   workflows, config, or docs for expected implementation text.
+- Go tests run Git only through `internal/testutil/gitfixture` or the
+  `gitsafe` runners, and every such test package calls
+  `gitsafe.RunIsolatedMain` from `TestMain`. `make git-test-fixture-check`
+  enforces this in pre-push and CI, including build-tagged and platform-specific
+  files (`tools/norawgittest/main.go`).
+- Use `gitfixture.ScratchDir(t)` before initializing custom Git fixtures; `t.TempDir()`
+  can land inside a checkout when `TMPDIR` points there. Environment isolation does not check placement
+  (`internal/testutil/gitfixture/repository.go::ScratchDir`).
 - JavaScript tests that create or mutate Git repositories must use the shared
   isolated fixture; raw child processes can inherit hook bindings and mutate the
   hosting checkout (`scripts/test-git-fixture.mjs::createGitTestRepository`).
 - Isolation must strip inherited Git variables, use scratch global and system
   configuration, and keep the fixture outside every checkout; a working
   directory or `git -C` alone does not isolate Git.
+- Keystrokes sent through a freshly attached terminal can be lost while the tmux
+  client starts; resend the command until its output arrives rather than sending
+  once (`internal/server/workspacetest/default_tmux_socket_test.go::TestWorkspaceUnconfiguredTmuxUsesForgeSocketE2E`).
+- ACP fixtures must explicitly select private tmux or disable tmux discovery;
+  a nil command discovers the live default server (`internal/workspace/localruntime/acp_test.go::newACPTestManager`).
+- Compare fixture working directories by file identity; Windows runners can use short-name paths
+  (`internal/workspace/localruntime/acp_test.go::TestACPStdioHelper`).
+- ACP owner processes can outlive manager stop; await their exit before deleting fixture state
+  (`internal/workspace/localruntime/acp_owner_test.go::TestACPReattachesAfterDaemonProcessExits`).
+- Use the owner-process fixture for saved-chat integration checks unless testing owner
+  internals, so cleanup waits for all writers to exit
+  (`internal/workspace/localruntime/acp_requests_test.go::launchRequestChat`).
 - Private tmux tests retain markers on gate, read, validation, or identity errors;
   one deadline covers gate closure and startup draining, and cleanup never addresses
   the default server. (`internal/testutil/testtmux/owner.go::Owner`)
@@ -90,8 +158,8 @@ fixtures, or changing shell-script coverage.
   `mise.ci.toml` (loaded with `MISE_ENV=ci`), never in `mise.toml`, which must
   stay installable on every workstation. Keep `mise.toml` and `mise.ci.toml` in
   the `ci` path filter, and remember pull requests run `ci.yml@main`, so a
-  workflow or tool-install change only takes effect after it merges
-  (`.github/workflows/ci-pr.yml`).
+  workflow or tool-install change only takes effect after it merges; exercise it
+  first with `gh workflow run ci.yml --ref <branch>` (`.github/workflows/ci-pr.yml`).
 - Fixtures asserted through windowed endpoints (activity's default 7d range)
   must seed now-relative instants, not absolute calendar dates — pinned dates
   age out and the test starts failing on a later calendar day

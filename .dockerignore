@@ -1,21 +1,29 @@
-# Keep the build context small and reproducible.
 .git
-.github
+.agents
+.claude
+.codex
+.pi
+.skillshare
+.superpowers
+.roborev*
+.kata*
 node_modules
 **/node_modules
-frontend/dist
-internal/web/dist
-internal/githubapp/ui/dist
-packages/*/dist
-target
+**/dist
+site
+.docs-stage
+tmp
+coverage
+**/test-results
+**/playwright-report
+custom-gcl
+kenn-forge
+kenn-forge-github-app
+*.log
+# Production image (Technophobe01): local databases and binaries left over
+# from the middleman name must not enter the build context.
 *.db
 *.db-*
 .DS_Store
-test-results
-playwright-report
-*.log
-kenn-forge
-kenn-forge-github-app
-# Binaries left over from the middleman name.
 middleman
 middleman-github-app

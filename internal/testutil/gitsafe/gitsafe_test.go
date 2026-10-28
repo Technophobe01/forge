@@ -26,7 +26,10 @@ func TestRunIsolatedMainProtectsRealGitWithPortableConfig(t *testing.T) {
 	info, err := os.Stat(globalConfig)
 	require.NoError(err)
 	assert.True(info.Mode().IsRegular(), "global config must be a regular file")
-	assert.Zero(info.Size(), "shared test config must stay empty")
+	contents, err := os.ReadFile(globalConfig)
+	require.NoError(err)
+	assert.Equal(SharedConfig, string(contents),
+		"shared test config holds only the background-maintenance settings")
 	assert.Equal("1", os.Getenv("GIT_CONFIG_NOSYSTEM"))
 	assert.Equal("0", os.Getenv("GIT_TERMINAL_PROMPT"))
 	require.DirExists(os.Getenv("XDG_CONFIG_HOME"))

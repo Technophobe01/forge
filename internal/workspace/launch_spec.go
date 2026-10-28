@@ -24,10 +24,12 @@ var (
 	ErrLaunchSpecResolverMissing = errors.New("workspace launch specification resolver is not configured")
 )
 
-type WorkspaceLaunchRepository = db.WorkspaceLaunchRepository
-type WorkspaceLaunchPull = db.WorkspaceLaunchPull
-type WorkspaceLaunchSpec = db.WorkspaceLaunchSpec
-type UnpreparedWorkspace = db.UnpreparedWorkspace
+type (
+	WorkspaceLaunchRepository = db.WorkspaceLaunchRepository
+	WorkspaceLaunchPull       = db.WorkspaceLaunchPull
+	WorkspaceLaunchSpec       = db.WorkspaceLaunchSpec
+	UnpreparedWorkspace       = db.UnpreparedWorkspace
+)
 
 // LaunchSpecRefreshError reports an expired or missing provider-fact lease
 // whose hub refresh could not complete. It remains identifiable as
@@ -53,8 +55,8 @@ func (e *LaunchSpecRefreshError) Unwrap() []error {
 // LaunchSpecErrorRetryable reports whether retrying after hub
 // recovery can make the validation succeed.
 func LaunchSpecErrorRetryable(err error) bool {
-	var refresh *LaunchSpecRefreshError
-	return errors.As(err, &refresh)
+	_, ok := errors.AsType[*LaunchSpecRefreshError](err)
+	return ok
 }
 
 func (m *Manager) launchSpecNow() time.Time {
@@ -163,13 +165,10 @@ func (m *Manager) validateWorkspaceLaunchSpec(
 	if err != nil {
 		return false, fmt.Errorf("resolve workspace launch repository: %w", err)
 	}
-	if repo == nil ||
-		!strings.EqualFold(repo.Platform, spec.Repository.Provider) ||
-		!strings.EqualFold(repo.PlatformHost, spec.Repository.PlatformHost) ||
-		strings.TrimSpace(repo.PlatformRepoID) != strings.TrimSpace(spec.Repository.PlatformRepoID) {
+	if repo == nil || repo.Identity() != spec.Repository.Identity() {
 		return false, fmt.Errorf(
 			"%w: workspace launch specification repository identity changed",
-			db.ErrRepositoryRouteFenceChanged,
+			db.ErrRepositoryIdentityChanged,
 		)
 	}
 	routeChanged := !strings.EqualFold(repo.Owner, spec.Repository.Owner) ||
@@ -305,12 +304,13 @@ func launchRequest(
 		ItemType: itemType, ItemNumber: itemNumber,
 		ItemKey: strconv.Itoa(itemNumber), GitHeadRef: strings.TrimSpace(gitHeadRef),
 		IssueBranchSlug: issueBranchSlug,
+		ForCreation:     true,
 	}
 }
 
 func launchSpecSummary(workspace Workspace, spec WorkspaceLaunchSpec) WorkspaceSummary {
 	summary := WorkspaceSummary{Workspace: workspace}
-	summary.RepoPlatformID = spec.Repository.PlatformRepoID
+	summary.RepoKey = spec.Repository.Key
 	summary.SourceItemVisible = spec.SourceVisible
 	if spec.SourceTitle != "" {
 		summary.SourceTitle = &spec.SourceTitle

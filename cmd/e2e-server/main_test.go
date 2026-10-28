@@ -21,17 +21,17 @@ import (
 	"testing/synctest"
 	"time"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/db"
 	ghclient "go.kenn.io/forge/internal/github"
-	"go.kenn.io/forge/platform"
 	"go.kenn.io/forge/internal/procutil"
 	"go.kenn.io/forge/internal/testutil"
 	"go.kenn.io/forge/internal/testutil/testsignal"
 	"go.kenn.io/forge/internal/web"
+	"go.kenn.io/forge/platform"
 )
 
 var testTmux = newTestTmuxTracker()
@@ -114,7 +114,7 @@ func (tracker *testTmuxTracker) stop(key string, tmuxCommand []string) error {
 	listOutput, listErr := procutil.Command(tmuxCommand[0], args...).CombinedOutput()
 	if listErr == nil {
 		return fmt.Errorf(
-			"stop e2e-server test tmux: %v: %s; server still accepts commands: %s",
+			"stop e2e-server test tmux: %w: %s; server still accepts commands: %s",
 			killErr, killOutput, listOutput,
 		)
 	}
@@ -131,6 +131,7 @@ func (tracker *testTmuxTracker) stop(key string, tmuxCommand []string) error {
 	tracker.mu.Unlock()
 	return nil
 }
+
 func TestE2EWorkflowClientExercisesProviderWorkflowContract(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -379,7 +380,7 @@ func TestInstanceTmuxCommandUsesPrivateSocketAndDefaultConfig(t *testing.T) {
 }
 
 func TestInstanceTmuxCommandUsesPlaywrightOwnedSocketDirectory(t *testing.T) {
-	dir, err := os.MkdirTemp("", "kf-e2e-tmux-")
+	dir, err := os.MkdirTemp("/tmp", "kf-e2e-tmux-")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	t.Setenv(e2eTmuxDirEnv, dir)
@@ -505,63 +506,58 @@ func TestPatchFixturePRSHAsUpdatesLookupPRs(t *testing.T) {
 }
 
 func TestAppStateRegistryWaitsForInFlightHandlersAfterSwap(t *testing.T) {
-	started := make(chan struct{})
-	release := make(chan struct{})
-	oldState := &appState{
-		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			close(started)
-			<-release
-			w.WriteHeader(http.StatusNoContent)
-		}),
-	}
-	newState := &appState{
-		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusAccepted)
-		}),
-	}
-	states := newAppStateRegistry(oldState)
+	synctest.Test(t, func(t *testing.T) {
+		started := make(chan struct{})
+		release := make(chan struct{})
+		oldState := &appState{
+			handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				close(started)
+				<-release
+				w.WriteHeader(http.StatusNoContent)
+			}),
+		}
+		newState := &appState{
+			handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusAccepted)
+			}),
+		}
+		states := newAppStateRegistry(oldState)
 
-	oldDone := make(chan struct{})
-	go func() {
-		defer close(oldDone)
-		states.ServeHTTP(
-			httptest.NewRecorder(),
-			httptest.NewRequest(http.MethodGet, "/", nil),
-		)
-	}()
-	<-started
+		oldDone := make(chan struct{})
+		go func() {
+			defer close(oldDone)
+			states.ServeHTTP(
+				httptest.NewRecorder(),
+				httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil),
+			)
+		}()
+		<-started
 
-	require := require.New(t)
-	swapped := states.Swap(newState)
-	require.Same(oldState, swapped)
+		require := require.New(t)
+		swapped := states.Swap(newState)
+		require.Same(oldState, swapped)
 
-	drained := make(chan struct{})
-	go func() {
-		defer close(drained)
-		_ = swapped.waitForHandlers(context.Background())
-	}()
+		drained := make(chan struct{})
+		go func() {
+			defer close(drained)
+			_ = swapped.waitForHandlers(t.Context())
+		}()
 
-	select {
-	case <-drained:
-		require.Fail("old state drained before its in-flight handler returned")
-	case <-time.After(100 * time.Millisecond):
-	}
+		synctest.Wait()
+		select {
+		case <-drained:
+			require.Fail("old state drained before its in-flight handler returned")
+		default:
+		}
 
-	newRecorder := httptest.NewRecorder()
-	states.ServeHTTP(newRecorder, httptest.NewRequest(http.MethodGet, "/", nil))
-	require.Equal(http.StatusAccepted, newRecorder.Code)
+		newRecorder := httptest.NewRecorder()
+		states.ServeHTTP(newRecorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil))
+		require.Equal(http.StatusAccepted, newRecorder.Code)
 
-	close(release)
-	select {
-	case <-oldDone:
-	case <-time.After(5 * time.Second):
-		require.Fail("old handler did not return")
-	}
-	select {
-	case <-drained:
-	case <-time.After(5 * time.Second):
-		require.Fail("old state did not drain after handler returned")
-	}
+		close(release)
+		<-oldDone
+		<-drained
+	})
 }
 
 func TestAppStateRegistryWaitsForAsyncStateCleanup(t *testing.T) {
@@ -617,6 +613,23 @@ func TestDefaultRoborevEndpointIsUnbindable(t *testing.T) {
 	assert.Positive(port)
 }
 
+func TestE2EGraphQLReadsStayLocal(t *testing.T) {
+	previousTransport := http.DefaultTransport
+	var outboundCalls int
+	http.DefaultTransport = platform.RoundTripFunc(func(*http.Request) (*http.Response, error) {
+		outboundCalls++
+		return nil, errors.New("unexpected outbound request")
+	})
+	t.Cleanup(func() { http.DefaultTransport = previousTransport })
+
+	fetcher := newE2EGraphQLFetcher(nil)
+	_, err := fetcher.FetchPullRequestCommentVisibility(t.Context(), "acme", "widgets", 1)
+	require.ErrorIs(t, err, platform.ErrMissingToken)
+	_, err = fetcher.FetchIssueCommentVisibility(t.Context(), "acme", "widgets", 10)
+	require.ErrorIs(t, err, platform.ErrMissingToken)
+	require.Zero(t, outboundCalls)
+}
+
 func TestMixedCIFixtureSurvivesRefresh(t *testing.T) {
 	require := require.New(t)
 	assets, err := web.Assets()
@@ -626,11 +639,11 @@ func TestMixedCIFixtureSurvivesRefresh(t *testing.T) {
 	t.Cleanup(state.close)
 
 	seed := httptest.NewRecorder()
-	state.handler.ServeHTTP(seed, httptest.NewRequest(http.MethodPost, "http://127.0.0.1/__e2e/pr-ci-state/mixed", nil))
+	state.handler.ServeHTTP(seed, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://127.0.0.1/__e2e/pr-ci-state/mixed", nil))
 	require.Equal(http.StatusOK, seed.Code, seed.Body.String())
 
 	refresh := httptest.NewRecorder()
-	state.handler.ServeHTTP(refresh, httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/v1/pulls/github/acme/widgets/1/ci-refresh", nil))
+	state.handler.ServeHTTP(refresh, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://127.0.0.1/api/v1/pulls/github/acme/widgets/1/ci-refresh", nil))
 	require.Equal(http.StatusOK, refresh.Code, refresh.Body.String())
 	var detail struct {
 		MergeRequest struct {
@@ -692,7 +705,7 @@ func TestBuildAppStateSeedsReviewedHeadsForUTCMergeTargets(t *testing.T) {
 			assert.Equal(mr.PlatformBaseSHA, mr.DiffBaseSHA)
 
 			recorder := httptest.NewRecorder()
-			request := httptest.NewRequest(
+			request := httptest.NewRequestWithContext(t.Context(),
 				http.MethodGet,
 				"http://127.0.0.1/api/v1/pulls/github/"+
 					target.owner+"/"+target.repo+"/"+strconv.Itoa(target.number),
@@ -732,13 +745,12 @@ func TestRunDefaultRoborevFailsClosedThroughProxy(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- run(ctx, 0, defaultRoborevEndpoint, serverInfoFile, "github.com", false, false)
+		done <- run(ctx, 0, defaultRoborevEndpoint, serverInfoFile, "github.com", false, false, "", "")
 	}()
 
 	baseURL := waitForServerInfoBaseURL(t, serverInfoFile, done)
 
-	resp, err := http.Get(baseURL + "/api/roborev/api/status")
-	require.NoError(err)
+	resp := doHTTP(t, http.MethodGet, baseURL+"/api/roborev/api/status", nil)
 	defer resp.Body.Close()
 
 	assert.Equal(http.StatusBadGateway, resp.StatusCode,
@@ -780,16 +792,18 @@ func waitForServerInfo(
 	t *testing.T, path string, done <-chan error,
 ) e2eServerInfo {
 	t.Helper()
-	r := require.New(t)
+	require := require.New(t)
 	// run() does SeedFixtures + SetupDiffRepo + stack detection before it
 	// starts listening. Cold race-enabled startup can take over 30 seconds
 	// when packages run concurrently in CI, so leave enough headroom for
 	// resource contention while retaining a bounded readiness failure.
-	deadline := time.Now().Add(90 * time.Second)
-	for time.Now().Before(deadline) {
+	deadline := time.After(90 * time.Second)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
 		select {
 		case err := <-done:
-			r.Failf("run exited early",
+			require.Failf("run exited early",
 				"run() exited before server-info was written: %v", err)
 		default:
 		}
@@ -800,10 +814,15 @@ func waitForServerInfo(
 				return info
 			}
 		}
-		time.Sleep(50 * time.Millisecond)
+		select {
+		case err := <-done:
+			require.Failf("run exited early",
+				"run() exited before server-info was written: %v", err)
+		case <-deadline:
+			require.FailNow("timed out waiting for server-info file")
+		case <-ticker.C:
+		}
 	}
-	r.FailNow("timed out waiting for server-info file")
-	return e2eServerInfo{}
 }
 
 // TestRunPprofListenerFromEnv pins the contract the workspace-switch
@@ -823,15 +842,14 @@ func TestRunPprofListenerFromEnv(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- run(ctx, 0, defaultRoborevEndpoint, serverInfoFile, "github.com", false, false)
+		done <- run(ctx, 0, defaultRoborevEndpoint, serverInfoFile, "github.com", false, false, "", "")
 	}()
 
 	info := waitForServerInfo(t, serverInfoFile, done)
 	require.NotEmpty(info.PprofAddr,
 		"server info must report the resolved pprof listener address")
 
-	resp, err := http.Get("http://" + info.PprofAddr + "/debug/pprof/")
-	require.NoError(err)
+	resp := doHTTP(t, http.MethodGet, "http://"+info.PprofAddr+"/debug/pprof/", nil)
 	defer resp.Body.Close()
 	assert.Equal(http.StatusOK, resp.StatusCode)
 
@@ -848,6 +866,7 @@ func TestRunCancellationStopsPrivateTmuxBeforeShutdown(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux not available")
 	}
+	//nolint:usetesting // unix socket path length requires a short OS temp root
 	tmuxDir, err := os.MkdirTemp("/tmp", "kf-e2e-tmux-")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(tmuxDir) })
@@ -858,7 +877,7 @@ func TestRunCancellationStopsPrivateTmuxBeforeShutdown(t *testing.T) {
 	serverInfoFile := filepath.Join(t.TempDir(), "server-info.json")
 	done := make(chan error, 1)
 	go func() {
-		done <- run(ctx, 0, defaultRoborevEndpoint, serverInfoFile, "github.com", false, false)
+		done <- run(ctx, 0, defaultRoborevEndpoint, serverInfoFile, "github.com", false, false, "", "")
 	}()
 	info := waitForServerInfo(t, serverInfoFile, done)
 	tmuxCommand := startPrivateE2ETmuxServer(t, info.ConfigPath)
@@ -886,7 +905,11 @@ func TestE2EServerTestMainStopsPrivateTmuxOnSIGTERM(t *testing.T) {
 			if writeErr := os.WriteFile(os.Getenv("KENN_FORGE_E2E_SIGNAL_READY"), encoded, 0o600); writeErr != nil {
 				os.Exit(4)
 			}
-			time.Sleep(250 * time.Millisecond)
+			// Hold tracker.mu through the parent's SIGTERM delivery.
+			var release [1]byte
+			if _, readErr := io.ReadFull(os.Stdin, release[:]); readErr != nil {
+				os.Exit(5)
+			}
 		})
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -902,6 +925,7 @@ func TestE2EServerTestMainStopsPrivateTmuxOnSIGTERM(t *testing.T) {
 	}
 
 	require := require.New(t)
+	//nolint:usetesting // unix socket path length requires a short OS temp root
 	tmuxDir, err := os.MkdirTemp("/tmp", "kf-e2e-tmux-")
 	require.NoError(err)
 	t.Cleanup(func() { _ = os.RemoveAll(tmuxDir) })
@@ -909,7 +933,12 @@ func TestE2EServerTestMainStopsPrivateTmuxOnSIGTERM(t *testing.T) {
 	// Model the interval after WriteFile creates the ready file but before it
 	// writes the JSON payload.
 	require.NoError(os.WriteFile(readyFile, nil, 0o600))
-	cmd := procutil.Command(os.Args[0], "-test.run=^TestE2EServerTestMainStopsPrivateTmuxOnSIGTERM$")
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	cmd := procutil.CommandContext(ctx, os.Args[0], "-test.run=^TestE2EServerTestMainStopsPrivateTmuxOnSIGTERM$")
+	release, err := cmd.StdinPipe()
+	require.NoError(err)
+	t.Cleanup(func() { _ = release.Close() })
 	cmd.Env = append(os.Environ(),
 		"KENN_FORGE_E2E_SIGNAL_HELPER=1",
 		"KENN_FORGE_E2E_SIGNAL_READY="+readyFile,
@@ -923,7 +952,9 @@ func TestE2EServerTestMainStopsPrivateTmuxOnSIGTERM(t *testing.T) {
 		}
 	})
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.After(5 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		data, readErr := os.ReadFile(readyFile)
 		if readErr == nil {
@@ -931,6 +962,8 @@ func TestE2EServerTestMainStopsPrivateTmuxOnSIGTERM(t *testing.T) {
 			if jsonErr := json.Unmarshal(data, &tmuxCommand); jsonErr == nil && len(tmuxCommand) > 0 {
 				t.Cleanup(func() { killTmuxServer(tmuxCommand) })
 				require.NoError(cmd.Process.Signal(syscall.SIGTERM))
+				_, err = release.Write([]byte{1})
+				require.NoError(err)
 				waitErr := cmd.Wait()
 				var exitErr *exec.ExitError
 				require.ErrorAs(waitErr, &exitErr)
@@ -939,10 +972,11 @@ func TestE2EServerTestMainStopsPrivateTmuxOnSIGTERM(t *testing.T) {
 				return
 			}
 		}
-		if time.Now().After(deadline) {
+		select {
+		case <-deadline:
 			require.FailNow("signal helper did not create its private tmux server")
+		case <-ticker.C:
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -961,7 +995,7 @@ func TestResetSwapsFixtureState(t *testing.T) {
 	serverInfoFile := filepath.Join(t.TempDir(), "server-info.json")
 	done := make(chan error, 1)
 	go func() {
-		done <- run(ctx, 0, defaultRoborevEndpoint, serverInfoFile, "github.com", false, false)
+		done <- run(ctx, 0, defaultRoborevEndpoint, serverInfoFile, "github.com", false, false, "", "")
 	}()
 	baseURL := waitForServerInfoBaseURL(t, serverInfoFile, done)
 
@@ -973,8 +1007,7 @@ func TestResetSwapsFixtureState(t *testing.T) {
 	seededCIStatus := seededMR["CIStatus"]
 
 	// Mutate old-state fixture data away from the seeded value.
-	resp, err := http.Post(baseURL+"/__e2e/pr-ci-state/mixed", "application/json", nil)
-	require.NoError(err)
+	resp := doHTTP(t, http.MethodPost, baseURL+"/__e2e/pr-ci-state/mixed", nil)
 	resp.Body.Close()
 	require.Equal(http.StatusOK, resp.StatusCode)
 	mutatedDetail := getJSON(t, baseURL+"/api/v1/pulls/github/acme/widgets/1")
@@ -983,14 +1016,12 @@ func TestResetSwapsFixtureState(t *testing.T) {
 	require.NotEqual(seededCIStatus, mutatedMR["CIStatus"], "fixture mutation must change CI status")
 
 	// Malformed JSON must fail loudly, not reset.
-	resp, err = http.Post(baseURL+"/__e2e/reset", "application/json", strings.NewReader("{not json"))
-	require.NoError(err)
+	resp = doHTTP(t, http.MethodPost, baseURL+"/__e2e/reset", strings.NewReader("{not json"))
 	resp.Body.Close()
 	assert.Equal(http.StatusBadRequest, resp.StatusCode)
 
 	// A real reset succeeds and reports a fresh config path.
-	resp, err = http.Post(baseURL+"/__e2e/reset", "application/json", nil)
-	require.NoError(err)
+	resp = doHTTP(t, http.MethodPost, baseURL+"/__e2e/reset", nil)
 	var resetInfo e2eServerInfo
 	require.NoError(json.NewDecoder(resp.Body).Decode(&resetInfo))
 	resp.Body.Close()
@@ -1005,12 +1036,12 @@ func TestResetSwapsFixtureState(t *testing.T) {
 	assert.Equal(seededCIStatus, mr["CIStatus"], "seeded CI state must be restored after reset")
 
 	// Option overrides apply to the rebuilt state.
-	resp, err = http.Post(
+	resp = doHTTP(
+		t,
+		http.MethodPost,
 		baseURL+"/__e2e/reset",
-		"application/json",
 		strings.NewReader(`{"default_platform_host":"ghe.example.com"}`),
 	)
-	require.NoError(err)
 	resp.Body.Close()
 	require.Equal(http.StatusOK, resp.StatusCode)
 	repos := getJSONList(t, baseURL+"/api/v1/repos")
@@ -1040,6 +1071,7 @@ func TestResetStopsOldPrivateTmuxServerBeforeReturning(t *testing.T) {
 		t.Skip("tmux not available")
 	}
 	require := require.New(t)
+	//nolint:usetesting // unix socket path length requires a short OS temp root
 	tmuxDir, err := os.MkdirTemp("/tmp", "kf-e2e-tmux-")
 	require.NoError(err)
 	t.Cleanup(func() { _ = os.RemoveAll(tmuxDir) })
@@ -1050,13 +1082,12 @@ func TestResetStopsOldPrivateTmuxServerBeforeReturning(t *testing.T) {
 	serverInfoFile := filepath.Join(t.TempDir(), "server-info.json")
 	done := make(chan error, 1)
 	go func() {
-		done <- run(ctx, 0, defaultRoborevEndpoint, serverInfoFile, "github.com", false, false)
+		done <- run(ctx, 0, defaultRoborevEndpoint, serverInfoFile, "github.com", false, false, "", "")
 	}()
 	info := waitForServerInfo(t, serverInfoFile, done)
 	oldTmuxCommand := startPrivateE2ETmuxServer(t, info.ConfigPath)
 
-	resp, err := http.Post(info.BaseURL+"/__e2e/reset", "application/json", nil)
-	require.NoError(err)
+	resp := doHTTP(t, http.MethodPost, info.BaseURL+"/__e2e/reset", nil)
 	resp.Body.Close()
 	require.Equal(http.StatusOK, resp.StatusCode)
 	requirePrivateTmuxServerStopped(t, oldTmuxCommand)
@@ -1105,8 +1136,7 @@ func readInfoFile(t *testing.T, path string) e2eServerInfo {
 
 func getJSON(t *testing.T, url string) map[string]any {
 	t.Helper()
-	resp, err := http.Get(url)
-	require.NoError(t, err)
+	resp := doHTTP(t, http.MethodGet, url, nil)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	var payload map[string]any
@@ -1116,11 +1146,100 @@ func getJSON(t *testing.T, url string) map[string]any {
 
 func getJSONList(t *testing.T, url string) []any {
 	t.Helper()
-	resp, err := http.Get(url)
-	require.NoError(t, err)
+	resp := doHTTP(t, http.MethodGet, url, nil)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	var payload []any
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&payload))
 	return payload
+}
+
+func doHTTP(t *testing.T, method, rawURL string, body io.Reader) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), method, rawURL, body)
+	require.NoError(t, err)
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	require.NoError(t, err)
+	return resp
+}
+
+func TestMarkdownVideoFixtureServesWebMClipAsWebM(t *testing.T) {
+	assets, err := web.Assets()
+	require.NoError(t, err)
+	clipPath := filepath.Join(t.TempDir(), "demo.webm")
+	require.NoError(t, os.WriteFile(clipPath, []byte("webm"), 0o600))
+	state, err := buildAppState(t.Context(), assets, appOptions{
+		roborevEndpoint: defaultRoborevEndpoint,
+		markdownVideo:   clipPath,
+	})
+	require.NoError(t, err)
+	t.Cleanup(state.close)
+
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet,
+		"http://127.0.0.1/api/v1/repo/github/acme/widgets/markdown-media?source="+
+			url.QueryEscape("https://github.com/user-attachments/assets/e2e-demo-video"), nil)
+	recorder := httptest.NewRecorder()
+	state.handler.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	assert.Equal(t, "video/webm", recorder.Header().Get("Content-Type"))
+}
+
+func TestMarkdownVideoFixtureServesRanges(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	assets, err := web.Assets()
+	require.NoError(err)
+	clip := make([]byte, 100)
+	for i := range clip {
+		clip[i] = byte(i)
+	}
+	clipPath := filepath.Join(t.TempDir(), "demo.mp4")
+	require.NoError(os.WriteFile(clipPath, clip, 0o600))
+
+	state, err := buildAppState(t.Context(), assets, appOptions{
+		roborevEndpoint: defaultRoborevEndpoint,
+		markdownVideo:   clipPath,
+	})
+	require.NoError(err)
+	t.Cleanup(state.close)
+
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet,
+		"http://127.0.0.1/api/v1/repo/github/acme/widgets/markdown-media?source="+
+			url.QueryEscape("https://github.com/user-attachments/assets/e2e-demo-video"), nil)
+	request.Header.Set("Range", "bytes=10-19")
+	recorder := httptest.NewRecorder()
+	state.handler.ServeHTTP(recorder, request)
+
+	require.Equal(http.StatusPartialContent, recorder.Code, recorder.Body.String())
+	assert.Equal("video/mp4", recorder.Header().Get("Content-Type"))
+	assert.Equal("bytes 10-19/100", recorder.Header().Get("Content-Range"))
+	assert.Equal([]byte{10, 11, 12, 13, 14, 15, 16, 17, 18, 19}, recorder.Body.Bytes())
+
+	repo, err := state.database.GetRepoByIdentity(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widgets"))
+	require.NoError(err)
+	require.NotNil(repo)
+	issue, err := state.database.GetIssueByRepoIDAndNumber(t.Context(), repo.ID, e2eMarkdownVideoIssueNumber)
+	require.NoError(err)
+	require.NotNil(issue)
+	assert.Contains(issue.Body, "\n\nhttps://github.com/user-attachments/assets/e2e-demo-video\n\n")
+}
+
+func TestMarkdownVideoFixtureAbsentWithoutFlag(t *testing.T) {
+	require := require.New(t)
+	assets, err := web.Assets()
+	require.NoError(err)
+	state, err := buildAppState(t.Context(), assets, appOptions{roborevEndpoint: defaultRoborevEndpoint})
+	require.NoError(err)
+	t.Cleanup(state.close)
+
+	repo, err := state.database.GetRepoByIdentity(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widgets"))
+	require.NoError(err)
+	require.NotNil(repo)
+	issue, err := state.database.GetIssueByRepoIDAndNumber(t.Context(), repo.ID, e2eMarkdownVideoIssueNumber)
+	require.NoError(err)
+	assert.Nil(t, issue)
 }

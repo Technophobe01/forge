@@ -71,8 +71,8 @@ func TestObjectViewIgnoresGlobalAndSystemConfig(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg"))
 	system := filepath.Join(root, "system.gitconfig")
 	require := require.New(t)
-	require.NoError(os.WriteFile(filepath.Join(root, ".gitconfig"), []byte("[landingprobe]\n global = visible\n"), 0600))
-	require.NoError(os.WriteFile(system, []byte("[landingprobe]\n system = visible\n"), 0600))
+	require.NoError(os.WriteFile(filepath.Join(root, ".gitconfig"), []byte("[landingprobe]\n global = visible\n"), 0o600))
+	require.NoError(os.WriteFile(system, []byte("[landingprobe]\n system = visible\n"), 0o600))
 	m := &meter{limits: Limits{Records: 1000, Nodes: 1000, InputBytes: 1 << 20, OutputBytes: 1 << 20}}
 	v, err := openView(ctx, r.Root, m)
 	require.NoError(err)
@@ -91,4 +91,29 @@ func TestObjectViewIgnoresGlobalAndSystemConfig(t *testing.T) {
 	parents, err := v.parents(ctx, r.Head())
 	require.NoError(err)
 	require.Empty(parents)
+}
+
+func TestMergeTreeLeavesCallerObjectsUnchanged(t *testing.T) {
+	r := gittest.NewRepoWithCommit(t)
+	require := require.New(t)
+	common := r.CommitFile("work", "original\n", "common")
+	r.Checkout("-b", "source", common)
+	source := r.CommitFile("work", "source\n", "source")
+	r.Checkout("-b", "target", common)
+	target := r.CommitFile("work", "target\n", "target")
+	objects := r.Run("cat-file", "--batch-all-objects", "--batch-check")
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	v, err := openView(ctx, r.Root, &meter{limits: Limits{Records: 1000, Nodes: 1000, InputBytes: 1 << 20, OutputBytes: 1 << 20}})
+	require.NoError(err)
+	defer func() { require.NoError(v.close()) }()
+	matched, err := v.mergeTreeMatches(ctx, "", target, source, target)
+	require.ErrorIs(err, editProofError("merge_conflict"))
+	assert.False(t, matched)
+	assert.Equal(t, objects, r.Run("cat-file", "--batch-all-objects", "--batch-check"))
+	// A conflict creates a new tree and conflict-marker blob. They belong to
+	// the disposable view, not the caller's repository.
+	out, err := v.run(ctx, "count-objects", "-v")
+	require.NoError(err)
+	assert.NotContains(t, string(out), "count: 0\n")
 }

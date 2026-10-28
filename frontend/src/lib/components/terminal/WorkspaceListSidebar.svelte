@@ -1,21 +1,37 @@
 <script lang="ts">
+  import ItemFilters from "../shared/ItemFilters.svelte";
+  import { workspaceAuthorOptions, workspaceMatchesAuthor } from "./workspace-author-filter.js";
+  import QuerySearchInput from "../shared/QuerySearchInput.svelte";
+  import { buildCanonicalProviderItemURL } from "../../utils/item-reference.js";
   import {
     copyToClipboard,
     formatRelativeTime,
     formatTimestamp,
     IconButton,
-    SearchInput,
+    Menu,
+    MenuContent,
+    MenuItem,
+    MenuSeparator,
     StatusDot,
+    type MenuAnchorPoint,
     type StatusDotStatus,
   } from "@kenn-io/kit-ui";
   import PlusIcon from "@lucide/svelte/icons/plus";
   import PencilIcon from "@lucide/svelte/icons/pencil";
+  import PinIcon from "@lucide/svelte/icons/pin";
+  import PinOffIcon from "@lucide/svelte/icons/pin-off";
+  import CopyIcon from "@lucide/svelte/icons/copy";
+  import ExternalLinkIcon from "@lucide/svelte/icons/external-link";
+  import FolderOpenIcon from "@lucide/svelte/icons/folder-open";
+  import LinkIcon from "@lucide/svelte/icons/link";
+  import RefreshCwIcon from "@lucide/svelte/icons/refresh-cw";
+  import Trash2Icon from "@lucide/svelte/icons/trash-2";
   import {
     openNewWorkspaceDialog,
     type NewWorkspaceRepoSeed,
   } from "../../stores/new-workspace.svelte.js";
   import { onMount, tick } from "svelte";
-  import { Effect, Stream } from "effect";
+  import { Effect, Result, Stream } from "effect";
   import { navigate } from "../../stores/router.svelte.ts";
   import GitBranchIcon from "@lucide/svelte/icons/git-branch";
   import ArrowUpIcon from "@lucide/svelte/icons/arrow-up";
@@ -30,7 +46,7 @@
   import { getStores } from "../../context.js";
   import { showFlash } from "../../stores/flash.svelte.js";
   import type { HostSummary as GeneratedHostSummary } from "../../api/generated/models/index.js";
-  import { DiffStats, FilterDropdown, ScrollBox, SidebarToggle } from "@kenn-io/kit-ui";
+  import { DiffStats, ScrollBox, SidebarToggle } from "@kenn-io/kit-ui";
   import GroupedSidebarSection from "../shared/GroupedSidebarSection.svelte";
   import SidebarTitlePopover from "../sidebar/SidebarTitlePopover.svelte";
   import type { WorkspaceItemIdentity } from "../../workspace-inline.js";
@@ -46,8 +62,10 @@
     defaultWorkspaceListSort,
     loadWorkspaceListDisplayOptions,
     loadWorkspaceListSort,
+    loadPinnedWorkspaces,
     saveWorkspaceListDisplayOptions,
     saveWorkspaceListSort,
+    savePinnedWorkspaces,
     workspaceAgentStatePriority,
     workspaceAgentStateSortTime,
     workspaceListSortTimestamp,
@@ -58,7 +76,9 @@
   import {
     WorkspaceListWorkflow,
     makeWorkspaceRefreshHub,
+    removeWorkspaceListEntry,
     workspaceListLifecycle,
+    type WorkspaceListSnapshot,
   } from "./workspace-list-workflow.js";
   import { workspaceEventStream } from "./workspace-event-stream.js";
   import {
@@ -68,11 +88,19 @@
   } from "./workspace-list-schema.js";
   import { parseRepoFilterValue } from "../../stores/filter.svelte.js";
   import {
+    isEmptySearchQuery,
+    matchesSearchQuery,
+    parseSearchQuery,
+    type SearchQuery,
+  } from "../../utils/search-query.js";
+  import {
     canonicalRepoFilterValue,
     type RepoFilterIdentity,
   } from "../../utils/repo-filter-values.js";
   import { setWorkspaceRepoCatalog } from "../../stores/workspace-repo-catalog.svelte.js";
   import { loadFleetSnapshot } from "../../api/fleet-snapshot.js";
+  import { repositoryKeyFromWire } from "../../api/repository-key.js";
+  import { workspaceItemAccent, workspaceItemState, type WorkspaceItemState } from "./workspace-item-state.js";
 
   type Workspace = WorkspaceListItem;
 
@@ -132,7 +160,7 @@
   }: Props = $props();
 
   const runtime = getAppRuntime();
-  const { events: eventsStore } = getStores();
+  const { events: eventsStore, detail } = getStores();
 
   const doneAcknowledgementsStorageKey =
     "kenn-forge:workspace-agent-done-acknowledgements/v1";
@@ -158,24 +186,34 @@
   let fleetPeerErrors = $state.raw<Record<string, string>>({});
   let collapsedGroups = $state<string[]>([]);
   let searchQuery = $state("");
+  let author = $state("");
   let sortMode = $state<WorkspaceListSort>(loadWorkspaceListSort());
+  let pinnedWorkspaceKeys = $state.raw(loadPinnedWorkspaces());
+  let pinsCollapsed = $state(false);
   let workspaceListStatus = $state<"loading" | "retrying" | "loaded">("loading");
+  // Kept after close so the menu can return focus to the right-clicked row.
   let contextMenu = $state<{
     ws: Workspace;
-    x: number;
-    y: number;
+    anchor: MenuAnchorPoint;
+    row: HTMLElement | undefined;
   } | null>(null);
+  let contextMenuOpen = $state(false);
+  // Row keys picked with shift-click (range) or Cmd/Ctrl-click (toggle).
+  // Separate from the opened workspace, which stays route-owned.
+  let multiSelectedKeys = $state.raw<ReadonlySet<string>>(new Set());
+  let selectionAnchorKey = $state<string | null>(null);
   let deleteConfirmWorkspace = $state<Workspace | null>(null);
   let deleteConfirmForce = $state(false);
+  let bulkDeleteConfirm = $state.raw<Workspace[] | null>(null);
+  // A bulk delete holds one key per in-flight row; each finished row drops
+  // its key so the remaining rows keep their busy state.
   let workspaceAction = $state<{
-    workspaceKey: string;
+    workspaceKeys: readonly string[];
     action: "push" | "pull" | "reveal" | "delete";
   } | null>(null);
-  let contextMenuEl = $state<HTMLDivElement | null>(null);
   // Row elements keyed by workspaceRowKey so the snippet-rendered rows can
   // each anchor their own truncation popover.
   let rowEls = $state<Record<string, HTMLElement | null>>({});
-  let contextMenuStyle = $state("");
   let acknowledgedDoneStates = $state.raw<Record<string, string>>(
     loadDoneAcknowledgements(),
   );
@@ -206,18 +244,17 @@
     items: Workspace[];
   };
 
-  const normalizedSearchQuery = $derived(
-    searchQuery.trim().toLowerCase(),
-  );
+  const parsedSearchQuery = $derived(parseSearchQuery(searchQuery));
+  const hasSearchQuery = $derived(!isEmptySearchQuery(parsedSearchQuery));
   const selectedRepoValues = $derived(new Set(parseRepoFilterValue(selectedRepos)));
   const deleteConfirmBusy = $derived(
     deleteConfirmWorkspace !== null &&
       workspaceActionMatches(deleteConfirmWorkspace, "delete"),
   );
 
-  const visibleWorkspaces = $derived.by(() => {
+  const scopedWorkspaces = $derived.by(() => {
     const repoIdentities = workspaces.map(workspaceRepoFilterIdentity);
-    const scoped = selectedRepoValues.size === 0
+    return selectedRepoValues.size === 0
       ? workspaces
       : workspaces.filter((workspace) => {
           const value = canonicalRepoFilterValue(
@@ -226,19 +263,29 @@
           );
           return value !== null && selectedRepoValues.has(value);
         });
-    if (!normalizedSearchQuery) return scoped;
-    return scoped.filter((ws) => workspaceMatchesSearch(ws, normalizedSearchQuery));
   });
+  const authorOptions = $derived(workspaceAuthorOptions(scopedWorkspaces));
+  const visibleWorkspaces = $derived(scopedWorkspaces.filter((ws) =>
+    workspaceMatchesAuthor(ws, author) &&
+    (!hasSearchQuery || workspaceMatchesSearch(ws, parsedSearchQuery)),
+  ));
+
+  const pinnedWorkspaces = $derived(
+    pinnedWorkspaceKeys.flatMap((key) =>
+      visibleWorkspaces.filter((ws) => workspaceRowKey(ws) === key),
+    ),
+  );
+  const unpinnedWorkspaces = $derived(visibleWorkspaces.filter((ws) => !isPinned(ws)));
 
   const sidebarCountLabel = $derived(
-    normalizedSearchQuery || selectedRepoValues.size > 0
+    hasSearchQuery || author || selectedRepoValues.size > 0
       ? `${visibleWorkspaces.length}/${workspaces.length}`
       : `${workspaces.length}`,
   );
 
   const grouped = $derived.by<WorkspaceGroup[]>(() => {
     const groups: WorkspaceGroup[] = [];
-    for (const ws of visibleWorkspaces) {
+    for (const ws of unpinnedWorkspaces) {
       const key = repoIdentityKey(workspaceRepoIdentity(ws));
       const group = groups.find((candidate) => candidate.key === key);
       if (group) {
@@ -257,6 +304,7 @@
   );
 
   const viewBadgeCount = $derived(
+    Number(Boolean(author)) + Number(hasSearchQuery) +
     Number(sortMode !== defaultWorkspaceListSort) +
       Number(
         displayOptions.showOrgNames !==
@@ -271,6 +319,7 @@
   const viewSections = $derived.by(() => [
     {
       title: "Sorting",
+      selectionMode: "single" as const,
       items: workspaceListSortOptions.map((option) => ({
         id: option.value,
         label: option.label,
@@ -326,7 +375,7 @@
   // Missing timestamps fall back to workspace creation time.
   const sortedFlat = $derived.by(() => {
     if (sortMode === "agent-status") {
-      return [...visibleWorkspaces].sort(
+      return [...unpinnedWorkspaces].sort(
         (a, b) =>
           workspaceAgentStatePriority(b.agent_state) - workspaceAgentStatePriority(a.agent_state) ||
           timeValue(workspaceAgentStateSortTime(b)) - timeValue(workspaceAgentStateSortTime(a)) ||
@@ -341,14 +390,60 @@
             timeValue(ws.item_last_activity_at) ||
             timeValue(ws.created_at)
         : (ws: Workspace) => timeValue(ws.created_at);
-    return [...visibleWorkspaces].sort(
+    return [...unpinnedWorkspaces].sort(
       (a, b) => stamp(b) - stamp(a) || a.id.localeCompare(b.id),
     );
   });
 
+  // Rows in on-screen order, skipping collapsed sections, so a shift-click
+  // range and bulk actions only ever cover rows the user can see.
+  const renderedWorkspaces = $derived.by<Workspace[]>(() => {
+    const rows = !hasSearchQuery && pinsCollapsed ? [] : [...pinnedWorkspaces];
+    if (sortMode !== "repo") return [...rows, ...sortedFlat];
+    for (const group of grouped) {
+      if (!hasSearchQuery && collapsedGroups.includes(group.key)) continue;
+      rows.push(...group.items);
+    }
+    return rows;
+  });
+  const multiSelectedWorkspaces = $derived(
+    renderedWorkspaces.filter((ws) => multiSelectedKeys.has(workspaceRowKey(ws))),
+  );
+
+  function resetFilters(): void {
+    author = "";
+    searchQuery = "";
+    setSort(defaultWorkspaceListSort);
+    displayOptions = { ...defaultWorkspaceListDisplayOptions };
+    saveWorkspaceListDisplayOptions(displayOptions);
+  }
+
   function setSort(sort: WorkspaceListSort): void {
     sortMode = sort;
     saveWorkspaceListSort(sort);
+  }
+
+  function isPinned(ws: Workspace): boolean {
+    return pinnedWorkspaceKeys.includes(workspaceRowKey(ws));
+  }
+
+  async function togglePin(ws: Workspace): Promise<void> {
+    const key = workspaceRowKey(ws);
+    if (isPinned(ws)) {
+      pinnedWorkspaceKeys = pinnedWorkspaceKeys.filter((candidate) => candidate !== key);
+      const groupKey = repoIdentityKey(workspaceRepoIdentity(ws));
+      collapsedGroups = collapsedGroups.filter((candidate) => candidate !== groupKey);
+    } else {
+      pinnedWorkspaceKeys = [...pinnedWorkspaceKeys, key];
+    }
+    savePinnedWorkspaces(pinnedWorkspaceKeys);
+    pinsCollapsed = false;
+    closeContextMenu();
+    // Pinning moves the row into another list, replacing the element the
+    // menu would return focus to. The destination list is expanded above so
+    // the new row renders.
+    await tick();
+    rowEls[key]?.focus();
   }
 
   function setDisplayOption(
@@ -358,40 +453,6 @@
     displayOptions = { ...displayOptions, [key]: value };
     saveWorkspaceListDisplayOptions(displayOptions);
   }
-
-  $effect(() => {
-    if (!contextMenu) return;
-
-    function closeForOutsideClick(event: MouseEvent): void {
-      if (
-        contextMenuEl &&
-        event.target instanceof Node &&
-        contextMenuEl.contains(event.target)
-      ) {
-        return;
-      }
-      closeContextMenu();
-    }
-
-    function closeForEscape(event: KeyboardEvent): void {
-      if (event.key === "Escape") closeContextMenu();
-    }
-
-    function reposition(): void {
-      positionContextMenu();
-    }
-
-    document.addEventListener("mousedown", closeForOutsideClick);
-    document.addEventListener("keydown", closeForEscape);
-    window.addEventListener("resize", reposition);
-    window.addEventListener("scroll", closeContextMenu, true);
-    return () => {
-      document.removeEventListener("mousedown", closeForOutsideClick);
-      document.removeEventListener("keydown", closeForEscape);
-      window.removeEventListener("resize", reposition);
-      window.removeEventListener("scroll", closeContextMenu, true);
-    };
-  });
 
   $effect(() => {
     onWorkspaceListStateChange?.({
@@ -446,6 +507,7 @@
       peerCatalogStatus = "loading";
     }).pipe(
       Effect.andThen(Effect.gen(function* () {
+        const workflow = yield* WorkspaceListWorkflow;
         const data = yield* loadFleetSnapshot().pipe(
           Effect.timeout(`${workspaceListLoadTimeoutMs} millis`),
         );
@@ -459,22 +521,27 @@
           data.aggregateIncomplete ?? false,
         );
         yield* Effect.sync(() => {
-          reconcileDoneAcknowledgements(nextWorkspaces);
-          workspaces = nextWorkspaces;
-          fleetHosts = nextHosts;
-          fleetPeerErrors = Object.fromEntries(
-            fleetHosts
-              .filter((host) => host.kind !== "self" && host.error)
-              .map((host) => [host.configKey, host.error ?? "Host unavailable"]),
-          );
-          fleetError = null;
-          workspaceListStatus = "loaded";
-          localCatalogStatus = "loaded";
-          fleetCatalogStatus = aggregateComplete ? "loaded" : "failed";
-          peerCatalogStatus = aggregateComplete ? "loaded" : "failed";
+          workflow.snapshot = { workspaces: nextWorkspaces, hosts: nextHosts, aggregateComplete };
+          applySnapshot(workflow.snapshot);
         });
       })),
     );
+  }
+
+  function applySnapshot(snapshot: WorkspaceListSnapshot): void {
+    reconcileDoneAcknowledgements(snapshot.workspaces);
+    workspaces = snapshot.workspaces;
+    fleetHosts = snapshot.hosts;
+    fleetPeerErrors = Object.fromEntries(
+      fleetHosts
+        .filter((host) => host.kind !== "self" && host.error)
+        .map((host) => [host.configKey, host.error ?? "Host unavailable"]),
+    );
+    fleetError = null;
+    workspaceListStatus = "loaded";
+    localCatalogStatus = "loaded";
+    fleetCatalogStatus = snapshot.aggregateComplete ? "loaded" : "failed";
+    peerCatalogStatus = snapshot.aggregateComplete ? "loaded" : "failed";
   }
 
   function toggleGroup(key: string): void {
@@ -544,7 +611,7 @@
 
   function workspaceMatchesSearch(
     ws: Workspace,
-    query: string,
+    query: SearchQuery,
   ): boolean {
       const haystack: Array<string | undefined> = [
       displayName(ws),
@@ -597,12 +664,11 @@
       );
     }
 
-    return haystack.some((value) =>
-      value?.toLowerCase().includes(query),
-    );
+    return matchesSearchQuery(query, haystack);
   }
 
   function workspaceStatus(ws: Workspace): StatusDotStatus {
+    if (workspaceMerging(ws)) return "working";
     if (ws.status === "ready") return "idle";
     if (ws.status === "creating" || ws.status === "deleting") return "working";
     if (ws.status === "error" || ws.status === "deletion_failed") return "unclean";
@@ -610,12 +676,26 @@
   }
 
   function workspaceStatusLabel(ws: Workspace): string {
+    if (workspaceMerging(ws)) return "Merging";
     if (ws.status === "ready") return "Workspace ready";
     if (ws.status === "creating") return "Creating workspace";
     if (ws.status === "error") return "Workspace error";
     if (ws.status === "deleting") return "Deleting workspace";
     if (ws.status === "deletion_failed") return "Deletion failed";
     return `Workspace ${ws.status}`;
+  }
+
+  function workspaceMerging(ws: Workspace): boolean {
+    if (!ws.repo) return false;
+    const number = ws.item_type === "pull_request" ? ws.item_number : (ws.associated_pr_number ?? 0);
+    return number > 0 && detail.isPullMerging({
+      provider: ws.repo.provider,
+      platformHost: ws.repo.platform_host,
+      repositoryKey: repositoryKeyFromWire(ws.repo),
+      owner: ws.repo.owner,
+      name: ws.repo.name,
+      repoPath: ws.repo.repo_path,
+    }, number);
   }
 
   function workingTitle(ws: Workspace): string {
@@ -724,17 +804,8 @@
     navigate(workspaceRoute(ws));
   }
 
-  function itemStateClass(ws: Workspace): string {
-    if (ws.item_type === "kata_task") {
-      return "kata";
-    }
-    if (ws.item_type === "issue") {
-      return ws.mr_state === "closed" ? "closed" : "issue";
-    }
-    if (ws.mr_is_draft) return "draft";
-    if (ws.mr_state === "merged") return "merged";
-    if (ws.mr_state === "closed") return "closed";
-    return "open";
+  function itemState(ws: Workspace): WorkspaceItemState {
+    return workspaceItemState(ws, ws.item_type === "issue" ? "issue" : "pr");
   }
 
   function shortBranch(ref: string): string {
@@ -801,32 +872,21 @@
   }
 
   function providerItemURL(ws: Workspace): string | null {
-    // Kata workspaces are not backed by a provider item, and an ad-hoc
-    // workspace only has one once a PR has been detected for its branch.
+    // Kata and unlinked ad-hoc workspaces have no provider item.
     if (ws.item_type === "kata_task") return null;
     const itemNumber = itemBubbleNumber(ws);
     if (itemNumber === null) return null;
     const provider = workspaceProvider(ws)?.toLowerCase();
-    const repoPath = ws.repo?.repo_path ?? `${ws.repo_owner}/${ws.repo_name}`;
-    const encodedPath = repoPath
-      .split("/")
-      .map((part) => encodeURIComponent(part))
-      .join("/");
-    const host = ws.platform_host;
-    if (!host || !encodedPath) return null;
-    if (provider === "github") {
-      const kind = ws.item_type === "issue" ? "issues" : "pull";
-      return `https://${host}/${encodedPath}/${kind}/${itemNumber}`;
-    }
-    if (provider === "gitlab") {
-      const kind = ws.item_type === "issue" ? "issues" : "merge_requests";
-      return `https://${host}/${encodedPath}/-/${kind}/${itemNumber}`;
-    }
-    if (provider === "gitea" || provider === "forgejo") {
-      const kind = ws.item_type === "issue" ? "issues" : "pulls";
-      return `https://${host}/${encodedPath}/${kind}/${itemNumber}`;
-    }
-    return null;
+    if (!provider) return null;
+    return buildCanonicalProviderItemURL({
+      provider,
+      platformHost: ws.platform_host,
+      owner: ws.repo_owner,
+      name: ws.repo_name,
+      repoPath: ws.repo?.repo_path ?? `${ws.repo_owner}/${ws.repo_name}`,
+      number: itemNumber,
+      itemType: ws.item_type === "issue" ? "issue" : "pr",
+    }) ?? null;
   }
 
   function providerLabel(ws: Workspace): string {
@@ -864,40 +924,75 @@
     return "";
   }
 
+  function clearMultiSelection(): void {
+    multiSelectedKeys = new Set();
+    selectionAnchorKey = null;
+  }
+
+  function isMultiSelected(ws: Workspace): boolean {
+    return multiSelectedKeys.has(workspaceRowKey(ws));
+  }
+
+  // The opened workspace starts a selection the way the focused file does in
+  // a file manager, so shift-click from it selects the range in between.
+  function openedRowKey(): string | null {
+    const opened = renderedWorkspaces.find(isSelectedWorkspace);
+    return opened ? workspaceRowKey(opened) : null;
+  }
+
+  function selectWorkspaceRange(ws: Workspace): void {
+    const keys = renderedWorkspaces.map(workspaceRowKey);
+    const clickedKey = workspaceRowKey(ws);
+    const anchorKey = [selectionAnchorKey, openedRowKey()].find(
+      (key) => key !== null && keys.includes(key),
+    ) ?? clickedKey;
+    const from = keys.indexOf(anchorKey);
+    const to = keys.indexOf(clickedKey);
+    multiSelectedKeys = new Set(keys.slice(Math.min(from, to), Math.max(from, to) + 1));
+    selectionAnchorKey = anchorKey;
+  }
+
+  function toggleWorkspaceSelection(ws: Workspace): void {
+    const key = workspaceRowKey(ws);
+    const next = new Set(multiSelectedWorkspaces.map(workspaceRowKey));
+    if (next.size === 0) {
+      const opened = openedRowKey();
+      if (opened !== null) next.add(opened);
+    }
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    multiSelectedKeys = next;
+    selectionAnchorKey = key;
+  }
+
+  // Shift extends a range and Cmd/Ctrl toggles a row; neither opens the
+  // workspace. A plain activation drops the selection and opens the row.
+  function activateRow(event: MouseEvent | KeyboardEvent, ws: Workspace): void {
+    if (event.shiftKey) {
+      selectWorkspaceRange(ws);
+    } else if (event.metaKey || event.ctrlKey) {
+      toggleWorkspaceSelection(ws);
+    } else {
+      clearMultiSelection();
+      openWorkspace(ws);
+    }
+  }
+
   function openContextMenu(event: MouseEvent, ws: Workspace): void {
     event.preventDefault();
     event.stopPropagation();
+    // Right-clicking outside the selection acts on that row alone.
+    if (!isMultiSelected(ws)) clearMultiSelection();
     contextMenu = {
       ws,
-      x: event.clientX,
-      y: event.clientY,
+      anchor: { x: event.clientX, y: event.clientY },
+      row: event.currentTarget instanceof HTMLElement ? event.currentTarget : undefined,
     };
-    runtime.runCommand(Effect.promise(() => tick()).pipe(Effect.andThen(Effect.sync(positionContextMenu))), {
-      operation: "position workspace context menu",
-      safeContext: { workspaceId: ws.id },
-      onFailure: () => undefined,
-    });
-  }
-
-  function positionContextMenu(): void {
-    if (!contextMenu || !contextMenuEl) return;
-    const margin = 8;
-    const width = contextMenuEl.offsetWidth;
-    const height = contextMenuEl.offsetHeight;
-    const left = Math.min(
-      Math.max(margin, contextMenu.x),
-      Math.max(margin, window.innerWidth - width - margin),
-    );
-    const top = Math.min(
-      Math.max(margin, contextMenu.y),
-      Math.max(margin, window.innerHeight - height - margin),
-    );
-    contextMenuStyle = `left: ${left}px; top: ${top}px;`;
+    contextMenuOpen = true;
   }
 
   function closeContextMenu(): void {
-    contextMenu = null;
-    contextMenuStyle = "";
+    contextMenuOpen = false;
   }
 
   function copyMenuText(value: string, successMessage: string): void {
@@ -923,8 +1018,8 @@
     closeContextMenu();
     const hostKey = ws.fleet_host_key;
     const refresh = hostKey
-      ? executeOpaqueGeneratedApiRequest("refresh remote workspace", (generatedClient, signal) =>
-          generatedClient.FleetService.refreshFleetWorkspace({ hostKey, id: ws.id }, { signal }),
+      ? executeOpaqueGeneratedApiRequest<unknown>("refresh remote workspace", (generatedClient, signal) =>
+          (hostKey.startsWith("devbox:") ? generatedClient.DevboxesService.refreshDevboxWorkspace({ connectionId: hostKey.slice(7),  id: ws.id }, { signal }) : generatedClient.FleetService.refreshFleetWorkspace({ hostKey, id: ws.id }, { signal })),
         ).pipe(Effect.asVoid)
       : executeGeneratedApiRequest("refresh workspace", (generatedClient, signal) =>
           generatedClient.WorkspacesService.refreshWorkspace({ id: ws.id }, { signal }),
@@ -941,7 +1036,8 @@
     action?: "push" | "pull" | "reveal" | "delete",
   ): boolean {
     return (
-      workspaceAction?.workspaceKey === workspaceRowKey(ws) &&
+      workspaceAction !== null &&
+      workspaceAction.workspaceKeys.includes(workspaceRowKey(ws)) &&
       (action === undefined || workspaceAction.action === action)
     );
   }
@@ -961,25 +1057,29 @@
     return "";
   }
 
+  function workspaceDeletable(ws: Workspace): boolean {
+    return ws.status !== "deleting" &&
+      workspaceOperationAvailable(ws, "workspaceWrite") &&
+      !(isWorkspaceActionDisabled?.(ws.id, ws.fleet_host_key) ?? false);
+  }
+
   function startWorkspaceAction(
     ws: Workspace,
     action: "push" | "pull" | "reveal" | "delete",
   ): boolean {
-    const externallyDisabled = isWorkspaceActionDisabled?.(ws.id, ws.fleet_host_key) ?? false;
-    const deletionDisabled = ws.status === "deleting" || externallyDisabled;
     if (
       workspaceAction !== null ||
-      !workspaceOperationAvailable(ws, "workspaceWrite") ||
-      (action === "delete" ? deletionDisabled : workspaceActionsDisabled(ws))
+      !(action === "delete" ? workspaceDeletable(ws) : !workspaceActionsDisabled(ws))
     ) return false;
-    workspaceAction = { workspaceKey: workspaceRowKey(ws), action };
+    workspaceAction = { workspaceKeys: [workspaceRowKey(ws)], action };
     return true;
   }
 
   function finishWorkspaceAction(ws: Workspace): void {
-    if (workspaceActionMatches(ws)) {
-      workspaceAction = null;
-    }
+    if (!workspaceAction || !workspaceActionMatches(ws)) return;
+    const key = workspaceRowKey(ws);
+    const remaining = workspaceAction.workspaceKeys.filter((candidate) => candidate !== key);
+    workspaceAction = remaining.length > 0 ? { ...workspaceAction, workspaceKeys: remaining } : null;
   }
 
   function syncWorkspaceBranch(ws: Workspace, action: "push" | "pull"): void {
@@ -988,11 +1088,11 @@
     const hostKey = ws.fleet_host_key;
     const command = hostKey
       ? action === "push"
-        ? executeOpaqueGeneratedApiRequest("push remote workspace branch", (generatedClient, signal) =>
-            generatedClient.FleetService.pushFleetWorkspaceBranch({ hostKey, id: ws.id }, { signal }),
+        ? executeOpaqueGeneratedApiRequest<unknown>("push remote workspace branch", (generatedClient, signal) =>
+            (hostKey.startsWith("devbox:") ? generatedClient.DevboxesService.pushDevboxWorkspace({ connectionId: hostKey.slice(7),  id: ws.id }, { signal }) : generatedClient.FleetService.pushFleetWorkspaceBranch({ hostKey, id: ws.id }, { signal })),
           ).pipe(Effect.asVoid)
-        : executeOpaqueGeneratedApiRequest("pull remote workspace branch", (generatedClient, signal) =>
-            generatedClient.FleetService.pullFleetWorkspaceBranch({ hostKey, id: ws.id }, { signal }),
+        : executeOpaqueGeneratedApiRequest<unknown>("pull remote workspace branch", (generatedClient, signal) =>
+            (hostKey.startsWith("devbox:") ? generatedClient.DevboxesService.pullDevboxWorkspace({ connectionId: hostKey.slice(7),  id: ws.id }, { signal }) : generatedClient.FleetService.pullFleetWorkspaceBranch({ hostKey, id: ws.id }, { signal })),
           ).pipe(Effect.asVoid)
       : action === "push"
         ? executeGeneratedApiRequest("push workspace branch", (generatedClient, signal) =>
@@ -1024,7 +1124,7 @@
     const label = revealLabel(ws);
     const hostKey = ws.fleet_host_key;
     const command = hostKey
-      ? executeOpaqueGeneratedApiRequest("reveal remote workspace path", (generatedClient, signal) =>
+      ? executeOpaqueGeneratedApiRequest<unknown>("reveal remote workspace path", (generatedClient, signal) =>
           generatedClient.FleetService.revealFleetWorkspace({ hostKey, id: ws.id }, { signal }),
         ).pipe(Effect.asVoid)
       : executeGeneratedApiRequest("reveal workspace path", (generatedClient, signal) =>
@@ -1055,19 +1155,28 @@
     deleteConfirmForce = false;
   }
 
-  function confirmDeleteWorkspaceFromList(): void {
-    const ws = deleteConfirmWorkspace;
-    if (!ws || !startWorkspaceAction(ws, "delete")) return;
-    const force = deleteConfirmForce;
-    onWorkspaceDeletePendingChange?.(ws.id, ws.fleet_host_key, true);
+  function deleteFailureMessage(failure: unknown): string {
+    const problem = failure instanceof ApiProblemError ? failure.problem : undefined;
+    const fallback = problem?.status === 409
+      ? "Workspace has uncommitted changes. Open it to force delete."
+      : "Delete failed.";
+    return failureMessage(failure, fallback);
+  }
+
+  // Deletes one workspace and evicts it from this list. Callers mark the
+  // workspace pending and reserve its action key before running this.
+  function deleteWorkspaceFromList(ws: Workspace, force: boolean) {
     const hostKey = ws.fleet_host_key;
     const command = hostKey
-      ? executeOpaqueGeneratedApiRequest("delete remote workspace", (generatedClient, signal) =>
-          generatedClient.FleetService.deleteFleetWorkspace(
+      ? executeOpaqueGeneratedApiRequest<unknown>("delete remote workspace", (generatedClient, signal) =>
+          (hostKey.startsWith("devbox:") ? generatedClient.DevboxesService.deleteDevboxWorkspace({ connectionId: hostKey.slice(7),  id: ws.id },
+            force ? { force: true } : undefined,
+            { signal },
+          ) : generatedClient.FleetService.deleteFleetWorkspace(
             { hostKey, id: ws.id },
             force ? { force: true } : undefined,
             { signal },
-          ),
+          )),
         ).pipe(Effect.asVoid)
       : executeGeneratedApiRequest("delete workspace", (generatedClient, signal) =>
           generatedClient.WorkspacesService.deleteWorkspace(
@@ -1076,27 +1185,49 @@
             { signal },
           ),
         ).pipe(Effect.asVoid);
+    return command.pipe(
+      Effect.tap(() => removeWorkspaceListEntry(ws.id, hostKey)),
+      Effect.tap(() =>
+        Effect.sync(() => {
+          workspaces = workspaces.filter(
+            (candidate) => candidate.id !== ws.id || candidate.fleet_host_key !== hostKey,
+          );
+          // Report the deletion regardless of selection so a hosting shell's
+          // inline claim cannot briefly reclaim a workspace this list destroyed.
+          onWorkspaceDeleted?.(
+            ws.id,
+            hostKey,
+            ws.repo
+              ? {
+                  provider: ws.repo.provider,
+                  platformHost: ws.repo.platform_host,
+                  owner: ws.repo.owner,
+                  name: ws.repo.name,
+                  repoPath: ws.repo.repo_path,
+                  number: ws.item_number,
+                  itemType: ws.item_type,
+                }
+              : undefined,
+          );
+        }),
+      ),
+      Effect.ensuring(
+        Effect.sync(() => {
+          onWorkspaceDeletePendingChange?.(ws.id, hostKey, false);
+          finishWorkspaceAction(ws);
+        }),
+      ),
+    );
+  }
+
+  function confirmDeleteWorkspaceFromList(): void {
+    const ws = deleteConfirmWorkspace;
+    if (!ws || !startWorkspaceAction(ws, "delete")) return;
+    onWorkspaceDeletePendingChange?.(ws.id, ws.fleet_host_key, true);
     runtime.runCommand(
-      command.pipe(
+      deleteWorkspaceFromList(ws, deleteConfirmForce).pipe(
         Effect.tap(() =>
           Effect.sync(() => {
-            // Report the deletion regardless of selection so a hosting shell's
-            // inline claim cannot briefly reclaim a workspace this list destroyed.
-            onWorkspaceDeleted?.(
-              ws.id,
-              hostKey,
-              ws.repo
-                ? {
-                    provider: ws.repo.provider,
-                    platformHost: ws.repo.platform_host,
-                    owner: ws.repo.owner,
-                    name: ws.repo.name,
-                    repoPath: ws.repo.repo_path,
-                    number: ws.item_number,
-                    itemType: ws.item_type,
-                  }
-                : undefined,
-            );
             requestApplicationWorkspaceRefresh();
             closeContextMenu();
             if (isSelectedWorkspace(ws)) navigate("/workspaces");
@@ -1104,8 +1235,6 @@
         ),
         Effect.ensuring(
           Effect.sync(() => {
-            onWorkspaceDeletePendingChange?.(ws.id, hostKey, false);
-            finishWorkspaceAction(ws);
             deleteConfirmWorkspace = null;
             deleteConfirmForce = false;
           }),
@@ -1113,14 +1242,67 @@
       ),
       {
         operation: "delete workspace",
-        safeContext: { workspaceId: ws.id, remote: Boolean(hostKey) },
-        onFailure: (failure) => {
-          const problem = failure instanceof ApiProblemError ? failure.problem : undefined;
-          const fallback = problem?.status === 409
-            ? "Workspace has uncommitted changes. Open it to force delete."
-            : "Delete failed.";
-          showFlash(failureMessage(failure, fallback), { tone: "danger" });
-        },
+        safeContext: { workspaceId: ws.id, remote: Boolean(ws.fleet_host_key) },
+        onFailure: (failure) => showFlash(deleteFailureMessage(failure), { tone: "danger" }),
+      },
+    );
+  }
+
+  function openBulkDeleteDialog(targets: Workspace[]): void {
+    bulkDeleteConfirm = targets;
+    closeContextMenu();
+  }
+
+  function closeBulkDeleteDialog(): void {
+    bulkDeleteConfirm = null;
+  }
+
+  function bulkDeleteMessage(targets: Workspace[]): string {
+    const names = targets.slice(0, 3).map((ws) => `"${displayName(ws)}"`);
+    const more = targets.length - names.length;
+    return `Delete ${names.join(", ")}${more > 0 ? ` and ${more} more` : ""}?`;
+  }
+
+  // Deletes without force, so the server keeps any workspace with
+  // uncommitted changes; those are reported rather than discarded. The
+  // dialog closes at once and each row disappears as its delete finishes.
+  function confirmBulkDelete(): void {
+    const targets = (bulkDeleteConfirm ?? []).filter(workspaceDeletable);
+    if (targets.length === 0 || workspaceAction !== null) return;
+    bulkDeleteConfirm = null;
+    clearMultiSelection();
+    workspaceAction = { workspaceKeys: targets.map(workspaceRowKey), action: "delete" };
+    for (const ws of targets) onWorkspaceDeletePendingChange?.(ws.id, ws.fleet_host_key, true);
+    runtime.runCommand(
+      Effect.forEach(
+        targets,
+        (ws) => Effect.result(deleteWorkspaceFromList(ws, false)).pipe(
+          Effect.map((result) => ({ ws, result })),
+        ),
+        { concurrency: 4 },
+      ).pipe(
+        Effect.flatMap((outcomes) =>
+          Effect.sync(() => {
+            requestApplicationWorkspaceRefresh();
+            const failures = outcomes.flatMap(({ ws, result }) =>
+              Result.isFailure(result) ? [`${displayName(ws)}: ${deleteFailureMessage(result.failure)}`] : [],
+            );
+            if (outcomes.some(({ ws, result }) => Result.isSuccess(result) && isSelectedWorkspace(ws))) {
+              navigate("/workspaces");
+            }
+            if (failures.length > 0) {
+              showFlash(
+                `Could not delete ${failures.length} of ${targets.length} workspaces. ${failures.join(" ")}`,
+                { tone: "danger" },
+              );
+            }
+          }),
+        ),
+      ),
+      {
+        operation: "delete workspaces",
+        safeContext: { count: targets.length },
+        onFailure: (failure) => showFlash(failureMessage(failure, "Delete failed."), { tone: "danger" }),
       },
     );
   }
@@ -1165,6 +1347,7 @@
     return {
       provider,
       platformHost: current.platform_host,
+      repositoryKey: repositoryKeyFromWire(current.repo),
       owner: current.repo_owner,
       name: current.repo_name,
     };
@@ -1200,12 +1383,18 @@
 
   onMount(() => {
     const workspaceEvents = workspaceEventStream(eventsStore.subscribeWorkspaceEvents).pipe(
-      Stream.filter((signal) => signal._tag === "Status"),
+      Stream.filter((signal) =>
+        signal._tag === "Status" ||
+        signal._tag === "Open" ||
+        signal._tag === "ReconnectStale" ||
+        signal._tag === "Associated"
+      ),
     );
     const execution = runtime.runCommand(
       Effect.scoped(
         Effect.gen(function* () {
           const workflow = yield* WorkspaceListWorkflow;
+          if (workflow.snapshot) applySnapshot(workflow.snapshot);
           requestApplicationWorkspaceRefresh = workflow.request;
           yield* workflow.claim(workspaceRefreshOwner, refreshWorkspaces.request);
           yield* workspaceListLifecycle({
@@ -1242,15 +1431,19 @@
       <PlusIcon size="13" strokeWidth="2.2" aria-hidden="true" />
     </IconButton>
     <div class="workspace-sort">
-      <FilterDropdown
-        label="View"
+      <ItemFilters
+        panelLabel="Workspace filters"
+        title="Filter workspaces"
+        align="end"
+        {author}
+        {authorOptions}
+        authorLoading={workspaceListStatus !== "loaded" && workspaces.length === 0}
+        compact
         detail={sortLabel}
-        active={viewBadgeCount > 0}
         badgeCount={viewBadgeCount}
         sections={viewSections}
-        title="View workspace options"
-        minWidth="220px"
-        align="end"
+        onAuthorSelect={(value) => { author = value; }}
+        onReset={resetFilters}
       />
     </div>
     {#if isSidebarToggleEnabled && onCollapseSidebar}
@@ -1266,7 +1459,7 @@
     {/if}
   </div>
   <div class="workspace-filter">
-    <SearchInput
+    <QuerySearchInput
       value={searchQuery}
       size="sm"
       block
@@ -1294,10 +1487,25 @@
   {/if}
   <ScrollBox class="sidebar-list" label="Workspaces">
     {#snippet children()}
+    {#if pinnedWorkspaces.length > 0}
+      <GroupedSidebarSection
+        label="Pinned"
+        count={pinnedWorkspaces.length}
+        collapsed={!hasSearchQuery && pinsCollapsed}
+        onclick={() => { pinsCollapsed = !pinsCollapsed; }}
+      >
+        {#snippet leading()}
+          <PinIcon size={12} aria-hidden="true" />
+        {/snippet}
+        {#each pinnedWorkspaces as ws (workspaceRowKey(ws))}
+          {@render workspaceRow(ws, true)}
+        {/each}
+      </GroupedSidebarSection>
+    {/if}
     {#if sortMode === "repo"}
     {#each grouped as { key: repoKey, items } (repoKey)}
       {@const collapsed =
-        !normalizedSearchQuery && collapsedGroups.includes(repoKey)}
+        !hasSearchQuery && collapsedGroups.includes(repoKey)}
       <GroupedSidebarSection
         label={repoLabel(items[0]!)}
         count={items.length}
@@ -1345,8 +1553,17 @@
           {@const sortTimestamp = workspaceListSortTimestamp(ws, sortMode)}
           {@const workspaceReadable = workspaceOperationAvailable(ws, "workspaceRead") && workspaceOperationAvailable(ws, "terminalAttach")}
           <div
-            class={["ws-row", { selected: isSelectedWorkspace(ws) }]}
+            class={["ws-row", {
+              selected: isSelectedWorkspace(ws),
+              "multi-selected": isMultiSelected(ws),
+              "context-target": contextMenuOpen && contextMenu !== null && workspaceRowKey(contextMenu.ws) === workspaceRowKey(ws),
+            }]}
             bind:this={rowEls[workspaceRowKey(ws)]}
+            aria-pressed={multiSelectedKeys.size > 0 ? isMultiSelected(ws) : undefined}
+            onmousedown={(e) => {
+              // Shift-click selects a range of rows, not the text between them.
+              if (e.shiftKey) e.preventDefault();
+            }}
             onclick={(e) => {
               // The PR/issue bubble is a focusable child button; let
               // its own click handler run without the row also
@@ -1356,7 +1573,7 @@
                 e.target.closest(".item-bubble")) {
                 return;
               }
-              openWorkspace(ws);
+              activateRow(e, ws);
             }}
             onkeydown={(e) => {
               // Ignore keydowns that originate inside a nested
@@ -1367,12 +1584,13 @@
               if (e.target !== e.currentTarget) return;
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
-                openWorkspace(ws);
+                activateRow(e, ws);
+              } else if (e.key === "Escape" && multiSelectedKeys.size > 0) {
+                e.preventDefault();
+                clearMultiSelection();
               }
             }}
-            oncontextmenu={(e) => {
-              void openContextMenu(e, ws);
-            }}
+            oncontextmenu={(e) => openContextMenu(e, ws)}
             aria-disabled={!workspaceReadable}
             tabindex={workspaceReadable ? 0 : -1}
             role="button"
@@ -1390,9 +1608,11 @@
                   <span
                     class="workspace-host-badge"
                     title={`Runs on ${workspaceHostName(ws)}`}
-                  >{workspaceHostName(ws)}</span>
+                  >{workspaceHostName(ws)}{ws.fleet_host_key?.startsWith("devbox:") ? " · Devbox" : ""}</span>
                 {/if}
-                {#if ws.status === "deleting" || ws.status === "deletion_failed"}
+                {#if workspaceMerging(ws)}
+                  <span class="workspace-lifecycle-state workspace-lifecycle-state--merging">Merging</span>
+                {:else if ws.status === "deleting" || ws.status === "deletion_failed"}
                   <span
                     class={["workspace-lifecycle-state", `workspace-lifecycle-state--${ws.status}`]}
                     title={ws.error_message ?? workspaceStatusLabel(ws)}
@@ -1499,9 +1719,10 @@
                 <button
                   class={[
                     "item-bubble",
-                    itemStateClass(ws),
+                    itemState(ws),
                     ws.item_type === "kata_task" && "item-bubble--kata",
                   ]}
+                  style:--item-accent={workspaceItemAccent[itemState(ws)]}
                   onclick={(e) => handleItemBubbleClick(e, ws)}
                   disabled={!workspaceOperationAvailable(ws, "workspaceRead")}
                   onkeydown={(e) => {
@@ -1540,7 +1761,7 @@
       <p class="filter-empty">Loading workspaces...</p>
     {:else if workspaceListStatus === "retrying" && workspaces.length === 0}
       <p class="filter-empty">Still loading workspaces. Retrying...</p>
-    {:else if visibleWorkspaces.length === 0 && normalizedSearchQuery}
+    {:else if visibleWorkspaces.length === 0 && (hasSearchQuery || author || selectedRepoValues.size > 0)}
       <p class="filter-empty">No workspaces match.</p>
     {:else if visibleWorkspaces.length === 0}
       <p class="filter-empty">No workspaces yet.</p>
@@ -1550,170 +1771,109 @@
 
 </div>
 
-{#if contextMenu}
-  {@const menuWorkspace = contextMenu.ws}
-  {@const localWorkspace = !isRemoteWorkspace(menuWorkspace)}
-  {@const itemURL = providerItemURL(menuWorkspace)}
-  {@const actionBusy = workspaceAction !== null}
-  {@const actionDisabled = actionBusy || workspaceActionsDisabled(menuWorkspace)}
-  <div
-    class="workspace-context-menu kit-filter-dropdown__panel"
-    bind:this={contextMenuEl}
-    style={contextMenuStyle}
-    role="menu"
-    aria-label="Workspace actions"
-    tabindex="-1"
-    oncontextmenu={(e) => e.preventDefault()}
-  >
-    <div class="workspace-context-heading">
-      <div class="workspace-context-title">
-        {displayName(menuWorkspace)}
-      </div>
-      <div class="workspace-context-meta">
-        {repoLabel(menuWorkspace)} · {shortBranch(menuWorkspace.git_head_ref)}
-      </div>
-    </div>
-
-    <div class="kit-filter-dropdown__section-title">Sync branch</div>
-    {#if canPush(menuWorkspace)}
-      <button
-        class="kit-filter-dropdown__item active"
-        role="menuitem"
-        type="button"
-        disabled={actionDisabled}
-        onclick={() => {
-          void syncWorkspaceBranch(menuWorkspace, "push");
-        }}
+<Menu bind:open={contextMenuOpen} anchor={contextMenu?.anchor} returnFocus={contextMenu?.row} class="workspace-context-menu-root">
+  <MenuContent ariaLabel="Workspace actions" class="workspace-context-menu">
+    {#if contextMenu && multiSelectedWorkspaces.length > 1 && isMultiSelected(contextMenu.ws)}
+      {@const selectedCount = multiSelectedWorkspaces.length}
+      {@const deletable = multiSelectedWorkspaces.filter(workspaceDeletable)}
+      <MenuItem
+        disabled={workspaceAction !== null || deletable.length === 0}
+        tone="danger"
+        onselect={() => openBulkDeleteDialog(deletable)}
       >
-        <span class="kit-filter-dropdown__dot filter-dot--success"></span>
-        <span class="kit-filter-dropdown__label">{workspaceActionMatches(menuWorkspace, "push") ? "Pushing..." : "Push branch"}</span>
-        <span class="workspace-context-detail">{syncActionDetail(menuWorkspace)}</span>
-      </button>
-    {:else if canPull(menuWorkspace)}
-      <button
-        class="kit-filter-dropdown__item active"
-        role="menuitem"
-        type="button"
-        disabled={actionDisabled}
-        onclick={() => {
-          void syncWorkspaceBranch(menuWorkspace, "pull");
-        }}
-      >
-        <span class="kit-filter-dropdown__dot filter-dot--warning"></span>
-        <span class="kit-filter-dropdown__label">{workspaceActionMatches(menuWorkspace, "pull") ? "Pulling..." : "Pull remote changes"}</span>
-        <span class="workspace-context-detail">{syncActionDetail(menuWorkspace)}</span>
-      </button>
-    {/if}
-    <button
-      class="kit-filter-dropdown__item active"
-      role="menuitem"
-      type="button"
-      disabled={actionDisabled}
-      onclick={() => {
-        void refreshWorkspaceStatus(menuWorkspace);
-      }}
-    >
-      <span class="kit-filter-dropdown__dot"></span>
-      <span class="kit-filter-dropdown__label">Refresh git status</span>
-    </button>
+        {#snippet icon()}<Trash2Icon size={14} />{/snippet}
+        {deletable.length === selectedCount
+          ? `Delete ${selectedCount} workspaces...`
+          : `Delete ${deletable.length} of ${selectedCount} workspaces...`}
+      </MenuItem>
+      <MenuSeparator />
+      <MenuItem onselect={() => { clearMultiSelection(); closeContextMenu(); }}>
+        Clear selection
+      </MenuItem>
+    {:else if contextMenu}
+      {@const menuWorkspace = contextMenu.ws}
+      {@const localWorkspace = !isRemoteWorkspace(menuWorkspace)}
+      {@const itemURL = providerItemURL(menuWorkspace)}
+      {@const actionBusy = workspaceAction !== null}
+      {@const actionDisabled = actionBusy || workspaceActionsDisabled(menuWorkspace)}
+      {@const deleteDisabled = actionBusy || !workspaceOperationAvailable(menuWorkspace, "workspaceWrite") || (isWorkspaceActionDisabled?.(menuWorkspace.id, menuWorkspace.fleet_host_key) ?? false)}
+      <MenuItem onselect={() => void togglePin(menuWorkspace)}>
+        {#snippet icon()}
+          {#if isPinned(menuWorkspace)}<PinOffIcon size={14} />{:else}<PinIcon size={14} />{/if}
+        {/snippet}
+        {isPinned(menuWorkspace) ? "Unpin workspace" : "Pin workspace"}
+      </MenuItem>
 
-    <div class="kit-filter-dropdown__divider"></div>
-    <button
-      class="kit-filter-dropdown__item active"
-      role="menuitem"
-      type="button"
-      disabled={actionBusy}
-      onclick={() => {
-        void copyMenuText(
-          shortBranch(menuWorkspace.git_head_ref),
-          "Copied branch name.",
-        );
-      }}
-    >
-      <span class="kit-filter-dropdown__dot"></span>
-      <span class="kit-filter-dropdown__label">Copy branch name</span>
-    </button>
-    {#if localWorkspace}
-      <button
-        class="kit-filter-dropdown__item active"
-        role="menuitem"
-        type="button"
+      <MenuSeparator />
+      {#if canPush(menuWorkspace)}
+        <MenuItem disabled={actionDisabled} onselect={() => void syncWorkspaceBranch(menuWorkspace, "push")}>
+          {#snippet icon()}<ArrowUpIcon size={14} />{/snippet}
+          {workspaceActionMatches(menuWorkspace, "push") ? "Pushing..." : "Push branch"}
+          {#snippet trailing()}{syncActionDetail(menuWorkspace)}{/snippet}
+        </MenuItem>
+      {:else if canPull(menuWorkspace)}
+        <MenuItem disabled={actionDisabled} onselect={() => void syncWorkspaceBranch(menuWorkspace, "pull")}>
+          {#snippet icon()}<ArrowDownIcon size={14} />{/snippet}
+          {workspaceActionMatches(menuWorkspace, "pull") ? "Pulling..." : "Pull remote changes"}
+          {#snippet trailing()}{syncActionDetail(menuWorkspace)}{/snippet}
+        </MenuItem>
+      {/if}
+      <MenuItem disabled={actionDisabled} onselect={() => void refreshWorkspaceStatus(menuWorkspace)}>
+        {#snippet icon()}<RefreshCwIcon size={14} />{/snippet}
+        Refresh git status
+      </MenuItem>
+
+      <MenuSeparator />
+      <MenuItem
         disabled={actionBusy}
-        onclick={() => {
-          void copyMenuText(
-            menuWorkspace.worktree_path,
-            "Copied worktree path.",
-          );
-        }}
+        onselect={() => void copyMenuText(shortBranch(menuWorkspace.git_head_ref), "Copied branch name.")}
       >
-        <span class="kit-filter-dropdown__dot"></span>
-        <span class="kit-filter-dropdown__label">Copy worktree path</span>
-      </button>
-      <button
-        class="kit-filter-dropdown__item active"
-        role="menuitem"
-        type="button"
-        disabled={actionDisabled}
-        onclick={() => {
-          void revealWorkspacePath(menuWorkspace);
-        }}
-      >
-        <span class="kit-filter-dropdown__dot"></span>
-        <span class="kit-filter-dropdown__label">{workspaceActionMatches(menuWorkspace, "reveal") ? "Opening..." : revealLabel(menuWorkspace)}</span>
-      </button>
-    {/if}
+        {#snippet icon()}<CopyIcon size={14} />{/snippet}
+        Copy branch name
+      </MenuItem>
+      {#if localWorkspace}
+        <MenuItem disabled={actionBusy} onselect={() => void copyMenuText(menuWorkspace.worktree_path, "Copied worktree path.")}>
+          {#snippet icon()}<CopyIcon size={14} />{/snippet}
+          Copy worktree path
+        </MenuItem>
+        {#if !menuWorkspace.fleet_host_key?.startsWith("devbox:")}
+          <MenuItem disabled={actionDisabled} onselect={() => void revealWorkspacePath(menuWorkspace)}>
+            {#snippet icon()}<FolderOpenIcon size={14} />{/snippet}
+            {workspaceActionMatches(menuWorkspace, "reveal") ? "Opening..." : revealLabel(menuWorkspace)}
+          </MenuItem>
+        {/if}
+      {/if}
 
-    {#if itemURL}
-      <div class="kit-filter-dropdown__divider"></div>
-      <button
-        class="kit-filter-dropdown__item active"
-        role="menuitem"
-        type="button"
-        disabled={actionBusy}
-        onclick={() => openProviderItem(menuWorkspace)}
-      >
-        <span class="kit-filter-dropdown__dot"></span>
-        <span class="kit-filter-dropdown__label">{providerLabel(menuWorkspace)}</span>
-      </button>
-      <button
-        class="kit-filter-dropdown__item active"
-        role="menuitem"
-        type="button"
-        disabled={actionBusy}
-        onclick={() => copyProviderItemURL(menuWorkspace)}
-      >
-        <span class="kit-filter-dropdown__dot"></span>
-        <span class="kit-filter-dropdown__label">Copy item URL</span>
-      </button>
-    {/if}
+      {#if itemURL}
+        <MenuSeparator />
+        <MenuItem disabled={actionBusy} onselect={() => openProviderItem(menuWorkspace)}>
+          {#snippet icon()}<ExternalLinkIcon size={14} />{/snippet}
+          {providerLabel(menuWorkspace)}
+        </MenuItem>
+        <MenuItem disabled={actionBusy} onselect={() => copyProviderItemURL(menuWorkspace)}>
+          {#snippet icon()}<LinkIcon size={14} />{/snippet}
+          Copy item URL
+        </MenuItem>
+      {/if}
 
-    <div class="kit-filter-dropdown__divider"></div>
-    <button
-      class="kit-filter-dropdown__item active workspace-context-danger"
-      role="menuitem"
-      type="button"
-      disabled={actionBusy || !workspaceOperationAvailable(menuWorkspace, "workspaceWrite") || menuWorkspace.status === "deleting" || (isWorkspaceActionDisabled?.(menuWorkspace.id, menuWorkspace.fleet_host_key) ?? false)}
-      onclick={() => {
-        openDeleteWorkspaceDialog(menuWorkspace);
-      }}
-    >
-      <span class="kit-filter-dropdown__dot filter-dot--danger"></span>
-      <span class="kit-filter-dropdown__label">{workspaceActionMatches(menuWorkspace, "delete") ? "Deleting..." : menuWorkspace.status === "deletion_failed" ? "Retry deletion..." : "Delete workspace..."}</span>
-    </button>
-    {#if menuWorkspace.status === "deletion_failed"}
-      <button
-        class="kit-filter-dropdown__item active workspace-context-danger"
-        role="menuitem"
-        type="button"
-        disabled={actionBusy || !workspaceOperationAvailable(menuWorkspace, "workspaceWrite") || (isWorkspaceActionDisabled?.(menuWorkspace.id, menuWorkspace.fleet_host_key) ?? false)}
-        onclick={() => openDeleteWorkspaceDialog(menuWorkspace, true)}
+      <MenuSeparator />
+      <MenuItem
+        disabled={deleteDisabled || menuWorkspace.status === "deleting"}
+        tone="danger"
+        onselect={() => openDeleteWorkspaceDialog(menuWorkspace)}
       >
-        <span class="kit-filter-dropdown__dot filter-dot--danger"></span>
-        <span class="kit-filter-dropdown__label">Force delete workspace...</span>
-      </button>
+        {#snippet icon()}<Trash2Icon size={14} />{/snippet}
+        {workspaceActionMatches(menuWorkspace, "delete") ? "Deleting..." : menuWorkspace.status === "deletion_failed" ? "Retry deletion..." : "Delete workspace..."}
+      </MenuItem>
+      {#if menuWorkspace.status === "deletion_failed"}
+        <MenuItem disabled={deleteDisabled} tone="danger" onselect={() => openDeleteWorkspaceDialog(menuWorkspace, true)}>
+          {#snippet icon()}<Trash2Icon size={14} />{/snippet}
+          Force delete workspace...
+        </MenuItem>
+      {/if}
     {/if}
-  </div>
-{/if}
+  </MenuContent>
+</Menu>
 
 <ConfirmDialog
   open={deleteConfirmWorkspace !== null && hostVisible}
@@ -1731,6 +1891,18 @@
   frameId="workspace-sidebar-delete"
   onCancel={closeDeleteWorkspaceDialog}
   onConfirm={() => void confirmDeleteWorkspaceFromList()}
+/>
+
+<ConfirmDialog
+  open={bulkDeleteConfirm !== null && hostVisible}
+  title={`Delete ${bulkDeleteConfirm?.length ?? 0} workspaces?`}
+  message={bulkDeleteConfirm ? bulkDeleteMessage(bulkDeleteConfirm) : ""}
+  hint="This removes their managed worktrees and runtime sessions. Workspaces with uncommitted changes are kept."
+  confirmLabel={`Delete ${bulkDeleteConfirm?.length ?? 0} workspaces`}
+  tone="danger"
+  frameId="workspace-sidebar-bulk-delete"
+  onCancel={closeBulkDeleteDialog}
+  onConfirm={() => void confirmBulkDelete()}
 />
 
 <style>
@@ -1766,8 +1938,8 @@
   .sidebar-header-label {
     font-size: var(--font-size-xs);
     font-weight: 700;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
+    letter-spacing: var(--letter-spacing-label, 0.08em);
+    text-transform: var(--label-transform, uppercase);
     color: var(--text-muted);
   }
 
@@ -1789,20 +1961,7 @@
     /* Claims the header's free space so the sort trigger (and the
      * collapse toggle after it) sit flush right. */
     margin-left: auto;
-    flex-shrink: 0;
-  }
-
-  .workspace-sort :global(.kit-filter-dropdown__btn) {
-    /* Borderless inside the 28px header rail; the dropdown trigger
-     * reads as header chrome rather than a standalone button. */
-    min-height: 22px;
-    padding: 2px 6px;
-    border-color: transparent;
-    background: transparent;
-  }
-
-  .workspace-sort :global(.kit-filter-dropdown__btn:hover:not(:disabled)) {
-    border-color: var(--border-muted);
+    min-width: 0;
   }
 
   .fleet-status {
@@ -1825,8 +1984,8 @@
   .fleet-status-title {
     font-size: var(--font-size-2xs);
     font-weight: 700;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
+    letter-spacing: var(--letter-spacing-label, 0.08em);
+    text-transform: var(--label-transform, uppercase);
     color: var(--text-muted);
   }
 
@@ -1889,6 +2048,16 @@
 
   .ws-row.selected:hover {
     background: var(--sidebar-row-hover-bg, var(--bg-surface-hover));
+  }
+
+  .ws-row.multi-selected,
+  .ws-row.multi-selected:hover {
+    background: color-mix(in srgb, var(--accent-blue) 14%, var(--sidebar-row-bg, var(--bg-surface)));
+  }
+
+  /* Marks the row a context menu acts on, as desktop file lists do. */
+  .ws-row.context-target {
+    box-shadow: inset 0 0 0 1px var(--accent-blue);
   }
 
   .ws-row-text {
@@ -1958,7 +2127,8 @@
     line-height: 1;
   }
 
-  .workspace-lifecycle-state--deleting {
+  .workspace-lifecycle-state--deleting,
+  .workspace-lifecycle-state--merging {
     color: var(--accent-blue);
   }
 
@@ -2117,43 +2287,13 @@
       color 80ms ease;
   }
 
-  /* Bubble fills mix each accent toward pure white, and the ink toward
+  /* Bubble fills mix the state accent toward pure white, and the ink toward
      --bubble-ink, in both themes. kit-ui-check deliberately permits pure
      black/white shade constants inside color-mix — white here is a shade
      anchor, not a palette color. */
-  .item-bubble.open {
-    --bubble-bg: color-mix(in srgb, var(--accent-green) 70%, #ffffff);
-    --bubble-fg: color-mix(in srgb, var(--accent-green) 25%, var(--bubble-ink));
-  }
-
-  .item-bubble.merged {
-    --bubble-bg: color-mix(in srgb, var(--accent-purple) 70%, #ffffff);
-    --bubble-fg: color-mix(in srgb, var(--accent-purple) 25%, var(--bubble-ink));
-  }
-
-  .item-bubble.closed {
-    --bubble-bg: color-mix(in srgb, var(--accent-red) 70%, #ffffff);
-    --bubble-fg: color-mix(in srgb, var(--accent-red) 25%, var(--bubble-ink));
-  }
-
-  .item-bubble.draft {
-    /* Amber matches the app-wide draft treatment (PR list, detail state
-     * chip, design system) so a draft PR reads as draft here too, rather
-     * than as a muted/neutral pill indistinguishable from other states. */
-    --bubble-bg: color-mix(in srgb, var(--accent-amber) 70%, #ffffff);
-    --bubble-fg: color-mix(in srgb, var(--accent-amber) 25%, var(--bubble-ink));
-  }
-
-  /* Open issues use blue instead of the open/green PR treatment so an
-   * issue-backed workspace is distinguishable from a PR-backed one. */
-  .item-bubble.issue {
-    --bubble-bg: color-mix(in srgb, var(--accent-blue) 70%, #ffffff);
-    --bubble-fg: color-mix(in srgb, var(--accent-blue) 25%, var(--bubble-ink));
-  }
-
-  .item-bubble.kata {
-    --bubble-bg: color-mix(in srgb, var(--accent-blue) 70%, #ffffff);
-    --bubble-fg: color-mix(in srgb, var(--accent-blue) 25%, var(--bubble-ink));
+  .item-bubble {
+    --bubble-bg: color-mix(in srgb, var(--item-accent) 70%, #ffffff);
+    --bubble-fg: color-mix(in srgb, var(--item-accent) 25%, var(--bubble-ink));
   }
 
   /* Kata identity labels are short slugs/qualified IDs rather than a
@@ -2207,122 +2347,13 @@
     font-size: var(--font-size-2xs);
   }
 
-  .workspace-context-menu {
-    position: fixed;
+  /* The menu root only hosts context; it must not add a box to the layout. */
+  :global(.kit-menu.workspace-context-menu-root) {
+    display: contents;
+  }
+
+  :global(.kit-menu__content.workspace-context-menu) {
     min-width: 224px;
-    max-width: min(320px, calc(100vw - 16px));
-    background: var(--bg-surface);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-sm);
-    box-shadow: var(--shadow-md);
-    z-index: var(--z-popover);
-    padding: 4px 0;
-  }
-
-  .workspace-context-heading {
-    padding: 6px 12px 7px;
-    border-bottom: 1px solid var(--border-muted);
-    margin-bottom: 4px;
-  }
-
-  .workspace-context-title {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--text-primary);
-    font-size: var(--font-size-xs);
-    font-weight: 600;
-  }
-
-  .workspace-context-meta {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    margin-top: 2px;
-    color: var(--text-muted);
-    font-family: var(--font-mono);
-    font-size: var(--font-size-2xs);
-  }
-
-  .kit-filter-dropdown__section-title {
-    padding: 4px 12px;
-    font-size: 0.9em;
-    font-weight: 600;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-
-  .kit-filter-dropdown__divider {
-    height: 1px;
-    background: var(--border-muted);
-    margin: 4px 8px;
-  }
-
-  .kit-filter-dropdown__item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-    padding: 4px 12px;
-    font-size: var(--font-size-xs);
-    color: var(--text-secondary);
-    text-align: left;
-    cursor: pointer;
-    transition: background 0.08s;
-    background: transparent;
-    border: 0;
-  }
-
-  .kit-filter-dropdown__item:hover:not(:disabled) {
-    background: var(--bg-surface-hover);
-  }
-
-  .kit-filter-dropdown__item:not(.active) {
-    opacity: 0.5;
-  }
-
-  .kit-filter-dropdown__item:disabled {
-    cursor: default;
-  }
-
-  .kit-filter-dropdown__dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    flex-shrink: 0;
-    background: var(--border-muted);
-  }
-
-  .filter-dot--success {
-    background: var(--accent-green);
-  }
-
-  .filter-dot--warning {
-    background: var(--accent-amber);
-  }
-
-  .filter-dot--danger {
-    background: var(--accent-red);
-  }
-
-  .kit-filter-dropdown__label {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .workspace-context-detail {
-    flex-shrink: 0;
-    color: var(--text-muted);
-    font-family: var(--font-mono);
-    font-size: var(--font-size-2xs);
-  }
-
-  .workspace-context-danger {
-    color: var(--accent-red);
   }
 
   /* Width-aware hiding: shed least-critical chrome first as the
@@ -2341,11 +2372,4 @@
     }
   }
 
-  /* The sort trigger collapses to its icon before the filter input
-   * is squeezed into uselessness. */
-  @container workspace-rail (max-width: 240px) {
-    .workspace-sort :global(.kit-filter-dropdown__trigger-label) {
-      display: none;
-    }
-  }
 </style>

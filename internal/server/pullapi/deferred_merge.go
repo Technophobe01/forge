@@ -56,6 +56,9 @@ func (h *deferredMergeHandle) supersede() {
 }
 
 func (h *deferredMergeHandle) isSuperseded() bool {
+	if h == nil {
+		return false
+	}
 	select {
 	case <-h.superseded:
 		return true
@@ -71,13 +74,15 @@ type deferredMergeTargetSnapshot struct {
 }
 
 type DeferredMergeCompletedPayload struct {
-	Provider                string `json:"provider"`
-	PlatformHost            string `json:"platform_host"`
-	RepoPath                string `json:"repo_path"`
-	Owner                   string `json:"owner"`
-	Name                    string `json:"name"`
-	Number                  int    `json:"number"`
-	HeadSHA                 string `json:"head_sha"`
+	Provider     string `json:"provider"`
+	PlatformHost string `json:"platform_host"`
+	RepoPath     string `json:"repo_path"`
+	Owner        string `json:"owner"`
+	Name         string `json:"name"`
+	Number       int    `json:"number"`
+	HeadSHA      string `json:"head_sha"`
+	// Status is "merged", "failed", or "queued" when the merge went to the
+	// target branch's merge queue.
 	Status                  string `json:"status"`
 	Merged                  bool   `json:"merged,omitempty"`
 	SHA                     string `json:"sha,omitempty"`
@@ -125,7 +130,7 @@ func (s *Handler) enqueueDeferredMerge(
 	if err != nil {
 		return deferMergePRBody{}, err
 	}
-	if err := s.requireSyncerCapability(*repo, capabilityMergeMutation); err != nil {
+	if err := s.requireSyncerCapability(repo.Repo, capabilityMergeMutation); err != nil {
 		return deferMergePRBody{}, err
 	}
 	mr, err := s.visibleMergeRequest(ctx, repo.ID, number)
@@ -145,7 +150,7 @@ func (s *Handler) enqueueDeferredMerge(
 	if err := s.requireMidStackMergeAllowed(ctx, repo.ID, number); err != nil {
 		return deferMergePRBody{}, err
 	}
-	expectedHeadSHA, err := s.preflightMergePR(repo, mr, number, body)
+	expectedHeadSHA, err := s.preflightMergePR(repo.Row(), mr, number, body)
 	if err != nil {
 		return deferMergePRBody{}, err
 	}
@@ -173,7 +178,7 @@ func (s *Handler) enqueueDeferredMerge(
 		)
 	}
 	if len(pendingKeys) == 0 && aggregateState != "pending" {
-		refreshed, refreshedKeys, err := s.refreshPendingDeferredMergeCheckKeys(ctx, *repo, number, queuedTarget)
+		refreshed, refreshedKeys, err := s.refreshPendingDeferredMergeCheckKeys(ctx, repo.Repo, number, queuedTarget)
 		if err != nil {
 			return deferMergePRBody{}, err
 		}
@@ -194,7 +199,7 @@ func (s *Handler) enqueueDeferredMerge(
 			map[string]any{"reason": "no_pending_checks"},
 		)
 	}
-	key := deferredMergeKey(*repo, number)
+	key := deferredMergeKey(repo.Repo, number)
 	var releaseDeferred func()
 	if s.providerWriteGate != nil {
 		releaseDeferred, err = s.providerWriteGate.BeginDeferredMerge(ctx)
@@ -222,7 +227,7 @@ func (s *Handler) enqueueDeferredMerge(
 	}
 	started := s.runBackground(func(bgCtx context.Context) {
 		defer s.clearDeferredMergeInFlight(key, handle)
-		s.runDeferredMerge(bgCtx, *repo, number, body, pendingKeys, queuedTarget, pollInterval, maxWait, handle)
+		s.runDeferredMerge(bgCtx, repo.Repo, number, body, pendingKeys, queuedTarget, pollInterval, maxWait, handle)
 	})
 	if !started {
 		s.clearDeferredMergeInFlight(key, handle)
@@ -401,15 +406,15 @@ func (s *Handler) refreshPendingDeferredMergeCheckKeys(
 
 func mergeRequestRepoRef(repo db.Repo) ghclient.RepoRef {
 	return ghclient.RepoRef{
-		Platform:           repoProviderKind(repo),
-		Owner:              repo.Owner,
-		Name:               repo.Name,
-		PlatformHost:       repoProviderHost(repo),
-		RepoPath:           repo.RepoPath,
-		PlatformExternalID: repo.PlatformRepoID,
-		WebURL:             repo.WebURL,
-		CloneURL:           repo.CloneURL,
-		DefaultBranch:      repo.DefaultBranch,
+		Platform:      repoProviderKind(repo),
+		Owner:         repo.Owner,
+		Name:          repo.Name,
+		PlatformHost:  repoProviderHost(repo),
+		RepoPath:      repo.RepoPath,
+		Key:           repo.Key,
+		WebURL:        repo.WebURL,
+		CloneURL:      repo.CloneURL,
+		DefaultBranch: repo.DefaultBranch,
 	}
 }
 
@@ -428,9 +433,44 @@ func (s *Handler) completeDeferredMerge(
 		s.broadcastDeferredMergeFailure(repo, number, deferredMergeHeadSHA(body, queuedTarget.HeadSHA), err.Error(), handle)
 		return
 	}
-	result, err := s.mergePRWithBody(ctx, string(repoProviderKind(repo)), repoProviderHost(repo), repo.Owner, repo.Name, number, body)
+	// An immediate enqueue can supersede this worker while its CI or target
+	// reads block. Enqueueing leaves the pull request open, so the target
+	// checks above cannot detect it. The supersession check runs under the
+	// pull request's merge lock, so it cannot race an immediate merge or
+	// enqueue that is still talking to the provider.
+	result, err := s.mergePRWithBodyAdmitted(
+		ctx, string(repoProviderKind(repo)), repoProviderHost(repo), repo.Owner, repo.Name, number, body,
+		func() bool { return !handle.isSuperseded() },
+	)
+	if errors.Is(err, errMergeNotAdmitted) {
+		return
+	}
 	if err != nil {
 		s.broadcastDeferredMergeFailure(repo, number, deferredMergeHeadSHA(body, queuedTarget.HeadSHA), err.Error(), handle)
+		return
+	}
+	if result.Queued {
+		// The enqueue above superseded this worker's own handle; that is
+		// expected and must not suppress its completion.
+		// The target branch's merge queue now owns the merge; it reports
+		// its own outcome through the pull request's queue state.
+		s.clearDeferredMergeInFlight(deferredMergeKey(repo, number), handle)
+		s.publish(Event{Type: "data_changed", Data: struct{}{}})
+		s.publish(Event{
+			Type: "deferred_merge_completed",
+			Data: DeferredMergeCompletedPayload{
+				Provider:     string(repoProviderKind(repo)),
+				PlatformHost: repoProviderHost(repo),
+				RepoPath:     repo.RepoPath,
+				Owner:        repo.Owner,
+				Name:         repo.Name,
+				Number:       number,
+				HeadSHA:      deferredMergeHeadSHA(body, queuedTarget.HeadSHA),
+				Status:       "queued",
+				Message:      result.Message,
+				CompletedAt:  formatUTCRFC3339(s.now().UTC()),
+			},
+		})
 		return
 	}
 	if !result.Merged {

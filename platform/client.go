@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"io"
 	"time"
 )
 
@@ -54,6 +55,25 @@ type MarkdownImage struct {
 // callers must not be able to turn this into a general-purpose URL fetcher.
 type MarkdownImageReader interface {
 	GetMarkdownImage(ctx context.Context, ref RepoRef, sourceURL string) (MarkdownImage, error)
+}
+
+// MarkdownMedia is an open stream of provider-hosted video. Body stays open
+// until the caller closes it or the request context ends.
+type MarkdownMedia struct {
+	Body        io.ReadCloser
+	ContentType string
+	// ContentLength is -1 when the upstream did not declare a length.
+	ContentLength int64
+	ContentRange  string
+	Partial       bool
+}
+
+// MarkdownMediaReader opens provider-hosted video embedded in repository
+// Markdown. Like MarkdownImageReader, providers accept only their own
+// trusted attachment URLs. byteRange is forwarded verbatim as the Range
+// header when non-empty. The caller must close Body.
+type MarkdownMediaReader interface {
+	OpenMarkdownMedia(ctx context.Context, ref RepoRef, sourceURL, byteRange string) (MarkdownMedia, error)
 }
 
 type MergeRequestReader interface {
@@ -178,6 +198,20 @@ type MergeMutator interface {
 	) (MergeResult, error)
 }
 
+// MergeQueueMutator adds a merge request to the provider's merge queue for
+// its target branch. The queue merges it with the queue's configured method
+// once the queue's own checks pass, so no commit title, message, or method
+// applies. expectedHeadSHA binds the request like MergeMergeRequest. A
+// successful result reports Queued unless the provider merged it outright.
+type MergeQueueMutator interface {
+	EnqueueMergeRequest(
+		ctx context.Context,
+		ref RepoRef,
+		number int,
+		expectedHeadSHA string,
+	) (MergeResult, error)
+}
+
 type WorkflowApprovalMutator interface {
 	ApproveWorkflow(ctx context.Context, ref RepoRef, runID string) error
 }
@@ -208,16 +242,37 @@ type AssigneeMutator interface {
 
 // ReviewerMutator requests reviews from users on a merge request and
 // removes pending review requests. Both calls return the full updated
-// requested-reviewer username list after the mutation. Requesting an
-// empty username list is a read: it mutates nothing and returns the
+// requested-reviewer identity list after the mutation. Requesting an
+// empty identity list is a read: it mutates nothing and returns the
 // provider's current requested-reviewer set, so callers can diff a
 // desired set against live provider state instead of cached state.
-// All usernames, in both directions, are individual user logins;
-// implementations must exclude team or group reviewer identities so a
+// Identities are individual user logins, except providers implementing
+// ReviewerDirectory, whose identities are stable account IDs.
+// Implementations must exclude team or group reviewer identities so a
 // caller-computed removal diff never targets an unsupported identity.
 type ReviewerMutator interface {
 	RequestMergeRequestReviewers(ctx context.Context, ref RepoRef, number int, usernames []string) ([]string, error)
 	RemoveMergeRequestReviewers(ctx context.Context, ref RepoRef, number int, usernames []string) ([]string, error)
+}
+
+// ReviewerAccount separates the provider's action identity from its display label.
+type ReviewerAccount struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	Nickname    string `json:"nickname"`
+	AvatarURL   string `json:"avatar_url"`
+}
+
+// ReviewerAccounts retains current account labels when candidate discovery fails.
+type ReviewerAccounts struct {
+	Accounts       []ReviewerAccount `json:"accounts"`
+	CandidateError string            `json:"candidate_error"`
+}
+
+// ReviewerDirectory supplies selectable accounts and current reviewers for
+// providers whose reviewer identities are not human-readable logins.
+type ReviewerDirectory interface {
+	ListReviewerAccounts(ctx context.Context, ref RepoRef, number int) (ReviewerAccounts, error)
 }
 
 type ReviewMutator interface {

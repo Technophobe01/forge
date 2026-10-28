@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const mockMergePull = vi.hoisted(() => vi.fn());
@@ -22,6 +22,7 @@ const baseProps = {
   number: 1,
   provider: "github",
   platformHost: "github.com",
+  repositoryKey: { kind: "id", id: 7001 },
   repoPath: "octo/repo",
   prTitle: "Add feature",
   prBody: "Body",
@@ -31,9 +32,11 @@ const baseProps = {
   allowMerge: true,
   allowRebase: true,
   onclose: () => {},
-  onmerged: () => {},
-  onqueued: () => {},
 };
+
+function normalized(text: string | null): string {
+  return (text ?? "").replace(/\s+/g, " ").trim();
+}
 
 describe("MergeModal modal frame integration", () => {
   beforeEach(() => {
@@ -55,17 +58,67 @@ describe("MergeModal modal frame integration", () => {
     expect(getStackDepth()).toBe(0);
   });
 
-  it("warns when the override permits a mid-stack merge", () => {
+  it("shows stack context when merging", () => {
     render(MergeModal, {
       props: {
         ...baseProps,
-        midStackWarning: "This is stack position 2 of 3. Branch #1 below it has not been merged.",
+        stackNote: "Stack position 2 of 3.",
       },
     });
 
-    const warning = screen.getByRole("alert");
-    expect(warning.textContent).toContain("Warning: this is a mid-stack merge.");
-    expect(warning.textContent).toContain("Branch #1 below it has not been merged.");
+    expect(screen.getByText("Stack position 2 of 3.").tagName).toBe("P");
+  });
+
+  it("names every pull request a native stack merge lands and the ones that stay open", () => {
+    render(MergeModal, {
+      props: {
+        ...baseProps,
+        number: 12,
+        stackNote: "Stack position 2 of 3.",
+        nativeStackMerge: { baseBranch: "main", landing: [11, 12], remaining: [13] },
+      },
+    });
+
+    expect(screen.getByRole("dialog", { name: "Merge Stack" })).toBeTruthy();
+    expect(normalized(screen.getByText(/This merges 2 pull requests into/).textContent)).toBe(
+      "This merges 2 pull requests into main as one GitHub stack merge: #11 and #12.",
+    );
+    expect(screen.getByText(/GitHub merges the stack asynchronously/)).toBeTruthy();
+    expect(screen.getByText(/#13\s+stays open/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Squash and merge 2 pull requests" })).toBeTruthy();
+    expect(screen.queryByText("Stack position 2 of 3.")).toBeNull();
+  });
+
+  it("says only the bottom pull request merges when nothing below it is unmerged", () => {
+    render(MergeModal, {
+      props: {
+        ...baseProps,
+        number: 11,
+        nativeStackMerge: { baseBranch: "main", landing: [11], remaining: [12, 13] },
+      },
+    });
+
+    expect(screen.getByRole("dialog", { name: "Merge Pull Request" })).toBeTruthy();
+    expect(screen.getByText("Only this pull request merges.")).toBeTruthy();
+    expect(screen.getByText(/#12 and #13\s+stay open/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Squash and merge" })).toBeTruthy();
+  });
+
+  it("describes a native stack entering the merge queue as one group", () => {
+    render(MergeModal, {
+      props: {
+        ...baseProps,
+        number: 13,
+        mergeQueue: { branch: "main", mergeMethod: "squash" },
+        nativeStackMerge: { baseBranch: "main", landing: [11, 12, 13], remaining: [] },
+      },
+    });
+
+    expect(screen.getByRole("dialog", { name: "Add Stack to Merge Queue" })).toBeTruthy();
+    expect(normalized(screen.getByText(/This adds 3 pull requests to the merge queue/).textContent)).toBe(
+      "This adds 3 pull requests to the merge queue as one group: #11, #12, and #13.",
+    );
+    expect(screen.queryByText(/asynchronously/)).toBeNull();
   });
 });
 
@@ -96,11 +149,12 @@ describe("MergeModal acknowledged merge commands", () => {
     await fireEvent.click(screen.getByText("Squash and merge", { selector: ".kit-modal-footer button" }));
   }
 
-  it("echoes the reviewed head in the generated merge body", async () => {
+  it("submits the stable repository identity and reviewed head", async () => {
     renderModal({ expectedHeadSha: "abc123" });
 
     await confirmMerge();
 
+    expect(mockMergePull.mock.calls[0]?.[0]).toMatchObject({ repositoryKey: { kind: "id", id: 7001 } });
     expect(mockMergePull.mock.calls[0]?.[2]).toMatchObject({
       expected_head_sha: "abc123",
       method: "squash",
@@ -133,48 +187,16 @@ describe("MergeModal acknowledged merge commands", () => {
     expect(mockMergePull.mock.calls[0]?.[2]).toMatchObject({ delete_workspace_id: "ws-1" });
   });
 
-  it("closes after merge acknowledgement without claiming cleanup finished", async () => {
-    let succeed = () => {};
-    let settle = () => {};
-    const onmerged = vi.fn();
-    mockMergePull.mockImplementation((...args: unknown[]) => {
-      const callbacks = args.at(-1) as {
-        onSuccess?: (outcome: { _tag: "Merged"; cleanupWarning?: string }) => void;
-        onSettled?: () => void;
-      };
-      succeed = () => callbacks.onSuccess?.({ _tag: "Merged" });
-      settle = () => callbacks.onSettled?.();
-    });
-    renderModal({ workspaceId: "ws-1", onmerged });
-
-    await confirmMerge();
-    expect(isWorkspaceDeletionPending("ws-1", undefined)).toBe(false);
-
-    succeed();
-    expect(isWorkspaceIdDeleted("ws-1")).toBe(false);
-    expect(onmerged).toHaveBeenCalledWith(undefined);
-    expect(isWorkspaceDeletionPending("ws-1", undefined)).toBe(false);
-
-    settle();
-    expect(isWorkspaceDeletionPending("ws-1", undefined)).toBe(false);
-  });
-
-  it("preserves the workspace when merge cleanup returns a warning", async () => {
-    const onmerged = vi.fn();
-    mockMergePull.mockImplementation((...args: unknown[]) => {
-      const callbacks = args.at(-1) as {
-        onSuccess?: (outcome: { _tag: "Merged"; cleanupWarning?: string }) => void;
-        onSettled?: () => void;
-      };
-      callbacks.onSuccess?.({ _tag: "Merged", cleanupWarning: "workspace has uncommitted changes" });
-      callbacks.onSettled?.();
-    });
-    renderModal({ workspaceId: "ws-1", onmerged });
+  it("closes on submission without waiting for acknowledgement or claiming cleanup finished", async () => {
+    mockMergePull.mockImplementation(() => {});
+    const onclose = vi.fn();
+    renderModal({ workspaceId: "ws-1", onclose });
 
     await confirmMerge();
 
+    expect(onclose).toHaveBeenCalledOnce();
+    expect(isWorkspaceDeletionPending("ws-1", undefined)).toBe(false);
     expect(isWorkspaceIdDeleted("ws-1")).toBe(false);
-    expect(onmerged).toHaveBeenCalledWith("workspace has uncommitted changes");
   });
 
   it("omits the head pin when the rendered head is unknown", async () => {
@@ -207,13 +229,11 @@ describe("MergeModal acknowledged merge commands", () => {
       });
       const onclose = vi.fn();
       const onstateconflict = vi.fn();
-      const onmerged = vi.fn();
       renderModal({
         expectedHeadSha: "abc123",
         routeGeneration: 12,
         onclose,
         onstateconflict,
-        onmerged,
       });
 
       await confirmMerge();
@@ -225,6 +245,7 @@ describe("MergeModal acknowledged merge commands", () => {
         {
           provider: "github",
           platformHost: "github.com",
+          repositoryKey: { kind: "id", id: 7001 },
           owner: "octo",
           name: "repo",
           repoPath: "octo/repo",
@@ -233,11 +254,10 @@ describe("MergeModal acknowledged merge commands", () => {
         12,
       );
       expect(onclose).toHaveBeenCalledOnce();
-      expect(onmerged).not.toHaveBeenCalled();
     },
   );
 
-  it("shows the provider message inline for generic merge conflicts", async () => {
+  it("shows generic merge conflicts through the shared flash after closing", async () => {
     mockMergePull.mockImplementation((...args: unknown[]) => {
       const callbacks = args.at(-1) as {
         onProblem?: (problem: unknown) => void;
@@ -260,8 +280,8 @@ describe("MergeModal acknowledged merge commands", () => {
 
     await confirmMerge();
 
-    expect(await screen.findByText("merge blocked by provider")).toBeTruthy();
-    expect(onclose).not.toHaveBeenCalled();
+    expect(flash.getFlash()).toMatchObject({ message: "octo/repo #1: merge blocked by provider", tone: "danger" });
+    expect(onclose).toHaveBeenCalledOnce();
   });
 
   it("shows non-conflict problem failures through the shared flash", async () => {
@@ -284,71 +304,126 @@ describe("MergeModal acknowledged merge commands", () => {
 
     await confirmMerge();
 
-    expect(flash.getFlash()).toMatchObject({ message: "commit title is required", tone: "danger" });
+    expect(flash.getFlash()).toMatchObject({ message: "octo/repo #1: commit title is required", tone: "danger" });
   });
 
-  it("routes a deferred merge and reports its acknowledgement", async () => {
-    const onqueued = vi.fn();
-    const onmerged = vi.fn();
-    renderModal({ workspaceId: "ws-1", deferUntilChecksPass: true, onqueued, onmerged });
+  it("routes a deferred merge and closes on submission", async () => {
+    const onclose = vi.fn();
+    renderModal({ workspaceId: "ws-1", deferUntilChecksPass: true, onclose });
 
     await fireEvent.click(screen.getByRole("button", { name: "Merge after CI is complete" }));
 
     expect(mockMergePull.mock.calls[0]?.[3]).toBe(true);
-    expect(onqueued).toHaveBeenCalledOnce();
-    expect(onmerged).not.toHaveBeenCalled();
+    expect(onclose).toHaveBeenCalledOnce();
     expect(isWorkspaceIdDeleted("ws-1")).toBe(false);
   });
 
   it("offers an immediate merge override while CI is pending", async () => {
-    const onmerged = vi.fn();
-    renderModal({ deferUntilChecksPass: true, onmerged });
+    renderModal({ deferUntilChecksPass: true });
 
     await fireEvent.click(screen.getByRole("button", { name: "Merge Anyway" }));
 
     expect(mockMergePull.mock.calls[0]?.[3]).toBe(false);
-    expect(onmerged).toHaveBeenCalledOnce();
   });
 
   it("requires an explicit merge anyway action when CI has failed", async () => {
-    const onmerged = vi.fn();
-    renderModal({ ciFailed: true, onmerged });
+    renderModal({ ciFailed: true });
 
     expect(screen.getByRole("alert").textContent).toContain("CI has failed.");
     expect(mockMergePull).not.toHaveBeenCalled();
     await fireEvent.click(screen.getByRole("button", { name: "Merge Anyway" }));
 
     expect(mockMergePull.mock.calls[0]?.[3]).toBe(false);
-    expect(onmerged).toHaveBeenCalledOnce();
   });
 
-  it("keeps the merge action disabled until its acknowledgement settles", async () => {
-    let settle = () => {};
-    mockMergePull.mockImplementation((...args: unknown[]) => {
-      const callbacks = args.at(-1) as { onSuccess?: (outcome: object) => void; onSettled?: () => void };
-      settle = () => {
-        callbacks.onSuccess?.({ _tag: "Queued" });
-        callbacks.onSettled?.();
-      };
-    });
-    renderModal({ deferUntilChecksPass: true });
+  it("explains that a draft must be marked ready and does not submit it", async () => {
+    renderModal({ isDraft: true, deferUntilChecksPass: true });
 
-    await fireEvent.click(screen.getByRole("button", { name: "Merge after CI is complete" }));
+    expect(normalized(screen.getByRole("alert").textContent)).toBe(
+      "This pull request is a draft. Mark it ready for review before merging.",
+    );
+    const mergeAfterCI = screen.getByRole("button", { name: "Merge after CI is complete" });
+    const mergeAnyway = screen.getByRole("button", { name: "Merge Anyway" });
+    expect((mergeAfterCI as HTMLButtonElement).disabled).toBe(true);
+    expect((mergeAnyway as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.click(mergeAfterCI);
+    await fireEvent.click(mergeAnyway);
 
-    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Merge scheduled..." }).disabled).toBe(true);
-    settle();
-    await waitFor(() => expect(screen.getByRole("button", { name: "Merge after CI is complete" })).toBeTruthy());
+    expect(mockMergePull).not.toHaveBeenCalled();
   });
 
   it("offers only an immediate merge when a deferred merge is already queued", async () => {
-    const onmerged = vi.fn();
-    renderModal({ deferUntilChecksPass: true, alreadyQueued: true, onmerged });
+    renderModal({ deferUntilChecksPass: true, alreadyQueued: true });
 
     expect(screen.queryByRole("button", { name: "Merge after CI is complete" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Merge Anyway" })).toBeNull();
     await confirmMerge();
 
     expect(mockMergePull.mock.calls[0]?.[3]).toBe(false);
-    expect(onmerged).toHaveBeenCalledOnce();
+  });
+
+  describe("when the base branch uses a merge queue", () => {
+    const mergeQueue = { branch: "main", mergeMethod: "squash" };
+
+    it("explains the queue and hides method and commit text", () => {
+      renderModal({ mergeQueue, workspaceId: "ws-1" });
+
+      expect(screen.getByText("Add to Merge Queue")).toBeTruthy();
+      expect(
+        screen.getByText(
+          /uses a merge queue\. This adds the pull request to the queue, which merges it using squash and merge once its checks pass\./,
+        ),
+      ).toBeTruthy();
+      expect(screen.queryByRole("group", { name: "Merge method" })).toBeNull();
+      expect(screen.queryByLabelText("Commit title")).toBeNull();
+      expect(screen.queryByLabelText("Commit message")).toBeNull();
+    });
+
+    it("omits the merge method while Forge has not read it", () => {
+      renderModal({ mergeQueue: { branch: "main", mergeMethod: "" } });
+
+      const note = screen.getByText(/uses a merge queue\./);
+      expect(note.textContent?.replace(/\s+/g, " ")).toContain(
+        "This adds the pull request to the queue, which merges it once its checks pass.",
+      );
+    });
+
+    it("asks to delete the workspace once the queue merges the pull request", async () => {
+      renderModal({ mergeQueue, workspaceId: "ws-1", expectedHeadSha: "abc123" });
+
+      expect(screen.getByRole<HTMLInputElement>("checkbox", { name: "Delete workspace after merge" }).checked).toBe(
+        true,
+      );
+      await fireEvent.click(screen.getByRole("button", { name: "Add to merge queue" }));
+
+      expect(mockMergePull).toHaveBeenCalledOnce();
+      expect(mockMergePull.mock.calls[0]?.[3]).toBe(false);
+      expect(mockMergePull.mock.calls[0]?.[2]).toMatchObject({
+        expected_head_sha: "abc123",
+        delete_workspace_id: "ws-1",
+      });
+    });
+
+    it("keeps the workspace when deletion is unchecked", async () => {
+      renderModal({ mergeQueue, workspaceId: "ws-1" });
+
+      await fireEvent.click(screen.getByRole("checkbox", { name: "Delete workspace after merge" }));
+      await fireEvent.click(screen.getByRole("button", { name: "Add to merge queue" }));
+
+      expect(mockMergePull.mock.calls[0]?.[2]).not.toHaveProperty("delete_workspace_id");
+    });
+
+    it("offers queueing after CI with an immediate queue override while CI is pending", async () => {
+      renderModal({ mergeQueue, deferUntilChecksPass: true });
+
+      expect(screen.queryByRole("button", { name: "Merge Anyway" })).toBeNull();
+      await fireEvent.click(screen.getByRole("button", { name: "Add to merge queue after CI is complete" }));
+      expect(mockMergePull.mock.calls[0]?.[3]).toBe(true);
+
+      cleanup();
+      renderModal({ mergeQueue, deferUntilChecksPass: true });
+      await fireEvent.click(screen.getByRole("button", { name: "Add to queue now" }));
+      expect(mockMergePull.mock.calls[1]?.[3]).toBe(false);
+    });
   });
 });

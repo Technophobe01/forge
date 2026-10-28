@@ -5,8 +5,10 @@ import type {
   ArchiveMutationBody,
   ArchivePacingStatusResponse,
   ArchiveReportResponse,
+  ArchiveSnapshot,
   ArchiveStatusResponse,
   GetArchiveReportParams,
+  GetArchiveSnapshotParams,
   ListArchiveStatusParams,
 } from "../models";
 
@@ -59,8 +61,16 @@ export const pauseArchives = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<ArchiveStatusResponse[]>(getPauseArchivesUrl(), {
     ...options,
@@ -106,6 +116,42 @@ export const getArchiveReport = async (
   });
 };
 
+export const getGetArchiveSnapshotUrl = (params: GetArchiveSnapshotParams) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+    const explodeParameters = ["repo"];
+
+    if (Array.isArray(value) && explodeParameters.includes(key)) {
+      value.forEach((v) => {
+        normalizedParams.append(key, v === null ? "null" : String(v));
+      });
+      return;
+    }
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? "null" : String(value));
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/archive/snapshot?${stringifiedParams}` : `/archive/snapshot`;
+};
+
+/**
+ * @summary Export cached work and archive coverage
+ */
+export const getArchiveSnapshot = async (
+  params: GetArchiveSnapshotParams,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<ArchiveSnapshot> => {
+  return orvalFetch<ArchiveSnapshot>(getGetArchiveSnapshotUrl(params), {
+    ...options,
+    method: "GET",
+  });
+};
+
 export const getStartArchivesUrl = () => {
   return `/archive/start`;
 };
@@ -120,8 +166,16 @@ export const startArchives = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<ArchiveStatusResponse[]>(getStartArchivesUrl(), {
     ...options,

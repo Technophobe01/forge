@@ -15,11 +15,11 @@ import (
 const repositoryFeatureProbeInterval = 24 * time.Hour
 
 type repositoryFeatureCooldownKey struct {
-	platform       platform.Kind
-	host           string
-	providerRepoID string
-	repoPath       string
-	feature        string
+	platform platform.Kind
+	host     string
+	repoKey  platform.RepositoryKey
+	repoPath string
+	feature  string
 }
 
 type repositoryFeatureCooldowns struct {
@@ -33,9 +33,9 @@ type repositoryFeatureCooldownState struct {
 	nextProbe   time.Time
 	generation  uint64
 	reservation uint64
-	// providerRepoID identifies the repository that recorded the state;
-	// empty when it was recorded from a route-only (unresolved) ref.
-	providerRepoID string
+	// repoKey identifies the repository that recorded the state;
+	// zero when it was recorded from a route-only (unresolved) ref.
+	repoKey platform.RepositoryKey
 }
 
 type repositoryFeatureProbe struct {
@@ -108,14 +108,14 @@ func repositoryFeatureKeys(repo RepoRef, feature string) []repositoryFeatureCool
 		repoPath: ref.RepoPath,
 		feature:  feature,
 	}
-	if ref.PlatformExternalID == "" {
+	if ref.Key.IsZero() {
 		return []repositoryFeatureCooldownKey{routeKey}
 	}
 	idKey := repositoryFeatureCooldownKey{
-		platform:       ref.Platform,
-		host:           ref.Host,
-		providerRepoID: ref.PlatformExternalID,
-		feature:        feature,
+		platform: ref.Platform,
+		host:     ref.Host,
+		repoKey:  ref.Key,
+		feature:  feature,
 	}
 	return []repositoryFeatureCooldownKey{idKey, routeKey}
 }
@@ -136,11 +136,18 @@ func (c *repositoryFeatureCooldowns) lookupState(
 		if !ok {
 			continue
 		}
-		if state.providerRepoID == "" || state.providerRepoID == primary.providerRepoID {
+		if state.repoKey.IsZero() || state.repoKey == primary.repoKey {
 			return key, state, true
 		}
 	}
 	return primary, repositoryFeatureCooldownState{}, false
+}
+
+func (c *repositoryFeatureCooldowns) inCooldown(repo RepoRef, feature string, now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, state, _ := c.lookupState(repositoryFeatureKeys(repo, feature))
+	return state.nextProbe.After(now)
 }
 
 func (c *repositoryFeatureCooldowns) beginProbeWithRetry(
@@ -210,9 +217,9 @@ func (c *repositoryFeatureCooldowns) deferUntil(repo RepoRef, feature string, ne
 	c.nextGeneration++
 	keys := repositoryFeatureKeys(repo, feature)
 	state := repositoryFeatureCooldownState{
-		nextProbe:      nextProbe,
-		generation:     c.nextGeneration,
-		providerRepoID: keys[0].providerRepoID,
+		nextProbe:  nextProbe,
+		generation: c.nextGeneration,
+		repoKey:    keys[0].repoKey,
 	}
 	for _, key := range keys {
 		c.states[key] = state
@@ -310,8 +317,8 @@ func (s *Syncer) recordRepositoryFeatureDisabledUntil(
 	feature string,
 	err error,
 ) (time.Time, bool) {
-	var platformErr *platform.Error
-	if !errors.As(err, &platformErr) ||
+	platformErr, ok := errors.AsType[*platform.Error](err)
+	if !ok ||
 		platformErr.Code != platform.ErrCodeRepositoryFeatureDisabled ||
 		platformErr.Capability != feature {
 		return time.Time{}, false

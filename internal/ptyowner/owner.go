@@ -40,6 +40,8 @@ type Options struct {
 	Command      []string
 	StripEnvVars []string
 	ExtraEnv     map[string]string
+	// onExit lets tests observe the completed owner exit transition.
+	onExit func()
 }
 
 type owner struct {
@@ -119,7 +121,7 @@ func RunOwner(ctx context.Context, opts Options) error {
 		}
 	}
 	_ = os.Remove(paths.Socket)
-	listener, err := net.Listen("unix", paths.Socket)
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "unix", paths.Socket)
 	if err != nil {
 		killOwnerProcess(cmd.Process)
 		_ = p.Close()
@@ -199,6 +201,9 @@ func RunOwner(ctx context.Context, opts Options) error {
 		<-o.done
 		return ctx.Err()
 	case <-o.done:
+		if opts.onExit != nil {
+			opts.onExit()
+		}
 		return o.waitAfterNaturalExit(ctx, acceptErr)
 	case err := <-acceptErr:
 		if errors.Is(err, net.ErrClosed) {

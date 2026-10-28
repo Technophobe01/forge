@@ -100,10 +100,24 @@ describe("TerminalSettings", () => {
     vi.stubGlobal("fetch", fetch);
   });
 
-  it("persists zero retained sessions without falling back to the default", async () => {
+  it("keeps an invalid retention limit local until corrected", async () => {
+    render(TerminalSettings, {
+      props: { terminal: { ...mockTerminalStore.defaultTerminal }, onUpdate: vi.fn() },
+    });
+    const input = screen.getByLabelText(/^Retained terminal sessions/);
+    await fireEvent.input(input, { target: { value: "101" } });
+    expect(screen.getByRole("alert").textContent).toContain("0 to 100");
+    expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(mockUpdateSettings).not.toHaveBeenCalled();
+    await fireEvent.input(input, { target: { value: "50" } });
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it.each([0, 50])("persists %i retained sessions without falling back to the default", async (retainedSessions) => {
     const updated = {
       ...mockTerminalStore.defaultTerminal,
-      retained_sessions: 0,
+      retained_sessions: retainedSessions,
     };
     mockUpdateSettings.mockResolvedValue({ terminal: updated });
     const onUpdate = vi.fn();
@@ -117,9 +131,9 @@ describe("TerminalSettings", () => {
 
     const retentionInput = screen.getByLabelText(/^Retained terminal sessions/) as HTMLInputElement;
     expect(retentionInput.min).toBe("0");
-    expect(retentionInput.max).toBe("20");
+    expect(retentionInput.max).toBe("100");
     await fireEvent.input(retentionInput, {
-      target: { value: "0" },
+      target: { value: String(retainedSessions) },
     });
     await fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
@@ -763,6 +777,31 @@ describe("TerminalSettings", () => {
 
     expect((filter as HTMLInputElement).value).toBe("");
     expect(screen.getByRole("dialog", { name: "Choose monospace font" })).toBeTruthy();
+  });
+
+  it("explains when the browser shares no installed fonts", async () => {
+    const queryLocalFonts = vi.fn().mockResolvedValue([]);
+    vi.stubGlobal("queryLocalFonts", queryLocalFonts);
+
+    render(TerminalSettings, {
+      props: {
+        terminal: { ...mockTerminalStore.defaultTerminal },
+        onUpdate: vi.fn(),
+      },
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Choose" }));
+
+    expect(await screen.findByText(/did not share any installed fonts/)).toBeTruthy();
+    expect(screen.queryByText(/No local monospace fonts were found/)).toBeNull();
+
+    queryLocalFonts.mockResolvedValue([
+      { family: "Example Mono", fullName: "Example Mono", postscriptName: "ExampleMono", style: "Regular" },
+    ]);
+    await fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+
+    expect(await screen.findByRole("button", { name: /Example Mono/ })).toBeTruthy();
+    expect(queryLocalFonts).toHaveBeenCalledTimes(2);
   });
 
   it("persists a font selected from the chooser", async () => {

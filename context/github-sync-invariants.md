@@ -49,6 +49,13 @@ Rules:
 
 ## Freshness Rules
 
+- Startup restores missing credential gates from the oldest error-free, non-future completion among tracked live repositories with a rate tracker; the run-slot owner applies completion plus interval once, while failed and never-synced repositories bypass the gate on the first startup pass (`internal/github/sync.go::Syncer.liveRepoSyncTimes`, `internal/github/sync.go::Syncer.runOnceWithSlot`).
+- Airplane mode pauses scheduled sync after the current pass; relay hints, item visits,
+  manual sync, and queued notification read propagation remain enabled
+  (`internal/github/sync.go::Syncer.AutomaticSyncEnabled`).
+- Startup and reload while paused reuse known repository identities instead of
+  provider discovery (`cmd/kenn-forge/main.go::resolveStartupRepos`).
+
 Bulk sync and detail sync have different jobs, but they must not disagree about
 what "current" means.
 
@@ -70,6 +77,21 @@ what "current" means.
 - Budgeted detail drain treats each queue item's worst-case cost as soft admission;
   provider pagination and child hydration may exceed it because the transport counts
   actual wire attempts (`internal/github/sync.go::drainDetailQueue`).
+- Dormant open items use a daily check, not hourly full hydration; overdue checks go
+  oldest-first within existing budgets. Closed history stays outside routine polling
+  (`internal/github/queue.go::BuildQueue`).
+- Daily coverage is a target, not permission to exceed quota. Show remaining overdue
+  open items, including never-fetched items, rather than implying complete freshness
+  (`internal/github/sync.go::countOverdueDetails`).
+- Unknown or missing GitHub mergeability remains eligible for budgeted detail refresh;
+  it can resolve after a base push without changing the PR's `updated_at`.
+  (`internal/github/sync.go::buildDetailQueueItems`)
+- Comment-only polling must respect dormant-item cadence. Admitted open-item detail
+  checks still check comments on parent 304s before advancing freshness; edits and
+  deletions may leave the parent unchanged (`internal/github/sync.go::markUnchangedIssueDetailFetched`).
+- Defer comment-only work until after details and skip items attempted by that pass,
+  even on failure. Failed details stay overdue for a later cycle
+  (`internal/github/sync.go::drainDetailQueue`).
 
 For pull requests, that means:
 
@@ -99,23 +121,91 @@ For pull requests, that means:
   Active watched-PR sync must use the same persisted pull-request ETag path as
   detail drain (`internal/github/sync.go::syncMRForRepo`,
   `internal/github/sync.go::getPullRequestForDetail`,
-  `internal/github/sync.go::markUnchangedMRDetailFetched`). Manual/API PR
-  refreshes must bypass that PR ETag gate so rerun checks, workflow approval,
-  comments, reviews, and commits can refresh even when GitHub's PR resource is
-  unchanged (`internal/github/sync.go::SyncMR`,
-  `internal/server/huma_routes.go::syncPR`). Cadence control is still required
-  because changed PRs correctly fall through to comments, reviews, commits, CI,
-  and workflow approval refreshes.
-- MR snapshot publication and workspace head-repository reclassification share
-  one reconciliation barrier. Provider-ID collisions preserve the destination
+  `internal/github/sync.go::markUnchangedMRDetailFetched`). Open PR-page 304s refresh
+  all children: comments, reviews, commits, CI, and workflow approval
+  (`internal/github/sync.go::refreshMRDetailSnapshot`). Background 304s refresh
+  comments, comment moderation metadata, review threads, and pending CI
+  (`internal/github/sync.go::markUnchangedMRDetailFetched`). Merged or closed PRs, a missing parent,
+  stale diff SHAs, or missing local diff commits force a full page fetch
+  that saves the returned ETag for the next poll
+  (`internal/github/sync.go::SyncMROnProviderIfChanged`). Manual refreshes remain
+  unconditional (`internal/github/sync.go::SyncMROnProvider`). Cadence control is
+  still required because child reads spend provider quota.
+- MR snapshot publication reclassifies workspace head-repository trust from the
+  stored row. Provider-ID collisions preserve the destination
   MR ID and merge its dependent review data before applying the newest provider
   snapshot. A snapshot moved from the old repository identity carries a durable
   stale-identity marker while its revision continues to advance; manual refresh
   preserves the workspace's prior trust classification until a post-move
   provider snapshot with authoritative head-repository data clears that marker
   (`internal/github/sync.go::CommitMergeRequestParentSnapshot`,
-  `internal/db/queries.go::UpsertRepoByProviderID`,
-  `internal/github/sync.go::reclassifyWorkspaceHeadRepoTrustUnderRepositoryReconciliationRead`).
+  `internal/github/sync.go::reclassifyWorkspaceHeadRepoTrust`).
+- Merge status observation times (`ci_observed_at`, `review_decision_observed_at`,
+  `mergeable_state_observed_at`) are written in the same statement as the value
+  they time, stamped with the moment Forge sent the provider request rather than
+  the response time; a value carried unchanged from the stored row keeps that
+  row's time (`internal/github/sync.go::CommitMergeRequestParentSnapshot`).
+- A field's time is set whenever that write's provider response authoritatively
+  reported the field, even when the value is empty (an empty review decision, a
+  complete empty CI check list); only mergeable state `""`/`"unknown"` is never
+  an observation, and a path that doesn't carry a field never stamps it
+  (`internal/github/sync.go::clearUnknownMergeableStateTime`).
+
+## Merge Queue Rules
+
+- Merge queue state is a property of the pull request, read per pull request
+  (`isMergeQueueEnabled`, `mergeQueueEntry`, and its latest enqueue or removal
+  timeline event), as the GitHub Pull Requests extension for VS Code does.
+  Never read or snapshot a repository's whole queue
+  (`internal/github/merge_queue.go::GraphQLFetcher.FetchPullRequestMergeQueue`).
+- The state shown is GitHub's answer at read time: an entry is queued; no entry
+  with a latest enqueue event is queued at an unknown position; no entry with a
+  latest non-`merged` removal shows that removal and its reason. Reopenings are
+  part of that timeline read, so a removal from before a close does not return.
+  A read that finds the pull request closed or merged clears its state. No
+  attempt matching across reads (maintainer decision).
+- Queue state belongs to the base branch it was read for: a retargeted pull
+  request is re-read, and the merge action offers the queue only when the
+  stored base branch matches the pull request's
+  (`internal/server/pullapi/routes.go::Handler.mergeQueueMutatorFor`).
+- Entering or leaving a queue does not change a pull request's `updated_at`,
+  so ordinary pull request sync never notices it. Every successful live pull
+  request detail sync also checks queue state when due, after the repository
+  is resolved and the archived and removed-upstream checks pass: watched,
+  relay, and manual syncs and the scheduled refresh of dormant pull requests.
+  Bulk hydration, which marks details fresh and so postpones that scheduled
+  refresh, checks each pull request at most hourly, counting failed reads as
+  checks so a refused queue read is not retried on every pass. Manual refresh, an
+  enqueue, and repository passes for pull requests last seen queued read it
+  directly. The async merge API cannot replace this: its
+  `enqueued` result is final
+  (`internal/github/merge_queue.go::Syncer.refreshMergeQueueAfterDetailSync`).
+- A pull request is due unless its state shows nothing and its base branch was
+  read without a queue within 6 hours, by it or any pull request on that
+  branch, so branches without merge queues cost one read per 6 hours. Merge
+  queue caches are keyed by the repository's stable key, never its owner/name
+  route (`internal/github/merge_queue.go::Syncer.refreshPullRequestMergeQueueIfDue`).
+- Never request `mergeQueue.configuration` in the pull request read: GitHub
+  refuses it to an App with only the Merge queues permission, and one refused
+  field fails the whole query. The branch's merge method is read separately at
+  most every 6 hours, including after a refused read, and shared by every pull
+  request on that branch, falling back to the merge credential
+  (`internal/github/merge_queue.go::Syncer.mergeQueueMergeMethod`).
+- Queue reads use the read credential first and fall back to the route's
+  separate write (merge) credential when GitHub refuses it ("Resource not
+  accessible by integration"); the fallback sticks per repository for an hour.
+  The App permission is optional and only keeps reads on the App's quota
+  (`internal/github/merge_queue.go::Syncer.mergeQueueRead`).
+- When the read after an enqueue cannot run, the pull request is stored as
+  queued at an unknown position, even if the request was cancelled, since
+  GitHub accepted the enqueue; it then counts as queued, so the next
+  repository pass replaces it with GitHub's state
+  (`internal/github/merge_queue.go::Syncer.RecordPullRequestEnqueued`).
+- A terminal state write, including a first insert as closed or merged,
+  deletes the pull request's queue state, so reopening never revives it
+  (`internal/db/migrations/000068_merge_queue_states.up.sql`).
+- Hosts whose schema rejects the merge queue fields latch them off per fetcher
+  until restart (`internal/github/merge_queue.go::isMergeQueueSchemaRejection`).
 
 ## Timeline Event Rules
 
@@ -137,7 +227,7 @@ PR timeline storage is intentionally selective.
   stored rows may predate parent-time realignment. (`internal/server/pullapi/routes.go::withSyntheticMRLifecycleEvents`)
 - Keep the existing event families stable: comments, reviews, commits, force
   pushes, and the currently supported PR system events.
-- GitHub commit events use the committer login/name and committed date as their activity actor/time when present, preserve a distinct original author in commit metadata, and fall back independently to author identity/time when committer data is absent.
+- GitHub commit events use the committer login/name and committed date as their activity actor/time when present, preserve every known original author in commit metadata even when it matches the actor, and fall back independently to author identity/time when committer data is absent.
 - Review comments are UI-aware but are not part of the stored sync model unless
   they can be fetched within the supported timeline path.
 - If bulk sync persists PR system events, detail sync must persist the same
@@ -176,10 +266,13 @@ Some PR-derived state is only valid for one head commit.
   SHA-256 (64-hex) repositories are out of scope and their commit events are
   never flagged
   (`internal/github/sync.go::computeCommitLiveness`,
-  `internal/db/queries.go::UpsertMergeRequestSnapshotWithLabelsUnderRepositoryReconciliationRead`,
+  `internal/db/queries.go::UpsertMergeRequestSnapshotWithLabelsAndEventMetadata`,
   `internal/gitclone/reachability.go::CommitsReachableFrom`).
-- Mutation-triggered closed-MR refetches capture the route generation before
-  provider I/O, carry stable clone identity, and fence all snapshot/diff writes
+- A fixture whose PR head is a real clone commit must seed live commit events with SHAs
+  reachable from that head; liveness flags every other SHA obsolete, and the timeline collapses
+  obsolete commits in all orders (`internal/testutil/diff_repo.go::alignWidgetsPR1CommitEvents`).
+- Mutation-triggered closed-MR refetches resolve the repository by its stored
+  provider ID and carry stable clone identity
   (`internal/github/sync.go::SyncClosedMROnProvider`).
 - Workflow-approval decisions must be tied to the correct PR identity, not just
   the head SHA. Shared SHAs across forks or sibling PRs must not leak approval
@@ -225,6 +318,18 @@ fallback repository listing.
 - GitHub.com merges are versioned asynchronous direct operations polled to terminal
   `merged`; `pending`/`enqueued` never count as merged. GHES stays synchronous with no
   probe fallback. (`platform/github/merge_async.go::Client.MergePullRequest`)
+- GitHub's "Changes must be made through the merge queue" refusal of a direct
+  merge is `platform.ErrMergeQueueRequired`; the merge handler then enqueues
+  instead. Do not rely on synced queue state alone: a sync credential (such as
+  a GitHub App) can be forbidden from reading `mergeQueue` while the merge
+  credential can still enqueue (`internal/server/pullapi/routes.go::Handler.mergePRWithBodyAdmitted`).
+- A merge of a pull request whose base branch sync last saw with a merge queue
+  enqueues with `merge_action: merge_queue` and no method, title, or message,
+  which GitHub rejects for queued merges; `enqueued` is success with
+  `queued: true`, never merged, and runs no merge-completion side effects beyond
+  keeping a requested workspace deletion for the queue's merge. Only
+  GitHub.com enqueues (`internal/server/pullapi/routes.go::Handler.mergeQueueMutatorFor`,
+  `platform/github/merge_async.go::Client.EnqueuePullRequest`).
 - Preserve required-rebase failures verbatim; do not substitute private website routes
   or local force-pushes until GitHub exposes a token-authenticated stack-rebase API.
   (`platform/github/merge_async.go::mergeAsyncTerminalResult`)
@@ -237,6 +342,11 @@ fallback repository listing.
 - Native projections use the bottom PR number as the neutral stack key; GitHub's
   independent stack number remains cache-only.
   (`internal/stacks/detect.go::persistStackChain`)
+- Merging a native stack member also merges every unmerged member below it, so
+  projections record `native` and the merge UI names every PR that lands; a branch
+  projection of the same row must clear it (`frontend/src/lib/components/detail/stack-merge.ts`).
+- Native member `mergeable`/`mergeStateStatus` compare each PR with its parent branch,
+  not the stack base; a stack can conflict on `main` while every member is `CLEAN`.
 - Disabling the preference synchronously restores branch-derived projections;
   cached native rows remain dormant. The syncer's preference is the transition
   authority — every server binds it to the boot config and reconciles on the
@@ -252,7 +362,7 @@ fallback repository listing.
   still serves its stored pull requests and no sync will revisit it. Boot with
   the preference off reconciles the same way, since the setting can change while
   the daemon is stopped.
-  (`internal/server/native_stack_settings.go::reconcileGitHubNativeStackProjection`,
+  (`internal/server/syncevents/native_stack_settings.go::Handlers.ReconcileGitHubNativeStackProjection`,
   `internal/github/sync.go::SetPreferGitHubNativeStacks`)
 - The preview must not widen the blast radius of the list it rides on. The REST
   hint decodes separately from the pull request, so a changed field shape costs
@@ -307,14 +417,14 @@ fallback repository listing.
   without a daemon restart even when exact and glob entries overlap.
   (`internal/github/notifications_sync.go::SyncNotifications`,
   `internal/github/sync.go::watchedMRsForFastSync`,
-  `internal/server/settings_handlers.go::mergeTrackedRepos`,
-  `internal/server/settings_handlers.go::replaceGlobRepos`)
+  `internal/server/settingsapi/settings_handlers.go::Handlers.MergeTrackedRepos`,
+  `internal/server/settingsapi/settings_handlers.go::Handlers.ReplaceGlobRepos`)
 - Tracked-set deduplication reconciles by stable provider id when one is
   present, falling back to the route key: a renamed route must collapse onto
   the same tracked entry, never sync or archive-seed the repository twice.
   Provider-resolved refs replace fallback-derived duplicates; fallback refs
   never overwrite resolved ones. (`internal/github/repo_config_resolver.go::ExpandedRepoSet`,
-  `internal/server/settings_handlers.go::trackedRepoIndex`)
+  `internal/server/settingsapi/settings_handlers.go::trackedRepoIndex`)
 - Exact-resolved refs record the config-entry path they came from
   (`RepoRef.ConfiguredRepoPath`); glob refs carry none — a pattern identifies
   no single entry, and stamping it would displace exact provenance on
@@ -356,7 +466,7 @@ fallback repository listing.
   `internal/github/repo_config_resolver.go::ExpandedRepoSet`,
   `internal/github/sync.go::repoRefFromCatalog`,
   `internal/github/sync.go::publishResolvedRepository`,
-  `internal/server/settings_handlers.go::trackedRepoProvenance`,
+  `internal/server/settingsapi/settings_handlers.go::trackedRepoProvenance`,
   `cmd/kenn-forge/main.go::fallbackExactFromDB`)
 - Catalog republication without fresh provider metadata preserves the
   currently tracked archived flag: a sync that began before a newer archived
@@ -467,6 +577,15 @@ fallback repository listing.
   single-issue endpoint means deleted; map it to `removed_upstream` only at
   that lookup boundary, never across GitHub endpoints.
   (`platform/github/provider_pages.go::Provider.classifyIssueLookup`)
+- A PR 404 proves removal only when the repository probe matches the tracked
+  provider key; a reused route must remain retryable.
+  (`platform/github/provider_pages.go::Provider.classifyMergeRequestLookup`)
+- A provider-confirmed removed PR is recorded as `removed_upstream` during live
+  sync; preserve its last content snapshot rather than inventing a closure.
+  (`internal/db/queries_archive.go::RecordRemovedMergeRequest`)
+- Fresh live PR inventory restores matching removed identities even at unchanged
+  provider timestamps; discovery mode has no maintenance pass to repair them.
+  (`internal/db/queries_archive.go::RecordLiveMergeRequestPresence`)
 - A previously-open issue whose GitHub-classified lookup is a true removal
   (not_found, no destination) is tombstoned closed locally; otherwise it would
   fail every cycle forever. Transfers and provider-neutral bare 404s (GitLab
@@ -492,8 +611,8 @@ fallback repository listing.
   detail replaces stored merge SHA and file count while filling missing merge
   time without weakening snapshot ordering. (`internal/db/queries_merge_lifecycle.go::FillMissingMergedMRMetrics`)
 - Rejected canonical merged snapshots repair each available lifecycle field and
-  the merger event under one route-fence lease; stored parent timing remains
-  authoritative when GitHub omits it, and a rejected fence stays retryable. (`internal/github/sync.go::syncMRForRepoResolved`)
+  the merger event; stored parent timing remains authoritative when GitHub
+  omits it. (`internal/github/sync.go::syncMRForRepoResolved`)
 - Post-hydration completeness queries the repository ID resolved by that sync;
   never re-resolve the caller's mutable route after reconciliation.
   (`internal/github/sync.go::SyncArchiveItem`)
@@ -538,7 +657,7 @@ must share one runtime; App reads use their installation identity.
 - A configured router with no exact, owner, or fallback route is a routing
   failure; operation availability must fail closed instead of treating it as an
   unrouted legacy host (`internal/github/auth_router.go::MissingRouteError`,
-  `internal/server/operation_availability.go::writeCredentialGateForRepo`).
+  `internal/server/operation_availability.go::Server.WriteCredentialGateForRepo`).
 - Background requests on the write credential (viewer-permission overlay,
   notifications, queued read propagation) charge the write identity's sync
   budget — the transport's context gate keeps foreground mutations uncharged —
@@ -546,6 +665,11 @@ must share one runtime; App reads use their installation identity.
   read and write, so a shared-PAT archive is preempted
   (`internal/github/client.go::NewClient`, `internal/github/sync.go::syncRepo`,
   `internal/github/notifications_sync.go::ProcessQueuedNotificationReads`).
+- Every sync and notification pass reads each repository, so the PAT viewer
+  overlay is cached per repository and credential and revalidated with its ETag
+  on every read; a 304 costs no rate limit or sync budget. Do not replace this
+  with a time-based cache: revalidation keeps permissions current without a
+  manual-refresh bypass (`platform/github/client.go::Client.viewerRepoOverlay`).
 - Reload probes share one fresh installation-token cache per validation batch:
   per-route caches would multiply minting, while reusing the live cache lets a
   revoked installation or replaced private key pass validation until the cached
@@ -559,12 +683,26 @@ Repository preview must select the entered owner's route even before that owner
 has a tracked repository. Ownerless APIs may use only the host fallback; never
 borrow an arbitrary owner PAT. Repository notifications use the user/write
 identity. App-only routes may read, but notifications and mutations remain
-disabled until restart establishes a stable user identity.
+disabled until restart establishes a stable user identity. Their repository
+reads skip the viewer-permission overlay and leave viewer permissions unknown
+instead of warning on every read (`platform/github/client.go::Client.withViewerOverlay`).
+
+A clone or fetch that fails for a credential reason is listed in sync status
+`git_access` until the repository's next successful clone or fetch or removal from tracking, and is
+logged when it starts or changes reason rather than on every pass
+(`internal/github/git_access.go::Syncer.recordGitAccess`). Token resolution
+failures carry `gitclone.ErrCredentialUnavailable` so the classification
+survives the sanitized Git error chain.
+
+Git access warnings follow provider-verified repository identity across renames;
+tracked-set changes refresh display routes and discard removed repositories
+(`internal/github/git_access.go::Syncer.gitAccessProblems`).
 
 Notification sync watermarks are per repository identity, never host-wide: a
 repository whose credential route is unavailable or exhausted reports its error
 without holding back watermark advancement for healthy repositories on the same
-host (`internal/github/notifications_sync.go::Syncer.syncNotificationsForRepo`).
+host, even though one host-wide listing serves every repository of a user
+identity (`internal/github/notifications_sync.go::Syncer.syncNotificationsForIdentity`).
 
 Queued read-acknowledgement backoff is scoped the same way. A rate limit belongs
 to the credential that hit it — on either refetch leg or the mark-read — so
@@ -604,21 +742,27 @@ path, so an ownerless path silently skips the App candidate and pays with the
 PAT for a read the route's tracker bills to the installation
 (`internal/github/auth_router.go::RoutedClient.GetUserForRepo`).
 
-Managed Git uses exact-repository or owner PAT routes with mutation context and
-must never expose an App installation token to smart HTTP. Thread full provider,
+Workspace Git (fetch and push against a workspace remote, and ownerless host
+Git) uses exact-repository or owner PAT routes with mutation context and must
+never receive an App installation token. Clones and fetches into Forge's own
+clone store never push, so they use the normal read chain: a covering App
+installation token takes priority over the route's PAT. Pass the repository
+owner so the chain selects only that owner's installation; App-only Forge
+can maintain clones without a user identity
+(`cmd/kenn-forge/provider_startup.go::gitStartup.ReadSourceForRepo`). Thread full provider,
 host, owner, and repository identity through clone/fetch and local reads, passing
 the normalized platform (`repoPlatform(repo)`) so an unqualified GitHub ref still
 picks its credential route instead of none. Partition sync, diff, and repository
 browser clone storage by stable provider repository identity
-(`internal/gitclone/repo_browser.go::repoBrowserCloneNamespace`). Only the shared fetch's starter discards
-a clone when its captured route generation no longer owns the path; later
-callers re-validate their own fences as pure gates so a stale caller never
-deletes a clone current-route callers are reading, and a follower rejected only
-by the starter's stale route retries with its own validated fetch. Workspace clones remain
+(`internal/gitclone/repo_browser.go::repoBrowserCloneNamespace`). Workspace clones remain
 path-scoped, so shared full-stack fixtures must seed both namespaces
 (`internal/testutil/diff_repo.go::SetupDiffRepo`). Before injecting
 a PAT into workspace fetch or push, require the branch upstream to be `origin`,
 reject repository-local URL rewrites, and validate every origin fetch/push URL.
+
+Spoke clone-read admission must also use read credentials, or App-only routes
+fail before fetching; workspace launch still requires a mutation credential
+(`internal/gitclone/clone.go::Manager.RequireReadCredentialRoute`).
 
 A nil `tokenauth.Source` is not fail-closed: `gitclone` reads it as permission to
 run git with no credential, which succeeds against any public repository and
@@ -638,6 +782,10 @@ Provider quota is keyed by `IdentityKey` and REST/GraphQL resource, so a user
 response never overwrites an App installation pool
 (`internal/github/quota.go::QuotaRegistry`).
 
+- Prefer valid core response headers over the `/rate_limit` core body: the body
+  can report full capacity while the same response reports exhaustion. GraphQL
+  remains a separate pool (`platform/github/client.go::Client.GetRateLimitSnapshot`).
+
 - Each client transport chain carries a fixed identity: reads spend the route's
   read identity, mutations and notifications its write identity
   (`internal/github/client.go::WithQuotaAccounting`).
@@ -647,6 +795,13 @@ response never overwrites an App installation pool
 - Local-ceiling failures retain the code, credential key, and refusal-window reset through
   item, hard-return, and parallel-run aggregation; UI details require both the key and reset
   to match the live row (`internal/github/sync.go::SyncStatus`, `internal/github/budget_transport.go::syncBudgetExhaustedError`).
+- Normal sync budget waits preserve the last completed repository health and timestamp,
+  including earlier failures; mixed cycles must retain the real failure alongside the
+  ceiling cause (`internal/github/sync.go::Syncer.syncRepo`).
+- A local budget refusal stops GraphQL retries and logs one wait line per repository.
+  Refused bulk reads preserve list ETags; only refused item work evicts them so
+  closures and timelines recover after refill
+  (`internal/github/sync.go::indexSyncRepo`).
 - List discovery (open PR/issue lists, repo identity resolve) spends the local
   ceiling's essential reserve; optional spend (details, fast-sync, archive
   attempts without a registry reservation)
@@ -733,7 +888,7 @@ GitHub App installation tokens are account-scoped, not host-scoped. An app
 installation for one owner must not authenticate reads for another owner just
 because both repos share the same host. Repo-scoped GitHub reads must resolve app
 tokens with the repository owner in context, and ownerless contexts such as
-clone auth must fall through to PAT/`gh` credentials. This owner scoping governs
+host-level Git auth must fall through to PAT/`gh` credentials. This owner scoping governs
 endpoint selection, not just token resolution: choose an installation-token-only
 read endpoint (such as installation-repositories listing) only when the requested
 owner actually resolves to an app installation. Gating it on whether the host has
@@ -743,6 +898,14 @@ chain "correctly" falls back to the PAT.
 - Private `user-attachments` reads are the exception to app-token-first reads:
   GitHub returns 404 to installation tokens, so the repo-scoped image proxy must
   use the user's PAT/`gh` chain (`platform/github/markdown_images.go::GetMarkdownImage`).
+  Some uploads 404 at their attachment URL for every credential, even on public
+  repos, yet GitHub still renders them; on a 404 the proxy renders the image
+  through `POST /markdown` in the repository's context and fetches the signed
+  storage URL GitHub substitutes, accepting only GitHub's signed image host
+  (`platform/github/markdown_images.go::renderSignedAttachmentURL`).
+  Video attachments use the same chain; the attachment URL redirects to signed
+  storage on another host, and Go drops `Authorization` on that cross-host
+  redirect (`platform/github/markdown_media.go::Client.OpenMarkdownMedia`).
 - Repository-file markdown images (`blob`/`raw` web URLs, `raw.githubusercontent.com`)
   are proxied only for the route's own repository, use the normal read chain, and are
   type-sniffed because the contents raw media type hides the file type; web URLs do not
@@ -776,25 +939,35 @@ error or cancellation unchanged and never adopts.
 
 ## Activity relay
 
+- Format failures remain visible across reconnects until a valid hint proves decoding recovered;
+  accepting an HTTP stream is not evidence of compatibility. (`internal/github/relay.go::RunRelay`)
 - Relay hints accelerate normal polling; each consumer still uses its own credentials and rate gates.
   (`internal/github/relay.go::refreshRelayHint`)
+- Relay ref reads must not advance the normal-sync list ETag: REST indexing omits
+  mergeability, while that validator also gates the richer GraphQL refresh.
+  (`internal/github/relay.go::refreshRelayRefs`)
 - One `RunRelay` loop owns the subscription and reconnects with jittered exponential backoff from
   the backoff library, 1s rising to a 30s base ceiling plus jitter, reset only after a stream stayed open. The `[relay]` config has no
   poll interval; `relay.poll_interval` is rejected at load. (`internal/github/relay.go::RunRelay`)
-- Webhook ingress maps `workflow_run` to checks-only hints for explicitly referenced PRs;
-  unassociated runs, `check_run`, `check_suite`, `workflow_job`, and `status` produce no hints.
-  Never fan an unassociated run out across a repository. (`internal/activityrelay/http.go::reduce`)
-- Feed repository IDs are GitHub node IDs, matching the durable catalog; numeric REST IDs need
-  a fresh provider resolve and must not become the consumer's lookup key. (`internal/activityrelay/http.go::reduce`)
+- `workflow_run` and `check_run` refresh checks only for explicit PR references;
+  workflows also invalidate the repository's Actions run list. Never fan an unassociated
+  event out across PRs. (`internal/activityrelay/http.go::reduce`)
+- Feed repository IDs are GitHub's integer repository IDs, the durable catalog key; the
+  consumer matches tracked repositories by that ID directly. (`internal/activityrelay/http.go::reduce`)
 - Nothing about a hint is persisted. Received hints wait in a bounded in-memory queue that
   coalesces repeats for one target; a single worker refreshes ready hints so provider work
   never stalls the stream. A hint that cannot run now because of budget, cooldown, or catalog
   state is dropped and left to ordinary syncing. (`internal/github/relay.go::relayQueue`)
-- Batch checks in the relay, never in consumers: one hint per repository/PR per minute,
-  with repeats unable to postpone delivery. Keep pending checks separate from immediate
-  activity and discard them on shutdown. (`internal/activityrelay/broadcast.go::Broadcaster`)
+- Batch Actions in the relay, never in consumers: one checks hint per PR and one runs hint
+  per repository per minute, with repeats unable to postpone delivery. Reserve room for
+  ordinary activity and discard pending hints on shutdown. (`internal/activityrelay/broadcast.go::Broadcaster`)
+- Reserve bounded workflow-list capacity in pending relay batches, subscriber buffers, and
+  consumer queues; PR-check traffic must not crowd out hints with no ordinary-sync fallback.
+  (`internal/activityrelay/broadcast.go`, `internal/github/relay.go::relayQueue`)
 - Checks refresh only known open PRs with a head SHA; never upgrade them to full PR syncs.
   (`internal/github/relay.go::refreshRelayHint`)
+- Workflow-list hints only notify foreground views, so background quota reserves must not
+  suppress them; the foreground read owns provider admission. (`internal/github/relay.go::refreshRelayHint`)
 - A parent ETag does not establish whether comment content changed; child-change hints require
   unconditional detail reads. (`internal/github/sync.go::getIssueForDetail`)
 - Relay status travels with ordinary sync status and is absent when the consumer is off. It
@@ -825,3 +998,25 @@ Also see [`context/testing.md`](./testing.md):
 - If you change GraphQL query shape in `internal/github/graphql.go` or
   `platform/github`, run the gated live GitHub validation for the owning
   package as well.
+
+## GitHub CLI shim
+
+- A partial sync/archive is not a complete `gh pr list` result. Obtain complete
+  lists through normal sync or delegate the original invocation; never silently
+  omit unsupported fields or filters (`internal/ghshim/storage.go::Read`).
+- Preserve upstream `gh` output bytes for intercepted commands; keep real-CLI
+  differential tests when growing coverage (`internal/ghshim/query_test.go::TestJSONMatchesRealGH`).
+- Shim reads use local stored data on hubs and spokes without requiring a syncer.
+  Missing numeric views may use the existing hub read API; otherwise delegate to
+  `gh`. Never add provider fetches or a TTL cache (`internal/server/pullapi/gh_shim.go`).
+- Log shim calls through the standard `slog` setup at debug level, never a
+  separate usage file, so default gh output stays clean. Keep the full argv,
+  formatted as a string so log redaction applies; command-only counts cannot
+  identify which flags and fields need interception support
+  (`internal/cli/ghcli/ghcli.go::logCall`).
+- The shim is the `kenn-forge gh` subcommand, reached directly or through a
+  `gh` link to `kenn-forge`; do not reintroduce a separate shim binary. Pass gh
+  arguments through unparsed and unnormalized (`cmd/kenn-forge/cli.go::cliArgs`).
+- A `gh` wrapper script around `kenn-forge gh` must not loop: pass-through
+  records the chosen executable and argv, a returning identical call skips it,
+  and a hop cap stops other cycles (`internal/cli/ghcli/ghcli.go::Run`).

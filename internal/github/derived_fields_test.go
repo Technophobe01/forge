@@ -7,6 +7,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/db"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	"go.kenn.io/forge/platform"
 )
 
 // TestCarryMergeRequestDerivedFieldsPersistence proves the carry semantics on
@@ -15,6 +17,8 @@ import (
 // while ci_had_pending and detail_fetched_at are owned by the snapshot
 // upsert itself (stored flag wins; a set marker is never cleared).
 func TestCarryMergeRequestDerivedFieldsPersistence(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name           string
 		closedHeadSHA  string
@@ -39,9 +43,9 @@ func TestCarryMergeRequestDerivedFieldsPersistence(t *testing.T) {
 			database := openTestDB(t)
 			ctx := t.Context()
 			now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
-			repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
+			repoID, err := reposeed.Seed(ctx, database, db.RepoIdentity{
 				Platform: "github", PlatformHost: "github.com",
-				PlatformRepoID: "1", Owner: "owner", Name: "repo",
+				Key: platform.RepositoryIDKey(1), Owner: "owner", Name: "repo",
 				RepoPath: "owner/repo",
 			})
 			require.NoError(err)

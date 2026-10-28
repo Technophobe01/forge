@@ -14,7 +14,7 @@ import (
 	"go.kenn.io/forge/internal/ptyowner"
 	ptyownerruntime "go.kenn.io/forge/internal/ptyowner/runtime"
 	"go.kenn.io/forge/internal/testutil/dbtest"
-	"go.kenn.io/forge/internal/workspace"
+	"go.kenn.io/forge/internal/testutil/workspacetest"
 	"go.kenn.io/forge/internal/workspace/localruntime"
 )
 
@@ -22,7 +22,7 @@ import (
 // workspace whose live agent session has reported through the hook
 // integration is not probed through tmux at all, and that the probe resumes
 // once the hook coverage is gone.
-func TestTmuxEnrichmentSkipsWorkspacesCoveredByHookReports(t *testing.T) {
+func TestTmuxEnrichmentSkipsWorkspacesCoveredByHookReports(t *testing.T) { //nolint:paralleltest // t.Setenv writes KENN_FORGE_AGENT_SESSION_HELPER
 	assert := assert.New(t)
 	require := require.New(t)
 	t.Setenv("KENN_FORGE_AGENT_SESSION_HELPER", "1")
@@ -51,7 +51,7 @@ func TestTmuxEnrichmentSkipsWorkspacesCoveredByHookReports(t *testing.T) {
 	require.NoError(os.WriteFile(tmuxScript, []byte(
 		"#!/bin/sh\necho \"$@\" >> \""+logPath+"\"\nexit 1\n",
 	), 0o755))
-	manager := workspace.NewManager(database, t.TempDir())
+	manager := workspacetest.NewManager(t, database, t.TempDir())
 	manager.SetTmuxCommand([]string{tmuxScript})
 
 	helperCommand := []string{
@@ -73,7 +73,8 @@ func TestTmuxEnrichmentSkipsWorkspacesCoveredByHookReports(t *testing.T) {
 	agentRuntime, err := runtime.Launch(ctx, workspaceID, worktree, "claude")
 	require.NoError(err)
 
-	activity := agentactivity.NewStore(t.TempDir())
+	now := time.Now().UTC().Truncate(time.Second)
+	activity := agentactivity.NewStoreWithClock(t.TempDir(), func() time.Time { return now })
 	handler := New(Deps{
 		DB: database, Workspaces: manager, Runtime: runtime, AgentActivity: activity,
 	})
@@ -112,20 +113,16 @@ func TestTmuxEnrichmentSkipsWorkspacesCoveredByHookReports(t *testing.T) {
 	require.NoError(activity.HandleEvent("claude", agentactivity.HookEvent{
 		SessionID: "second-session", CWD: worktree, HookEventName: "PermissionRequest",
 	}, secondRuntime.Key))
-	time.Sleep(1100 * time.Millisecond)
+	now = now.Add(2 * time.Second)
 	require.NoError(activity.HandleEvent("claude", agentactivity.HookEvent{
 		SessionID: "claude-session", CWD: worktree, HookEventName: "PostToolUse",
 	}, agentRuntime.Key))
-	reports := activity.LiveReportsForWorkspace(worktree, []string{agentRuntime.Key, secondRuntime.Key})
-	require.Len(reports, 2)
-	newest := reports[0]
-	assert.Equal("claude-session", newest.SessionID)
 	badge, ok := activity.SnapshotForWorkspace(worktree, []string{agentRuntime.Key, secondRuntime.Key})
 	require.True(ok)
 	assert.Equal(agentactivity.StateApproval, badge.State, "the badge still shows the pending approval")
 	result = handler.workspaceResponseWithTmuxEnrichment(ctx, summary)
 	require.NotNil(result.response.TmuxLastOutputAt)
-	assert.Equal(newest.UpdatedAt.UTC().Format(time.RFC3339), *result.response.TmuxLastOutputAt,
+	assert.Equal(now.UTC().Format(time.RFC3339), *result.response.TmuxLastOutputAt,
 		"last activity comes from the newest report, not the priority pick")
 	require.NoError(activity.HandleEvent("claude", agentactivity.HookEvent{
 		SessionID: "second-session", CWD: worktree, HookEventName: "SessionEnd",

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { getCommentNavigation } from "../stores/router.svelte.js";
   import type { Snippet } from "svelte";
   import { getSidebar, getStores } from "../context.js";
   import { CollapsibleSidebar } from "@kenn-io/kit-ui";
@@ -13,9 +14,10 @@
   import { isSessionPaneKey } from "../stores/session-pane-key.js";
   import type { IssueDetailSyncMode } from "../stores/issues.svelte.js";
   import type { IssueRouteRef } from "../routes.js";
-  import { issueDetailMatchesRef } from "../components/detail/detail-match.js";
+  import { repoIdentityMatches, issueDetailMatchesRef } from "../components/detail/detail-match.js";
   import type { InlineWorkspaceController, WorkspaceItemIdentity } from "../workspace-inline.js";
   import { useItemWorkspaceClaim } from "../item-workspace-claim.svelte.js";
+  import { repositoryKeyFromWire } from "../api/repository-key.js";
 
   const { toggleSidebar } = getSidebar();
   const { issues } = getStores();
@@ -39,11 +41,11 @@
      * the workspace pane or one of its promoted sessions. Supplied by the app
      * shell: the controls live in `frontend/`, next to the state they act on.
      */
-    workspacePaneControls?: Snippet<[boolean]> | undefined;
+    workspacePaneControls?: Snippet<[TabbedPanelLeaf]> | undefined;
   }
 
   let {
-    selectedIssue = null,
+    selectedIssue: routeSelection = null,
     detailPresentation = "panes",
     isSidebarCollapsed = false,
     hideSidebar = false,
@@ -58,6 +60,20 @@
     workspacePaneControls = undefined,
   }: Props = $props();
 
+  const selectedRepositoryKey = $derived.by(() => {
+    if (!routeSelection || routeSelection.repositoryKey) return routeSelection?.repositoryKey;
+    const item = issues.getIssues().find((item) =>
+      item.Number === routeSelection.number && repoIdentityMatches(item, routeSelection),
+    );
+    return repositoryKeyFromWire(item?.repo);
+  });
+  const selectedIssue = $derived(
+    routeSelection ? { ...routeSelection, repositoryKey: selectedRepositoryKey } : null,
+  );
+
+  const commentNavigation = $derived(
+    selectedIssue ? getCommentNavigation({ ...selectedIssue, itemType: "issue" }) : null,
+  );
   function refreshSelectedDetail(): void {
     if (selectedIssue === null) return;
     const ref = selectedIssue;
@@ -65,6 +81,7 @@
       sync: false,
       provider: ref.provider,
       platformHost: ref.platformHost,
+      repositoryKey: ref.repositoryKey,
       repoPath: ref.repoPath,
     });
   }
@@ -151,6 +168,7 @@
           number={selectedIssue.number}
           provider={selectedIssue.provider}
           platformHost={selectedIssue.platformHost}
+          repositoryKey={selectedIssue.repositoryKey}
           repoPath={selectedIssue.repoPath}
           autoSync={autoSyncDetail}
           hideStaleWhileLoading={hideStaleDetailWhileLoading}
@@ -160,6 +178,8 @@
         />
       {:else if paneLayout !== null}
       <DetailPaneLayout
+        routeTabKey={commentNavigation ? "conversation" : undefined}
+        routeNavigation={commentNavigation}
         layout={paneLayout}
         tabs={paneTabs}
         tablistLabel="Issue detail panes"
@@ -170,11 +190,13 @@
         {#snippet renderPane(tabKey, visible, _inputActive)}
           {#if tabKey === "conversation"}
             <IssueDetail
+              {visible}
               owner={selectedIssue.owner}
               name={selectedIssue.name}
               number={selectedIssue.number}
               provider={selectedIssue.provider}
               platformHost={selectedIssue.platformHost}
+              repositoryKey={selectedIssue.repositoryKey}
               repoPath={selectedIssue.repoPath}
               autoSync={autoSyncDetail}
               hideStaleWhileLoading={hideStaleDetailWhileLoading}
@@ -232,7 +254,7 @@
      panes would be a control with no subject. -->
 {#snippet workspaceLeafExtras(leaf: TabbedPanelLeaf)}
   {#if leaf.tabs.some((tabKey) => tabKey === "workspace" || isSessionPaneKey(tabKey))}
-    {@render workspacePaneControls?.(leaf.tabs.includes("workspace"))}
+    {@render workspacePaneControls?.(leaf)}
   {/if}
 {/snippet}
 

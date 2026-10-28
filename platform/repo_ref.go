@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -52,7 +53,7 @@ func CanonicalRepoRefsEqual(left, right RepoRef) (bool, error) {
 
 func validateCanonicalRepoHost(host string) error {
 	if host == "" || strings.TrimSpace(host) != host {
-		return fmt.Errorf("platform host is empty or contains surrounding whitespace")
+		return errors.New("platform host is empty or contains surrounding whitespace")
 	}
 	if strings.ToLower(host) != host {
 		return fmt.Errorf("platform host %q is not lowercase", host)
@@ -95,11 +96,10 @@ func validateCanonicalRepoHost(host string) error {
 func validateCanonicalRepoPort(host string) error {
 	port := ""
 	if strings.HasPrefix(host, "[") {
-		closing := strings.LastIndex(host, "]")
-		if closing < 0 {
+		_, suffix, found := strings.CutLast(host, "]")
+		if !found {
 			return fmt.Errorf("platform host %q is not a canonical host authority", host)
 		}
-		suffix := host[closing+1:]
 		if suffix == "" {
 			return nil
 		}

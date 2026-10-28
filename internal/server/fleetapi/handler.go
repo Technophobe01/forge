@@ -13,6 +13,7 @@ import (
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/federation"
 	"go.kenn.io/forge/internal/federationauth"
+	"go.kenn.io/forge/internal/fleet"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server/workspaceapi"
 )
@@ -34,19 +35,24 @@ type Event struct {
 
 // Deps contains Fleet's durable services and root-owned integration hooks.
 type Deps struct {
-	DB                          *db.DB
-	Syncer                      *ghclient.Syncer
-	Config                      ConfigSnapshot
-	BasePath                    string
-	BuildVersion                func() string
-	Now                         func() time.Time
-	LocalHandler                func() http.Handler
-	Broadcast                   func(Event) uint64
-	Generation                  func() uint64
-	WorkspaceSnapshot           func(context.Context) (workspaceapi.FleetSnapshot, error)
-	WorkspaceStatsSnapshot      func(context.Context) (workspaceapi.FleetSnapshot, error)
+	ExecutionTargets       func(context.Context, time.Duration) []fleet.PeerResult
+	DB                     *db.DB
+	Syncer                 *ghclient.Syncer
+	Config                 ConfigSnapshot
+	BasePath               string
+	BuildVersion           func() string
+	Now                    func() time.Time
+	LocalHandler           func() http.Handler
+	Broadcast              func(Event) uint64
+	Generation             func() uint64
+	WorkspaceSnapshot      func(context.Context) (workspaceapi.FleetSnapshot, error)
+	WorkspaceStatsSnapshot func(context.Context) (workspaceapi.FleetSnapshot, error)
+	// WorkspaceProviderState asks the hub for the provider state of this
+	// spoke's own workspaces. Nil on hubs, which enrich from their own store.
+	WorkspaceProviderState      func(context.Context, []fleet.RawWorkspace) ([]fleet.RawWorkspace, error)
 	QueueWorkspaceDeletion      func(string) error
 	RuntimeSnapshot             func(string) workspaceapi.RuntimeSnapshot
+	RuntimeExited               func(sessionKey string) bool
 	RevalidateDiffs             func()
 	NodeID                      string
 	FederationActive            bool
@@ -66,6 +72,7 @@ type Deps struct {
 
 // Handler implements Fleet routes, caches, transports, and workers.
 type Handler struct {
+	executionTargets            func(context.Context, time.Duration) []fleet.PeerResult
 	db                          *db.DB
 	syncer                      *ghclient.Syncer
 	basePath                    string
@@ -75,8 +82,10 @@ type Handler struct {
 	broadcast                   func(Event) uint64
 	generation                  func() uint64
 	workspaceSnapshot           func(context.Context) (workspaceapi.FleetSnapshot, error)
+	workspaceProviderState      func(context.Context, []fleet.RawWorkspace) ([]fleet.RawWorkspace, error)
 	queueWorkspaceDeletion      func(string) error
 	runtimeSnapshot             func(string) workspaceapi.RuntimeSnapshot
+	runtimeExited               func(string) bool
 	revalidateDiffs             func()
 	nodeID                      string
 	federationActive            bool
@@ -110,6 +119,9 @@ type Handler struct {
 	// by this handler; it keeps the monitors active for hub-driven spokes
 	// that never open a local event stream.
 	snapshotDemandAt atomic.Int64
+	// activityPeers holds the latest member results behind hub Activity
+	// workspace indicators so Activity never waits on a member fan-out.
+	activityPeers activityPeerCache
 }
 
 // New constructs a Fleet handler without starting its workers.
@@ -120,6 +132,7 @@ func New(deps Deps) *Handler {
 		now = time.Now
 	}
 	h := &Handler{
+		executionTargets:            deps.ExecutionTargets,
 		db:                          deps.DB,
 		syncer:                      deps.Syncer,
 		basePath:                    deps.BasePath,
@@ -129,8 +142,10 @@ func New(deps Deps) *Handler {
 		broadcast:                   deps.Broadcast,
 		generation:                  deps.Generation,
 		workspaceSnapshot:           deps.WorkspaceSnapshot,
+		workspaceProviderState:      deps.WorkspaceProviderState,
 		queueWorkspaceDeletion:      deps.QueueWorkspaceDeletion,
 		runtimeSnapshot:             deps.RuntimeSnapshot,
+		runtimeExited:               deps.RuntimeExited,
 		revalidateDiffs:             deps.RevalidateDiffs,
 		nodeID:                      deps.NodeID,
 		federationActive:            deps.FederationActive,

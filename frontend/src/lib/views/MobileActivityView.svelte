@@ -45,6 +45,7 @@
   import UserRoundIcon from "@lucide/svelte/icons/user-round";
   import {
     activityBranchKey,
+    activityAuthor,
     activityItemKey,
     isClosedOrMergedActivity,
     isDefaultBranchActivity,
@@ -56,6 +57,7 @@
     createRepoLabelFormatter,
     type RepoLabelIdentity,
   } from "../utils/repo-label.js";
+  import { repositoryKeyFromWire } from "../api/repository-key.js";
 
   const { activity, settings, sync, grouping } = getStores();
   const runtime = getAppRuntime();
@@ -112,8 +114,7 @@
     activityPageLimit = parked?.pageLimit ?? 30;
     pendingScrollTop = parked?.scrollTop ?? null;
     activity.setActivityPageLimit(activityPageLimit);
-    activity.loadActivity(true);
-    activity.startActivityPolling();
+    activity.ensureActivityLoaded();
     unsubSync = sync.subscribeSyncComplete(() => {
       activity.loadActivity();
       activity.loadActivityAuthors(true);
@@ -132,8 +133,6 @@
   });
 
   onDestroy(() => {
-    activity.setActivityPageLimit(undefined);
-    activity.stopActivityPolling();
     unsubSync?.();
     searchExecution?.interrupt();
   });
@@ -203,7 +202,7 @@
         ? activityBranchKey({
             provider: item.repo.provider,
             platformHost: item.repo.platform_host,
-            platformRepoId: item.repo.platform_repo_id,
+            repositoryKey: repositoryKeyFromWire(item.repo),
             owner: item.repo.owner,
             name: item.repo.name,
             repoPath: item.repo.repo_path,
@@ -212,7 +211,7 @@
         : activityItemKey({
             provider: item.repo.provider,
             platformHost: item.repo.platform_host,
-            platformRepoId: item.repo.platform_repo_id,
+            repositoryKey: repositoryKeyFromWire(item.repo),
             owner: item.repo.owner,
             name: item.repo.name,
             repoPath: item.repo.repo_path,
@@ -250,7 +249,7 @@
       const key = activityItemKey({
         provider: subject.repo.provider,
         platformHost: subject.repo.platform_host,
-        platformRepoId: subject.repo.platform_repo_id,
+        repositoryKey: repositoryKeyFromWire(subject.repo),
         owner: subject.repo.owner,
         name: subject.repo.name,
         repoPath: subject.repo.repo_path,
@@ -294,7 +293,7 @@
       const key = activityItemKey({
         provider: subject.repo.provider,
         platformHost: subject.repo.platform_host,
-        platformRepoId: subject.repo.platform_repo_id,
+        repositoryKey: repositoryKeyFromWire(subject.repo),
         owner: subject.repo.owner,
         name: subject.repo.name,
         repoPath: subject.repo.repo_path,
@@ -357,6 +356,7 @@
     + (activity.getEnabledItemTypes().has("issue") ? 0 : 1)
     + (EVENT_TYPES.length - activity.getEnabledEvents().size)
     + (activity.getHideBots() ? 1 : 0)
+    + (activity.getHideDrafts() ? 1 : 0)
     + (activity.getHideClosedMerged() ? 1 : 0)
     + (activity.getHideDefaultBranchActivity() ? 1 : 0)
     + (grouping.getHideOrgName() ? 1 : 0)
@@ -427,6 +427,11 @@
   function toggleHideBots(): void {
     activity.setHideBots(!activity.getHideBots());
     applyFilters();
+  }
+
+  function toggleHideDrafts(): void {
+    activity.setHideDrafts(!activity.getHideDrafts());
+    activity.loadActivity();
   }
 
   function toggleHideClosedMerged(): void {
@@ -608,7 +613,7 @@
     const id = `${activityType}:${activityItemKey({
       provider: subject.repo.provider,
       platformHost: subject.repo.platform_host,
-      platformRepoId: subject.repo.platform_repo_id,
+      repositoryKey: repositoryKeyFromWire(subject.repo),
       owner: subject.repo.owner,
       name: subject.repo.name,
       repoPath: subject.repo.repo_path,
@@ -707,7 +712,7 @@
     return {
       provider: item.repo.provider,
       platformHost: item.repo.platform_host,
-      platformRepoId: item.repo.platform_repo_id,
+      repositoryKey: repositoryKeyFromWire(item.repo),
       owner: item.repo.owner,
       name: item.repo.name,
       repoPath: item.repo.repo_path,
@@ -718,7 +723,7 @@
     return {
       provider: subject.repo.provider,
       platformHost: subject.repo.platform_host,
-      platformRepoId: subject.repo.platform_repo_id,
+      repositoryKey: repositoryKeyFromWire(subject.repo),
       owner: subject.repo.owner,
       name: subject.repo.name,
       repoPath: subject.repo.repo_path,
@@ -743,9 +748,9 @@
   }
 
   function eventDetail(event: ActivityItem): string {
-    if (!isDefaultBranchActivity(event)) return event.author;
+    if (!isDefaultBranchActivity(event)) return activityAuthor(event);
     if (isDefaultBranchForcePushActivity(event)) return branchActivityTitle(event);
-    return [shortSha(event.commit_sha), event.author_name || event.author]
+    return [shortSha(event.commit_sha), activityAuthor(event)]
       .filter(Boolean)
       .join(" · ");
   }
@@ -893,6 +898,14 @@
 
       <div class="mobile-boolean-toggle">
         <Toggle
+          checked={activity.getHideDrafts()}
+          label="Hide drafts"
+          onchange={() => toggleHideDrafts()}
+        />
+      </div>
+
+      <div class="mobile-boolean-toggle">
+        <Toggle
           checked={activity.getHideDefaultBranchActivity()}
           label="Hide branch"
           onchange={() => toggleHideDefaultBranchActivity()}
@@ -1029,7 +1042,7 @@
     --mobile-space-lg: 17.5px;
     --mobile-radius-sm: var(--radius-md);
     --mobile-radius-md: var(--radius-lg);
-    --mobile-hit-target: 45.5px;
+    --mobile-hit-target: 40px;
     container-type: inline-size;
     font-size: var(--font-size-md);
     display: flex;

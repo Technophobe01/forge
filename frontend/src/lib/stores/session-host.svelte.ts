@@ -1,4 +1,6 @@
 import type { Attachment } from "svelte/attachments";
+import { DEFAULT_TERMINAL_SETTINGS } from "../api/types.js";
+import { schemaConstraints } from "../api/generated/schema-constraints.js";
 import type { TerminalKey } from "../components/terminal/terminal-key.js";
 
 /**
@@ -45,6 +47,8 @@ export function sessionHostPrefix(workspaceId: string, hostKey: string | undefin
 
 /** What the pool needs to render one session's terminal. */
 export interface MountedSession {
+  kind?: string | undefined;
+  label?: string;
   hostKey: SessionHostKey;
   fleetHostKey?: string;
   websocketPath: string;
@@ -66,7 +70,7 @@ interface SessionInputSender {
 }
 const inputSenders = new Map<SessionHostKey, SessionInputSender>();
 let releasedKeys: SessionHostKey[] = [];
-let retainedSessionLimit = 10;
+let retainedSessionLimit = DEFAULT_TERMINAL_SETTINGS.retained_sessions;
 
 export function registerSessionSlot(key: SessionHostKey, el: HTMLElement | null): void {
   // A targeted property write, not `slotEls = { ...slotEls, [key]: el }`. This
@@ -185,6 +189,8 @@ export function noteSessionMounted(session: MountedSession): void {
       existing.websocketPath === session.websocketPath &&
       existing.fleetHostKey === session.fleetHostKey &&
       existing.status === session.status &&
+      existing.kind === session.kind &&
+      existing.label === session.label &&
       (existing.cursorWheelInput ?? false) === (session.cursorWheelInput ?? false) &&
       (existing.disabled ?? false) === (session.disabled ?? false)
     ) {
@@ -277,7 +283,7 @@ export function noteSessionConnection(key: SessionHostKey, isConnected: boolean)
 }
 
 export function setRetainedSessionLimit(limit: number): void {
-  retainedSessionLimit = Math.max(0, Math.min(20, Math.trunc(limit)));
+  retainedSessionLimit = Math.max(0, Math.min(schemaConstraints.Terminal.retained_sessions.maximum, Math.trunc(limit)));
   trimReleasedSessions();
 }
 
@@ -364,7 +370,7 @@ export function resetSessionHostForTest(): void {
   connected.clear();
   inputSenders.clear();
   releasedKeys = [];
-  retainedSessionLimit = 10;
+  retainedSessionLimit = DEFAULT_TERMINAL_SETTINGS.retained_sessions;
   mounted = [];
   pendingFocusKey = null;
   pendingFocusSoft = false;

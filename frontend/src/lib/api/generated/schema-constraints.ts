@@ -4,6 +4,27 @@
  */
 
 export const schemaConstraints = {
+  ACP: {
+    font_size: { minimum: 8, maximum: 32 },
+  },
+  ACPQueuedPrompt: {
+    generation: { minimum: 0 },
+  },
+  ACPSettingsUpdate: {
+    font_size: { minimum: 8, maximum: 32 },
+  },
+  ACPSupervision: {
+    generation: { minimum: 0 },
+  },
+  ACPTurnRecord: {
+    generation: { minimum: 0 },
+  },
+  Assignment: {
+    uid: { minimum: 0 },
+  },
+  Connection: {
+    uid: { minimum: 0 },
+  },
   CreateEnrollmentTokenInputBody: {
     expires_in_seconds: { minimum: 1, maximum: 86400 },
   },
@@ -15,6 +36,9 @@ export const schemaConstraints = {
   },
   DiffDescriptor: {
     snapshot_revision: { minimum: 0 },
+  },
+  ExternalContextActionInput: {
+    max_length: { minimum: 1, maximum: 16384 },
   },
   FederationDiffDescriptorRequest: {
     pull_number: { minimum: 1 },
@@ -28,16 +52,46 @@ export const schemaConstraints = {
   RawSnapshot: {
     generation: { minimum: 0 },
   },
-  RepositoryDescriptor: {
-    snapshot_revision: { minimum: 0 },
-  },
   Snapshot: {
     generation: { minimum: 0 },
+  },
+  SyncSettingsResponse: {
+    budget_per_hour: { minimum: 50, maximum: 15000 },
+  },
+  SyncSettingsUpdate: {
+    budget_per_hour: { minimum: 50, maximum: 15000 },
+  },
+  Terminal: {
+    retained_sessions: { minimum: 0, maximum: 100 },
+  },
+  WorkerIdentity: {
+    uid: { minimum: 0 },
+  },
+  WorkerWorkspaceTargetRequest: {
+    number: { minimum: 1 },
+  },
+  WorklistItemRef: {
+    number: { minimum: 1 },
+  },
+  WorklistItemResponse: {
+    score: { minimum: 1, maximum: 10 },
+  },
+  WorkspaceChat: {
+    messageCursor: { minimum: 0 },
+  },
+  WorkspaceChatCommand: {
+    generation: { minimum: 0 },
+  },
+  WorkspaceChatMessage: {
+    version: { minimum: 0 },
   },
   WorkspaceLaunchPull: {
     snapshot_revision: { minimum: 1 },
   },
   WorkspaceLaunchSpec: {
     item_number: { minimum: 1 },
+  },
+  WorkspaceTargetSelection: {
+    number: { minimum: 1 },
   },
 } as const;

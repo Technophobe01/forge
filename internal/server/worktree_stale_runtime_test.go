@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,17 +9,19 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/server/workspaceapi"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 )
 
 func TestRemoveStaleWorktreeRouteStopsRuntimeSessions(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	requirePTYAvailable(t)
 	require := require.New(t)
 	assert := assert.New(t)
 
-	srv, projectID, worktreeID, recordPath :=
-		setupProjectWorktreeCommandSessionTestWithRecord(t)
+	srv, projectID, worktreeID, recordPath := setupProjectWorktreeCommandSessionTestWithRecord(t)
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
@@ -34,15 +35,15 @@ func TestRemoveStaleWorktreeRouteStopsRuntimeSessions(t *testing.T) {
 		t.Context(), projectID, db.ProjectInventory{}, time.Now(),
 	))
 
-	resp := httpDo(t, ts, http.MethodPost, "/api/v1/worktrees/remove-stale",
-		mustMarshal(t, map[string]any{"scopedKey": "worktree:" + worktree.Path}))
+	resp := serverfake.HttpDo(t, ts, http.MethodPost, "/api/v1/worktrees/remove-stale",
+		serverfake.MustMarshal(t, map[string]any{"scopedKey": "worktree:" + worktree.Path}))
 	require.Equal(http.StatusOK, resp.StatusCode)
 	resp.Body.Close()
 
 	assertFakeTmuxKilledSession(t, recordPath, tmuxSession)
 	assert.Empty(srv.runtime.ListSessions(workspaceapi.ProjectWorktreeRuntimeScope(worktreeID)))
 	rows, err := srv.db.ListProjectWorktreeTmuxSessions(
-		context.Background(), worktreeID,
+		t.Context(), worktreeID,
 	)
 	require.NoError(err)
 	assert.Empty(rows)

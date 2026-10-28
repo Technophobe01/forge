@@ -43,7 +43,7 @@ func (s *Scheduler) Run(
 	var worked atomic.Bool
 	var wg sync.WaitGroup
 	for _, key := range keys {
-		key, repos := key, groups[key]
+		repos := groups[key]
 		wg.Go(func() {
 			handled, err := work(ctx, repos)
 			if handled {
@@ -70,6 +70,14 @@ var errAdmissionDeferred = errors.New("archive request deferred by admission")
 // provider was reached, so the pass counts as work.
 var errRequestPreempted = fmt.Errorf("archive request preempted by live work: %w", errAdmissionDeferred)
 
+// An admission denial may follow earlier provider work in the same pass.
+type admissionDeferredError struct {
+	providerAttempted bool
+}
+
+func (e *admissionDeferredError) Error() string { return errAdmissionDeferred.Error() }
+func (e *admissionDeferredError) Unwrap() error { return errAdmissionDeferred }
+
 type featureDeferredError struct {
 	FeatureDeferral
 	providerAttempted bool
@@ -79,8 +87,8 @@ func (e *featureDeferredError) Error() string { return e.Detail }
 func (e *featureDeferredError) Unwrap() error { return errAdmissionDeferred }
 
 func featureDeferredBeforeProvider(err error) bool {
-	var deferred *featureDeferredError
-	return errors.As(err, &deferred) && deferred != nil && !deferred.providerAttempted
+	deferred, ok := errors.AsType[*featureDeferredError](err)
+	return ok && deferred != nil && !deferred.providerAttempted
 }
 
 // RunEligible performs one worker pass. Tests and one-shot callers use it;
@@ -258,15 +266,18 @@ func (s *Service) runNextInventoryWork(
 }
 
 // finishWork converts a work unit's outcome into the pass result. A unit that
-// reached the provider is work, even when the provider answered with a feature
-// deferral or live work preempted the request: other repositories on the host
+// reached the provider is work, even when a budget or feature deferral stops
+// it or live work preempts the request: other repositories on the host
 // may be eligible right now, so the loop keeps its pacing interval. Only an
 // admission denial before any provider request is idle: nothing was attempted
 // and the deferral names when to look again, so the worker may back off.
 func (s *Service) finishWork(err error) (bool, error) {
-	var deferred *featureDeferredError
+	if deferred, ok := errors.AsType[*admissionDeferredError](err); ok {
+		return deferred.providerAttempted, nil
+	}
+	deferred, deferredOK := errors.AsType[*featureDeferredError](err)
 	switch {
-	case errors.As(err, &deferred):
+	case deferredOK:
 		return deferred.providerAttempted, nil
 	case errors.Is(err, errRequestPreempted):
 		return true, nil

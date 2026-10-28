@@ -10,24 +10,25 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v7"
+
 	"go.kenn.io/forge/internal/activityrelay"
 	"go.kenn.io/forge/internal/archive"
 	"go.kenn.io/forge/internal/db"
-	"go.kenn.io/forge/internal/platformdb"
 	"go.kenn.io/forge/platform"
 	platformgithub "go.kenn.io/forge/platform/github"
 )
 
 // RelayStatus is a process-local view of the subscription, carried with sync status.
 type RelayStatus struct {
-	Connected bool            `json:"connected"`
-	Recent    []RelayActivity `json:"recent"`
+	Connected    bool            `json:"connected"`
+	Incompatible bool            `json:"incompatible,omitempty"`
+	Recent       []RelayActivity `json:"recent"`
 }
 
 type RelayActivity struct {
 	ID         int64     `json:"id"`
 	Repository string    `json:"repository"`
-	Target     string    `json:"target" enum:"pull_request,pull_request_checks,issue,repository_refs,repository"`
+	Target     string    `json:"target" enum:"pull_request,pull_request_checks,workflow_runs,issue,repository_refs,repository"`
 	Number     int       `json:"number"`
 	ReceivedAt time.Time `json:"received_at"`
 }
@@ -50,6 +51,8 @@ const (
 	// relayQueueLimit bounds refresh work waiting on provider budget; hints
 	// beyond it are dropped and covered by ordinary syncing.
 	relayQueueLimit = 1024
+	// Workflow notifications have no ordinary-sync fallback.
+	relayWorkflowReserve = 256
 )
 
 func (s *Syncer) updateRelayStatus(update func(*RelayStatus)) {
@@ -95,17 +98,29 @@ func (s *Syncer) RunRelay(ctx context.Context, options RelayOptions) {
 			opened := time.Now()
 			s.updateRelayStatus(func(status *RelayStatus) { status.Connected = true })
 			err = stream.Read(func(hint activityrelay.Hint) {
+				if s.Status().Relay.Incompatible {
+					s.updateRelayStatus(func(status *RelayStatus) { status.Incompatible = false })
+				}
 				sequence++
 				s.receiveRelayHint(hint, sequence, queue)
 			})
 			_ = stream.Close()
-			s.updateRelayStatus(func(status *RelayStatus) { status.Connected = false })
 			// An accepted stream that dies at once is still a failure; only a
 			// stream that stayed up resets the backoff, so a relay or proxy
 			// that accepts and immediately drops cannot cause a reconnect storm.
 			if time.Since(opened) >= relayStableAfter {
 				policy.Reset()
 			}
+		}
+		incompatible := errors.Is(err, activityrelay.ErrIncompatible)
+		if incompatible && !s.Status().Relay.Incompatible {
+			slog.Warn("relay message format is incompatible; update Forge and the relay to compatible versions")
+		}
+		if status := s.Status().Relay; status.Connected || (incompatible && !status.Incompatible) {
+			s.updateRelayStatus(func(status *RelayStatus) {
+				status.Connected = false
+				status.Incompatible = status.Incompatible || incompatible
+			})
 		}
 		if ctx.Err() != nil {
 			return
@@ -129,7 +144,7 @@ func (s *Syncer) receiveRelayHint(hint activityrelay.Hint, id int64, queue *rela
 	if !s.SyncEnabled() {
 		return
 	}
-	repo, ok := s.trackedRepoByProviderID(platform.KindGitHub, hint.Host, hint.RepositoryID)
+	repo, ok := s.trackedRepoByProviderKey(platform.KindGitHub, hint.Host, platform.RepositoryIDKey(hint.RepositoryID))
 	if !ok || repo.Archived {
 		return
 	}
@@ -153,7 +168,11 @@ type relayQueue struct {
 
 func (q *relayQueue) push(hint activityrelay.Hint) {
 	q.mu.Lock()
-	if _, waiting := q.pending[hint]; !waiting && len(q.order) < relayQueueLimit {
+	limit := relayQueueLimit
+	if hint.Target == activityrelay.WorkflowRuns {
+		limit += relayWorkflowReserve
+	}
+	if _, waiting := q.pending[hint]; !waiting && len(q.order) < limit {
 		if q.pending == nil {
 			q.pending = make(map[activityrelay.Hint]struct{})
 		}
@@ -193,7 +212,8 @@ func (s *Syncer) drainRelayQueue(ctx context.Context, queue *relayQueue) {
 			if !s.SyncEnabled() {
 				continue
 			}
-			if err := s.refreshRelayHint(WithSyncBudget(ctx), hint); err != nil && ctx.Err() == nil {
+			err := s.refreshRelayHint(WithSyncBudget(ctx), hint)
+			if err != nil && ctx.Err() == nil && !isReportedGitAccessFailure(err) {
 				slog.Warn("relay refresh failed", "repository_id", hint.RepositoryID, "target", hint.Target, "number", hint.Number, "err", err)
 			}
 		}
@@ -204,7 +224,7 @@ func (s *Syncer) drainRelayQueue(ctx context.Context, queue *relayQueue) {
 // served now, because budget, cooldown, or catalog state forbids it, is
 // dropped: ordinary syncing covers it later.
 func (s *Syncer) refreshRelayHint(ctx context.Context, hint activityrelay.Hint) error {
-	repo, tracked := s.trackedRepoByProviderID(platform.KindGitHub, hint.Host, hint.RepositoryID)
+	repo, tracked := s.trackedRepoByProviderKey(platform.KindGitHub, hint.Host, platform.RepositoryIDKey(hint.RepositoryID))
 	if !tracked || repo.Archived {
 		return nil
 	}
@@ -212,10 +232,10 @@ func (s *Syncer) refreshRelayHint(ctx context.Context, hint activityrelay.Hint) 
 	if err != nil {
 		return err
 	}
-	if s.backgroundReserveExhausted(repo, QuotaResourceREST, false) {
+	if hint.Target != activityrelay.WorkflowRuns && s.backgroundReserveExhausted(repo, QuotaResourceREST, false) {
 		return nil
 	}
-	stored, err := s.db.GetRepositoryByProviderID(ctx, hint.Provider, hint.Host, repo.PlatformExternalID)
+	stored, err := s.db.GetRepositoryByProviderID(ctx, repo.Identity())
 	if err != nil {
 		return err
 	}
@@ -249,6 +269,8 @@ func (s *Syncer) refreshRelayHint(ctx context.Context, hint activityrelay.Hint) 
 		cost = IssueDetailWorstCase * wireAttemptsPerRequest
 	}
 	switch target {
+	case activityrelay.WorkflowRuns:
+		// Notify open Actions views; only a visible view reads workflow runs.
 	case activityrelay.PullRequest, activityrelay.Issue:
 		if budget := s.budgets[bucket]; budget != nil && !budget.CanSpend(cost) {
 			return nil
@@ -263,7 +285,7 @@ func (s *Syncer) refreshRelayHint(ctx context.Context, hint activityrelay.Hint) 
 		}
 		providerAttempted := false
 		if target == activityrelay.PullRequest {
-			err = s.syncMRForRepoResolved(ctx, repo, hint.Number, false, &providerAttempted, nil, nil, nil, &repoID)
+			err = s.syncMRForRepoResolved(ctx, repo, hint.Number, mrDetailFull, &providerAttempted, nil, nil, nil, &repoID)
 			if _, onlyDiffFailed := err.(*DiffSyncError); onlyDiffFailed { //nolint:errorlint // joined hard failures must surface
 				err = nil
 			}
@@ -291,7 +313,7 @@ func (s *Syncer) refreshRelayHint(ctx context.Context, hint activityrelay.Hint) 
 		err = s.refreshRelayRefs(ctx, repo)
 	}
 	if err != nil {
-		return fmt.Errorf("refresh %s/%s/%d: %w", hint.RepositoryID, target, hint.Number, err)
+		return fmt.Errorf("refresh %d/%s/%d: %w", hint.RepositoryID, target, hint.Number, err)
 	}
 	if s.onRelayRefresh != nil {
 		s.onRelayRefresh(ctx, repoID, target, hint.Number)
@@ -305,11 +327,10 @@ func (s *Syncer) refreshRelayRefs(ctx context.Context, repo RepoRef) error {
 		return err
 	}
 	defer s.beginProviderWork(ctx, bucket, archive.PriorityNormalIndex)()
-	repo, repoID, fence, found, err := s.reconcileRepoForDirectSync(ctx, repo)
-	if err != nil || !found {
+	repo, repoID, err := s.reconcileRepoForDirectSync(ctx, repo)
+	if err != nil {
 		return err
 	}
-	ctx = s.db.WithRepositoryRouteFence(ctx, platformdb.DBRepoIdentity(platformRepoRef(repo)), fence)
 	ctx = withCloneRepositoryIdentity(ctx, repo)
 	if s.clones != nil {
 		branch := s.defaultBranchForActivity(ctx, repoID, repo)
@@ -317,7 +338,7 @@ func (s *Syncer) refreshRelayRefs(ctx context.Context, repo RepoRef) error {
 		if err != nil {
 			return err
 		}
-		if err := s.ensureCloneForRoute(ctx, repo, repoID, fence); err != nil {
+		if err := s.ensureClone(ctx, repo); err != nil {
 			return err
 		}
 		s.syncDefaultBranchActivity(ctx, repo, repoID, branch, previous)
@@ -326,7 +347,10 @@ func (s *Syncer) refreshRelayRefs(ctx context.Context, repo RepoRef) error {
 	if err != nil {
 		return err
 	}
-	prs, err := client.ListOpenPullRequests(ctx, repo.Owner, repo.Name)
+	requestedAt := s.nowUTC()
+	// This read only indexes REST fields. Leave the list ETag to normal sync,
+	// where a changed list also triggers the GraphQL mergeability refresh.
+	prs, err := client.ListOpenPullRequests(platformgithub.WithUnconditionalRead(ctx), repo.Owner, repo.Name)
 	if platformgithub.IsNotModified(err) {
 		return nil
 	}
@@ -334,7 +358,7 @@ func (s *Syncer) refreshRelayRefs(ctx context.Context, repo RepoRef) error {
 		return err
 	}
 	for _, pr := range prs {
-		if err := s.indexUpsertMR(ctx, client, repo, repoID, pr); err != nil {
+		if err := s.indexUpsertMR(ctx, client, repo, repoID, pr, requestedAt); err != nil {
 			return err
 		}
 	}

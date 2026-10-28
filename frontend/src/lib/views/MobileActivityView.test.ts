@@ -9,7 +9,8 @@ function branchActivityItem(id: string, overrides: Partial<ActivityItem> = {}): 
     id,
     cursor: id,
     activity_type: "default_branch_commit",
-    author: "alice",
+    author: "Alice Example",
+    commit_author: "alice",
     author_name: "Alice Example",
     body_preview: "Refresh cache warmer",
     branch_name: "main",
@@ -61,6 +62,12 @@ const enabledItemTypes = vi.hoisted(() => ({
 const setEnabledEvents = vi.hoisted(() =>
   vi.fn((events: Set<string>) => {
     enabledEvents.value = events;
+  }),
+);
+const hideDrafts = vi.hoisted(() => ({ value: false }));
+const setHideDrafts = vi.hoisted(() =>
+  vi.fn((value: boolean) => {
+    hideDrafts.value = value;
   }),
 );
 const setHideClosedMerged = vi.hoisted(() =>
@@ -122,6 +129,7 @@ vi.mock("../context.js", () => ({
     activity: {
       initializeFromMount: vi.fn(),
       loadActivity,
+      ensureActivityLoaded: loadActivity,
       startActivityPolling: vi.fn(),
       stopActivityPolling: vi.fn(),
       getActivitySearch: () => "",
@@ -141,6 +149,7 @@ vi.mock("../context.js", () => ({
       getUnassigned: () => unassigned.value,
       getHideClosedMerged: () => hideClosedMerged.value,
       getHideBots: () => hideBots.value,
+      getHideDrafts: () => hideDrafts.value,
       getUseWorkspaceActivityForRecency: () => useWorkspaceActivityForRecency.value,
       getHideDefaultBranchActivity: () => false,
       isActivityLoading: () => activityLoading.value,
@@ -165,6 +174,7 @@ vi.mock("../context.js", () => ({
       loadThreadPreview,
       markNotificationSeen,
       setHideBots: vi.fn(),
+      setHideDrafts,
       setHideDefaultBranchActivity: vi.fn(),
       syncToURL: vi.fn(),
     },
@@ -177,7 +187,7 @@ vi.mock("../context.js", () => ({
           owner: "acme",
           name: "api",
           repo_path: "acme/api",
-          platform_repo_id: "R_api",
+          platform_repo_id: 1101,
           is_glob: false,
           matched_repo_count: 1,
           hidden_from_ui: false,
@@ -190,7 +200,7 @@ vi.mock("../context.js", () => ({
             {
               provider: "github",
               platform_host: "github.com",
-              platform_repo_id: "R_api",
+              platform_repo_id: 1101,
               repo_path: "acme/api",
             },
           ],
@@ -236,6 +246,8 @@ describe("MobileActivityView branch activity", () => {
     setActivityAuthor.mockClear();
     setEnabledEvents.mockClear();
     setHideClosedMerged.mockClear();
+    hideDrafts.value = false;
+    setHideDrafts.mockClear();
     loadActivity.mockClear();
     setFullEventProjectionRequired.mockClear();
     setActivityPageLimit.mockClear();
@@ -321,6 +333,20 @@ describe("MobileActivityView branch activity", () => {
     expect(setHideClosedMerged).toHaveBeenCalledWith(true);
   });
 
+  it("reloads activity when draft visibility changes", async () => {
+    render(MobileActivityView, { props: { onSelectItem } });
+    const mountedReads = loadActivity.mock.calls.length;
+
+    await fireEvent.click(screen.getByRole("button", { name: "Filters" }));
+    const control = screen.getByRole<HTMLInputElement>("switch", { name: "Hide drafts" });
+    expect(control.checked).toBe(false);
+
+    await fireEvent.click(control);
+
+    expect(setHideDrafts).toHaveBeenCalledWith(true);
+    expect(loadActivity).toHaveBeenCalledTimes(mountedReads + 1);
+  });
+
   it("renders branch activity without a fake PR or issue number", () => {
     const { container } = render(MobileActivityView, {
       props: { onSelectItem },
@@ -336,7 +362,7 @@ describe("MobileActivityView branch activity", () => {
     expect(article?.querySelector(".chip--kind-issue")).toBeNull();
   });
 
-  it("uses a bounded projection for its mounted lifetime", () => {
+  it("keeps its bounded projection for background refresh after leaving", () => {
     const view = render(MobileActivityView, { props: { onSelectItem } });
 
     expect(setActivityPageLimit).toHaveBeenCalledWith(30);
@@ -346,7 +372,7 @@ describe("MobileActivityView branch activity", () => {
     expect(setFullEventProjectionRequired).not.toHaveBeenCalled();
 
     view.unmount();
-    expect(setActivityPageLimit).toHaveBeenLastCalledWith(undefined);
+    expect(setActivityPageLimit).toHaveBeenLastCalledWith(30);
   });
 
   it("autoloads one direct-activity chunk when the end sentinel enters the viewport", async () => {
@@ -547,6 +573,14 @@ describe("MobileActivityView branch activity", () => {
     expect(setActivityAuthor).toHaveBeenLastCalledWith(undefined);
   });
 
+  it("shows the linked author on a default-branch commit", () => {
+    render(MobileActivityView, {
+      props: { onSelectItem },
+    });
+
+    expect(screen.getByRole("button", { name: /Commit.*a1b2c3d.*alice/ })).toBeTruthy();
+  });
+
   it("does not select a PR or issue when tapping a branch event", async () => {
     const open = vi.spyOn(window, "open").mockImplementation(() => null);
 
@@ -554,7 +588,7 @@ describe("MobileActivityView branch activity", () => {
       props: { onSelectItem },
     });
 
-    const event = screen.getByRole("button", { name: /Commit.*a1b2c3d.*Alice Example/ });
+    const event = screen.getByRole("button", { name: /Commit.*a1b2c3d/ });
     await fireEvent.click(event);
 
     expect(onSelectItem).not.toHaveBeenCalled();
@@ -760,7 +794,7 @@ describe("MobileActivityView workspace activity", () => {
         repo: {
           provider: "github",
           platform_host: "github.com",
-          platform_repo_id: "repo-acme-widgets",
+          platform_repo_id: 1018,
           owner: "acme",
           name: "widgets",
           repo_path: "acme/widgets",
@@ -772,7 +806,7 @@ describe("MobileActivityView workspace activity", () => {
         repo: {
           provider: "gitlab",
           platform_host: "gitlab.example.com",
-          platform_repo_id: "repo-platform-widgets",
+          platform_repo_id: 1015,
           owner: "platform",
           name: "widgets",
           repo_path: "platform/widgets",

@@ -11,26 +11,30 @@ import (
 
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/db"
+	"go.kenn.io/forge/internal/devbox"
+	"go.kenn.io/forge/internal/gitclone"
 	"go.kenn.io/forge/internal/github"
-	"go.kenn.io/forge/internal/server"
+	"go.kenn.io/forge/internal/server/syncevents"
 	"go.kenn.io/forge/internal/tokenauth"
 	"go.kenn.io/forge/platform"
+	bitbucketclient "go.kenn.io/forge/platform/bitbucket"
+	"go.kenn.io/forge/platform/bitbucketdc"
 	forgejoclient "go.kenn.io/forge/platform/forgejo"
 	giteaclient "go.kenn.io/forge/platform/gitea"
 	gitlabclient "go.kenn.io/forge/platform/gitlab"
 )
 
-func wireSyncStatus(syncer *github.Syncer, hub *server.EventHub) {
+func wireSyncStatus(syncer *github.Syncer, hub *syncevents.EventHub) {
 	// Syncer serializes status callbacks, including relay-only updates.
 	wasRunning := syncer.Status().Running
 	syncer.SetOnStatusChange(func(status *github.SyncStatus) {
-		hub.Broadcast(server.Event{Type: "sync_status", Data: status})
+		hub.Broadcast(syncevents.Event{Type: "sync_status", Data: status})
 		if wasRunning && !status.Running {
-			hub.Broadcast(server.Event{Type: "data_changed", Data: struct{}{}})
+			hub.Broadcast(syncevents.Event{Type: "data_changed", Data: struct{}{}})
 		}
 		wasRunning = status.Running
 	})
-	hub.Broadcast(server.Event{Type: "sync_status", Data: syncer.Status()})
+	hub.Broadcast(syncevents.Event{Type: "sync_status", Data: syncer.Status()})
 }
 
 type providerFactory func(context.Context, providerFactoryInput) (providerFactoryOutput, error)
@@ -228,33 +232,77 @@ func (s *gitStartup) SourceForRepo(
 	}
 	platformName = strings.ToLower(strings.TrimSpace(platformName))
 	host = strings.ToLower(strings.TrimSpace(host))
-	providerSource := s.cloneSources[tokenauth.Key{Platform: platformName, Host: host}]
 	if platformName != string(platform.KindGitHub) {
-		return providerSource
+		return s.cloneSources[tokenauth.Key{Platform: platformName, Host: host}]
 	}
+	if route, ok := s.githubRouteForRepo(host, owner, name); ok {
+		return route.mutationSource()
+	}
+	if _, routed := s.githubHosts[host]; routed {
+		return missingRouteTokenSource{host: host, owner: owner, name: name}
+	}
+	return s.cloneSources[tokenauth.Key{Platform: platformName, Host: host}]
+}
+
+// ReadSourceForRepo selects the credential for clones and fetches into the
+// clone store. It uses the route's normal read chain, which prefers a covering
+// GitHub App installation over a user credential.
+func (s *gitStartup) ReadSourceForRepo(
+	platformName, host, owner, name string,
+) tokenauth.Source {
+	source := s.SourceForRepo(platformName, host, owner, name)
+	if s == nil || !strings.EqualFold(strings.TrimSpace(platformName), string(platform.KindGitHub)) {
+		return source
+	}
+	route, ok := s.githubRouteForRepo(strings.ToLower(strings.TrimSpace(host)), owner, name)
+	if !ok {
+		return source
+	}
+	return readGitTokenSource{
+		Source: route.source, owner: strings.TrimSpace(owner), required: route.required,
+	}
+}
+
+func (s *gitStartup) githubRouteForRepo(host, owner, name string) (gitCredentialRoute, bool) {
 	owner = strings.ToLower(strings.TrimSpace(owner))
 	name = strings.ToLower(strings.TrimSpace(name))
 	for _, scope := range []string{"repo:" + owner + "/" + name, "owner:" + owner, ""} {
 		route, ok := s.githubRoutes[tokenauth.Key{
 			Platform: string(platform.KindGitHub), Host: host, Scope: scope,
 		}]
-		if !ok || route.source == nil {
-			continue
+		if ok && route.source != nil {
+			return route, true
 		}
-		if route.identityBound {
-			return identityBoundMutationTokenSource{
-				Source: route.source, writeIdentity: route.writeIdentity,
-			}
-		}
-		if route.required {
-			return mutationTokenSource{Source: route.source}
-		}
-		return optionalMutationTokenSource{Source: route.source}
 	}
-	if _, routed := s.githubHosts[host]; routed {
-		return missingRouteTokenSource{host: host, owner: owner, name: name}
+	return gitCredentialRoute{}, false
+}
+
+func (r gitCredentialRoute) mutationSource() tokenauth.Source {
+	if r.identityBound {
+		return identityBoundMutationTokenSource{
+			Source: r.source, writeIdentity: r.writeIdentity,
+		}
 	}
-	return providerSource
+	if r.required {
+		return mutationTokenSource{Source: r.source}
+	}
+	return optionalMutationTokenSource{Source: r.source}
+}
+
+// readGitTokenSource scopes clone-store reads to the repository owner while
+// preserving anonymous Git for optional routes without credentials.
+type readGitTokenSource struct {
+	tokenauth.Source
+	owner    string
+	required bool
+}
+
+func (s readGitTokenSource) Token(ctx context.Context) (string, error) {
+	token, err := s.Source.Token(tokenauth.WithGitHubOwner(ctx, s.owner))
+	if !s.required && errors.Is(err, tokenauth.ErrMissingToken) {
+		return "", nil
+	}
+	return token, err
 }
 
 func (s *gitStartup) FallbackSource(host string) tokenauth.Source {
@@ -269,15 +317,7 @@ func (s *gitStartup) FallbackSource(host string) tokenauth.Source {
 	if route, ok := s.githubRoutes[tokenauth.Key{
 		Platform: string(platform.KindGitHub), Host: host,
 	}]; ok && route.source != nil {
-		if route.identityBound {
-			return identityBoundMutationTokenSource{
-				Source: route.source, writeIdentity: route.writeIdentity,
-			}
-		}
-		if route.required {
-			return mutationTokenSource{Source: route.source}
-		}
-		return optionalMutationTokenSource{Source: route.source}
+		return route.mutationSource()
 	}
 	return clone
 }
@@ -315,6 +355,14 @@ func defaultProviderFactories() map[string]providerFactory {
 			return providerFactoryOutput{
 				githubClient: client,
 			}, nil
+		},
+		string(platform.KindBitbucket): func(_ context.Context, input providerFactoryInput) (providerFactoryOutput, error) {
+			if input.host != platform.DefaultBitbucketHost {
+				client, err := bitbucketdc.NewClient(input.host, input.tokenSource, github.WrapSyncBudgetTransport(http.DefaultTransport, input.budget), input.rateObserver())
+				return providerFactoryOutput{provider: client}, err
+			}
+			client, err := bitbucketclient.NewClient(input.host, input.tokenSource, github.WrapSyncBudgetTransport(http.DefaultTransport, input.budget), input.rateObserver())
+			return providerFactoryOutput{provider: client}, err
 		},
 		string(platform.KindGitLab): func(ctx context.Context, input providerFactoryInput) (providerFactoryOutput, error) {
 			client, err := gitlabclient.NewClient(
@@ -508,7 +556,7 @@ func providerTokenSources(
 }
 
 type serveControlPlanes struct {
-	Git      gitStartup
+	Git      gitclone.RouteResolver
 	Provider *providerControlPlane
 }
 
@@ -524,11 +572,14 @@ func buildServeControlPlanes(
 	resolver github.IdentityResolver,
 	disableSync bool,
 ) (serveControlPlanes, error) {
+	if cfg.ExecutionWorker.Enabled {
+		return serveControlPlanes{Git: devbox.NewBrokerClient(cfg.ExecutionWorker.BrokerSocket)}, nil
+	}
 	gitRoutes, err := buildGitStartup(cfg, set)
 	if err != nil {
 		return serveControlPlanes{}, err
 	}
-	result := serveControlPlanes{Git: gitRoutes}
+	result := serveControlPlanes{Git: &gitRoutes}
 	if cfg.Fleet.RoleOrDefault() == config.FleetRoleSpoke {
 		return result, nil
 	}
@@ -558,7 +609,7 @@ func buildServeControlPlanes(
 		return serveControlPlanes{}, err
 	}
 	result.Provider = &control
-	result.Git.ApplyProviderControlPlane(result.Provider)
+	gitRoutes.ApplyProviderControlPlane(result.Provider)
 	return result, nil
 }
 
@@ -1137,7 +1188,15 @@ func buildGitHubRouteClients(startup *providerControlPlane) error {
 			)
 		}
 		var writeSnapshotClient github.Client
+		var writeFetcher *github.GraphQLFetcher
 		if writeRuntime != nil && configured.writeIdentity != configured.readIdentity {
+			writeFetcher = github.NewGraphQLFetcher(
+				mutationTokenSource{Source: configured.source}, key.Host,
+				writeRuntime.graphql, writeRuntime.budget,
+				github.WithGraphQLQuotaAccounting(
+					startup.quotaRegistry, configured.writeIdentity,
+				),
+			)
 			writeSnapshotClient, err = github.NewClient(
 				mutationTokenSource{Source: configured.source}, key.Host,
 				writeRuntime.rest, nil,
@@ -1174,7 +1233,8 @@ func buildGitHubRouteClients(startup *providerControlPlane) error {
 			WriteCredentialKey: writeCredentialKey(descriptor),
 			Client:             client, DiscoveryClient: discoveryClient,
 			WriteSnapshotClient: writeSnapshotClient,
-			Fetcher:             fetcher, ReadIdentity: configured.readIdentity,
+			Fetcher:             fetcher, WriteFetcher: writeFetcher,
+			ReadIdentity:  configured.readIdentity,
 			WriteIdentity: configured.writeIdentity,
 			ArchiveKey:    archiveRouteKey(configured.archiveKey, key.Host),
 			ArchiveClient: archiveClient, ArchiveFetcher: archiveFetcher,

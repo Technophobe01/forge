@@ -15,6 +15,7 @@ import (
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/server"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 )
 
 // fakeGitealikeUserAPI serves the minimal Gitea/Forgejo surface the
@@ -41,6 +42,7 @@ func gitealikeUsersJSON(names []string) string {
 }
 
 func (f *fakeGitealikeUserAPI) handler(t *testing.T) http.Handler {
+	t.Helper()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		key := r.Method + " " + r.URL.Path
@@ -147,6 +149,7 @@ func setupGitealikeUserStack(
 }
 
 func TestGitealikeSetPullAssigneesUpdatesProviderAndDB(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	for _, variant := range gitealikeLabelVariants() {
 		t.Run(variant.name, func(t *testing.T) {
 			require := require.New(t)
@@ -175,6 +178,7 @@ func TestGitealikeSetPullAssigneesUpdatesProviderAndDB(t *testing.T) {
 }
 
 func TestGitealikeSetIssueAssigneesUpdatesProviderAndDB(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	for _, variant := range gitealikeLabelVariants() {
 		t.Run(variant.name, func(t *testing.T) {
 			require := require.New(t)
@@ -203,6 +207,7 @@ func TestGitealikeSetIssueAssigneesUpdatesProviderAndDB(t *testing.T) {
 }
 
 func TestGitealikeSetPullReviewersRequestsAndRemovesThroughAPI(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	for _, variant := range gitealikeLabelVariants() {
 		t.Run(variant.name, func(t *testing.T) {
 			require := require.New(t)

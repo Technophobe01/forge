@@ -1,8 +1,12 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { tick } from "svelte";
+import { Effect } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import WorkspaceListSidebar from "./WorkspaceListSidebarTestHarness.svelte";
+import { createDetailStore } from "../../stores/detail.svelte.js";
+import { makeTestAppRuntime } from "../../testing/effect-layers.js";
+import type { GeneratedClient } from "../../api/generated-api.js";
 import {
   getNewWorkspaceSeedRepo,
   isNewWorkspaceDialogOpen,
@@ -13,6 +17,8 @@ import {
   isWorkspaceRepoCatalogReady,
   setWorkspaceRepoCatalog,
 } from "../../stores/workspace-repo-catalog.svelte.js";
+import { repositoryKeyToWire, type RepositoryKey } from "../../api/repository-key.js";
+import { getFlashes } from "../../stores/flash.svelte.js";
 
 const mockGet = vi.fn();
 const mockPost = vi.fn();
@@ -20,10 +26,12 @@ const mockDelete = vi.fn();
 const mockNavigate = vi.fn();
 const subscribeWorkspaceEvents = vi.fn();
 let workspaceEventsSubscriber: ((event: unknown) => void) | undefined;
+let detailStore: Pick<ReturnType<typeof createDetailStore>, "isPullMerging">;
 
 vi.mock("../../context.js", () => ({
   getStores: () => ({
     events: { subscribeWorkspaceEvents },
+    detail: detailStore,
   }),
 }));
 
@@ -53,6 +61,7 @@ interface WorkspaceFixtureOptions {
   id: string;
   provider: string;
   platformHost: string;
+  repositoryKey?: RepositoryKey | undefined;
   owner: string;
   name: string;
   number: number;
@@ -93,6 +102,7 @@ function workspaceFixture({
   id,
   provider,
   platformHost,
+  repositoryKey,
   owner,
   name,
   number,
@@ -127,6 +137,7 @@ function workspaceFixture({
     repo: {
       provider,
       platform_host: platformHost,
+      ...repositoryKeyToWire(repositoryKey),
       owner,
       name,
       repo_path: `${owner}/${name}`,
@@ -219,6 +230,7 @@ function deferred<T>() {
 
 describe("WorkspaceListSidebar", () => {
   beforeEach(() => {
+    detailStore = { isPullMerging: () => false };
     mockGet.mockReset();
     mockPost.mockReset();
     mockDelete.mockReset();
@@ -257,7 +269,118 @@ describe("WorkspaceListSidebar", () => {
     expect(screen.getByText("Workspaces")).toBeTruthy();
   });
 
-  it("labels workspace rows with their execution machine on the hub", async () => {
+  it("shows merging for linked PR workspaces until the merge settles", async () => {
+    const ref = {
+      provider: "github",
+      platformHost: "github.com",
+      repositoryKey: { kind: "id", id: 7001 },
+      owner: "acme",
+      name: "api",
+      repoPath: "acme/api",
+    };
+    const merge = Promise.withResolvers<{ data: { merged: boolean } }>();
+    const runtime = makeTestAppRuntime({
+      GET: vi.fn(async () => ({
+        data: {
+          repo_owner: "acme",
+          repo_name: "api",
+          repo: {
+            provider: "github",
+            platform_host: "github.com",
+            platform_repo_id: 7001,
+            owner: "acme",
+            name: "api",
+            repo_path: "acme/api",
+          },
+          merge_request: { Number: 1 },
+          events: [],
+        },
+      })),
+      POST: vi.fn(() => merge.promise),
+      PUT: vi.fn(),
+      DELETE: vi.fn(),
+    } as unknown as GeneratedClient);
+    const store = createDetailStore({ runtime });
+    detailStore = store;
+    const workspaces = [
+      workspaceFixture({ ...ref, id: "pr-workspace", name: "renamed-api", number: 1, title: "Linked pull request" }),
+      workspaceFixture({
+        ...ref,
+        id: "replacement-repo",
+        repositoryKey: { kind: "id", id: 7999 },
+        number: 1,
+        title: "Replacement repository",
+      }),
+      workspaceFixture({
+        ...ref,
+        id: "unverified-repo",
+        repositoryKey: undefined,
+        number: 1,
+        title: "Unverified repository",
+      }),
+      workspaceFixture({ ...ref, id: "adhoc-workspace", number: 0, itemType: "adhoc", associatedPRNumber: 1 }),
+      workspaceFixture({ ...ref, id: "other-host", number: 1, platformHost: "git.example.com" }),
+      workspaceFixture({ ...ref, id: "issue-workspace", number: 1, itemType: "issue" }),
+      workspaceFixture({ ...ref, id: "linked-issue", number: 2, itemType: "issue", associatedPRNumber: 1 }),
+      workspaceFixture({ ...ref, id: "linked-kata", number: 0, itemType: "kata_task", associatedPRNumber: 1 }),
+    ];
+    mockGet.mockResolvedValue({ data: { workspaces } });
+    try {
+      store.loadDetail("acme", "api", 1, { ...ref, sync: false });
+      await waitFor(() => expect(store.isDetailLoading()).toBe(false));
+      render(WorkspaceListSidebar, { props: { selectedId: "pr-workspace" } });
+      await screen.findByText("Linked pull request");
+
+      store.mergePull(ref, 1, { method: "squash", commit_title: "Merge", commit_message: "" }, false);
+      await waitFor(() => expect(screen.getAllByText("Merging")).toHaveLength(4));
+      expect(within(screen.getByText("Linked pull request").closest(".ws-row")!).getByText("Merging")).toBeTruthy();
+      expect(within(screen.getByText("Replacement repository").closest(".ws-row")!).queryByText("Merging")).toBeNull();
+      expect(within(screen.getByText("Unverified repository").closest(".ws-row")!).queryByText("Merging")).toBeNull();
+
+      merge.resolve({ data: { merged: true } });
+      await waitFor(() => expect(screen.queryByText("Merging")).toBeNull());
+      expect(screen.getByText("Linked pull request")).toBeTruthy();
+    } finally {
+      cleanup();
+      await Effect.runPromise(runtime.disposeEffect);
+    }
+  });
+
+  it.each([false, true])("restores a cached list before a remount refresh completes (empty: %s)", async (empty) => {
+    const initial = empty ? [] : sortFixtures();
+    mockGet.mockResolvedValue({ data: { workspaces: initial } });
+    const onWorkspaceListStateChange = vi.fn();
+    const view = render(WorkspaceListSidebar, {
+      props: { selectedId: "", onWorkspaceListStateChange },
+    });
+    await waitFor(() =>
+      expect(onWorkspaceListStateChange).toHaveBeenLastCalledWith({
+        status: "loaded",
+        total: initial.length,
+      }),
+    );
+    await view.rerender({ showSidebar: false });
+
+    const refresh = deferred<{ data: { workspaces: ReturnType<typeof sortFixtures> } }>();
+    mockGet.mockReturnValue(refresh.promise);
+    mockGet.mockClear();
+    onWorkspaceListStateChange.mockClear();
+    await view.rerender({ showSidebar: true });
+    await waitFor(() => expect(mockGet).toHaveBeenCalledWith("/snapshot", expect.anything()));
+    await waitFor(() =>
+      expect(onWorkspaceListStateChange).toHaveBeenLastCalledWith({
+        status: "loaded",
+        total: initial.length,
+      }),
+    );
+    expect(rowTitles(view.container)).toHaveLength(initial.length);
+
+    refresh.resolve({ data: { workspaces: [sortFixtures()[0]!] } });
+    await waitFor(() => expect(rowTitles(view.container)).toEqual(["Newest created"]));
+  });
+
+  it.each(["remote", "devbox"])("labels %s workspace rows with their execution machine on the hub", async (kind) => {
+    const hostKey = kind === "devbox" ? "devbox:compute-a" : "peer-a";
     mockGet.mockImplementation((path: string) => {
       if (path === "/snapshot") {
         return Promise.resolve({
@@ -277,12 +400,12 @@ describe("WorkspaceListSidebar", () => {
                 tmuxSessions: [],
               },
               {
-                configKey: "79e90262-7426-4dd5-9ef1-0d511af84e12",
+                configKey: hostKey,
                 diagnostics: [],
-                id: "79e90262-7426-4dd5-9ef1-0d511af84e12",
-                kind: "remote",
-                name: "Build spoke",
-                federationRole: "spoke",
+                id: hostKey,
+                kind,
+                name: "Build machine",
+                federationRole: kind === "devbox" ? "devbox" : "spoke",
                 operationAvailability: {},
                 platform: "linux",
                 preferredTransport: "http",
@@ -310,7 +433,7 @@ describe("WorkspaceListSidebar", () => {
                   number: 12,
                   title: "Remote workspace",
                 }),
-                fleet_host_key: "79e90262-7426-4dd5-9ef1-0d511af84e12",
+                fleet_host_key: hostKey,
               },
             ],
           },
@@ -325,10 +448,10 @@ describe("WorkspaceListSidebar", () => {
 
     await screen.findByText("Remote workspace");
     expect(screen.getByTitle("Runs on Studio hub")).toBeTruthy();
-    expect(screen.getByText("Build spoke")).toBeTruthy();
-    expect(screen.getByTitle("Runs on Build spoke")).toBeTruthy();
+    expect(screen.getByText(kind === "devbox" ? "Build machine · Devbox" : "Build machine")).toBeTruthy();
+    expect(screen.getByTitle("Runs on Build machine")).toBeTruthy();
     expect(screen.queryByLabelText("Fleet hosts")).toBeNull();
-    expect(screen.queryByText("79e90262-7426-4dd5-9ef1-0d511af84e12")).toBeNull();
+    expect(screen.queryByText(hostKey)).toBeNull();
   });
 
   it("coalesces workspace completion bursts into one list refresh", async () => {
@@ -679,7 +802,12 @@ describe("WorkspaceListSidebar", () => {
     expect(mockGet).not.toHaveBeenCalledWith("/fleet/hosts/{host_key}/workspaces", expect.anything());
   });
 
-  it("refreshes inline workspace summaries after a workspace event", async () => {
+  it.each([
+    { type: "workspace_status", payload: {} },
+    { type: "open" },
+    { type: "reconnect.stale", payload: {} },
+    { type: "workspace_pr_associated", payload: {} },
+  ])("refreshes inline workspace summaries after $type", async (event) => {
     let snapshotLoads = 0;
     mockGet.mockImplementation((path: string) => {
       if (path === "/snapshot") {
@@ -721,7 +849,7 @@ describe("WorkspaceListSidebar", () => {
     expect(await screen.findByText("Initial local workspace")).toBeTruthy();
     await waitFor(() => expect(workspaceEventsSubscriber).toBeTypeOf("function"));
 
-    emitWorkspaceStatus();
+    workspaceEventsSubscriber?.(event);
 
     expect(await screen.findByText("Updated local workspace")).toBeTruthy();
     expect(snapshotLoads).toBe(2);
@@ -1263,6 +1391,12 @@ describe("WorkspaceListSidebar", () => {
     });
     expect(container.querySelectorAll(".ws-row")).toHaveLength(1);
     expect(screen.getByText("Add notification inbox triage")).toBeTruthy();
+
+    await fireEvent.input(filter, {
+      target: { value: "kenn-io NOT huma !#224" },
+    });
+    expect(container.querySelectorAll(".ws-row")).toHaveLength(1);
+    expect(screen.getByText("Hosted code fetch and caching strategy")).toBeTruthy();
   });
 
   it("shows matching workspaces in collapsed groups while filtering", async () => {
@@ -1354,6 +1488,59 @@ describe("WorkspaceListSidebar", () => {
     expect(screen.queryByRole("tooltip")).toBeNull();
   });
 
+  it("filters by item author alongside search and resets the filter", async () => {
+    const base = workspaceFixture({
+      id: "ws-alice",
+      provider: "github",
+      platformHost: "github.com",
+      owner: "acme",
+      name: "widgets",
+      number: 1,
+      title: "First change",
+    });
+    mockGet.mockResolvedValue({
+      data: {
+        workspaces: [
+          { ...base, item_author: "alice" },
+          {
+            ...base,
+            id: "ws-alice-issue",
+            item_number: 4,
+            item_type: "issue",
+            item_author: "ALICE",
+            mr_title: "Follow up",
+          },
+          { ...base, id: "ws-bob", item_number: 2, item_author: "bob", mr_title: "Second change" },
+          { ...base, id: "ws-unlinked", item_number: 0, item_type: "adhoc", mr_title: null },
+        ],
+      },
+    });
+    const { container, rerender } = render(WorkspaceListSidebar, { props: { selectedId: "ws-alice" } });
+    await screen.findByText("First change");
+    await fireEvent.click(screen.getByRole("button", { name: "Filters" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Filter authors: Anyone" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "alice" }));
+    expect(rowTitles(container)).toEqual(["First change", "Follow up"]);
+    expect(screen.getByLabelText("1 active filters")).toBeTruthy();
+
+    await rerender({ selectedRepos: "github|github.com/acme/other" });
+    expect(screen.getByText("No workspaces match.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Filter authors: alice" })).toBeTruthy();
+    await rerender({ selectedRepos: undefined });
+
+    await fireEvent.input(screen.getByRole("searchbox", { name: "Filter workspaces" }), {
+      target: { value: "Second" },
+    });
+    expect(screen.getByText("No workspaces match.")).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Filter authors: alice" }));
+    expect(screen.getByRole("option", { name: "alice" })).toBeTruthy();
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "bob" }));
+    expect(rowTitles(container)).toEqual(["Second change"]);
+    await fireEvent.click(screen.getByRole("button", { name: "Reset filters" }));
+    expect(container.querySelectorAll(".ws-row")).toHaveLength(4);
+    expect((screen.getByRole("searchbox", { name: "Filter workspaces" }) as HTMLInputElement).value).toBe("");
+  });
+
   it("sorts flat by creation time and drops group headers", async () => {
     mockGet.mockResolvedValue({
       data: { workspaces: sortFixtures() },
@@ -1368,13 +1555,188 @@ describe("WorkspaceListSidebar", () => {
     expect(screen.getByText("kenn-io/kenn-forge")).toBeTruthy();
     expect(container.querySelectorAll(".repo-context")).toHaveLength(0);
 
-    await fireEvent.click(screen.getByTitle("View workspace options"));
-    await fireEvent.click(screen.getByRole("button", { name: "Created" }));
+    await fireEvent.click(screen.getByTitle("Filter workspaces"));
+    await fireEvent.click(screen.getByRole("radio", { name: "Created" }));
 
     expect(rowTitles(container)).toEqual(["Newest created", "Most recently active", "Oldest without activity"]);
     expect(container.querySelectorAll(".sidebar-group-header")).toHaveLength(0);
     // Flat rows carry their own repo context instead of a header.
     expect(container.querySelectorAll(".repo-context")).toHaveLength(3);
+  });
+
+  it.each(["repo", "created", "activity", "item-activity", "agent-status"])(
+    "pins workspaces across projects above the %s list and restores them on remount",
+    async (sort) => {
+      localStorage.setItem("kenn-forge:workspaceListSort", sort);
+      const workspaces = [
+        workspaceFixture({
+          id: "api-new",
+          provider: "github",
+          platformHost: "github.com",
+          owner: "acme",
+          name: "api",
+          number: 1,
+          title: "API cleanup",
+          createdAt: "2026-05-14T12:00:00Z",
+        }),
+        workspaceFixture({
+          id: "api-old",
+          provider: "github",
+          platformHost: "github.com",
+          owner: "acme",
+          name: "api",
+          number: 2,
+          title: "API feature",
+        }),
+        workspaceFixture({
+          id: "web-old",
+          provider: "gitlab",
+          platformHost: "gitlab.example.com",
+          owner: "acme",
+          name: "web",
+          number: 3,
+          title: "Web feature",
+        }),
+      ];
+      mockGet.mockResolvedValue({ data: { workspaces } });
+      const view = render(WorkspaceListSidebar, { props: { selectedId: "api-new" } });
+      await screen.findByText("Web feature");
+
+      await fireEvent.contextMenu(screen.getByText("Web feature").closest(".ws-row")!);
+      await fireEvent.click(screen.getByRole("menuitem", { name: "Pin workspace", exact: true }));
+      await fireEvent.contextMenu(screen.getByText("API feature").closest(".ws-row")!);
+      await fireEvent.click(screen.getByRole("menuitem", { name: "Pin workspace", exact: true }));
+
+      expect(rowTitles(view.container)).toEqual(["Web feature", "API feature", "API cleanup"]);
+      const pinned = screen.getByRole("button", { name: "Pinned 2" }).closest("section")!;
+      expect(rowTitles(pinned)).toEqual(["Web feature", "API feature"]);
+      expect(within(pinned).getByText("acme/web")).toBeTruthy();
+      expect(within(pinned).getByText("acme/api")).toBeTruthy();
+      expect(mockNavigate).not.toHaveBeenCalled();
+
+      await view.rerender({ showSidebar: false });
+      await view.rerender({ showSidebar: true, selectedRepos: "github|github.com/acme/api" });
+      await waitFor(() => expect(rowTitles(view.container)).toEqual(["API feature", "API cleanup"]));
+
+      await fireEvent.input(screen.getByRole("searchbox", { name: "Filter workspaces" }), {
+        target: { value: "Web feature" },
+      });
+      expect(rowTitles(view.container)).toEqual([]);
+      await fireEvent.input(screen.getByRole("searchbox", { name: "Filter workspaces" }), { target: { value: "" } });
+      await view.rerender({ selectedRepos: undefined });
+      expect(rowTitles(view.container)).toEqual(["Web feature", "API feature", "API cleanup"]);
+
+      await fireEvent.contextMenu(screen.getByText("Web feature").closest(".ws-row")!);
+      await fireEvent.click(screen.getByRole("menuitem", { name: "Unpin workspace", exact: true }));
+      await view.rerender({ selectedRepos: "github|github.com/acme/api" });
+      expect(rowTitles(view.container)).toEqual(["API feature", "API cleanup"]);
+      await fireEvent.contextMenu(screen.getByText("API feature").closest(".ws-row")!);
+      await fireEvent.click(screen.getByRole("menuitem", { name: "Unpin workspace", exact: true }));
+      expect(screen.queryByRole("button", { name: /^Pinned/ })).toBeNull();
+      expect(rowTitles(view.container)).toEqual(["API cleanup", "API feature"]);
+      await view.rerender({ showSidebar: false });
+      await view.rerender({ showSidebar: true });
+      await waitFor(() => expect(rowTitles(view.container)).toEqual(["API cleanup", "API feature"]));
+    },
+  );
+
+  it("keeps focus on the workspace row after pinning and unpinning it", async () => {
+    mockGet.mockResolvedValue({
+      data: {
+        workspaces: [
+          workspaceFixture({
+            id: "ws-focus",
+            provider: "github",
+            platformHost: "github.com",
+            owner: "acme",
+            name: "api",
+            number: 1,
+            title: "Focus workspace",
+          }),
+        ],
+      },
+    });
+    render(WorkspaceListSidebar, { props: { selectedId: "" } });
+    await screen.findByText("Focus workspace");
+    const focusRow = () => screen.getByText("Focus workspace").closest(".ws-row") as HTMLElement;
+
+    const unpinnedRow = focusRow();
+    unpinnedRow.focus();
+    await fireEvent.contextMenu(unpinnedRow);
+    await fireEvent.click(screen.getByRole("menuitem", { name: "Pin workspace", exact: true }));
+    await waitFor(() => expect(document.activeElement).toBe(focusRow()));
+    expect(focusRow()).not.toBe(unpinnedRow);
+
+    const pinnedRow = focusRow();
+    await fireEvent.contextMenu(pinnedRow);
+    await fireEvent.click(screen.getByRole("menuitem", { name: "Unpin workspace", exact: true }));
+    await waitFor(() => expect(document.activeElement).toBe(focusRow()));
+    expect(focusRow()).not.toBe(pinnedRow);
+  });
+
+  it("opens a collapsed repo group to keep focus on an unpinned workspace", async () => {
+    const repoWorkspace = (id: string, number: number, title: string) =>
+      workspaceFixture({
+        id,
+        provider: "github",
+        platformHost: "github.com",
+        owner: "acme",
+        name: "api",
+        number,
+        title,
+      });
+    mockGet.mockResolvedValue({
+      data: {
+        workspaces: [
+          repoWorkspace("ws-moving", 1, "Moving workspace"),
+          repoWorkspace("ws-staying", 2, "Staying workspace"),
+        ],
+      },
+    });
+    render(WorkspaceListSidebar, { props: { selectedId: "" } });
+    await screen.findByText("Moving workspace");
+    const movingRow = () => screen.queryByText("Moving workspace")?.closest(".ws-row") as HTMLElement | null;
+
+    await fireEvent.contextMenu(movingRow()!);
+    await fireEvent.click(screen.getByRole("menuitem", { name: "Pin workspace", exact: true }));
+    const groupHeader = screen.getByRole("button", { name: /api/, expanded: true });
+    await fireEvent.click(groupHeader);
+    expect(groupHeader.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("Staying workspace")).toBeNull();
+
+    await fireEvent.contextMenu(movingRow()!);
+    await fireEvent.click(screen.getByRole("menuitem", { name: "Unpin workspace", exact: true }));
+    await waitFor(() => expect(document.activeElement).toBe(movingRow()));
+    expect(groupHeader.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("pins only the chosen host when workspace IDs match", async () => {
+    const local = workspaceFixture({
+      id: "shared-id",
+      provider: "github",
+      platformHost: "github.com",
+      owner: "acme",
+      name: "api",
+      number: 1,
+      title: "Local workspace",
+    });
+    const remote = { ...local, mr_title: "Remote workspace", fleet_host_key: "peer-a" };
+    mockGet.mockResolvedValue({ data: { workspaces: [local, remote] } });
+    const view = render(WorkspaceListSidebar, { props: { selectedId: "" } });
+    await screen.findByText("Remote workspace");
+    await fireEvent.contextMenu(screen.getByText("Remote workspace").closest(".ws-row")!);
+    await fireEvent.click(screen.getByRole("menuitem", { name: "Pin workspace", exact: true }));
+    expect(rowTitles(view.container)).toEqual(["Remote workspace", "Local workspace"]);
+    expect(rowTitles(screen.getByRole("button", { name: "Pinned 1" }).closest("section")!)).toEqual([
+      "Remote workspace",
+    ]);
+
+    await fireEvent.contextMenu(screen.getByText("Local workspace").closest(".ws-row")!);
+    expect(screen.getByRole("menuitem", { name: "Pin workspace", exact: true })).toBeTruthy();
+    await fireEvent.keyDown(document, { key: "Escape" });
+    await view.rerender({ showSidebar: false });
+    await view.rerender({ showSidebar: true });
+    await waitFor(() => expect(rowTitles(view.container)).toEqual(["Remote workspace", "Local workspace"]));
   });
 
   it("keeps provider and host identity visible in flat rows", async () => {
@@ -1420,8 +1782,8 @@ describe("WorkspaceListSidebar", () => {
     });
     await screen.findByText("GitHub workspace");
 
-    await fireEvent.click(screen.getByTitle("View workspace options"));
-    await fireEvent.click(screen.getByRole("button", { name: "Created" }));
+    await fireEvent.click(screen.getByTitle("Filter workspaces"));
+    await fireEvent.click(screen.getByRole("radio", { name: "Created" }));
 
     // Provider icons survive the loss of group headers.
     expect(container.querySelectorAll(".repo-context")).toHaveLength(3);
@@ -1446,8 +1808,8 @@ describe("WorkspaceListSidebar", () => {
     });
     await screen.findByText("Newest created");
 
-    await fireEvent.click(screen.getByTitle("View workspace options"));
-    await fireEvent.click(screen.getByRole("button", { name: "Activity" }));
+    await fireEvent.click(screen.getByTitle("Filter workspaces"));
+    await fireEvent.click(screen.getByRole("radio", { name: "Activity" }));
 
     // ws-old has no tmux output, so it sorts by its creation time.
     expect(rowTitles(container)).toEqual(["Most recently active", "Newest created", "Oldest without activity"]);
@@ -1499,8 +1861,8 @@ describe("WorkspaceListSidebar", () => {
     });
     await screen.findByText("Newest created fallback");
 
-    await fireEvent.click(screen.getByTitle("View workspace options"));
-    const itemActivitySort = screen.getByRole("button", { name: "Item activity" });
+    await fireEvent.click(screen.getByTitle("Filter workspaces"));
+    const itemActivitySort = screen.getByRole("radio", { name: "Item activity" });
     expect(itemActivitySort.getAttribute("title")).toBe(
       "Sort by latest linked PR or issue activity, falling back to workspace creation.",
     );
@@ -1549,8 +1911,8 @@ describe("WorkspaceListSidebar", () => {
     });
     await screen.findByText("approval");
 
-    await fireEvent.click(screen.getByTitle("View workspace options"));
-    const agentStatusSort = screen.getByRole("button", { name: "Agent status" });
+    await fireEvent.click(screen.getByTitle("Filter workspaces"));
+    const agentStatusSort = screen.getByRole("radio", { name: "Agent status" });
     expect(agentStatusSort.getAttribute("title")).toBe(
       "Group by agent status, with workspaces needing attention first.",
     );
@@ -1591,8 +1953,8 @@ describe("WorkspaceListSidebar", () => {
       "unreported",
     ]);
 
-    await fireEvent.click(screen.getByTitle("View workspace options"));
-    await fireEvent.click(screen.getByRole("button", { name: "Created" }));
+    await fireEvent.click(screen.getByTitle("Filter workspaces"));
+    await fireEvent.click(screen.getByRole("radio", { name: "Created" }));
     expect(doneRow?.querySelector(".agent-state")?.textContent).toContain("Done");
   });
 
@@ -1631,8 +1993,8 @@ describe("WorkspaceListSidebar", () => {
     });
     await screen.findByText("Newer creation");
 
-    await fireEvent.click(screen.getByTitle("View workspace options"));
-    await fireEvent.click(screen.getByRole("button", { name: "Agent status" }));
+    await fireEvent.click(screen.getByTitle("Filter workspaces"));
+    await fireEvent.click(screen.getByRole("radio", { name: "Agent status" }));
 
     expect(rowTitles(container)).toEqual(["Newer item activity", "Newer creation"]);
     expect(
@@ -1678,8 +2040,8 @@ describe("WorkspaceListSidebar", () => {
       ["Item activity", "2026-05-12T12:00:00Z"],
       ["Agent status", "2026-05-13T12:00:00Z"],
     ]) {
-      await fireEvent.click(screen.getByTitle("View workspace options"));
-      await fireEvent.click(screen.getByRole("button", { name: sort }));
+      await fireEvent.click(screen.getByTitle("Filter workspaces"));
+      await fireEvent.click(screen.getByRole("radio", { name: sort }));
       expect(
         container.querySelector(".ws-row-aside > .item-bubble + .workspace-sort-time")?.getAttribute("datetime"),
       ).toBe(timestamp);
@@ -1696,8 +2058,8 @@ describe("WorkspaceListSidebar", () => {
     });
     await screen.findByText("Newest created");
 
-    await fireEvent.click(screen.getByTitle("View workspace options"));
-    await fireEvent.click(screen.getByRole("button", { name: "Activity" }));
+    await fireEvent.click(screen.getByTitle("Filter workspaces"));
+    await fireEvent.click(screen.getByRole("radio", { name: "Activity" }));
     first.unmount();
 
     const { container } = render(WorkspaceListSidebar, {
@@ -1709,7 +2071,7 @@ describe("WorkspaceListSidebar", () => {
     expect(container.querySelectorAll(".sidebar-group-header")).toHaveLength(0);
   });
 
-  it("folds sort choices into the workspace view menu", async () => {
+  it("shares author, sort, and display choices in the workspace filters", async () => {
     mockGet.mockResolvedValue({
       data: { workspaces: sortFixtures() },
     });
@@ -1719,13 +2081,13 @@ describe("WorkspaceListSidebar", () => {
     });
     await screen.findByText("Newest created");
 
-    await fireEvent.click(screen.getByRole("button", { name: "View" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Filters" }));
 
     expect(screen.getByText("Sorting")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Org / repo" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Created" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Activity" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Agent status" })).toBeTruthy();
+    expect(screen.getByRole("radio", { name: "Org / repo" })).toBeTruthy();
+    expect(screen.getByRole("radio", { name: "Created" })).toBeTruthy();
+    expect(screen.getByRole("radio", { name: "Activity" })).toBeTruthy();
+    expect(screen.getByRole("radio", { name: "Agent status" })).toBeTruthy();
     expect(screen.getByText("Visibility")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Hide org name" }).classList.contains("active")).toBe(false);
     expect(screen.getByRole("button", { name: "Show PR diff stats" })).toBeTruthy();
@@ -1741,7 +2103,7 @@ describe("WorkspaceListSidebar", () => {
     });
     await screen.findByText("kenn-io/kenn-forge");
 
-    await fireEvent.click(screen.getByRole("button", { name: "View" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Filters" }));
     const hideOrgName = screen.getByRole("button", { name: "Hide org name" });
     await fireEvent.click(hideOrgName);
     expect(hideOrgName.classList.contains("active")).toBe(true);
@@ -1749,7 +2111,7 @@ describe("WorkspaceListSidebar", () => {
     expect(screen.queryByText("kenn-io/kenn-forge")).toBeNull();
     expect(screen.getByText("kenn-forge")).toBeTruthy();
 
-    await fireEvent.click(screen.getByRole("button", { name: "Created" }));
+    await fireEvent.click(screen.getByRole("radio", { name: "Created" }));
 
     expect(container.querySelectorAll(".repo-context-name")[0]?.textContent?.trim()).toBe("kenn-forge");
     expect(container.querySelectorAll(".repo-context-name")[1]?.textContent?.trim()).toBe("agentsview");
@@ -1798,14 +2160,14 @@ describe("WorkspaceListSidebar", () => {
     });
     await screen.findByText("GitHub acme widgets");
 
-    await fireEvent.click(screen.getByRole("button", { name: "View" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Filters" }));
     await fireEvent.click(screen.getByRole("button", { name: "Hide org name" }));
 
     expect(
       Array.from(container.querySelectorAll(".sidebar-group-header__name")).map((el) => el.textContent?.trim()),
     ).toEqual(["github.com/acme/widgets", "ghe.example.com/acme/widgets", "platform/widgets"]);
 
-    await fireEvent.click(screen.getByRole("button", { name: "Created" }));
+    await fireEvent.click(screen.getByRole("radio", { name: "Created" }));
 
     expect(Array.from(container.querySelectorAll(".repo-context-name")).map((el) => el.textContent?.trim())).toEqual([
       "github.com/acme/widgets",
@@ -1879,7 +2241,7 @@ describe("WorkspaceListSidebar", () => {
 
     expect(container.querySelector(".workspace-diff-stats")).toBeTruthy();
 
-    await fireEvent.click(screen.getByRole("button", { name: "View" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Filters" }));
     await fireEvent.click(screen.getByRole("button", { name: "Show PR diff stats" }));
 
     expect(container.querySelector(".workspace-diff-stats")).toBeNull();
@@ -1930,8 +2292,8 @@ describe("WorkspaceListSidebar", () => {
     // With a sort timestamp visible the pencil stays on the meta line. In
     // the aside column it would stack as a third line under the bubble and
     // time and make the dirty row taller than its clean neighbours.
-    await fireEvent.click(screen.getByTitle("View workspace options"));
-    await fireEvent.click(screen.getByRole("button", { name: "Created" }));
+    await fireEvent.click(screen.getByTitle("Filter workspaces"));
+    await fireEvent.click(screen.getByRole("radio", { name: "Created" }));
     const dirtyRow = screen.getByText("Dirty workspace").closest<HTMLElement>(".ws-row");
     const firstClass = (el: Element) => el.className.split(" ")[0];
     expect(Array.from(dirtyRow?.querySelector(".ws-row-aside")?.children ?? [], firstClass)).toEqual([
@@ -2084,6 +2446,42 @@ describe("WorkspaceListSidebar", () => {
     expect(draftBubble?.classList.contains("open")).toBe(false);
     expect(openBubble?.classList.contains("open")).toBe(true);
     expect(openBubble?.classList.contains("draft")).toBe(false);
+  });
+
+  it("colors pull request bubbles with the same lifecycle accent as the phone badges", async () => {
+    const base = { provider: "github", platformHost: "github.com", owner: "acme", name: "widgets" };
+    mockGet.mockResolvedValue({
+      data: {
+        workspaces: [
+          workspaceFixture({ ...base, id: "ws-open", number: 1, title: "Open PR" }),
+          { ...workspaceFixture({ ...base, id: "ws-merged", number: 2, title: "Merged PR" }), mr_state: "merged" },
+          { ...workspaceFixture({ ...base, id: "ws-closed", number: 3, title: "Closed PR" }), mr_state: "closed" },
+          workspaceFixture({ ...base, id: "ws-draft", number: 4, title: "Draft PR", isDraft: true }),
+          {
+            ...workspaceFixture({ ...base, id: "ws-closed-draft", number: 5, title: "Closed draft PR", isDraft: true }),
+            mr_state: "closed",
+          },
+        ],
+      },
+    });
+
+    const { container } = render(WorkspaceListSidebar, { props: { selectedId: "ws-open" } });
+    await screen.findByText("Closed draft PR");
+
+    const accents = Object.fromEntries(
+      Array.from(container.querySelectorAll<HTMLElement>(".item-bubble")).map((bubble) => [
+        bubble.textContent?.trim(),
+        bubble.style.getPropertyValue("--item-accent"),
+      ]),
+    );
+    expect(accents).toEqual({
+      "#1": "var(--accent-green)",
+      "#2": "var(--accent-purple)",
+      "#3": "var(--accent-red)",
+      "#4": "var(--accent-amber)",
+      // Matches the PR list and detail: a closed draft reads as closed.
+      "#5": "var(--accent-red)",
+    });
   });
 
   it("gives an issue-backed workspace bubble the issue state class, not open", async () => {
@@ -2268,7 +2666,7 @@ describe("WorkspaceListSidebar", () => {
     expect(mockNavigate).toHaveBeenCalledWith("/terminal/ws-delete-failed");
 
     await fireEvent.contextMenu(container.querySelector(".ws-row")!);
-    expect((screen.getByRole("menuitem", { name: "Retry deletion..." }) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.getByRole("menuitem", { name: "Retry deletion..." }).getAttribute("aria-disabled")).toBeNull();
     await fireEvent.click(screen.getByRole("menuitem", { name: "Force delete workspace..." }));
 
     const dialog = await screen.findByRole("dialog", { name: "Force delete workspace?" });
@@ -2496,7 +2894,8 @@ describe("WorkspaceListSidebar", () => {
     });
     await screen.findByText("Ahead workspace");
 
-    await fireEvent.contextMenu(container.querySelector(".ws-row")!);
+    const row = container.querySelector(".ws-row")!;
+    await fireEvent.contextMenu(row);
 
     await fireEvent.click(screen.getByRole("menuitem", { name: /Push branch/ }));
 
@@ -2504,8 +2903,13 @@ describe("WorkspaceListSidebar", () => {
       params: { path: { id: "ws-ahead" } },
       signal: expect.any(AbortSignal),
     });
-    expect((screen.getByRole("menuitem", { name: /Pushing\.\.\./ }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByRole("menu", { name: "Workspace actions" })).toBeNull();
     expect(screen.getByLabelText("Pushing branch")).toBeTruthy();
+
+    // Reopening the menu while the push runs shows it and blocks a second one.
+    await fireEvent.contextMenu(row);
+    expect(screen.getByRole("menuitem", { name: /Pushing\.\.\./ }).getAttribute("aria-disabled")).toBe("true");
+    expect(screen.getByRole("menuitem", { name: "Copy worktree path" }).getAttribute("aria-disabled")).toBe("true");
 
     push.resolve({ data: undefined, response: { ok: true, status: 200 } });
     await waitFor(() => {
@@ -2609,14 +3013,16 @@ describe("WorkspaceListSidebar", () => {
     });
     await screen.findByText("Behind workspace");
 
-    await fireEvent.contextMenu(container.querySelector(".ws-row")!);
+    const row = container.querySelector(".ws-row")!;
+    await fireEvent.contextMenu(row);
     await fireEvent.click(screen.getByRole("menuitem", { name: /Pull remote changes/ }));
 
     expect(mockPost).toHaveBeenCalledWith("/workspaces/{id}/pull", {
       params: { path: { id: "ws-behind" } },
       signal: expect.any(AbortSignal),
     });
-    expect((screen.getByRole("menuitem", { name: /Pulling\.\.\./ }) as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.contextMenu(row);
+    expect(screen.getByRole("menuitem", { name: /Pulling\.\.\./ }).getAttribute("aria-disabled")).toBe("true");
 
     pull.resolve({ data: undefined, response: { ok: true, status: 200 } });
     await waitFor(() => {
@@ -2751,6 +3157,38 @@ describe("WorkspaceListSidebar", () => {
     expect(mockNavigate).toHaveBeenCalledWith("/workspaces");
   });
 
+  it("keeps a confirmed deletion out of the remounted list while preserving the same ID on another host", async () => {
+    const local = workspaceFixture({
+      id: "ws-shared-id",
+      provider: "github",
+      platformHost: "github.com",
+      owner: "acme",
+      name: "widgets",
+      number: 42,
+      title: "Local workspace",
+    });
+    const remote = { ...local, mr_title: "Remote workspace", fleet_host_key: "peer-a" };
+    mockGet.mockResolvedValue({ data: { workspaces: [local, remote] } });
+    mockDelete.mockResolvedValue({ response: { ok: true, status: 204 } });
+    const view = render(WorkspaceListSidebar, { props: { selectedId: "" } });
+    await screen.findByText("Local workspace");
+    mockGet.mockReturnValue(new Promise(() => {}));
+
+    await fireEvent.contextMenu(screen.getByText("Local workspace").closest(".ws-row")!);
+    await fireEvent.click(screen.getByRole("menuitem", { name: "Delete workspace..." }));
+    const confirmation = await screen.findByRole("dialog", { name: "Delete workspace?" });
+    await fireEvent.click(within(confirmation).getByRole("button", { name: "Delete workspace" }));
+    await waitFor(() => expect(screen.queryByText("Local workspace")).toBeNull());
+    expect(screen.getByText("Remote workspace")).toBeTruthy();
+
+    await view.rerender({ showSidebar: false });
+    mockGet.mockClear();
+    await view.rerender({ showSidebar: true });
+    await waitFor(() => expect(mockGet).toHaveBeenCalledWith("/snapshot", expect.anything()));
+    expect(await screen.findByText("Remote workspace")).toBeTruthy();
+    expect(screen.queryByText("Local workspace")).toBeNull();
+  });
+
   it("keeps a workspace when context menu deletion is cancelled in-app", async () => {
     vi.stubGlobal(
       "confirm",
@@ -2788,6 +3226,121 @@ describe("WorkspaceListSidebar", () => {
     expect(window.confirm).not.toHaveBeenCalled();
     expect(mockDelete).not.toHaveBeenCalled();
     expect(mockNavigate).not.toHaveBeenCalled();
+  });
+
+  it("bulk-deletes a shift-click range and keeps workspaces with uncommitted changes", async () => {
+    mockGet.mockResolvedValue({ data: { workspaces: sortFixtures() } });
+    // Like the server, the fake refuses the dirty workspace only when the
+    // request does not force deletion.
+    mockDelete.mockImplementation(
+      (_path: string, options: { params: { path: { id: string }; query?: { force?: boolean } } }) =>
+        Promise.resolve(
+          options.params.path.id === "ws-old" && options.params.query?.force !== true
+            ? { error: { detail: "workspace has uncommitted changes" }, response: new Response(null, { status: 409 }) }
+            : { response: { ok: true, status: 204 } },
+        ),
+    );
+    const { container } = render(WorkspaceListSidebar, { props: { selectedId: "ws-new" } });
+    const row = async (title: string) => (await screen.findByText(title)).closest<HTMLElement>(".ws-row")!;
+    const selectedTitles = () =>
+      Array.from(container.querySelectorAll(".ws-row.multi-selected .ws-name")).map((el) => el.textContent?.trim());
+
+    // Grouped order is kenn-forge (Newest, Oldest) then agentsview, so the
+    // range from the opened row stops before the other repository's row.
+    await fireEvent.click(await row("Oldest without activity"), { shiftKey: true });
+    expect(selectedTitles()).toEqual(["Newest created", "Oldest without activity"]);
+    expect(mockNavigate).not.toHaveBeenCalled();
+
+    await fireEvent.contextMenu(await row("Oldest without activity"));
+    await fireEvent.click(screen.getByRole("menuitem", { name: "Delete 2 workspaces..." }));
+    const dialog = await screen.findByRole("dialog", { name: "Delete 2 workspaces?" });
+    expect(dialog.textContent).toContain('Delete "Newest created", "Oldest without activity"?');
+    await fireEvent.click(within(dialog).getByRole("button", { name: "Delete 2 workspaces" }));
+
+    await waitFor(() => expect(screen.queryByText("Newest created")).toBeNull());
+    expect(mockDelete.mock.calls.map(([, options]) => options.params.path.id).sort()).toEqual(["ws-new", "ws-old"]);
+    // Bulk deletion never forces, so uncommitted changes are never discarded.
+    expect(mockDelete.mock.calls.filter(([, options]) => options.params.query?.force === true)).toEqual([]);
+    expect(screen.getByText("Oldest without activity")).toBeTruthy();
+    expect(screen.getByText("Most recently active")).toBeTruthy();
+    expect(mockNavigate).toHaveBeenCalledWith("/workspaces");
+    await waitFor(() => {
+      expect(getFlashes().map((flash) => flash.message)).toContainEqual(
+        expect.stringContaining("Could not delete 1 of 2 workspaces. Oldest without activity:"),
+      );
+    });
+    expect(screen.queryByRole("dialog", { name: "Delete 2 workspaces?" })).toBeNull();
+    expect(selectedTitles()).toEqual([]);
+  });
+
+  it("closes the bulk delete dialog while rows keep deleting in the background", async () => {
+    mockGet.mockResolvedValue({ data: { workspaces: sortFixtures() } });
+    const pending = new Map<string, () => void>();
+    mockDelete.mockImplementation(
+      (_path: string, options: { params: { path: { id: string } } }) =>
+        new Promise((resolve) => {
+          pending.set(options.params.path.id, () => resolve({ response: { ok: true, status: 204 } }));
+        }),
+    );
+    render(WorkspaceListSidebar, { props: { selectedId: "ws-new" } });
+    const row = async (title: string) => (await screen.findByText(title)).closest<HTMLElement>(".ws-row")!;
+
+    await fireEvent.click(await row("Oldest without activity"), { shiftKey: true });
+    await fireEvent.contextMenu(await row("Oldest without activity"));
+    await fireEvent.click(screen.getByRole("menuitem", { name: "Delete 2 workspaces..." }));
+    const dialog = await screen.findByRole("dialog", { name: "Delete 2 workspaces?" });
+    await fireEvent.click(within(dialog).getByRole("button", { name: "Delete 2 workspaces" }));
+
+    await waitFor(() => expect(pending.size).toBe(2));
+    expect(screen.queryByRole("dialog", { name: "Delete 2 workspaces?" })).toBeNull();
+    expect(screen.getByText("Newest created")).toBeTruthy();
+    expect(screen.getByText("Oldest without activity")).toBeTruthy();
+
+    pending.get("ws-old")!();
+    await waitFor(() => expect(screen.queryByText("Oldest without activity")).toBeNull());
+    expect(screen.getByText("Newest created")).toBeTruthy();
+
+    pending.get("ws-new")!();
+    await waitFor(() => expect(screen.queryByText("Newest created")).toBeNull());
+    expect(mockNavigate).toHaveBeenCalledWith("/workspaces");
+  });
+
+  it("toggles rows with Cmd/Ctrl-click without opening them", async () => {
+    mockGet.mockResolvedValue({ data: { workspaces: sortFixtures() } });
+    const { container } = render(WorkspaceListSidebar, { props: { selectedId: "" } });
+    const row = async (title: string) => (await screen.findByText(title)).closest<HTMLElement>(".ws-row")!;
+    const selectedTitles = () =>
+      Array.from(container.querySelectorAll(".ws-row.multi-selected .ws-name")).map((el) => el.textContent?.trim());
+
+    await fireEvent.click(await row("Newest created"), { ctrlKey: true });
+    await fireEvent.click(await row("Most recently active"), { metaKey: true });
+    expect(selectedTitles()).toEqual(["Newest created", "Most recently active"]);
+    await fireEvent.click(await row("Newest created"), { ctrlKey: true });
+    expect(selectedTitles()).toEqual(["Most recently active"]);
+    expect(mockNavigate).not.toHaveBeenCalled();
+
+    await fireEvent.keyDown(await row("Most recently active"), { key: "Escape" });
+    expect(selectedTitles()).toEqual([]);
+
+    await fireEvent.click(await row("Newest created"), { ctrlKey: true });
+    await fireEvent.click(await row("Oldest without activity"), { ctrlKey: true });
+    await fireEvent.click(await row("Most recently active"));
+    expect(selectedTitles()).toEqual([]);
+    expect(mockNavigate).toHaveBeenCalledWith("/terminal/ws-mid");
+  });
+
+  it("acts on a single row when right-clicking outside the selection", async () => {
+    mockGet.mockResolvedValue({ data: { workspaces: sortFixtures() } });
+    const { container } = render(WorkspaceListSidebar, { props: { selectedId: "" } });
+    const row = async (title: string) => (await screen.findByText(title)).closest<HTMLElement>(".ws-row")!;
+
+    await fireEvent.click(await row("Newest created"), { ctrlKey: true });
+    await fireEvent.click(await row("Oldest without activity"), { ctrlKey: true });
+    await fireEvent.contextMenu(await row("Most recently active"));
+
+    expect(screen.getByRole("menuitem", { name: "Delete workspace..." })).toBeTruthy();
+    expect(screen.queryByRole("menuitem", { name: /Delete \d+ workspaces/ })).toBeNull();
+    expect(container.querySelectorAll(".ws-row.multi-selected")).toHaveLength(0);
   });
 
   it("omits local filesystem actions and offers force-delete recovery for remote workspaces", async () => {

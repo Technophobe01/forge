@@ -29,6 +29,7 @@ export function createSyncStore(opts: SyncStoreOptions) {
   let onSyncCompleteOnce: (() => void) | null = null;
   const syncCompleteListeners = new Set<() => void>();
   let currentIntervalMs = 30_000;
+  let liveUpdatesConnected = false;
   let refreshGeneration = 0;
   // The trigger endpoint can acknowledge before status observes the new run.
   // Retain the optimistic state until status reports running or advances past
@@ -50,6 +51,11 @@ export function createSyncStore(opts: SyncStoreOptions) {
 
   function setProviderAvailable(available: boolean): void {
     providerAvailable = available;
+  }
+
+  function setLiveUpdatesConnected(connected: boolean): void {
+    liveUpdatesConnected = connected;
+    adjustPollingSpeed(status?.running ?? false);
   }
 
   function onNextSyncComplete(fn: () => void): void {
@@ -125,6 +131,24 @@ export function createSyncStore(opts: SyncStoreOptions) {
   }
 
   const refreshSyncStatusEffect = Effect.suspend(refreshSyncStatusProgram);
+
+  // Rate limits never arrive through sync status events, so this read is not
+  // tied to refreshGeneration: a status event that lands while it is in flight
+  // must not discard it. Use it after a change that moves a quota or ceiling.
+  function refreshRateLimits(): void {
+    runtime.runCommand(
+      rateLimitsRead().pipe(
+        Effect.map((next) => {
+          rateLimits = next;
+        }),
+      ),
+      {
+        operation: "refresh rate limits",
+        safeContext: {},
+        onFailure: () => {},
+      },
+    );
+  }
 
   function reconcileSyncStatusProgram() {
     const generation = refreshGeneration;
@@ -232,7 +256,7 @@ export function createSyncStore(opts: SyncStoreOptions) {
   }
 
   function adjustPollingSpeed(running: boolean): void {
-    const targetMs = running ? 2_000 : 30_000;
+    const targetMs = running && !liveUpdatesConnected ? 2_000 : 30_000;
     if (targetMs === currentIntervalMs) return;
     currentIntervalMs = targetMs;
     const signal = pollWakeSignal;
@@ -275,9 +299,11 @@ export function createSyncStore(opts: SyncStoreOptions) {
     getRateLimits,
     getProviderAvailable,
     setProviderAvailable,
+    setLiveUpdatesConnected,
     onNextSyncComplete,
     subscribeSyncComplete,
     refreshSyncStatus,
+    refreshRateLimits,
     refreshSyncStatusEffect,
     reconcileSyncStatusEffect,
     setSyncStatus,

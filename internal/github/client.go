@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"go.kenn.io/forge/internal/tokenauth"
 	"go.kenn.io/forge/platform"
 	platformgithub "go.kenn.io/forge/platform/github"
@@ -53,6 +53,7 @@ type Client interface {
 	DeleteIssueComment(ctx context.Context, owner, repo string, commentID int64) error
 	CreatePullRequestReviewCommentReply(ctx context.Context, owner, repo string, number int, body string, commentID int64) (*gh.PullRequestComment, error)
 	GetRepository(ctx context.Context, owner, repo string) (*gh.Repository, error)
+	GetRepositoryByID(ctx context.Context, owner string, id int64) (*gh.Repository, error)
 	CreateReview(ctx context.Context, owner, repo string, number int, event string, body string) (*gh.PullRequestReview, error)
 	CreateReviewWithComments(
 		ctx context.Context,
@@ -113,6 +114,14 @@ type markdownImageClient interface {
 	) (platform.MarkdownImage, error)
 }
 
+// markdownMediaClient streams video attachments with the credential that owns
+// the repository, for the same reason as markdownImageClient.
+type markdownMediaClient interface {
+	OpenMarkdownMedia(
+		ctx context.Context, owner, repo, sourceURL, byteRange string,
+	) (platform.MarkdownMedia, error)
+}
+
 type conditionalPullRequestGetter interface {
 	GetPullRequestIfChanged(
 		ctx context.Context,
@@ -151,7 +160,6 @@ func graphQLEndpointForHost(platformHost string) string {
 		return "https://api.github.com/graphql"
 	}
 	return "https://" + platformHost + "/api/graphql"
-
 }
 
 // ClientOption adjusts NewClient construction.
@@ -321,6 +329,8 @@ func NewClient(
 		ReadRate: githubRateObserver(rateTracker), NotificationRate: githubRateObserver(options.notificationRateTracker),
 		ViewerCacheTTL:  authenticatedViewerLoginTTL,
 		ReadOnlyContext: IsArchiveSyncBudgetContext,
+		WritesDisabled:  options.mutationsDisabled,
+		OwnerContext:    tokenauth.WithGitHubOwner,
 		GraphQLContext:  func(ctx context.Context) context.Context { return withQuotaResource(ctx, QuotaResourceGraphQL) },
 		InvalidateETags: et.invalidateRepo,
 		Warning:         slog.Warn,

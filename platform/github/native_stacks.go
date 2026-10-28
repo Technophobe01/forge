@@ -7,13 +7,14 @@ import (
 	"encoding/hex"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"slices"
 	"time"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 )
 
 // NativeStackHint is the compact stack membership GitHub includes on a pull
@@ -227,7 +228,7 @@ func (resource nativeStackResource) nativeStack() NativeStack {
 
 func ValidateNativeStack(stack NativeStack) error {
 	if stack.ID <= 0 || stack.Number <= 0 {
-		return fmt.Errorf("invalid stack identity")
+		return errors.New("invalid stack identity")
 	}
 	if len(stack.Members) == 0 {
 		return fmt.Errorf("stack %d has no members", stack.Number)

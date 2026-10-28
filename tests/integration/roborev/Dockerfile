@@ -1,13 +1,16 @@
-FROM golang:1.27.0 AS builder
+FROM golang:1.27.3 AS builder
 ARG ROBOREV_REF=main
 COPY . /src
 WORKDIR /src
-RUN git checkout ${ROBOREV_REF} && \
-    go build -o /roborev ./cmd/roborev/
+RUN git checkout ${ROBOREV_REF}
+# "|" falls back to the source repo on any proxy error, including HTTP/2 stream resets mid-download.
+ENV GOPROXY="https://proxy.golang.org|direct"
+RUN go mod download
+RUN GOPROXY=off go build -o /roborev ./cmd/roborev/
 COPY --from=forge tests/integration/roborev/tcp-forward.go /tcp-forward.go
 RUN go build -o /tcp-forward /tcp-forward.go
 
-FROM golang:1.27.0
+FROM golang:1.27.3
 RUN command -v git && command -v curl
 COPY --from=builder /roborev /usr/local/bin/roborev
 COPY --from=builder /tcp-forward /usr/local/bin/tcp-forward

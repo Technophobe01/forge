@@ -3,6 +3,7 @@
 </script>
 
 <script lang="ts">
+  import { getCommentNavigation } from "../stores/router.svelte.js";
   import type { Snippet } from "svelte";
   import { untrack } from "svelte";
   import { getNavigate, getSidebar, getStores } from "../context.js";
@@ -10,7 +11,7 @@
   import PullList from "../components/sidebar/PullList.svelte";
   import PullDetailPane from "../components/detail/PullDetailPane.svelte";
   import KataLinksPanel from "../components/kata/KataLinksPanel.svelte";
-  import { pullDetailMatchesRef } from "../components/detail/detail-match.js";
+  import { repoIdentityMatches, pullDetailMatchesRef } from "../components/detail/detail-match.js";
   import DetailPaneLayout from "../components/shared/DetailPaneLayout.svelte";
   import type { TabbedPanelLeaf } from "../components/shared/tabbed-panel-layout.js";
   import { getPaneLayoutStore, type PaneLayoutStore, type PaneTabSpec } from "../stores/paneLayout.svelte.js";
@@ -25,12 +26,13 @@
   } from "../routes.js";
   import type { InlineWorkspaceController, WorkspaceItemIdentity } from "../workspace-inline.js";
   import { useItemWorkspaceClaim } from "../item-workspace-claim.svelte.js";
+  import { repositoryKeyFromWire } from "../api/repository-key.js";
 
   type StackMemberNavigate = (ref: PullRequestRouteRef) => boolean | void;
 
   const { toggleSidebar } = getSidebar();
   const navigate = getNavigate();
-  const { detail: detailStore } = getStores();
+  const { detail: detailStore, pulls } = getStores();
   interface Props {
     selectedPR?: PullRequestRouteRef | null;
     detailTab?: DetailTab;
@@ -51,17 +53,19 @@
     onViewWorkspaces?: (() => void) | undefined;
     /** Phone-like routes render PR actions as one kit action grid. */
     phonePresentation?: boolean;
+    /** Phone diff layout only; see PullDetailPane. */
+    phoneFilesLayout?: boolean;
     inlineWorkspace?: InlineWorkspaceController | null;
     /**
      * The workspace's own controls, rendered in the tab strip of the leaf holding
      * the workspace pane or one of its promoted sessions. Supplied by the app
      * shell: the controls live in `frontend/`, next to the state they act on.
      */
-    workspacePaneControls?: Snippet<[boolean]> | undefined;
+    workspacePaneControls?: Snippet<[TabbedPanelLeaf]> | undefined;
   }
 
   let {
-    selectedPR = null,
+    selectedPR: routeSelection = null,
     detailTab = "conversation",
     detailPresentation = "panes",
     isSidebarCollapsed = false,
@@ -78,9 +82,24 @@
     onOpenWorkspace,
     onViewWorkspaces,
     phonePresentation = false,
+    phoneFilesLayout = false,
     inlineWorkspace = null,
     workspacePaneControls = undefined,
   }: Props = $props();
+
+  const selectedRepositoryKey = $derived.by(() => {
+    if (!routeSelection || routeSelection.repositoryKey) return routeSelection?.repositoryKey;
+    const item = pulls.getPulls().find((item) =>
+      item.Number === routeSelection.number && repoIdentityMatches(item, routeSelection),
+    );
+    return repositoryKeyFromWire(item?.repo);
+  });
+  const selectedPR = $derived(
+    routeSelection ? { ...routeSelection, repositoryKey: selectedRepositoryKey } : null,
+  );
+  const commentNavigation = $derived(
+    selectedPR ? getCommentNavigation({ ...selectedPR, itemType: "pull" }) : null,
+  );
   const paneLayoutStore = getPaneLayoutStore("prs");
   const paneLayout = $derived<PaneLayoutStore | null>(detailPresentation === "panes" ? paneLayoutStore : null);
 
@@ -171,6 +190,7 @@
       sync: false,
       provider: ref.provider,
       platformHost: ref.platformHost,
+      repositoryKey: ref.repositoryKey,
       repoPath: ref.repoPath,
     });
   }
@@ -274,14 +294,17 @@
           {onViewWorkspaces}
           {inlineWorkspace}
           {phonePresentation}
+          {phoneFilesLayout}
         />
       {:else if paneLayout !== null}
       <DetailPaneLayout
         layout={paneLayout}
         tabs={paneTabs}
+        {...(workspaceClaim.ref() !== null ? { flattenBelowPx: 0 } : {})}
         tablistLabel="Pull request detail panes"
         leafLabel="Pull request detail pane group"
         routeTabKey={detailTab}
+        routeNavigation={commentNavigation}
         onSelectTab={handlePaneSelect}
         onFocusPane={handlePaneFocus}
         paneLeafExtras={workspacePaneControls ? workspaceLeafExtras : undefined}
@@ -330,6 +353,7 @@
               {onViewWorkspaces}
               {inlineWorkspace}
               {phonePresentation}
+              {phoneFilesLayout}
             />
           {/if}
         {/snippet}
@@ -353,7 +377,7 @@
      panes would be a control with no subject. -->
 {#snippet workspaceLeafExtras(leaf: TabbedPanelLeaf)}
   {#if leaf.tabs.some((tabKey) => tabKey === "workspace" || isSessionPaneKey(tabKey))}
-    {@render workspacePaneControls?.(leaf.tabs.includes("workspace"))}
+    {@render workspacePaneControls?.(leaf)}
   {/if}
 {/snippet}
 

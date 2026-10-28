@@ -98,8 +98,10 @@ func TestDirectPushes(t *testing.T) {
 			assert.Equal(f.head, r.DirectPushes[0].Terminal)
 			assert.ElementsMatch(append(slices.Clone(f.source), f.head), r.DirectPushes[0].Introduced)
 		} else {
-			assert.Equal([]landedwork.DirectPush{{Before: f.base, Terminal: f.source[0], Introduced: f.source[:1]},
-				{Before: f.source[0], Terminal: f.head, Introduced: f.source[1:]}}, r.DirectPushes)
+			assert.Equal([]landedwork.DirectPush{
+				{Before: f.base, Terminal: f.source[0], Introduced: f.source[:1]},
+				{Before: f.source[0], Terminal: f.head, Introduced: f.source[1:]},
+			}, r.DirectPushes)
 		}
 		assert.Empty(r.Landings)
 		assert.Empty(r.Unattributed)
@@ -234,7 +236,6 @@ func TestOriginOverlaps(t *testing.T) {
 			assert.Equal([]landedwork.DirectPush{{Before: f.base, Terminal: direct, Introduced: []string{direct}}}, r.DirectPushes)
 		}
 	}
-
 }
 
 func TestBlockedSpan(t *testing.T) {
@@ -260,5 +261,137 @@ func TestBlockedSpan(t *testing.T) {
 		}
 		assert.Equal(landedwork.Span{Before: f.base, Through: through}, r.Coverage.Gaps[0].Span)
 		assert.Equal(f.base, r.Coverage.CertifiedHead)
+	}
+}
+
+func TestTerminalOutsideInterval(t *testing.T) {
+	for _, variant := range []string{"other branch", "rewritten away", "far after head", "inside range", "range cut back", "source kept", "missing terminal", "incomplete source", "missing source head"} {
+		t.Run(variant, func(t *testing.T) {
+			f := buildFixture(t, true)
+			f.head = ""
+			r := f.repo
+			r.Checkout("-b", "target", f.base)
+			first := r.CommitFile("target.txt", "one\n", "first push")
+			var terminal string
+			var source []string
+			reason := ""
+			switch variant {
+			case "other branch", "missing terminal":
+				// The change merged into another branch. Its source includes
+				// a target commit because it started from the target.
+				r.Checkout("-b", "release", f.base)
+				r.CommitFile("release.txt", "release\n", "release starts")
+				r.Checkout("-b", "feature", first)
+				work := r.CommitFile("feature.txt", "feature\n", "feature")
+				r.Checkout("release")
+				r.Run("merge", "--no-ff", "feature", "-m", "merge feature into release")
+				terminal, source = r.Head(), []string{first, work}
+				if variant == "missing terminal" {
+					reason = "objects_unavailable"
+				}
+			case "rewritten away":
+				// The change was squashed, then the target was reset to the
+				// change's own commits.
+				r.Checkout("-b", "change", first)
+				one := r.CommitFile("work.txt", "new\nkeep\n", "one")
+				two := r.CommitFile("work.txt", "new\nkeep\ntwo\n", "two")
+				r.Checkout("target")
+				r.Run("merge", "--squash", "change")
+				r.Run("commit", "-m", "squash change")
+				terminal, source = r.Head(), []string{one, two}
+				r.Run("reset", "--hard", two)
+			case "source kept":
+				// The first source commit landed unchanged and the target
+				// later dropped the rest of the range, so the change can
+				// still own that commit.
+				r.Checkout("-b", "change", first)
+				one := r.CommitFile("work.txt", "new\nkeep\n", "one")
+				two := r.CommitFile("work.txt", "new\nkeep\ntwo\n", "two")
+				source = []string{one, two}
+				r.Checkout("target")
+				r.Run("merge", "--ff-only", one)
+				r.Run("cherry-pick", two)
+				terminal = r.Head()
+				r.Run("reset", "--hard", one)
+				reason = "method_unproven"
+			case "far after head", "inside range", "range cut back", "incomplete source", "missing source head":
+				r.Checkout("-b", "change", f.base)
+				one := r.CommitFile("work.txt", "new\nkeep\n", "one")
+				two := r.CommitFile("work.txt", "new\nkeep\ntwo\n", "two")
+				source = []string{one, two}
+				r.Checkout("target")
+				if variant == "far after head" {
+					r.CommitFile("later.txt", "later\n", "later push")
+				}
+				r.Run("cherry-pick", one)
+				rewritten := r.Head()
+				r.Run("cherry-pick", two)
+				terminal = r.Head()
+				// The interval ends before the change's rewritten range lands.
+				f.head = first
+				if variant == "incomplete source" {
+					// Without every source commit, the range length is unknown.
+					f.head, reason = rewritten, "source_incomplete"
+				}
+				if variant == "inside range" {
+					// A rewritten range ending at the terminal can own the head.
+					f.head, reason = rewritten, "method_unproven"
+				}
+				if variant == "missing source head" {
+					// The interval reaches the rewritten range, but whether
+					// the change was written on top of it needs the source
+					// head, which is not fetched yet.
+					f.head, reason = rewritten, "objects_unavailable"
+				}
+				if variant == "range cut back" {
+					// The target dropped the terminal but kept the earlier
+					// rewritten commit, which the change can still own.
+					r.Run("reset", "--hard", rewritten)
+					f.head, reason = "", "method_unproven"
+				}
+			}
+			if f.head == "" {
+				r.Checkout("target")
+				f.head = r.CommitFile("target.txt", "two\n", "second push")
+			}
+			switch variant {
+			case "missing terminal":
+				require.NoError(t, os.Remove(filepath.Join(r.GitDir, "objects", terminal[:2], terminal[2:])))
+			case "missing source head":
+				head := source[len(source)-1]
+				require.NoError(t, os.Remove(filepath.Join(r.GitDir, "objects", head[:2], head[2:])))
+			}
+			ctx, p := f.prepare(t)
+			e := fixtureEvidence(f, p, "")
+			e.Capabilities = landedwork.Capabilities{Merge: true, SingleParentCorrespondence: true}
+			e.Candidates = []landedwork.Candidate{squashCandidate(f, "7", terminal, source...)}
+			if variant == "incomplete source" {
+				e.Candidates[0].Source, e.Candidates[0].SourceComplete = source[1:], false
+			}
+			res, err := landedwork.Analyze(ctx, p, e, fixtureLimits())
+			require.NoError(t, err)
+			assert := assert.New(t)
+			assert.Empty(res.Landings)
+			assert.Empty(res.Integrated)
+			if reason != "" {
+				assert.False(res.Coverage.Complete)
+				require.Len(t, res.Coverage.Gaps, 1)
+				assert.Equal(reason, res.Coverage.Gaps[0].Reason)
+				// Naming the terminal lets a caller extend its next interval
+				// to where the change can be proven.
+				assert.Equal(terminal, res.Coverage.Gaps[0].ObjectID)
+				assert.Equal(landedwork.Span{Before: f.base, Through: f.head}, res.Coverage.Gaps[0].Span)
+				assert.Empty(res.DirectPushes)
+				return
+			}
+			assert.Empty(res.Coverage.Gaps)
+			assert.True(res.Coverage.Complete)
+			var terminals []string
+			for _, d := range res.DirectPushes {
+				terminals = append(terminals, d.Terminal)
+			}
+			spine := strings.Fields(r.Run("rev-list", "--first-parent", "--reverse", f.head, "^"+f.base))
+			assert.Equal(spine, terminals)
+		})
 	}
 }

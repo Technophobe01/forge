@@ -1,4 +1,7 @@
-FROM golang:1.27.0
+FROM golang:1.27.3
+
+# "|" falls back to the source repo on any proxy error, including HTTP/2 stream resets mid-download.
+ENV GOPROXY="https://proxy.golang.org|direct"
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl git make openssh-client openssl socat tmux unzip && rm -rf /var/lib/apt/lists/*
 
@@ -9,7 +12,7 @@ RUN case "$TARGETARCH" in \
       arm64) BUN_ARCH=aarch64 ;; \
       *) echo "unsupported arch: $TARGETARCH" && exit 1 ;; \
     esac \
-    && curl -fsSL -o /tmp/bun.zip "https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-${BUN_ARCH}.zip" \
+    && curl -fsSL -o /tmp/bun.zip "https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-${BUN_ARCH}.zip" \
     && unzip -q /tmp/bun.zip -d /tmp/bun \
     && mv /tmp/bun/bun-linux-${BUN_ARCH}/bun /usr/local/bin/bun \
     && chmod +x /usr/local/bin/bun \

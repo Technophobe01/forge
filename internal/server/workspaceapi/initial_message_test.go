@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,35 +23,44 @@ import (
 	"go.kenn.io/forge/internal/ptysize"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/testutil/dbtest"
-	"go.kenn.io/forge/internal/workspace"
+	"go.kenn.io/forge/internal/testutil/workspacetest"
 	"go.kenn.io/forge/internal/workspace/localruntime"
 )
 
-func TestNormalizeInitialAgentMessage(t *testing.T) {
+func TestNormalizeAgentMessage(t *testing.T) {
+	t.Parallel()
+	terminal, acp := localruntime.LaunchTargetAgent, localruntime.LaunchTargetACP
 	tests := []struct {
 		name      string
+		kind      localruntime.LaunchTargetKind
 		message   string
 		want      string
 		wantBytes int
 		wantErr   string
 	}{
-		{name: "line endings", message: "first\r\nsecond\rthird", want: "first\nsecond\nthird", wantBytes: 18},
-		{name: "tab", message: "review\tthis", wantErr: "control character"},
-		{name: "vertical tab", message: "review\vthis", wantErr: "control character"},
-		{name: "form feed", message: "review\fthis", wantErr: "control character"},
-		{name: "next line", message: "review\u0085this", wantErr: "control character"},
-		{name: "maximum", message: strings.Repeat("a", 64<<10), wantBytes: 64 << 10},
-		{name: "blank", message: " \n\t ", wantErr: "must not be blank"},
-		{name: "invalid utf8", message: string([]byte{0xff}), wantErr: "valid UTF-8"},
-		{name: "nul", message: "before\x00after", wantErr: "control character"},
-		{name: "escape", message: "before\x1bafter", wantErr: "control character"},
-		{name: "oversized", message: strings.Repeat("a", (64<<10)+1), wantErr: "64 KiB"},
+		{name: "line endings", kind: terminal, message: "first\r\nsecond\rthird", want: "first\nsecond\nthird", wantBytes: 18},
+		{name: "tab", kind: terminal, message: "review\tthis", wantErr: "control character"},
+		{name: "vertical tab", kind: terminal, message: "review\vthis", wantErr: "control character"},
+		{name: "form feed", kind: terminal, message: "review\fthis", wantErr: "control character"},
+		{name: "next line", kind: terminal, message: "review\u0085this", wantErr: "control character"},
+		{name: "maximum", kind: terminal, message: strings.Repeat("a", 64<<10), wantBytes: 64 << 10},
+		{name: "blank", kind: terminal, message: " \n\t ", wantErr: "must not be blank"},
+		{name: "invalid utf8", kind: terminal, message: string([]byte{0xff}), wantErr: "valid UTF-8"},
+		{name: "nul", kind: terminal, message: "before\x00after", wantErr: "control character"},
+		{name: "escape", kind: terminal, message: "before\x1bafter", wantErr: "control character"},
+		{name: "oversized", kind: terminal, message: strings.Repeat("a", (64<<10)+1), wantErr: "64 KiB"},
+		{name: "unknown kind gets terminal rules", message: strings.Repeat("a", (64<<10)+1), wantErr: "64 KiB"},
+		{name: "acp line endings", kind: acp, message: "first\r\nsecond", want: "first\nsecond", wantBytes: 12},
+		{name: "acp tab", kind: acp, message: "review\tthis", want: "review\tthis", wantBytes: 11},
+		{name: "acp large", kind: acp, message: strings.Repeat("a", 1<<20), wantBytes: 1 << 20},
+		{name: "acp blank", kind: acp, message: " \n\t ", wantErr: "must not be blank"},
+		{name: "acp invalid utf8", kind: acp, message: string([]byte{0xff}), wantErr: "valid UTF-8"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			assert := assert.New(t)
 			require := require.New(t)
-			normalized, messageBytes, err := normalizeInitialAgentMessage(tc.message)
+			normalized, messageBytes, err := normalizeAgentMessage(tc.message, tc.kind)
 			if tc.wantErr != "" {
 				require.ErrorContains(err, tc.wantErr)
 				return
@@ -65,6 +75,7 @@ func TestNormalizeInitialAgentMessage(t *testing.T) {
 }
 
 func TestInitialMessageSubmitFailureReleasesPreWriteAttempt(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	handler := New(Deps{Now: func() time.Time {
@@ -90,6 +101,7 @@ func TestInitialMessageSubmitFailureReleasesPreWriteAttempt(t *testing.T) {
 }
 
 func TestInitialMessageInactivePasteModeReturnsRetryableServiceSignal(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	handler := New(Deps{Now: func() time.Time {
@@ -112,6 +124,7 @@ func TestInitialMessageInactivePasteModeReturnsRetryableServiceSignal(t *testing
 }
 
 func TestSubmitInitialMessageServiceReturnsDeliveredStateAndRoutesShareAttempt(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
@@ -149,7 +162,7 @@ func TestSubmitInitialMessageServiceReturnsDeliveredStateAndRoutesShareAttempt(t
 	}, session.Key))
 
 	handler := New(Deps{
-		DB: database, Workspaces: workspace.NewManager(database, t.TempDir()),
+		DB: database, Workspaces: workspacetest.NewManager(t, database, t.TempDir()),
 		Runtime: runtime, AgentActivity: activity,
 	})
 	mux := http.NewServeMux()
@@ -163,7 +176,7 @@ func TestSubmitInitialMessageServiceReturnsDeliveredStateAndRoutesShareAttempt(t
 			"target_key": targetKey, "message": message,
 		})
 		require.NoError(marshalErr)
-		request := httptest.NewRequest(http.MethodPost, target, bytes.NewReader(body)).WithContext(requestContext)
+		request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, target, bytes.NewReader(body)).WithContext(requestContext)
 		request.Header.Set("Content-Type", "application/json")
 		recorder := httptest.NewRecorder()
 		mux.ServeHTTP(recorder, request)
@@ -257,10 +270,16 @@ func TestSubmitInitialMessageServiceReturnsDeliveredStateAndRoutesShareAttempt(t
 
 	failingSession := launchSession("coding-failure", true)
 	owner.pty.setWriteError(errors.New("write failed"))
-	failedResult, err := handler.SubmitInitialMessageService(ctx, InitialMessageRequest{
-		WorkspaceID: workspaceID, RuntimeSessionKey: failingSession.Key,
-		TargetKey: "codex", Message: "try once",
-	})
+	var failedResult InitialMessageResult
+	// Launch returns before the terminal reader observes the paste mode.
+	// Wait for that readiness signal before asserting the write failure.
+	require.Eventually(func() bool {
+		failedResult, err = handler.SubmitInitialMessageService(ctx, InitialMessageRequest{
+			WorkspaceID: workspaceID, RuntimeSessionKey: failingSession.Key,
+			TargetKey: "codex", Message: "try once",
+		})
+		return !errors.Is(err, ErrInitialMessageInputModeNotReady)
+	}, 5*time.Second, 10*time.Millisecond)
 	require.Error(err)
 	assert.Equal(initialMessageUncertain, failedResult.State)
 	failedAttempt, found := handler.initialMessageAttempt(workspaceID, failingSession.Key)
@@ -281,9 +300,12 @@ func TestSubmitInitialMessageServiceReturnsDeliveredStateAndRoutesShareAttempt(t
 
 	owner.setEmitBracketedPaste(true)
 	unreportedSession := launchSession("coding-unreported", false)
-	response = post(
-		endpointFor(unreportedSession.Key), "codex", "do not send",
-	)
+	require.Eventually(func() bool {
+		response = post(
+			endpointFor(unreportedSession.Key), "codex", "do not send",
+		)
+		return response.Code != http.StatusBadRequest
+	}, 5*time.Second, 10*time.Millisecond)
 	require.Equal(http.StatusOK, response.Code, response.Body.String())
 	_, found = handler.initialMessageAttempt(workspaceID, unreportedSession.Key)
 	assert.True(found)
@@ -294,7 +316,7 @@ func TestSubmitInitialMessageServiceReturnsDeliveredStateAndRoutesShareAttempt(t
 	require.Equal(http.StatusConflict, response.Code, response.Body.String())
 
 	getRecorder := httptest.NewRecorder()
-	mux.ServeHTTP(getRecorder, httptest.NewRequest(http.MethodGet, endpoint, nil))
+	mux.ServeHTTP(getRecorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, endpoint, nil))
 	require.Equal(http.StatusOK, getRecorder.Code, getRecorder.Body.String())
 	messageStatus = struct {
 		TargetKey    string     `json:"target_key"`
@@ -311,6 +333,8 @@ type initialMessagePTYOwner struct {
 	mu                 sync.Mutex
 	pty                *initialMessagePTY
 	ptys               map[string]*initialMessagePTY
+	command            []string
+	startErr           error
 	emitBracketedPaste bool
 }
 
@@ -320,11 +344,7 @@ func newInitialMessagePTYOwner() *initialMessagePTYOwner {
 	}
 }
 
-func (o *initialMessagePTYOwner) HasState(session string) bool {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.ptys[session] != nil
-}
+func (*initialMessagePTYOwner) Gone(context.Context, string) bool { return false }
 
 func (o *initialMessagePTYOwner) Attach(
 	_ context.Context,
@@ -339,14 +359,18 @@ func (o *initialMessagePTYOwner) Start(
 	_ context.Context,
 	session string,
 	_ string,
-	_ []string,
+	command []string,
 	_ []string,
 	_ map[string]string,
 ) (ptyownerruntime.PTY, error) {
+	if o.startErr != nil {
+		return nil, o.startErr
+	}
 	pty := &initialMessagePTY{
 		output: make(chan []byte, 8), done: make(chan struct{}),
 	}
 	o.mu.Lock()
+	o.command = command
 	o.pty = pty
 	o.ptys[session] = pty
 	emitBracketedPaste := o.emitBracketedPaste
@@ -382,6 +406,7 @@ type initialMessagePTY struct {
 	writeErr error
 	onWrite  func()
 	once     sync.Once
+	closed   bool
 }
 
 func (p *initialMessagePTY) Output() <-chan []byte         { return p.output }
@@ -391,15 +416,23 @@ func (p *initialMessagePTY) Resize(ptysize.Geometry) error { return nil }
 
 func (p *initialMessagePTY) Write(data []byte) error {
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return io.ErrClosedPipe
+	}
 	if p.writeErr != nil {
 		p.mu.Unlock()
 		return p.writeErr
 	}
 	p.writes = append(p.writes, data...)
 	onWrite := p.onWrite
-	output := p.output
+	select {
+	case p.output <- bytes.Clone(data):
+	case <-p.done:
+		p.mu.Unlock()
+		return io.ErrClosedPipe
+	}
 	p.mu.Unlock()
-	output <- bytes.Clone(data)
 	if onWrite != nil {
 		onWrite()
 	}
@@ -426,7 +459,29 @@ func (p *initialMessagePTY) written() []byte {
 
 func (p *initialMessagePTY) Close() {
 	p.once.Do(func() {
-		close(p.output)
 		close(p.done)
+		p.mu.Lock()
+		p.closed = true
+		close(p.output)
+		p.mu.Unlock()
 	})
+}
+
+// A launch message is validated against its target's protocol before the
+// workspace is looked up: terminal limits refuse it, an ACP target does not.
+func TestLaunchValidatesInitialMessageByTargetProtocol(t *testing.T) {
+	t.Parallel()
+	runtime := localruntime.NewManager(localruntime.Options{Targets: []localruntime.LaunchTarget{
+		{Key: "terminal", Kind: localruntime.LaunchTargetAgent, Available: true, Command: []string{"true"}},
+		{Key: "chat", Kind: localruntime.LaunchTargetACP, Available: true, Command: []string{"true"}},
+	}})
+	t.Cleanup(runtime.Shutdown)
+	handler := New(Deps{DB: dbtest.Open(t), Runtime: runtime})
+	large := strings.Repeat("a", (64<<10)+1)
+
+	_, err := handler.LaunchWorkspaceRuntimeService(t.Context(), "missing", "terminal", large)
+	require.ErrorContains(t, err, "64 KiB")
+	_, err = handler.LaunchWorkspaceRuntimeService(t.Context(), "missing", "chat", large)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "64 KiB", "an ACP launch gets past message validation")
 }

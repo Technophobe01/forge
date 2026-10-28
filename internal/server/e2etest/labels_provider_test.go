@@ -15,10 +15,13 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/forge/internal/apiclient/generated"
 	"go.kenn.io/forge/internal/db"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/testutil/servertest"
 	"go.kenn.io/forge/internal/tokenauth"
 	"go.kenn.io/forge/platform"
@@ -39,26 +42,18 @@ type labelWireResponse struct {
 	Labels []db.Label `json:"labels"`
 }
 
-type repoCapabilitiesWire []struct {
-	Owner        string `json:"owner"`
-	Name         string `json:"name"`
-	Capabilities struct {
-		ReadLabels    bool `json:"read_labels"`
-		LabelMutation bool `json:"label_mutation"`
-	} `json:"capabilities"`
-}
-
 // assertRepoLabelCapabilities checks the payload the label picker UI is
 // gated on: both label capabilities must be advertised for the repo.
-func assertRepoLabelCapabilities(t *testing.T, srv http.Handler) {
+func assertRepoLabelCapabilities(t *testing.T, srv http.Handler, provider string) {
 	t.Helper()
-	rr := doJSONRequest(t, srv, http.MethodGet, "/api/v1/repos", nil)
-	require.Equal(t, http.StatusOK, rr.Code, "response: %s", rr.Body.String())
-	var body repoCapabilitiesWire
-	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
-	require.Len(t, body, 1)
-	assert.True(t, body[0].Capabilities.ReadLabels, "read_labels must be advertised")
-	assert.True(t, body[0].Capabilities.LabelMutation, "label_mutation must be advertised")
+	require := require.New(t)
+	rr := doJSONRequest(t, srv, http.MethodGet, "/api/v1/pulls/"+provider+"/acme/widget/7", nil)
+	require.Equal(http.StatusOK, rr.Code, "response: %s", rr.Body.String())
+	var body generated.MergeRequestDetailResponse
+	require.NoError(json.Unmarshal(rr.Body.Bytes(), &body))
+	require.NotNil(body.Repo)
+	assert.True(t, body.Repo.Capabilities.ReadLabels, "read_labels must be advertised")
+	assert.True(t, body.Repo.Capabilities.LabelMutation, "label_mutation must be advertised")
 }
 
 func seedProviderRepo(
@@ -68,13 +63,13 @@ func seedProviderRepo(
 	host string,
 ) int64 {
 	t.Helper()
-	repoID, err := database.UpsertRepo(t.Context(), db.RepoIdentity{
-		Platform:       string(kind),
-		PlatformHost:   host,
-		PlatformRepoID: "repo-" + string(kind) + "-acme-widget",
-		Owner:          "acme",
-		Name:           "widget",
-		RepoPath:       "acme/widget",
+	repoID, err := reposeed.Seed(t.Context(), database, db.RepoIdentity{
+		Platform:     string(kind),
+		PlatformHost: host,
+		Key:          platform.RepositoryIDKey(42),
+		Owner:        "acme",
+		Name:         "widget",
+		RepoPath:     "acme/widget",
 	})
 	require.NoError(t, err)
 	return repoID
@@ -148,19 +143,19 @@ func newLabelTestServer(
 	syncer := ghclient.NewSyncerWithRegistry(
 		registry, database, nil,
 		[]ghclient.RepoRef{{
-			Platform:           kind,
-			PlatformHost:       host,
-			PlatformExternalID: "repo-" + string(kind) + "-acme-widget",
-			Owner:              "acme",
-			Name:               "widget",
-			RepoPath:           "acme/widget",
+			Platform:     kind,
+			PlatformHost: host,
+			Key:          platform.RepositoryIDKey(42),
+			Owner:        "acme",
+			Name:         "widget",
+			RepoPath:     "acme/widget",
 		}},
 		time.Minute, nil, nil,
 	)
 	t.Cleanup(syncer.Stop)
 	srv := servertest.New(t, database, syncer, nil, "/", nil, server.ServerOptions{})
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
 		defer cancel()
 		require.NoError(t, srv.Shutdown(ctx))
 	})
@@ -178,7 +173,7 @@ func doJSONRequest(
 	if body != nil {
 		require.NoError(t, json.NewEncoder(&payload).Encode(body))
 	}
-	req := httptest.NewRequest(method, path, &payload)
+	req := httptest.NewRequestWithContext(t.Context(), method, path, &payload)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -296,10 +291,11 @@ func setupGitLabLabelStack(t *testing.T) (*server.Server, *db.DB, int64, *fakeGi
 }
 
 func TestGitLabListRepoLabelsSyncsCatalogFromProvider(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database, repoID, _ := setupGitLabLabelStack(t)
-	assertRepoLabelCapabilities(t, srv)
+	assertRepoLabelCapabilities(t, srv, "gitlab")
 
 	rr := doJSONRequest(t, srv, http.MethodGet, "/api/v1/repo/gitlab/acme/widget/labels", nil)
 	require.Equal(http.StatusOK, rr.Code, "response: %s", rr.Body.String())
@@ -320,6 +316,7 @@ func TestGitLabListRepoLabelsSyncsCatalogFromProvider(t *testing.T) {
 }
 
 func TestGitLabSetPullLabelsUpdatesProviderAndDB(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database, repoID, fake := setupGitLabLabelStack(t)
@@ -353,6 +350,7 @@ func TestGitLabSetPullLabelsUpdatesProviderAndDB(t *testing.T) {
 }
 
 func TestGitLabSetIssueLabelsUpdatesProviderAndDB(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database, repoID, fake := setupGitLabLabelStack(t)
@@ -391,6 +389,7 @@ func TestGitLabSetIssueLabelsUpdatesProviderAndDB(t *testing.T) {
 // end up empty. A missing or null labels field is rejected instead
 // (covered in internal/server/apitest).
 func TestGitLabSetLabelsEmptyArrayClearsAll(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	tests := []struct {
 		name     string
 		kind     string
@@ -466,6 +465,7 @@ func TestGitLabSetLabelsEmptyArrayClearsAll(t *testing.T) {
 }
 
 func TestGitLabSetPullLabelsRejectsCommaNamesFromCatalog(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database, repoID, fake := setupGitLabLabelStack(t)
@@ -500,6 +500,7 @@ func TestGitLabSetPullLabelsRejectsCommaNamesFromCatalog(t *testing.T) {
 // external ID and its own row by name, and the save would fail after
 // the provider mutation already succeeded.
 func TestGitLabSetPullLabelsNameCollidingWithAnotherLabelID(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database, repoID, fake := setupGitLabLabelStack(t)
@@ -663,12 +664,13 @@ func setupGitealikeLabelStack(
 }
 
 func TestGitealikeListRepoLabelsSyncsCatalogFromProvider(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	for _, variant := range gitealikeLabelVariants() {
 		t.Run(variant.name, func(t *testing.T) {
 			require := require.New(t)
 			assert := assert.New(t)
 			srv, database, repoID, _ := setupGitealikeLabelStack(t, variant)
-			assertRepoLabelCapabilities(t, srv)
+			assertRepoLabelCapabilities(t, srv, variant.route)
 
 			rr := doJSONRequest(t, srv, http.MethodGet, "/api/v1/repo/"+variant.route+"/acme/widget/labels", nil)
 			require.Equal(http.StatusOK, rr.Code, "response: %s", rr.Body.String())
@@ -690,6 +692,7 @@ func TestGitealikeListRepoLabelsSyncsCatalogFromProvider(t *testing.T) {
 }
 
 func TestGitealikeSetPullLabelsResolvesIDsAndUpdatesDB(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	for _, variant := range gitealikeLabelVariants() {
 		t.Run(variant.name, func(t *testing.T) {
 			require := require.New(t)
@@ -724,6 +727,7 @@ func TestGitealikeSetPullLabelsResolvesIDsAndUpdatesDB(t *testing.T) {
 }
 
 func TestGitealikeSetIssueLabelsResolvesIDsAndUpdatesDB(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	for _, variant := range gitealikeLabelVariants() {
 		t.Run(variant.name, func(t *testing.T) {
 			require := require.New(t)
@@ -762,6 +766,7 @@ func TestGitealikeSetIssueLabelsResolvesIDsAndUpdatesDB(t *testing.T) {
 // empty. A missing or null labels field is rejected instead (covered in
 // internal/server/apitest).
 func TestGitealikeSetLabelsEmptyArrayClearsAll(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	items := []struct {
 		name   string
 		kind   string
@@ -828,6 +833,7 @@ func TestGitealikeSetLabelsEmptyArrayClearsAll(t *testing.T) {
 }
 
 func TestGitealikeSetLabelsFailsWhenCatalogNameVanishedUpstream(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	for _, variant := range gitealikeLabelVariants() {
 		t.Run(variant.name, func(t *testing.T) {
 			require := require.New(t)

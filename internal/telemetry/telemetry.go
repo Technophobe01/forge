@@ -7,66 +7,171 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
-	"math"
-	"os"
-	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/posthog/posthog-go"
 	"go.kenn.io/forge/internal/db"
+	"go.kenn.io/kit/telemetry/posthog"
 )
 
 const (
 	EnabledEnv           = "TELEMETRY_ENABLED"
 	applicationSlug      = "kenn-forge"
-	installIDMetadataKey = "telemetry.install_id"
+	envPrefix            = "KENN_FORGE"
+	InstallIDMetadataKey = "telemetry.install_id"
+	installedAtKey       = "telemetry.install_created_at"
 	postHogAPIKey        = "phc_AzHd9YvuHR7M5poKzC6eW654d3SgKyBdoQPuwkWhimUf"
 	postHogEndpoint      = "https://us.i.posthog.com"
 )
 
+// HeartbeatInterval is how often a running daemon reports daemon_active.
+const HeartbeatInterval = 24 * time.Hour
+
+const (
+	repoCount0To5    = "0-5"
+	repoCount6To20   = "6-20"
+	repoCount21To100 = "21-100"
+	repoCountOver100 = "over-100"
+)
+
+// RepoCountBucket groups tracked repository counts into fixed telemetry ranges.
+func RepoCountBucket(count int) string {
+	switch {
+	case count <= 5:
+		return repoCount0To5
+	case count <= 20:
+		return repoCount6To20
+	case count <= 100:
+		return repoCount21To100
+	default:
+		return repoCountOver100
+	}
+}
+
 var ErrUnsupportedEvent = errors.New("unsupported telemetry event")
 
-type propertyFilter func(any) (any, bool)
+const (
+	SyncSourceMergeRequests = "merge_requests"
+	SyncSourceIssues        = "issues"
+	SyncSourceChecks        = "checks"
+	SyncReasonRateLimited   = "rate_limited"
+	SyncReasonAuth          = "auth"
+	SyncReasonNotFound      = "not_found"
+	SyncReasonOther         = "other"
+)
 
-var allowedEvents = map[string]map[string]propertyFilter{
-	"app_loaded": {
-		"view": safeTelemetryToken,
+var syncSources = []string{SyncSourceMergeRequests, SyncSourceIssues, SyncSourceChecks}
+
+// SyncSources returns the sources reported by full sync passes.
+func SyncSources() []string { return slices.Clone(syncSources) }
+
+var syncReasons = []string{SyncReasonRateLimited, SyncReasonAuth, SyncReasonNotFound, SyncReasonOther}
+
+// SyncReasons returns failure reasons in descending priority order.
+func SyncReasons() []string { return slices.Clone(syncReasons) }
+
+var screenNames = []string{
+	"activity", "actions", "repos", "repo-browser", "pulls", "issues", "docs",
+	"workspaces", "terminal", "workspace-item", "settings", "project-intake",
+	"design-system", "onboarding", "worklists",
+}
+
+var screenFilter = posthog.AllowStringValues(screenNames...)
+
+var durationFilter = posthog.AllowStringValues("under_1m", "1_to_5m", "5_to_30m", "over_30m", "30m_to_2h", "over_2h")
+
+func SessionDuration(value any) (any, bool) {
+	return durationFilter(value)
+}
+
+var requiredProperties = map[string]map[string]bool{
+	"sync_failed":      {"sync_source": true, "reason": true},
+	"search_empty":     {"surface": true},
+	"error_shown":      {"surface": true, "kind": true},
+	"screen_viewed":    {"screen": true},
+	"session_ended":    {"duration_bucket": true},
+	"pr_viewed":        {"provider": true, "surface": true},
+	"workspace_opened": {"item_type": true, "surface": true},
+}
+
+func stringValuesOrOther(values ...string) posthog.PropertyFilter {
+	filter := posthog.AllowStringValues(values...)
+	return func(value any) (any, bool) {
+		if allowed, ok := filter(value); ok {
+			return allowed, true
+		}
+		return "other", true
+	}
+}
+
+var allowedEvents = map[string]map[string]posthog.PropertyFilter{
+	"search_empty": {
+		"surface": posthog.AllowStringValues("web"),
+	},
+	"error_shown": {
+		"surface": posthog.AllowStringValues("web"),
+		"kind":    stringValuesOrOther("pr_viewed", "workspace_opened"),
+	},
+	"sync_failed": {
+		"sync_source": posthog.AllowStringValues(syncSources...),
+		"reason":      stringValuesOrOther(syncReasons...),
+	},
+	"setup_finished": {},
+	"pr_viewed": {
+		"provider": posthog.AllowStringValues("github", "gitlab", "forgejo", "gitea", "bitbucket"),
+		"surface":  posthog.AllowStringValues("web"),
+	},
+	"workspace_opened": {
+		"item_type": posthog.AllowStringValues("pull_request", "issue", "kata_task", "adhoc"),
+		"surface":   posthog.AllowStringValues("web"),
+	},
+	"screen_viewed": {
+		"screen":  screenFilter,
+		"surface": posthog.AllowStringValues("web"),
+	},
+	"app_opened": {
+		"surface": posthog.AllowStringValues("web"),
+	},
+	"session_ended": {
+		"surface":         posthog.AllowStringValues("web"),
+		"duration_bucket": durationFilter,
 	},
 	"daemon_active": {
-		"repo_count": safeTelemetryNumber,
+		"repo_count": posthog.AllowStringValues(repoCount0To5, repoCount6To20, repoCount21To100, repoCountOver100),
 	},
 }
 
 type Client interface {
-	Capture(event string, properties map[string]any) error
-	Close() error
-	Enabled() bool
+	posthog.Client
+	Report(context.Context, string, map[string]any) (posthog.Status, error)
 }
 
+// Reporter routes each event to the kit reporter for its source, since kit
+// fixes the source property per reporter.
 type Reporter struct {
-	client     enqueueCloser
-	distinctID string
-	enabled    bool
-	version    string
-	commit     string
-}
-
-type enqueueCloser interface {
-	Enqueue(posthog.Message) error
-	Close() error
+	daemon  Client
+	backend Client
 }
 
 type Options struct {
-	Database *db.DB
-	Version  string
-	Commit   string
+	Database        *db.DB
+	DailyClaimsPath string
+	Version         string
+	Commit          string
 }
 
+// newKitReporter builds one kit reporter; tests replace it.
+var newKitReporter = func(opts posthog.Options, options ...posthog.Option) (Client, error) {
+	return posthog.NewReporter(opts, options...)
+}
+
+// EnabledFromEnv reports whether the environment allows telemetry. Kit honors
+// both the documented generic TELEMETRY_ENABLED=0 opt-out and the prefixed
+// KENN_FORGE_TELEMETRY_ENABLED=0 one.
 func EnabledFromEnv() bool {
-	return strings.TrimSpace(os.Getenv(EnabledEnv)) != "0"
+	return posthog.EnabledFromEnv(envPrefix)
 }
 
 func EventAllowed(event string) bool {
@@ -74,58 +179,83 @@ func EventAllowed(event string) bool {
 	return ok
 }
 
-func SanitizeProperties(event string, properties map[string]any) (map[string]any, error) {
-	allowedProperties, ok := allowedEvents[strings.TrimSpace(event)]
-	if !ok {
-		return nil, ErrUnsupportedEvent
-	}
-
-	safeProperties := map[string]any{}
-	for key, value := range properties {
-		key = strings.TrimSpace(key)
-		filter, ok := allowedProperties[key]
-		if !ok {
-			continue
-		}
-		if safeValue, ok := filter(value); ok {
-			safeProperties[key] = safeValue
-		}
-	}
-	safeProperties["$process_person_profile"] = false
-	safeProperties["$geoip_disable"] = true
-	safeProperties["application"] = applicationSlug
-	return safeProperties, nil
+// UIEventAllowed reports whether the web UI may send event; daemon events stay daemon-only.
+func UIEventAllowed(event string) bool {
+	return EventAllowed(event) && sourceForEvent(strings.TrimSpace(event)) == "backend"
 }
 
 func NewReporter(opts Options) (*Reporter, error) {
-	if !enabledInBuild() || !EnabledFromEnv() || testing.Testing() {
+	if testing.Testing() {
+		return DisabledReporter(), nil
+	}
+	return newReporter(opts, time.Now())
+}
+
+// newReporter is NewReporter without the go test guard.
+func newReporter(opts Options, now time.Time) (*Reporter, error) {
+	if !enabledInBuild() || !EnabledFromEnv() {
 		return DisabledReporter(), nil
 	}
 	if opts.Database == nil {
 		return nil, errors.New("telemetry database is required")
 	}
 
-	distinctID, err := loadOrCreateInstallID(context.Background(), opts.Database)
+	distinctID, installedAt, err := loadOrCreateInstallID(context.Background(), opts.Database, now)
 	if err != nil {
 		return nil, err
 	}
-
-	disableGeoIP := true
-	client, err := posthog.NewWithConfig(postHogAPIKey, posthog.Config{
-		Endpoint:     postHogEndpoint,
-		DisableGeoIP: &disableGeoIP,
-	})
-	if err != nil {
+	if err := initializeDailyClaims(opts.Database, distinctID, opts.DailyClaimsPath); err != nil {
 		return nil, err
 	}
 
-	return &Reporter{
-		client:     client,
-		distinctID: distinctID,
-		enabled:    true,
-		version:    opts.Version,
-		commit:     opts.Commit,
-	}, nil
+	base := posthog.Options{
+		APIKey:      postHogAPIKey,
+		Endpoint:    postHogEndpoint,
+		Application: applicationSlug,
+		EnvPrefix:   envPrefix,
+		DistinctID:  distinctID,
+		Version:     opts.Version,
+		Commit:      opts.Commit,
+		InstalledAt: installedAt,
+	}
+	daemonOpts := base
+	daemonOpts.Source = "daemon"
+	daemon, err := newKitReporter(daemonOpts, kitAllowedEvents("daemon")...)
+	if err != nil {
+		return nil, err
+	}
+	backendOpts := base
+	backendOpts.Source = "backend"
+	claims := posthog.NewDailyClaims(opts.DailyClaimsPath)
+	backendOptions := append(kitAllowedEvents("backend"),
+		posthog.WithDailyEvent("screen_viewed", "screen", claims),
+		posthog.WithDailyEvent("pr_viewed", "provider", claims),
+		posthog.WithDailyEvent("workspace_opened", "item_type", claims))
+	backend, err := newKitReporter(backendOpts, backendOptions...)
+	if err != nil {
+		return nil, errors.Join(err, daemon.Close())
+	}
+	return &Reporter{daemon: daemon, backend: backend}, nil
+}
+
+// kitAllowedEvents builds kit's allowlist for one source from allowedEvents.
+func kitAllowedEvents(source string) []posthog.Option {
+	var options []posthog.Option
+	for event, properties := range allowedEvents {
+		if sourceForEvent(event) != source {
+			continue
+		}
+		allowed := make([]posthog.AllowedProperty, 0, len(properties))
+		for name, filter := range properties {
+			if requiredProperties[event][name] {
+				allowed = append(allowed, posthog.RequireProperty(name, filter))
+			} else {
+				allowed = append(allowed, posthog.AllowProperty(name, filter))
+			}
+		}
+		options = append(options, posthog.WithAllowedEvent(event, allowed...))
+	}
+	return options
 }
 
 func DisabledReporter() *Reporter {
@@ -142,102 +272,92 @@ func NewReporterOrDisabled(opts Options) *Reporter {
 }
 
 func (r *Reporter) Enabled() bool {
-	return r != nil && r.enabled && r.client != nil
+	if r == nil {
+		return false
+	}
+	return (r.daemon != nil && r.daemon.Enabled()) || (r.backend != nil && r.backend.Enabled())
 }
 
 func (r *Reporter) Capture(event string, properties map[string]any) error {
+	ctx, cancel := context.WithTimeout(context.Background(), posthog.ShutdownTimeout)
+	defer cancel()
+	_, err := r.Report(ctx, event, properties)
+	return err
+}
+
+func (r *Reporter) Report(ctx context.Context, event string, properties map[string]any) (posthog.Status, error) {
 	if !r.Enabled() {
-		return nil
+		return posthog.StatusDisabled, nil
 	}
 
 	event = strings.TrimSpace(event)
 	if event == "" {
-		return errors.New("telemetry event is required")
+		return "", errors.New("telemetry event is required")
+	}
+	if !EventAllowed(event) {
+		return "", ErrUnsupportedEvent
 	}
 
-	safeProperties, err := SanitizeProperties(event, properties)
-	if err != nil {
-		return err
+	client := r.backend
+	if sourceForEvent(event) == "daemon" {
+		client = r.daemon
 	}
-
-	props := posthog.Properties{}
-	maps.Copy(props, safeProperties)
-	r.addDefaultProperties(event, props)
-
-	return r.client.Enqueue(posthog.Capture{
-		DistinctId: r.distinctID,
-		Event:      event,
-		Timestamp:  time.Now().UTC(),
-		Properties: props,
-	})
-}
-
-func (r *Reporter) addDefaultProperties(event string, props posthog.Properties) {
-	props["$process_person_profile"] = false
-	props["$geoip_disable"] = true
-	props["application"] = applicationSlug
-	props["version"] = r.version
-	props["commit"] = r.commit
-	props["goos"] = runtime.GOOS
-	props["goarch"] = runtime.GOARCH
-	props["source"] = sourceForEvent(event)
+	if client == nil {
+		return posthog.StatusDisabled, nil
+	}
+	return client.Report(ctx, event, properties)
 }
 
 func sourceForEvent(event string) string {
-	if event == "daemon_active" {
+	if event == "daemon_active" || event == "sync_failed" || event == "setup_finished" {
 		return "daemon"
 	}
 	return "backend"
 }
 
 func (r *Reporter) Close() error {
-	if !r.Enabled() {
+	if r == nil {
 		return nil
 	}
-	return r.client.Close()
+	var err error
+	for _, client := range []posthog.Client{r.daemon, r.backend} {
+		if client != nil {
+			err = errors.Join(err, client.Close())
+		}
+	}
+	return err
 }
 
-func safeTelemetryToken(value any) (any, bool) {
-	text, ok := value.(string)
-	if !ok {
-		return nil, false
+// loadOrCreateInstallID returns the install ID and when it was created. A zero
+// time means the age is unknown (the ID predates install-age tracking or the
+// stored time is unreadable), so events go untagged.
+func loadOrCreateInstallID(ctx context.Context, database *db.DB, now time.Time) (string, time.Time, error) {
+	_, found, err := database.AppMetadataValue(ctx, InstallIDMetadataKey)
+	if err != nil {
+		return "", time.Time{}, err
 	}
-	text = strings.TrimSpace(text)
-	if text == "" || len(text) > 64 {
-		return nil, false
-	}
-	for i := 0; i < len(text); i++ {
-		b := text[i]
-		if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
-			(b >= '0' && b <= '9') || b == '_' || b == '-' || b == '.' {
-			continue
+	if !found {
+		// Write the creation time first so a crash between writes can't leave a new ID that looks old.
+		if _, err := database.GetOrCreateAppMetadataValue(ctx, installedAtKey, func() (string, error) {
+			return now.UTC().Format(time.RFC3339Nano), nil
+		}); err != nil {
+			return "", time.Time{}, err
 		}
-		return nil, false
 	}
-	return text, true
-}
-
-func safeTelemetryNumber(value any) (any, bool) {
-	switch v := value.(type) {
-	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
-		return v, true
-	case float32:
-		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
-			return nil, false
-		}
-		return v, true
-	case float64:
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			return nil, false
-		}
-		return v, true
-	default:
-		return nil, false
+	id, err := database.GetOrCreateAppMetadataValue(ctx, InstallIDMetadataKey, randomInstallID)
+	if err != nil {
+		return "", time.Time{}, err
 	}
-}
-
-func loadOrCreateInstallID(ctx context.Context, database *db.DB) (string, error) {
-	return database.GetOrCreateAppMetadataValue(ctx, installIDMetadataKey, randomInstallID)
+	raw, found, err := database.AppMetadataValue(ctx, installedAtKey)
+	if err != nil || !found {
+		return id, time.Time{}, err
+	}
+	installedAt, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		slog.Warn("telemetry install age unavailable", "err", err)
+		return id, time.Time{}, nil
+	}
+	return id, installedAt, nil
 }
 
 func randomInstallID() (string, error) {

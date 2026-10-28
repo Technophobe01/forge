@@ -1,14 +1,17 @@
 package activityrelay
 
 import (
+	"bufio"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json/v2"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +21,56 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// Freeze the receiving side independently of Hint so changing both relay and
+// consumer together cannot silently redefine the deployed wire contract.
+func TestFeedWireContract(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	feed := new(Broadcaster)
+	ingress, private := Handlers(feed, map[string]Source{"team": {Secret: []byte("synthetic-secret"), RepositoryIDs: []int64{12345}}})
+	server := httptest.NewServer(private)
+	t.Cleanup(server.Close)
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL+"/activity", nil)
+	require.NoError(err)
+	response, err := server.Client().Do(request)
+	require.NoError(err)
+	t.Cleanup(func() { response.Body.Close() })
+	require.Equal("1", response.Header.Get("X-Kenn-Forge-Relay-Protocol"))
+	reader := bufio.NewReader(response.Body)
+	for range 2 {
+		_, err = reader.ReadString('\n')
+		require.NoError(err)
+	}
+	require.Equal(http.StatusNoContent, deliver(t, ingress, []byte("synthetic-secret"), "issues", `{"repository":{"id":12345},"issue":{"number":7}}`).Code)
+	event, err := reader.ReadString('\n')
+	require.NoError(err)
+	require.Equal("event: hint\n", event)
+	data, err := reader.ReadString('\n')
+	require.NoError(err)
+	var legacyConsumer struct {
+		Provider     string `json:"provider"`
+		Host         string `json:"host"`
+		RepositoryID int64  `json:"repository_id"`
+		Target       string `json:"target"`
+		Number       int    `json:"number"`
+	}
+	require.NoError(json.Unmarshal([]byte(strings.TrimPrefix(data, "data: ")), &legacyConsumer))
+	require.Equal("github", legacyConsumer.Provider)
+	require.Equal("github.com", legacyConsumer.Host)
+	require.Equal(int64(12345), legacyConsumer.RepositoryID)
+	require.Equal("issue", legacyConsumer.Target)
+	require.Equal(7, legacyConsumer.Number)
+}
+
+func TestReadUnversionedWireContract(t *testing.T) {
+	t.Parallel()
+	stream := &Stream{idleTimeout: time.Second, body: io.NopCloser(strings.NewReader("event: hint\ndata: {\"provider\":\"github\",\"host\":\"github.com\",\"repository_id\":12345,\"target\":\"issue\",\"number\":7,\"future_optional_field\":true}\n\n"))}
+	var received []Hint
+	err := stream.Read(func(hint Hint) { received = append(received, hint) })
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	require.Equal(t, []Hint{{Provider: "github", Host: "github.com", RepositoryID: 12345, Target: "issue", Number: 7}}, received)
+}
 
 // subscribe opens a stream and returns hints as they arrive. The stream is
 // closed when the test ends.
@@ -52,10 +105,10 @@ func TestSignedWebhookFansOutAndKeepsPayloadsPrivate(t *testing.T) {
 	t.Cleanup(feedServer.Close)
 	first := subscribe(t, feedServer)
 	second := subscribe(t, feedServer)
-	body := `{"action":"edited","repository":{"id":12345,"node_id":"R_test_project","full_name":"private-repository-marker"},"pull_request":{"number":42,"title":"private-title-marker","body":"private-body-marker"},"sender":{"login":"private-user-marker"}}`
+	body := `{"action":"edited","repository":{"id":12345,"full_name":"private-repository-marker"},"pull_request":{"number":42,"title":"private-title-marker","body":"private-body-marker"},"sender":{"login":"private-user-marker"}}`
 	response := deliver(t, ingress, secret, "pull_request", body)
 	assert.Equal(http.StatusNoContent, response.Code)
-	want := Hint{Provider: "github", Host: "github.com", RepositoryID: "R_test_project", Target: PullRequest, Number: 42}
+	want := Hint{Provider: "github", Host: "github.com", RepositoryID: 12345, Target: PullRequest, Number: 42}
 	assert.Equal(want, <-first)
 	assert.Equal(want, <-second)
 	bad := deliver(t, ingress, []byte("wrong-secret"), "pull_request", body)
@@ -70,12 +123,12 @@ func TestSignedWebhookFansOutAndKeepsPayloadsPrivate(t *testing.T) {
 	default:
 	}
 	publicFeed := httptest.NewRecorder()
-	ingress.ServeHTTP(publicFeed, httptest.NewRequest(http.MethodGet, "/activity", nil))
+	ingress.ServeHTTP(publicFeed, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/activity", nil))
 	assert.Equal(http.StatusNotFound, publicFeed.Code)
 	privateWebhook := deliver(t, private, secret, "pull_request", body)
 	assert.Equal(http.StatusNotFound, privateWebhook.Code)
 	health := httptest.NewRecorder()
-	private.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	private.ServeHTTP(health, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/healthz", nil))
 	assert.Equal(http.StatusNoContent, health.Code)
 }
 
@@ -85,15 +138,15 @@ func TestSubscriberReleaseAndSlowConsumers(t *testing.T) {
 	feed := new(Broadcaster)
 	hints, cancel := feed.Subscribe()
 	assert.Equal(1, feed.Subscribers())
-	hint := Hint{Provider: "github", Host: "github.com", RepositoryID: "R_test_project", Target: Repository}
-	for range subscriberBuffer + 5 {
+	hint := Hint{Provider: "github", Host: "github.com", RepositoryID: 12345, Target: Repository}
+	for range cap(hints) + 5 {
 		feed.Publish([]Hint{hint})
 	}
-	assert.Len(hints, subscriberBuffer, "a stalled subscriber drops hints instead of blocking the webhook")
+	assert.Len(hints, cap(hints), "a stalled subscriber drops hints instead of blocking the webhook")
 	cancel()
 	assert.Zero(feed.Subscribers())
 	feed.Publish([]Hint{hint})
-	assert.Len(hints, subscriberBuffer)
+	assert.Len(hints, cap(hints))
 }
 
 func TestOpenRejectsNonStreamResponses(t *testing.T) {
@@ -109,7 +162,7 @@ func TestOpenRejectsNonStreamResponses(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	_, err := Open(t.Context(), server.Client(), server.URL)
-	require.Error(err, "a page response must not be mistaken for a subscription")
+	require.ErrorIs(err, ErrIncompatible, "a page response must not be mistaken for a subscription")
 	_, err = Open(t.Context(), server.Client(), server.URL+"/missing")
 	require.Error(err)
 }
@@ -186,7 +239,7 @@ func TestShutdownReleasesASubscriberBlockedInWrite(t *testing.T) {
 	}()
 	// Hints waiting in the subscriber's buffer at shutdown must not re-arm a
 	// fresh write deadline after cancellation expired the previous one.
-	feed.Publish([]Hint{{Provider: "github", Host: "github.com", RepositoryID: "R_x", Target: Repository}})
+	feed.Publish([]Hint{{Provider: "github", Host: "github.com", RepositoryID: 1001, Target: Repository}})
 	awaitSignal(t, writer.started, "the stream did not start writing")
 	require.True(writer.lastDeadline().After(time.Now()), "a frame write carries a bounded deadline")
 	cancel()
@@ -206,7 +259,7 @@ func TestShutdownWaitsForAStartedExpiryCallback(t *testing.T) {
 			defer close(done)
 			serveStream(ctx, writer, feed)
 		}()
-		feed.Publish([]Hint{{Provider: "github", Host: "github.com", RepositoryID: "R_x", Target: Repository}})
+		feed.Publish([]Hint{{Provider: "github", Host: "github.com", RepositoryID: 1001, Target: Repository}})
 		<-writer.started
 		cancel()
 		// The expiry callback wakes the blocked write, then stays inside its
@@ -229,7 +282,7 @@ func TestReadReconnectsWhenAnOpenStreamStalls(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, ": connected\n\n")
-		http.NewResponseController(w).Flush() //nolint:errcheck // the stall is the point
+		http.NewResponseController(w).Flush()
 		<-r.Context().Done()
 	}))
 	t.Cleanup(server.Close)
@@ -244,7 +297,7 @@ func TestReadReconnectsWhenAnOpenStreamStalls(t *testing.T) {
 func TestReadRejectsInvalidHints(t *testing.T) {
 	require := require.New(t)
 	t.Parallel()
-	stream := &Stream{idleTimeout: time.Second, body: io.NopCloser(strings.NewReader(": connected\n\nevent: hint\ndata: {\"provider\":\"github\",\"host\":\"github.com\",\"repository_id\":\"R_x\",\"target\":\"issue\",\"number\":0}\n\n"))}
+	stream := &Stream{idleTimeout: time.Second, body: io.NopCloser(strings.NewReader(": connected\n\nevent: hint\ndata: {\"provider\":\"github\",\"host\":\"github.com\",\"repository_id\":1001,\"target\":\"issue\",\"number\":0}\n\n"))}
 	var received []Hint
 	err := stream.Read(func(hint Hint) { received = append(received, hint) })
 	require.Error(err)
@@ -290,7 +343,7 @@ func TestWebhookTargets(t *testing.T) {
 			t.Cleanup(cancel)
 			secret := []byte("synthetic-secret")
 			ingress, _ := Handlers(feed, map[string]Source{"team": {Secret: secret, RepositoryIDs: []int64{12345}}})
-			response := deliver(t, ingress, secret, tt.event, `{"action":"created","repository":{"id":12345,"node_id":"R_test_project"},`+tt.fields+`}`)
+			response := deliver(t, ingress, secret, tt.event, `{"action":"created","repository":{"id":12345},`+tt.fields+`}`)
 			require.Equal(tt.status, response.Code, response.Body.String())
 			if tt.target == "" {
 				require.Empty(hints)
@@ -318,7 +371,7 @@ func TestWorkflowRunHintsBatchBeforeReachingSubscribers(t *testing.T) {
 		secret := []byte("synthetic-secret")
 		ingress, _ := Handlers(feed, map[string]Source{"team": {Secret: secret, RepositoryIDs: []int64{12345}}})
 		for i, action := range []string{"requested", "in_progress", "completed"} {
-			response := deliver(t, ingress, secret, "workflow_run", `{"action":"`+action+`","repository":{"id":12345,"node_id":"R_test_project"},"workflow_run":{"name":"Private workflow","head_sha":"private-sha","pull_requests":[{"number":7},{"number":8}]}}`)
+			response := deliver(t, ingress, secret, "workflow_run", `{"action":"`+action+`","repository":{"id":12345},"workflow_run":{"name":"Private workflow","head_sha":"private-sha","pull_requests":[{"number":7},{"number":8}]}}`)
 			require.Equal(http.StatusNoContent, response.Code, response.Body.String())
 			if i == 0 {
 				time.Sleep(59 * time.Second)
@@ -327,20 +380,27 @@ func TestWorkflowRunHintsBatchBeforeReachingSubscribers(t *testing.T) {
 		synctest.Wait()
 		assert.Empty(first, "workflow bursts stay in the relay")
 		assert.Empty(second)
-		response := deliver(t, ingress, secret, "pull_request", `{"repository":{"id":12345,"node_id":"R_test_project"},"pull_request":{"number":7}}`)
+		response := deliver(t, ingress, secret, "pull_request", `{"repository":{"id":12345},"pull_request":{"number":7}}`)
 		require.Equal(http.StatusNoContent, response.Code)
-		ordinary := Hint{Provider: "github", Host: "github.com", RepositoryID: "R_test_project", Target: PullRequest, Number: 7}
+		ordinary := Hint{Provider: "github", Host: "github.com", RepositoryID: 12345, Target: PullRequest, Number: 7}
 		require.Equal(ordinary, <-first, "ordinary updates do not wait behind checks")
 		require.Equal(ordinary, <-second)
+		// Individual check updates share the workflow's existing window.
+		response = deliver(t, ingress, secret, "check_run", `{"repository":{"id":12345},"check_run":{"pull_requests":[{"number":7},{"number":9}]}}`)
+		require.Equal(http.StatusNoContent, response.Code)
 		time.Sleep(time.Second)
 		synctest.Wait()
 		check := ordinary
 		check.Target = PullRequestChecks
 		other := check
 		other.Number = 8
+		checkOnly := check
+		checkOnly.Number = 9
 		for _, hints := range []<-chan Hint{first, second} {
-			require.Len(hints, 2, "one hint per PR, even with multiple workflows")
-			assert.ElementsMatch([]Hint{check, other}, []Hint{<-hints, <-hints})
+			runs := ordinary
+			runs.Target, runs.Number = "workflow_runs", 0
+			require.Len(hints, 4, "one hint per PR and one for the repository's runs")
+			assert.ElementsMatch([]Hint{check, other, checkOnly, runs}, []Hint{<-hints, <-hints, <-hints, <-hints})
 		}
 		feed.Publish([]Hint{check})
 		time.Sleep(59 * time.Second)
@@ -360,6 +420,28 @@ func TestWorkflowRunHintsBatchBeforeReachingSubscribers(t *testing.T) {
 	})
 }
 
+func TestUnassociatedActionsHints(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		require := require.New(t)
+		feed := new(Broadcaster)
+		defer feed.Close()
+		hints, cancel := feed.Subscribe()
+		defer cancel()
+		secret := []byte("synthetic-secret")
+		ingress, _ := Handlers(feed, map[string]Source{"team": {Secret: secret, RepositoryIDs: []int64{12345}}})
+		for _, event := range []string{"check_run", "workflow_run"} {
+			response := deliver(t, ingress, secret, event, `{"repository":{"id":12345},"`+event+`":{"pull_requests":[]}}`)
+			require.Equal(http.StatusNoContent, response.Code)
+		}
+		require.Empty(hints)
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		require.Len(hints, 1, "a run without a PR refreshes Actions, never every PR")
+		assert.Equal(t, Hint{Provider: "github", Host: "github.com", RepositoryID: 12345, Target: "workflow_runs"}, <-hints)
+	})
+}
+
 func TestPendingChecksDoNotCrowdOutActivity(t *testing.T) {
 	t.Parallel()
 	feed := new(Broadcaster)
@@ -367,22 +449,65 @@ func TestPendingChecksDoNotCrowdOutActivity(t *testing.T) {
 	hints, cancel := feed.Subscribe()
 	defer cancel()
 	for number := 1; number <= 1025; number++ {
-		feed.Publish([]Hint{{Provider: "github", Host: "github.com", RepositoryID: "R_project", Target: PullRequestChecks, Number: number}})
+		feed.Publish([]Hint{{Provider: "github", Host: "github.com", RepositoryID: 1001, Target: PullRequestChecks, Number: number}})
 	}
 	for _, target := range []string{PullRequest, Issue, RepositoryRefs, Repository} {
-		hint := Hint{Provider: "github", Host: "github.com", RepositoryID: "R_project", Target: target, Number: 1}
+		hint := Hint{Provider: "github", Host: "github.com", RepositoryID: 1001, Target: target, Number: 1}
 		feed.Publish([]Hint{hint})
 		require.Equal(t, hint, <-hints, "pending checks must not occupy ordinary activity buffers")
 	}
 }
 
+func TestFlushedChecksLeaveRoomForWorkflowAndActivity(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name    string
+		batches int
+	}{
+		{name: "full batch", batches: 1},
+		{name: "backlogged subscriber", batches: 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				feed := new(Broadcaster)
+				defer feed.Close()
+				hints, cancel := feed.Subscribe()
+				defer cancel()
+				checks := make([]Hint, 1024)
+				for i := range checks {
+					checks[i] = Hint{Provider: "github", Host: "github.com", RepositoryID: 1001, Target: PullRequestChecks, Number: i + 1}
+				}
+				workflow := Hint{Provider: "github", Host: "github.com", RepositoryID: 1001, Target: WorkflowRuns}
+				for i := range tt.batches {
+					feed.Publish(checks)
+					if i == tt.batches-1 {
+						feed.Publish([]Hint{workflow})
+					}
+					time.Sleep(time.Minute)
+					synctest.Wait()
+				}
+				ordinary := Hint{Provider: "github", Host: "github.com", RepositoryID: 1001, Target: PullRequest, Number: 1}
+				feed.Publish([]Hint{ordinary})
+				require.Len(t, hints, len(checks)+2, "checks must leave room for workflow updates and immediate activity")
+				received := make([]Hint, len(checks)+1)
+				for i := range received {
+					received[i] = <-hints
+				}
+				assert.ElementsMatch(t, slices.Concat(checks, []Hint{workflow}), received)
+				assert.Equal(t, ordinary, <-hints)
+			})
+		})
+	}
+}
+
 func deliver(t *testing.T, handler http.Handler, secret []byte, event, body string) *httptest.ResponseRecorder {
-	require := require.New(t)
 	t.Helper()
+	require := require.New(t)
 	mac := hmac.New(sha256.New, secret)
 	_, err := io.WriteString(mac, body)
 	require.NoError(err)
-	req := httptest.NewRequest(http.MethodPost, "/webhooks/github/team", strings.NewReader(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhooks/github/team", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-GitHub-Event", event)
 	req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))

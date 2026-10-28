@@ -2,6 +2,7 @@ package workspaceapi
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,14 +12,15 @@ import (
 	"go.kenn.io/forge/internal/providerplane"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/workspacetest"
 	"go.kenn.io/forge/internal/workspace"
 )
 
-func TestRevealWorkspaceOpensWorkspacePath(t *testing.T) {
+func TestRevealWorkspaceOpensWorkspacePath(t *testing.T) { //nolint:paralleltest // writes package variable revealWorkspacePath
 	require := require.New(t)
 	assert := assert.New(t)
 	database := dbtest.Open(t)
-	manager := workspace.NewManager(database, t.TempDir())
+	manager := workspacetest.NewManager(t, database, t.TempDir())
 	path := t.TempDir()
 	require.NoError(database.InsertWorkspace(t.Context(), &db.Workspace{
 		ID: "ws-reveal", Platform: "github", PlatformHost: "github.com",
@@ -41,19 +43,21 @@ func TestRevealWorkspaceOpensWorkspacePath(t *testing.T) {
 }
 
 func TestLaunchSpecBranchActionMapsHubOutage(t *testing.T) {
+	t.Parallel()
 	err := workspaceBranchActionProblem(&workspace.LaunchSpecRefreshError{
 		Cause: providerplane.ErrHubUnavailable,
 	})
 
-	problem, ok := err.(*httpapi.ProblemError)
+	problem, ok := errors.AsType[*httpapi.ProblemError](err)
 	require.True(t, ok)
 	assert.Equal(t, httpapi.CodeHubUnavailable, problem.Code)
 }
 
 func TestBranchActionMapsMissingGitCredential(t *testing.T) {
+	t.Parallel()
 	err := workspaceBranchActionProblem(gitclone.ErrCredentialUnavailable)
 
-	problem, ok := err.(*httpapi.ProblemError)
+	problem, ok := errors.AsType[*httpapi.ProblemError](err)
 	require.True(t, ok)
 	assert.Equal(t, httpapi.CodeGitCredentialUnavailable, problem.Code)
 }

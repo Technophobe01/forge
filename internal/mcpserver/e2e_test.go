@@ -21,9 +21,13 @@ import (
 	ghclient "go.kenn.io/forge/internal/github"
 	mcpserver "go.kenn.io/forge/internal/mcpserver"
 	forgeserver "go.kenn.io/forge/internal/server"
+	"go.kenn.io/forge/internal/server/authapi"
+	"go.kenn.io/forge/internal/server/mcpapi"
 	"go.kenn.io/forge/internal/testutil"
 	"go.kenn.io/forge/internal/testutil/dbtest"
-	gitcmd "go.kenn.io/kit/git/cmd"
+	"go.kenn.io/forge/internal/testutil/gitsafe"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	"go.kenn.io/forge/platform"
 )
 
 func TestMCPToolsUseTheInProcessForgeBackend(t *testing.T) {
@@ -45,7 +49,7 @@ func TestMCPToolsUseTheInProcessForgeBackend(t *testing.T) {
 		Body: "cache follow-up needs a look", CreatedAt: now.Add(-20 * time.Minute),
 		DedupeKey: "mcp-e2e-issue-comment",
 	}}))
-	stackID, err := database.UpsertStack(ctx, repoID, 2, "cache-stack")
+	stackID, err := database.UpsertStack(ctx, repoID, 2, "cache-stack", false)
 	require.NoError(err)
 	require.NoError(database.ReplaceStackMembers(ctx, stackID, []db.StackMember{
 		{StackID: stackID, MergeRequestID: basePullID, Position: 1},
@@ -55,7 +59,7 @@ func TestMCPToolsUseTheInProcessForgeBackend(t *testing.T) {
 	diffRoot := t.TempDir()
 	diffRepo, err := testutil.SetupDiffRepo(ctx, diffRoot, database)
 	require.NoError(err)
-	_, stderr, err := gitcmd.New().Run(
+	_, stderr, err := gitsafe.Runner().Run(
 		ctx, filepath.Join(diffRoot, "workrepo"), nil,
 		"update-ref", "refs/pull/1/head", diffRepo.HeadSHA,
 	)
@@ -99,18 +103,18 @@ esac
 	t.Cleanup(syncer.Stop)
 	const token = "mcp-e2e-token"
 	forge := forgeserver.New(database, syncer, nil, "/", cfg, forgeserver.ServerOptions{
-		DaemonAccess: forgeserver.DaemonAccessOptions{Token: token, RequireAPIAuth: true},
+		DaemonAccess: authapi.DaemonAccessOptions{Token: token, RequireAPIAuth: true},
 		Clones:       diffRepo.Manager, WorktreeDir: t.TempDir(),
 		DisableWorkspaceBackgroundMonitors: true,
 		DisableWorkspaceEnrichment:         true,
 		PtyOwnerInProcess:                  true,
-		HostCheck: forgeserver.HostCheckOptions{
+		HostCheck: authapi.HostCheckOptions{
 			Bind: config.HostKey{Host: "127.0.0.1", Port: "8080"},
 		},
 		HostCheckAllowLoopbackAnyPort: true,
 	})
 	t.Cleanup(func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
 		defer cancel()
 		require.NoError(forge.Shutdown(shutdownCtx))
 	})
@@ -123,9 +127,9 @@ esac
 	mcpHTTP := httptest.NewUnstartedServer(nil)
 	bind, err := config.ParseHostKey(mcpHTTP.Listener.Addr().String())
 	require.NoError(err)
-	mcpHTTP.Config.Handler = forgeserver.NewMCPHTTPGuard(
+	mcpHTTP.Config.Handler = mcpapi.NewMCPHTTPGuard(
 		companion.HTTPHandler(),
-		forgeserver.MCPHTTPGuardOptions{Bind: bind, Token: token, RequireAuth: true},
+		mcpapi.MCPHTTPGuardOptions{Bind: bind, Token: token, RequireAuth: true},
 	)
 	mcpHTTP.Start()
 	t.Cleanup(mcpHTTP.Close)
@@ -139,13 +143,13 @@ esac
 	repos := callTool[struct {
 		Repos []struct {
 			Provider       string `json:"provider"`
-			PlatformRepoID string `json:"platform_repo_id"`
+			PlatformRepoID int64  `json:"platform_repo_id"`
 			RepoPath       string `json:"repo_path"`
 		} `json:"repos"`
 	}](t, session, "kenn_forge_list_repos", map[string]any{})
 	require.Len(repos.Repos, 1)
 	assert.Equal("github", repos.Repos[0].Provider)
-	assert.Equal("repo-acme-widgets", repos.Repos[0].PlatformRepoID)
+	assert.Equal(testutil.FixtureRepoID("acme", "widgets"), repos.Repos[0].PlatformRepoID)
 	assert.Equal("acme/widgets", repos.Repos[0].RepoPath)
 
 	candidates := callTool[struct {
@@ -162,7 +166,7 @@ esac
 		"since": "2h", "item_types": []string{"pr", "issue"},
 		"repo": map[string]any{
 			"provider": "github", "platform_host": "github.com",
-			"platform_repo_id": "repo-acme-widgets", "repo_path": "acme/widgets",
+			"platform_repo_id": testutil.FixtureRepoID("acme", "widgets"), "repo_path": "acme/widgets",
 		},
 	})
 	require.Len(candidates.Candidates, 3)
@@ -180,7 +184,7 @@ esac
 
 	item := map[string]any{
 		"type": "pr", "provider": "github", "platform_host": "github.com",
-		"platform_repo_id": "repo-acme-widgets",
+		"platform_repo_id": testutil.FixtureRepoID("acme", "widgets"),
 		"owner":            "acme", "name": "widgets", "number": 1,
 	}
 	contextResult := callTool[struct {
@@ -360,8 +364,8 @@ func callTool[T any](t *testing.T, session *mcp.ClientSession, name string, args
 func seedPull(t *testing.T, database *db.DB, number int, title string) (int64, int64) {
 	t.Helper()
 	identity := db.GitHubRepoIdentity("github.com", "acme", "widgets")
-	identity.PlatformRepoID = "repo-acme-widgets"
-	repoID, err := database.UpsertRepo(t.Context(), identity)
+	identity.Key = platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widgets"))
+	repoID, err := reposeed.Seed(t.Context(), database, identity)
 	require.NoError(t, err)
 	now := time.Now().UTC().Truncate(time.Second)
 	pullID, err := database.UpsertMergeRequest(t.Context(), &db.MergeRequest{
@@ -379,8 +383,8 @@ func seedPull(t *testing.T, database *db.DB, number int, title string) (int64, i
 func seedIssue(t *testing.T, database *db.DB, number int, title string) int64 {
 	t.Helper()
 	identity := db.GitHubRepoIdentity("github.com", "acme", "widgets")
-	identity.PlatformRepoID = "repo-acme-widgets"
-	repoID, err := database.UpsertRepo(t.Context(), identity)
+	identity.Key = platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widgets"))
+	repoID, err := reposeed.Seed(t.Context(), database, identity)
 	require.NoError(t, err)
 	now := time.Now().UTC().Truncate(time.Second)
 	issueID, err := database.UpsertIssue(t.Context(), &db.Issue{

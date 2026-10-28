@@ -142,6 +142,7 @@
   const MIN_RATIO = 0.12;
   const MAX_RATIO = 0.88;
 
+  let soloActionsWidth = $state(0);
   let splitEl = $state<HTMLDivElement | null>(null);
   let splitSize = $state(0);
   let resizeStartRatio = 0.5;
@@ -621,6 +622,7 @@
       },
     ]}
     aria-label={leafLabel}
+    style:--tabbed-panel-solo-actions-width={soloChrome ? `${soloActionsWidth + 6}px` : undefined}
     onfocusin={onFocusPane ? (event) => handleLeafFocusIn(event, node) : undefined}
   >
     {#if !soloChrome}
@@ -752,7 +754,7 @@
         <!-- The strip's remaining actions with the strip taken away: they float at
              the top right of the body, which is where the pane's own strip ends, so
              the two read as one bar. -->
-        <div class="tabbed-panel-solo-actions" data-testid="tabbed-panel-solo-actions">
+        <div class="tabbed-panel-solo-actions" data-testid="tabbed-panel-solo-actions" bind:clientWidth={soloActionsWidth}>
           {@render tabActions?.(soloTab)}
           {@render leafActions?.(node)}
         </div>
@@ -807,7 +809,6 @@
     </div>
     {#if zoomSide === null}
       <SplitResizeHandle
-        class="tabbed-panel-split-divider"
         ariaLabel={resizeLabel}
         orientation={node.direction}
         ariaValueMin={Math.round(MIN_RATIO * splitSize)}
@@ -920,10 +921,6 @@
     flex-shrink: 0;
   }
 
-  :global(.tabbed-panel-split-divider) {
-    flex: 0 0 var(--chrome-pane-divider-width);
-  }
-
   :global(.tabbed-panel-split.horizontal
       > .tabbed-panel-split-child.first
       .tabbed-panel-leaf) {
@@ -962,6 +959,13 @@
        every popover, with no z-index involved. */
     padding: var(--chrome-border-width);
     background: var(--bg-surface);
+  }
+
+  /* A tree placed right after a split handle, such as a list sidebar's, meets
+     the handle with its left edge; the handle is the divider there. Leaves off
+     that edge already drop their left border as second split children. */
+  :global(.kit-split-resize-handle--horizontal + *) .tabbed-panel-leaf {
+    border-left: 0;
   }
 
   /* Paint focus as part of the leaf instead of as a high-z overlay. Descendant
@@ -1110,10 +1114,6 @@
     height: var(--chrome-active-accent-width);
     background: var(--accent-blue);
     pointer-events: none;
-  }
-
-  .tabbed-panel-leaf.input-active > .tabbed-panel-tabs > .tabbed-panel-tab.active::before {
-    content: none;
   }
 
   .tabbed-panel-tab.dragging {
@@ -1283,11 +1283,11 @@
   }
 
   .tab-drop-placeholder.before::after {
-    left: var(--chrome-pane-divider-width);
+    left: var(--space-1);
   }
 
   .tab-drop-placeholder.after::after {
-    right: var(--chrome-pane-divider-width);
+    right: var(--space-1);
   }
 
   .tabbed-panel-body {

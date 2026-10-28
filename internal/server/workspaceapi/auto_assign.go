@@ -2,6 +2,7 @@ package workspaceapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -82,7 +83,7 @@ func (s *Handler) applyWorkspaceAutoAssignment(
 	}
 	username = strings.TrimSpace(username)
 	if username == "" {
-		return fmt.Errorf("authenticated username is empty")
+		return errors.New("authenticated username is empty")
 	}
 
 	if issue {
@@ -135,15 +136,18 @@ func (s *Handler) AutoAssignProviderWorkspaceItem(
 			"workspace item type must be pull_request or issue", nil,
 		)
 	}
-	repo, err := s.lookupRepoByProviderRoute(
-		ctx, request.Repository.Provider, request.Repository.PlatformHost,
-		request.Repository.Owner, request.Repository.Name,
-	)
+	repo, err := s.db.GetActiveRepoByProviderID(ctx, platform.RepositoryIdentity{
+		Provider: request.Repository.Provider, PlatformHost: request.Repository.PlatformHost,
+		Key: request.RepoKey,
+	})
 	if err != nil {
 		return providerRouteLookupError(err)
 	}
+	if repo == nil {
+		return httpapi.NotFound(httpapi.CodeRepoNotFound, "repo not found", nil)
+	}
 	return s.applyWorkspaceAutoAssignment(
-		ctx, *repo, request.ItemNumber, issue,
+		ctx, repo.Repo, request.ItemNumber, issue,
 	)
 }
 
@@ -160,6 +164,9 @@ func (s *Handler) assignPullWorkspaceUser(
 	if err != nil {
 		return fmt.Errorf("resolve pull request reader: %w", err)
 	}
+	// Same lock as the assignee routes, so an assignee edit cannot land
+	// between this read and the write and be overwritten, or overwrite it.
+	defer httpapi.LockItemMembership("pull", repo.ID, number, "assignees")()
 	pull, err := reader.GetMergeRequest(ctx, ref, number)
 	if err != nil {
 		return fmt.Errorf("read pull request assignees: %w", err)
@@ -198,6 +205,9 @@ func (s *Handler) assignIssueWorkspaceUser(
 	if err != nil {
 		return fmt.Errorf("resolve issue reader: %w", err)
 	}
+	// Same lock as the assignee routes, so an assignee edit cannot land
+	// between this read and the write and be overwritten, or overwrite it.
+	defer httpapi.LockItemMembership("issue", repo.ID, number, "assignees")()
 	item, err := reader.GetIssue(ctx, ref, number)
 	if err != nil {
 		return fmt.Errorf("read issue assignees: %w", err)

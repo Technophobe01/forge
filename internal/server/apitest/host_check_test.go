@@ -3,7 +3,6 @@ package apitest
 import (
 	"context"
 	"encoding/json"
-	apiruntime "github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	apiruntime "github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -20,7 +21,9 @@ import (
 	"go.kenn.io/forge/internal/db"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
+	"go.kenn.io/forge/internal/server/authapi"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/testutil/servertest"
 )
 
@@ -42,6 +45,7 @@ import (
 // (127.0.0.1:8091) reaches the handler and returns 200 with the
 // seeded PR list.
 func TestHostValidationE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	srv, database := setupHostValidationServer(t)
 	seedPR(t, database, "acme", "widget", 1)
 
@@ -76,6 +80,7 @@ func TestHostValidationE2E(t *testing.T) {
 }
 
 func TestHostValidationUsesConfigDerivedTrustedProxyE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	srv, database := setupHostValidationServerFromConfig(t, `host = "127.0.0.1"
 port = 8091
 allowed_hosts = ["proxy.local:8091", "forge.example"]
@@ -102,7 +107,8 @@ trust_reverse_proxy = true
 }
 
 func TestHostValidationTrustedProxyE2E(t *testing.T) {
-	srv, database := setupHostValidationServer(t, server.HostCheckOptions{
+	serverfake.RunParallelServerTest(t)
+	srv, database := setupHostValidationServer(t, authapi.HostCheckOptions{
 		Bind: config.HostKey{Host: "127.0.0.1", Port: "8091"},
 		Allowed: []config.HostKey{
 			{Host: "proxy.local", Port: "8091"},
@@ -140,12 +146,12 @@ func TestHostValidationTrustedProxyE2E(t *testing.T) {
 // setupHostValidationServer builds a Server with an explicit
 // HostCheckOptions so the production contract — strict bind match
 // plus no any-port relaxation — is what the test exercises.
-func setupHostValidationServer(t *testing.T, opts ...server.HostCheckOptions) (*server.Server, *db.DB) {
+func setupHostValidationServer(t *testing.T, opts ...authapi.HostCheckOptions) (*server.Server, *db.DB) {
 	t.Helper()
 	database := dbtest.Open(t)
 	syncer := ghclient.NewSyncer(nil, database, nil, defaultTestRepos, time.Minute, nil, nil)
 	t.Cleanup(syncer.Stop)
-	hostCheck := server.HostCheckOptions{
+	hostCheck := authapi.HostCheckOptions{
 		Bind: config.HostKey{Host: "127.0.0.1", Port: "8091"},
 	}
 	if len(opts) > 0 {
@@ -196,7 +202,7 @@ func newHostValidationClient(t *testing.T, srv *server.Server, baseURL string) *
 				_ = req.Body.Close()
 				body = strings.NewReader(string(payload))
 			}
-			serverReq := httptest.NewRequest(req.Method, req.URL.String(), body)
+			serverReq := httptest.NewRequestWithContext(t.Context(), req.Method, req.URL.String(), body)
 			serverReq.Header = req.Header.Clone()
 			if req.Method != http.MethodGet && serverReq.Header.Get("Content-Type") == "" {
 				serverReq.Header.Set("Content-Type", "application/json")

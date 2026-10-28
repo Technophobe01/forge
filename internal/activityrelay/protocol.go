@@ -23,6 +23,7 @@ import (
 const (
 	PullRequest       = "pull_request"
 	PullRequestChecks = "pull_request_checks"
+	WorkflowRuns      = "workflow_runs"
 	Issue             = "issue"
 	RepositoryRefs    = "repository_refs"
 	Repository        = "repository"
@@ -31,13 +32,13 @@ const (
 type Hint struct {
 	Provider     string `json:"provider"`
 	Host         string `json:"host"`
-	RepositoryID string `json:"repository_id"`
+	RepositoryID int64  `json:"repository_id"`
 	Target       string `json:"target"`
 	Number       int    `json:"number,omitempty"`
 }
 
 func (h Hint) Validate() error {
-	if h.Provider != "github" || h.Host != "github.com" || len(h.RepositoryID) == 0 || len(h.RepositoryID) > 256 {
+	if h.Provider != "github" || h.Host != "github.com" || h.RepositoryID <= 0 {
 		return errors.New("invalid relay repository identity")
 	}
 	switch h.Target {
@@ -45,7 +46,7 @@ func (h Hint) Validate() error {
 		if h.Number > 0 {
 			return nil
 		}
-	case RepositoryRefs, Repository:
+	case RepositoryRefs, Repository, WorkflowRuns:
 		if h.Number == 0 {
 			return nil
 		}
@@ -64,9 +65,14 @@ type Stream struct {
 
 const (
 	hintEvent         = "hint"
+	protocolHeader    = "X-Kenn-Forge-Relay-Protocol"
+	protocolVersion   = "1"
 	maxEventLineBytes = 4096
 	streamIdleTimeout = 3 * keepaliveInterval
 )
+
+// ErrIncompatible identifies a feed whose format this consumer cannot read.
+var ErrIncompatible = errors.New("relay message format is incompatible")
 
 // Open connects to the feed and returns once the relay has accepted the
 // subscription. Callers own the returned stream and must close it.
@@ -89,10 +95,16 @@ func Open(ctx context.Context, client *http.Client, baseURL string) (*Stream, er
 		_ = response.Body.Close()
 		return nil, fmt.Errorf("relay returned HTTP %d", response.StatusCode)
 	}
+	// Existing relays omit the header. They still have to pass hint decoding;
+	// adding this header must not break a compatible, already deployed feed.
+	if version := response.Header.Get(protocolHeader); version != "" && version != protocolVersion {
+		_ = response.Body.Close()
+		return nil, ErrIncompatible
+	}
 	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
 	if err != nil || mediaType != "text/event-stream" {
 		_ = response.Body.Close()
-		return nil, errors.New("relay did not return an event stream")
+		return nil, ErrIncompatible
 	}
 	return &Stream{body: response.Body, idleTimeout: streamIdleTimeout}, nil
 }
@@ -117,7 +129,7 @@ func (s *Stream) Read(handle func(Hint)) error {
 			if event == hintEvent {
 				var hint Hint
 				if json.Unmarshal([]byte(strings.Join(data, "\n")), &hint) != nil || hint.Validate() != nil {
-					return errors.New("relay sent an invalid hint")
+					return ErrIncompatible
 				}
 				handle(hint)
 			}

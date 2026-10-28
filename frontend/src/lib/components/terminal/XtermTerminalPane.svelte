@@ -5,6 +5,8 @@
   import { observeResize } from "../../browser/observers.js";
   import { getStores } from "../../context.js";
   import { showFlash } from "../../stores/flash.svelte.js";
+  import { isColorEReader, isDark, isEReader } from "../../stores/theme.svelte.js";
+  import { terminalAppearance } from "./terminal-appearance.js";
   import { Terminal } from "@xterm/xterm";
   import type { ILinkHandler } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
@@ -100,6 +102,11 @@
 
   let containerEl: HTMLElement;
   let terminal: Terminal | null = $state(null);
+  const appearance = $derived(
+    terminalAppearance(
+      isColorEReader() ? "e-reader-color" : isEReader() ? "e-reader" : isDark() ? "dark" : "light",
+    ),
+  );
   let hoveredTerminalLink: string | null = $state(null);
   let fitAddon: FitAddon | null = null;
   let imageAddon: ImageAddon | null = null;
@@ -155,6 +162,15 @@
       return;
     }
     explicitFocusRequested = true;
+  }
+
+  /** The live xterm appearance; contrast is not observable through WebGL output. */
+  export function appearanceOptions(): { background: string | undefined; minimumContrastRatio: number } | null {
+    if (!terminal) return null;
+    return {
+      background: terminal.options.theme?.background,
+      minimumContrastRatio: terminal.options.minimumContrastRatio ?? 1,
+    };
   }
 
   export function sendInput(data: string): boolean {
@@ -219,7 +235,6 @@
   }
 
   const TERMINAL_SMOOTH_SCROLL_DURATION = 0;
-  const TERMINAL_MINIMUM_CONTRAST_RATIO = 4.5;
   const TERMINAL_FONT_WAIT_MS = 300;
   const TERMINAL_FONT_LOAD_GLYPHS = "0MWim@#";
   const TERMINAL_SEQUENCE_CANCEL = new Uint8Array([0x18]);
@@ -267,6 +282,15 @@
 
   function terminalLinkModifierPressed(event: MouseEvent): boolean {
     return terminalLinkUsesMetaKey ? event.metaKey : event.ctrlKey;
+  }
+
+  function handleTerminalLinkMouse(event: MouseEvent): void {
+    if (event.button !== 0 || hoveredTerminalLink === null || !terminalLinkModifierPressed(event)) return;
+    // Let the screen's linkifier handle the gesture, then stop it before
+    // xterm's parent mouse handler sends the same click to the remote app.
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.type === "mousedown") terminal?.focus();
   }
 
   function showTerminalLink(_event: MouseEvent, uri: string): void {
@@ -638,7 +662,8 @@
   }
 
   function initialStatusMessage(status: string | undefined): string {
-    return status === "exited" ? "Process exited" : "Session unavailable";
+    if (status === "exited") return "Process exited";
+    return status === "parked" ? "Stopped while idle; it restarts when the workspace shows" : "Session unavailable";
   }
 
   function defaultTerminalFontFamily(): string {
@@ -1194,6 +1219,12 @@
   $effect(syncRendererState);
 
   $effect(() => {
+    if (!terminal) return;
+    terminal.options.theme = appearance.theme;
+    terminal.options.minimumContrastRatio = appearance.minimumContrastRatio;
+  });
+
+  $effect(() => {
     syncImageAddon(terminalGraphics);
   });
 
@@ -1269,11 +1300,7 @@
 
       function startTerminal(): void {
       const term = new Terminal({
-        theme: {
-          background: "#0d1117",
-          foreground: "#c9d1d9",
-          cursor: "#58a6ff",
-        },
+        theme: appearance.theme,
         // The ligatures addon registers a character joiner, which xterm
         // exposes as proposed API. This is constructor-only and must be on
         // before a user enables ligatures at runtime.
@@ -1287,7 +1314,7 @@
         letterSpacing: terminalLetterSpacing,
         lineHeight: terminalLineHeight,
         linkHandler: terminalLinkHandler,
-        minimumContrastRatio: TERMINAL_MINIMUM_CONTRAST_RATIO,
+        minimumContrastRatio: appearance.minimumContrastRatio,
         rescaleOverlappingGlyphs: true,
         scrollOnEraseInDisplay: true,
         smoothScrollDuration: TERMINAL_SMOOTH_SCROLL_DURATION,
@@ -1306,6 +1333,9 @@
         registerTerminalTextureAtlasParticipant(terminal);
 
       term.open(containerEl);
+      const screen = containerEl.querySelector<HTMLElement>(".xterm-screen")!;
+      screen.addEventListener("mousedown", handleTerminalLinkMouse);
+      screen.addEventListener("mouseup", handleTerminalLinkMouse);
       term.attachCustomKeyEventHandler(handleTerminalCustomKeyEvent);
       term.parser.registerOscHandler(52, handleOsc52Clipboard);
       switchTimer.record("terminal-constructed");

@@ -1,5 +1,7 @@
 <script lang="ts">
+  import ErrorShown from "../shared/ErrorShown.svelte";
   import { Effect } from "effect";
+  import { untrack } from "svelte";
   import { getStores } from "../../context.js";
   import WorkspaceCreateSplitButton from "../workspace/WorkspaceCreateSplitButton.svelte";
   import {
@@ -13,15 +15,18 @@
   } from "@kenn-io/kit-ui";
   import GitBranchIcon from "@lucide/svelte/icons/git-branch";
   import { canonicalProvider, providerHostRouteParams, providerRouteParams, providerUsesHostRoute } from "../../api/provider-routes.js";
-  import type { Repo } from "../../api/types.js";
+  import type { RepoCatalog } from "../../api/types.js";
   import {
     ApiProblemError,
     InvalidExternalPayload,
     type TransientTransportError,
   } from "../../api/effect-errors.js";
   import { executeGeneratedApiRequest } from "../../api/generated-api.js";
+  import { RepositoryReads } from "../../api/repository-reads.js";
+  import { repositoryKeyFromCatalog, repositoryKeyToWire, type RepositoryKey } from "../../api/repository-key.js";
   import { executeOpaqueGeneratedApiRequest } from "../../api/generated-api.js";
-  import { loadFleetSnapshot, type HostSummary } from "../../api/fleet-snapshot.js";
+  import { FleetSnapshotReads, type HostSummary } from "../../api/fleet-snapshot.js";
+  import { devboxRepositoryUnavailableReason, workspaceTargetUnavailableReason } from "../../stores/workspace-target.svelte.js";
   import type { ProblemBody } from "../../api/problems.js";
   import type { AppExecution } from "../../app/runtime.js";
   import { getAppRuntime } from "../../app/runtime-context.js";
@@ -43,6 +48,7 @@
     type KataWorkspaceIdentity,
   } from "../../stores/kata-workspace-create.svelte.js";
   import { navigate } from "../../stores/router.svelte.js";
+  import { repoIdentityKey } from "../../utils/repo-label.js";
   import {
     getLastUsedNewWorkspaceRepoKey,
     rememberNewWorkspaceRepoKey,
@@ -78,6 +84,7 @@
     key: string;
     provider: string;
     platformHost: string;
+    repositoryKey: RepositoryKey | undefined;
     owner: string;
     name: string;
     label: string;
@@ -88,7 +95,7 @@
     status?: string;
   };
 
-  let repos = $state<RepoOption[]>([]);
+  let repos = $state.raw<RepoOption[]>([]);
   let reposLoading = $state(false);
   let reposError = $state<string | null>(null);
   let selectedKey = $state("");
@@ -98,6 +105,8 @@
   let suggestedBranch = $state<string | null>(null);
   let pendingLaunchTargetKey = $state<string | null>(null);
   let workspaceHosts = $state.raw<HostSummary[]>([]);
+  let workspaceHostsLoaded = $state(false);
+  let workspaceHostsError = $state("");
   let selectedWorkspaceHostKey = $state("");
   let source = $state<NewWorkspaceSource>("repository");
   const kataDaemons = createKataDaemonsStore();
@@ -123,37 +132,35 @@
 
   function loadWorkspaceHosts(session: object): void {
     fleetLoadExecution?.interrupt();
-    const execution = runtime.runCommand(
-      loadFleetSnapshot().pipe(
-        Effect.tap((snapshot) =>
-          Effect.sync(() => {
-            if (activeSession !== session) return;
-            const hosts = snapshot.hosts ?? [];
-            const self = hosts.find((host) => host.kind === "self");
-            workspaceHosts = self?.federationRole === "hub"
-              ? hosts
-              : self
-                ? [self]
-                : hosts.filter((host) => host.operationAvailability.workspaceWrite?.available === true);
-            selectedWorkspaceHostKey =
-              workspaceHosts.find((host) => host.kind === "self")?.configKey ??
-              workspaceHosts[0]?.configKey ??
-              "";
-          }),
-        ),
-        Effect.asVoid,
-      ),
+    workspaceHostsLoaded = false;
+    workspaceHostsError = "";
+    function receiveHosts(hosts: HostSummary[]): void {
+      if (activeSession !== session) return;
+      const self = hosts.find((host) => host.kind === "self");
+      workspaceHosts = self && self.federationRole !== "hub" ? [self] : hosts;
+    }
+    fleetLoadExecution = untrack(() => runtime.runCommand(
+      Effect.gen(function* () {
+        const reads = yield* FleetSnapshotReads;
+        yield* Effect.sync(() => {
+          if (reads.hosts !== undefined) receiveHosts(reads.hosts);
+        });
+        const snapshot = yield* reads.load;
+        yield* Effect.sync(() => {
+          if (activeSession !== session) return;
+          receiveHosts(snapshot.hosts ?? []);
+          workspaceHostsLoaded = true;
+        });
+      }),
       {
         operation: "load workspace execution hosts",
         safeContext: {},
         onFailure: () => {
           if (activeSession !== session) return;
-          workspaceHosts = [];
-          selectedWorkspaceHostKey = "";
+          workspaceHostsError = "Preferred devbox — status unavailable";
         },
       },
-    );
-    fleetLoadExecution = execution;
+    ));
   }
 
   function cancelKataSearch(): void {
@@ -177,21 +184,17 @@
     kataSearching = false;
   }
 
-  function repoOption(repo: Repo): RepoOption {
+  function repoOption(repo: RepoCatalog): RepoOption {
     const provider = canonicalProvider(repo.Platform);
     return {
       key: `${provider}/${repo.PlatformHost}/${repo.Owner}/${repo.Name}`,
       provider,
       platformHost: repo.PlatformHost,
+      repositoryKey: repositoryKeyFromCatalog(repo),
       owner: repo.Owner,
       name: repo.Name,
       label: `${repo.Owner}/${repo.Name}`,
     };
-  }
-
-  function seedKey(seed: NewWorkspaceRepoSeed | null): string {
-    if (!seed) return "";
-    return `${canonicalProvider(seed.provider)}/${seed.platformHost}/${seed.owner}/${seed.name}`;
   }
 
   function normalizeCreatedWorkspace(value: unknown): CreatedWorkspacePayload {
@@ -206,21 +209,61 @@
   // An explicit seed is a promise about which repository the workspace
   // targets. When it cannot be resolved (for example a repository hidden
   // from the UI), require a choice instead of silently diverting to another
-  // repository. Without a seed, prefer the last repo work was started in,
-  // then the first.
+  // repository. Remembered choices must still resolve by stable identity;
+  // use the first repository only when there is no remembered choice.
   function defaultRepoSelection(): string {
-    const seededRepoKey = seedKey(seedRepo);
-    if (seededRepoKey) {
-      return repos.some((repo) => repo.key === seededRepoKey) ? seededRepoKey : "";
+    if (seedRepo) {
+      if (!seedRepo.repositoryKey) return "";
+      const seededIdentity = repoIdentityKey({ ...seedRepo, provider: canonicalProvider(seedRepo.provider) });
+      return repos.find((repo) => repo.repositoryKey && repoIdentityKey(repo) === seededIdentity)?.key ?? "";
     }
     const lastUsed = getLastUsedNewWorkspaceRepoKey();
-    return (lastUsed && repos.some((repo) => repo.key === lastUsed) ? lastUsed : repos[0]?.key) ?? "";
+    if (lastUsed) {
+      return repos.find((repo) => repo.repositoryKey && repoIdentityKey(repo) === lastUsed)?.key ?? "";
+    }
+    return repos[0]?.key ?? "";
   }
 
-  // Each open starts a fresh request and fresh form state; a stale response
-  // from a previous open must not repopulate the list. The previous list and
-  // selection are dropped up front so a reopen cannot submit against the repo
-  // picked last time while the new list is still in flight, or if it fails.
+  function loadRepositories(session: object): void {
+    reposLoading = true;
+    repoLoadExecution = untrack(() => runtime.runCommand(
+      Effect.gen(function* () {
+        const reads = yield* RepositoryReads;
+        yield* Effect.sync(() => {
+          if (activeSession !== session || reads.snapshot === undefined) return;
+          repos = reads.snapshot.map(repoOption);
+          selectedKey = defaultRepoSelection();
+          reposLoading = false;
+        });
+        const loaded = yield* reads.refresh;
+        yield* Effect.sync(() => {
+          if (activeSession !== session) return;
+          reposLoading = false;
+          const previous = repos.find((repo) => repo.key === selectedKey);
+          repos = loaded.map(repoOption);
+          // Follow the selected identity across renames. A replacement at its
+          // old route must never become the selection.
+          selectedKey = previous
+            ? repos.find((repo) => repo.repositoryKey && repoIdentityKey(repo) === repoIdentityKey(previous))?.key ?? ""
+            : defaultRepoSelection();
+        });
+      }),
+      {
+        operation: "load repositories for a new workspace",
+        safeContext: {},
+        onFailure: (failure) => {
+          if (activeSession !== session) return;
+          reposLoading = false;
+          reposError = failure instanceof ApiProblemError
+            ? apiErrorMessage(failure.problem, "Could not load repositories")
+            : "Could not load repositories";
+        },
+      },
+    ));
+  }
+
+  // Each open resets form intent, then restores the app's repository snapshot
+  // while refreshing. Responses from a closed session cannot change this form.
   $effect(() => {
     if (!open) {
       activeSession = null;
@@ -241,7 +284,9 @@
     suggestedBranch = null;
     pendingLaunchTargetKey = null;
     workspaceHosts = [];
-    selectedWorkspaceHostKey = "";
+    workspaceHostsLoaded = false;
+    workspaceHostsError = "";
+    selectedWorkspaceHostKey = untrack(() => settings.getWorkspaceSettings().default_execution_target ?? "");
     submitting = false;
     repos = [];
     selectedKey = "";
@@ -263,32 +308,12 @@
       };
     }
     loadWorkspaceHosts(session);
-    const execution = runtime.runCommand(
-      executeGeneratedApiRequest("load repositories", (client, signal) => client.RepositoriesService.listRepos({ signal })).pipe(
-        Effect.flatMap((loaded) =>
-          Effect.sync(() => {
-            if (activeSession !== session) return;
-            reposLoading = false;
-            repos = (loaded ?? []).map(repoOption);
-            selectedKey = defaultRepoSelection();
-          }),
-        ),
-      ),
-      {
-        operation: "load repositories for a new workspace",
-        safeContext: {},
-        onFailure: (failure) => {
-          if (activeSession !== session) return;
-          reposLoading = false;
-          reposError = failure instanceof ApiProblemError
-            ? apiErrorMessage(failure.problem, "Could not load repositories")
-            : "Could not load repositories";
-        },
-      },
-    );
-    repoLoadExecution = execution;
+    loadRepositories(session);
+    const execution = repoLoadExecution;
+    const fleetExecution = fleetLoadExecution;
     return () => {
-      execution.interrupt();
+      execution?.interrupt();
+      fleetExecution?.interrupt();
       if (repoLoadExecution === execution) repoLoadExecution = null;
       if (activeSession === session) activeSession = null;
     };
@@ -323,30 +348,7 @@
       return;
     }
     loadWorkspaceHosts(session);
-    reposLoading = true;
-    const execution = runtime.runCommand(
-      executeGeneratedApiRequest("load repositories", (client, signal) => client.RepositoriesService.listRepos({ signal })).pipe(
-        Effect.tap((loaded) => Effect.sync(() => {
-          if (activeSession !== session) return;
-          reposLoading = false;
-          repos = (loaded ?? []).map(repoOption);
-          selectedKey = defaultRepoSelection();
-        })),
-        Effect.asVoid,
-      ),
-      {
-        operation: "load repositories for a new workspace",
-        safeContext: {},
-        onFailure: (failure) => {
-          if (activeSession !== session) return;
-          reposLoading = false;
-          reposError = failure instanceof ApiProblemError
-            ? apiErrorMessage(failure.problem, "Could not load repositories")
-            : "Could not load repositories";
-        },
-      },
-    );
-    repoLoadExecution = execution;
+    loadRepositories(session);
   }
 
   const repoRows = $derived<TypeaheadOption[]>(
@@ -355,26 +357,39 @@
 
   const selected = $derived(repos.find((repo) => repo.key === selectedKey) ?? null);
   const selectedWorkspaceHost = $derived(
-    workspaceHosts.find((host) => host.configKey === selectedWorkspaceHostKey) ?? null,
+    workspaceHosts.find((host) => selectedWorkspaceHostKey ? host.configKey === selectedWorkspaceHostKey : host.kind === "self") ?? null,
   );
-  const remoteWorkspaceHostKey = $derived(
-    source !== "repository" || selectedWorkspaceHost?.kind === "self"
-      ? undefined
-      : selectedWorkspaceHost?.configKey,
-  );
+  const workspaceTargetReason = $derived.by(() => {
+    if (!selected) return "";
+    if (selectedWorkspaceHostKey.startsWith("devbox:")) {
+      const reason = devboxRepositoryUnavailableReason(selected);
+      if (reason) return reason;
+    }
+    if (selectedWorkspaceHost) return workspaceTargetUnavailableReason(selectedWorkspaceHost, selected, workspaceHostsLoaded);
+    if (!selectedWorkspaceHostKey) return "";
+    return workspaceHostsLoaded
+      ? "Your selected machine is unavailable. Choose another machine or reconnect it in Settings → Workspaces."
+      : "";
+  });
   const workspaceHostOptions = $derived<SelectDropdownOption[]>(
-    workspaceHosts.map((host) => {
-      const writeAvailability = host.operationAvailability.workspaceWrite;
-      const unavailableReason = writeAvailability?.unavailableReason || "Workspace creation is unavailable.";
+    [
+    ...(selectedWorkspaceHostKey && !selectedWorkspaceHost
+      ? [{ value: selectedWorkspaceHostKey, label: workspaceHostsLoaded ? "Unavailable machine — choose another" : workspaceHostsError || "Preferred devbox — checking…", disabled: workspaceTargetReason !== "" }]
+      : []),
+    ...(!workspaceHosts.some((host) => host.kind === "self") ? [{ value: "", label: "This Forge machine" }] : []),
+    ...workspaceHosts.map((host) => {
+      const unavailableReason = selected
+        ? workspaceTargetUnavailableReason(host, selected, workspaceHostsLoaded)
+        : "Pick a repository first.";
       return {
-        value: host.configKey,
-        label: `${host.name.trim() || host.hostname?.trim() || host.configKey}${host.kind === "self" ? " (this machine)" : ""}`,
-        disabled: writeAvailability?.available !== true,
-        ...(writeAvailability?.available === true
+        value: host.kind === "self" ? "" : host.configKey,
+        label: `${host.name.trim() || host.hostname?.trim() || host.configKey}${host.kind === "self" ? " (this machine)" : host.kind === "devbox" ? " (devbox)" : ""}`,
+        disabled: unavailableReason !== "",
+        ...(unavailableReason === ""
           ? {}
           : { indicator: { tone: "danger" as const, title: unavailableReason } }),
       };
-    }),
+    })],
   );
 
   const selectedDaemon = $derived(
@@ -416,7 +431,7 @@
 
   const canSubmit = $derived(
     source === "repository"
-      ? selected !== null
+      ? !!selected?.repositoryKey && workspaceTargetReason === ""
       : selectedKataReference !== null && selectedDaemonUsable,
   );
 
@@ -480,8 +495,13 @@
     const repo = selected;
     const kataReference = selectedKataReference;
     const requestedSource = source;
+    const remoteWorkspaceHostKey = requestedSource === "repository" && selectedWorkspaceHostKey ? selectedWorkspaceHostKey : undefined;
     const daemonID = selectedDaemonID;
-    if (requestedSource === "repository" && !repo) {
+    if (requestedSource === "repository" && workspaceTargetReason) {
+      error = workspaceTargetReason;
+      return;
+    }
+    if (requestedSource === "repository" && !repo?.repositoryKey) {
       error = "Pick a repository.";
       return;
     }
@@ -523,7 +543,16 @@
             repoPath: `${repo.owner}/${repo.name}`,
           };
           const routeParams = providerRouteParams(ref);
-          const body = requested ? { branch: requested } : {};
+          const body = { ...repositoryKeyToWire(repo.repositoryKey), ...(requested ? { branch: requested } : {}) };
+          if (remoteWorkspaceHostKey?.startsWith("devbox:")) {
+            return executeGeneratedApiRequest("create devbox workspace", (client, signal) =>
+              client.DevboxesService.createDevboxWorkspace(
+                { connectionId: remoteWorkspaceHostKey.slice(7) },
+                { provider: repo.provider, platform_host: repo.platformHost, owner: repo.owner, name: repo.name, ...body },
+                { signal },
+              ),
+            ).pipe(Effect.map(normalizeCreatedWorkspace));
+          }
           if (remoteWorkspaceHostKey) {
             return executeOpaqueGeneratedApiRequest("create fleet workspace", (client, signal) =>
               providerUsesHostRoute(ref)
@@ -582,7 +611,7 @@
           if (launchTargetKey) queueWorkspaceLaunch(workspaceId, launchTargetKey, remoteWorkspaceHostKey);
           // The workspace exists either way, so it stays the last-used repo; only
           // the navigation is abandoned when the user moved on.
-          if (requestedSource === "repository" && repo) rememberNewWorkspaceRepoKey(repo.key);
+          if (requestedSource === "repository" && repo) rememberNewWorkspaceRepoKey(repoIdentityKey(repo));
         }),
       ),
       Effect.tap((workspaceId) =>
@@ -709,7 +738,7 @@
         </small>
       </label>
 
-      {#if workspaceHostOptions.length > 1}
+      {#if workspaceHostOptions.length > 1 || settings.getWorkspaceSettings().default_execution_target}
         <label class="field">
           <span class="field-label">Run on</span>
           <SelectDropdown
@@ -722,7 +751,10 @@
             title="Workspace machine"
             disabled={submitting}
           />
-          <small class="field-hint">The selected Forge owns the worktree and runtime sessions.</small>
+          <small class="field-hint">Files, agents and tests run on the selected machine. Change the default in Settings → Workspaces.</small>
+          {#if workspaceTargetReason}
+            <p class="form-error" role="alert">{workspaceTargetReason}</p>
+          {/if}
         </label>
       {/if}
     {:else}
@@ -790,6 +822,9 @@
     {/if}
 
     {#if error}
+      {#if pendingLaunchTargetKey && !submitting}
+        <ErrorShown kind="workspace_opened" scope="new-workspace" />
+      {/if}
       <p class="form-error" role="alert">
         {error}
         {#if suggestedBranch}
@@ -872,8 +907,8 @@
     font-size: var(--font-size-xs);
     font-weight: 600;
     color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+    text-transform: var(--label-transform, uppercase);
+    letter-spacing: var(--letter-spacing-label, 0.05em);
   }
 
   .field-hint {

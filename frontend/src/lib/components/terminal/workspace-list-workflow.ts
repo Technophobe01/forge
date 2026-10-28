@@ -3,8 +3,18 @@ import type * as Duration from "effect/Duration";
 import type { Scope } from "effect/Scope";
 
 import { pollWhileVisible } from "../../effect/poll-while-visible.js";
+import type { HostSummary } from "../../api/fleet-snapshot.js";
+import type { WorkspaceListItem } from "./workspace-list-schema.js";
+
+export interface WorkspaceListSnapshot {
+  workspaces: WorkspaceListItem[];
+  hosts: HostSummary[];
+  aggregateComplete: boolean;
+}
 
 export interface WorkspaceListWorkflowService {
+  // Presentation survives sidebar unmounts; each mount still revalidates.
+  snapshot: WorkspaceListSnapshot | undefined;
   readonly claim: (owner: string, refresh: () => void) => Effect.Effect<void, never, Scope>;
   readonly request: () => void;
 }
@@ -13,11 +23,27 @@ export class WorkspaceListWorkflow extends Context.Service<WorkspaceListWorkflow
   "kenn-forge/WorkspaceListWorkflow",
 ) {}
 
+export const removeWorkspaceListEntry = Effect.fn("WorkspaceListWorkflow.remove")(function* (
+  workspaceId: string,
+  hostKey?: string,
+) {
+  const workflow = yield* WorkspaceListWorkflow;
+  if (workflow.snapshot) {
+    workflow.snapshot = {
+      ...workflow.snapshot,
+      workspaces: workflow.snapshot.workspaces.filter(
+        (workspace) => workspace.id !== workspaceId || workspace.fleet_host_key !== hostKey,
+      ),
+    };
+  }
+});
+
 export const makeWorkspaceListWorkflow = Effect.sync(() => {
   const owners = new Map<string, () => void>();
   let pending = false;
 
   return {
+    snapshot: undefined as WorkspaceListSnapshot | undefined,
     claim: (owner: string, refresh: () => void) =>
       Effect.acquireRelease(
         Effect.sync(() => {
@@ -110,7 +136,7 @@ export function workspaceListLifecycle<WorkspaceR, FleetR, EventR>({
       Effect.all(
         [
           refreshWorkspaces.program,
-          poll(refreshWorkspaces.request, "5 seconds"),
+          poll(refreshWorkspaces.request, "15 seconds"),
           Stream.runForEach(workspaceEvents, () =>
             Effect.sync(refreshWorkspaces.request).pipe(Effect.andThen(Effect.yieldNow)),
           ),

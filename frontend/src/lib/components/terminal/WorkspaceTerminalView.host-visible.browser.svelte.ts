@@ -1,4 +1,4 @@
-import { page } from "vite-plus/test/browser";
+import { page, userEvent } from "vite-plus/test/browser";
 import { flushSync, mount, unmount } from "svelte";
 import { Effect } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -7,10 +7,16 @@ import { makeAppRuntime, type OwnedAppRuntime } from "../../app/runtime.js";
 import { createDiffStore } from "../../stores/diff.svelte.js";
 import { getStackDepth } from "../../stores/keyboard/modal-stack.svelte.js";
 import { createSettingsStore } from "../../stores/settings.svelte.js";
+import { getPaneLayoutStore, resetPaneLayoutStoresForTest } from "../../stores/paneLayout.svelte.js";
+import { navigate } from "../../stores/router.svelte.js";
+import { sessionPaneKey } from "../../stores/session-pane-key.js";
+import { getInlineWorkspaceController, resetWorkspaceHostForTest } from "../../stores/workspace-host.svelte.js";
+import "../../../app.css";
 
 import { STORES_KEY } from "../../context.js";
 import { createMockApiFetch, jsonResponse, type MockRouteOverride } from "../../../test/mockApiFetch.js";
 import WorkspaceTerminalView from "./WorkspaceTerminalViewTestHarness.svelte";
+import { defaultTerminalLayout } from "./terminal-layout.js";
 
 const WAIT = 10_000;
 const eventsStore = {
@@ -157,7 +163,8 @@ class NoopEventSource {
 describe("WorkspaceTerminalView hostVisible", () => {
   let runtime: OwnedAppRuntime;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    await page.viewport(1200, 800);
     runtime = makeAppRuntime();
     controlledSockets.length = 0;
   });
@@ -226,6 +233,199 @@ describe("WorkspaceTerminalView hostVisible", () => {
 
   afterEach(async () => {
     await Effect.runPromise(runtime.disposeEffect);
+  });
+
+  it.each([
+    ["prs", false, false, "bottom"],
+    ["prs", true, false, "bottom"],
+    ["prs", true, true, "bottom"],
+    ["prs", true, true, "top"],
+    ["activity", false, false, "bottom"],
+    ["activity", true, false, "bottom"],
+    ["activity", true, true, "bottom"],
+    ["activity", true, true, "top"],
+  ] as const)(
+    "opens the launcher over the visible %s dock with promoted ACP: %s, all sessions promoted: %s, dock: %s",
+    async (surface, promotedAgent, allPromoted, dock) => {
+      resetPaneLayoutStoresForTest();
+      resetWorkspaceHostForTest();
+      navigate(surface === "prs" ? "/pulls" : "/activity");
+      const controller = getInlineWorkspaceController(surface);
+      controller.claim(
+        {
+          provider: "github",
+          platformHost: "github.com",
+          owner: "acme",
+          name: "widget",
+          repoPath: "acme/widget",
+          number: 7,
+          itemType: "pull",
+        },
+        { id: "ws-1", status: "ready" },
+      );
+      const layout = getPaneLayoutStore(surface);
+      layout.notePaneRender({
+        activeInputTabKey: "conversation",
+        editableTabs: ["conversation"],
+        onScreenTabs: ["conversation"],
+        flattened: false,
+        soloChromeTabs: [],
+      });
+      const leafID = layout.leafIDForTab("conversation");
+      if (leafID === null) throw new Error("Missing conversation pane");
+      if (promotedAgent) {
+        layout.promoteTab(sessionPaneKey("ws-1", undefined, "ws-1:helper"), { kind: "tab", leafID });
+      }
+      const shell = {
+        key: "ws-1:shell",
+        workspace_id: "ws-1",
+        target_key: "plain_shell",
+        label: "Shell",
+        kind: "plain_shell",
+        status: "running",
+        display_region: "terminal",
+        created_at: "2026-04-29T00:00:00Z",
+      };
+      const api = createMockApiFetch([
+        (request) =>
+          request.url.pathname === "/api/v1/workspaces/ws-1/runtime" && request.method === "GET"
+            ? jsonResponse({
+                launch_targets: [{ key: "helper", label: "Helper", kind: "agent", available: true }],
+                sessions: promotedAgent
+                  ? [{ ...agentRuntime.sessions[0], kind: "acp" }, ...(allPromoted ? [] : [shell])]
+                  : [shell, { ...shell, key: "ws-1:shell-2", label: "Shell 2" }],
+              })
+            : null,
+        workspaceRoutes(),
+      ]);
+      const originalFetch = globalThis.fetch;
+      const originalEventSource = globalThis.EventSource;
+      globalThis.fetch = api.fetch;
+      globalThis.EventSource = NoopEventSource as unknown as typeof EventSource;
+      vi.stubGlobal("WebSocket", ControlledWebSocket);
+      localStorage.setItem(
+        "kenn-forge-workspace-terminal-layout:ws-1",
+        JSON.stringify({ ...defaultTerminalLayout(), dock, open: true }),
+      );
+      const target = document.createElement("div");
+      target.style.width = "900px";
+      target.style.height = "600px";
+      target.style.display = "flex";
+      target.style.flexDirection = "column";
+      target.style.overflow = "hidden";
+      document.body.appendChild(target);
+      const instance = mount(WorkspaceTerminalView, {
+        target,
+        props: {
+          runtime,
+          workspaceId: "ws-1",
+          paneSurface: surface,
+          hostVisible: false,
+          hideWorkspaceList: true,
+          hideRightSidebar: true,
+        },
+        context: new Map([[STORES_KEY, { events: eventsStore, settings: createSettingsStore() }]]),
+      });
+
+      try {
+        await vi.waitFor(() => {
+          expect(allPromoted ? controller.workspacePaneEmpty() : controller.workspacePaneRowOnly()).toBe(true);
+        }, WAIT);
+        const parkedView = target.querySelector<HTMLElement>(".terminal-view");
+        if (parkedView === null) throw new Error("Missing workspace view");
+        parkedView.style.display = "none";
+        if (dock === "top") {
+          await vi.waitFor(() => {
+            const panel = target.querySelector(".workspace-dock-launcher-host .terminal-panel");
+            expect(panel?.getBoundingClientRect().height).toBeCloseTo(target.clientHeight, 0);
+          }, WAIT);
+        }
+        await page
+          .getByRole("region", { name: "Terminal panel" })
+          .getByRole("button", { name: "Launch session" })
+          .click();
+        const launcher = page.getByRole("dialog", { name: "Launch a session" });
+        await expect.element(launcher).toBeVisible();
+        await expect.element(launcher.getByRole("button", { name: "Helper", exact: true })).toBeVisible();
+        if (allPromoted) {
+          await launcher.getByRole("button", { name: "Helper Running", exact: true }).click();
+        } else {
+          await launcher.getByRole("button", { name: "Close", exact: true }).click();
+        }
+        await expect.element(launcher).not.toBeInTheDocument();
+        if (allPromoted && dock === "bottom") {
+          await vi.waitFor(() => {
+            expect(target.querySelector(".workspace-dock-launcher-host .terminal-panel.open")).toBeNull();
+          }, WAIT);
+        }
+      } finally {
+        flushSync(() => unmount(instance));
+        target.remove();
+        globalThis.fetch = originalFetch;
+        globalThis.EventSource = originalEventSource;
+        vi.unstubAllGlobals();
+        resetWorkspaceHostForTest();
+        resetPaneLayoutStoresForTest();
+        localStorage.removeItem("kenn-forge-workspace-terminal-layout:ws-1");
+        navigate("/workspaces");
+      }
+    },
+  );
+
+  it("pauses runtime polling while parked and resumes when revealed", async () => {
+    let runtimeReads = 0;
+    const api = createMockApiFetch([
+      (request) => {
+        if (request.url.pathname !== "/api/v1/workspaces/ws-1/runtime" || request.method !== "GET") return null;
+        runtimeReads += 1;
+        return jsonResponse(emptyRuntime);
+      },
+      workspaceRoutes(),
+    ]);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = api.fetch;
+    let hostVisible = $state(true);
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    vi.useFakeTimers();
+    const instance = mount(WorkspaceTerminalView, {
+      target,
+      props: {
+        runtime,
+        workspaceId: "ws-1",
+        hideWorkspaceList: true,
+        hideRightSidebar: true,
+        get hostVisible() {
+          return hostVisible;
+        },
+      },
+      context: new Map([[STORES_KEY, { events: eventsStore, settings: createSettingsStore() }]]),
+    });
+
+    try {
+      flushSync();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runtimeReads).toBe(1);
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(runtimeReads).toBe(2);
+
+      flushSync(() => {
+        hostVisible = false;
+      });
+      await vi.advanceTimersByTimeAsync(9000);
+      expect(runtimeReads).toBe(2);
+
+      flushSync(() => {
+        hostVisible = true;
+      });
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(runtimeReads).toBe(3);
+    } finally {
+      flushSync(() => unmount(instance));
+      target.remove();
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
   });
 
   it("clears workflow focus ownership when the host is parked", async () => {
@@ -303,6 +503,7 @@ describe("WorkspaceTerminalView hostVisible", () => {
     // main subtree cannot mount without a settings store on STORES_KEY.
     const settingsStore = {
       getTerminalFontSize: () => DEFAULT_TERMINAL_SETTINGS.font_size,
+      getQuickActions: () => [],
       getTerminalSettings: () => DEFAULT_TERMINAL_SETTINGS,
       getWorkspaceSettings: () => ({ auto_assign_on_create: false, default_sidebar_view: "diff" as const }),
     };
@@ -358,7 +559,7 @@ describe("WorkspaceTerminalView hostVisible", () => {
 
       // Reappears with no further interaction: the open-state variable
       // (forcePromptMessage) survived the hidden window.
-      await expect.element(page.getByRole("dialog")).toBeVisible();
+      await expect.element(page.getByRole("dialog", { name: "Force delete workspace?" })).toBeVisible();
     } finally {
       flushSync(() => unmount(instance));
       target.remove();
@@ -376,6 +577,7 @@ describe("WorkspaceTerminalView hostVisible", () => {
 
     const settingsStore = {
       getTerminalFontSize: () => DEFAULT_TERMINAL_SETTINGS.font_size,
+      getQuickActions: () => [],
       getTerminalSettings: () => DEFAULT_TERMINAL_SETTINGS,
       getWorkspaceSettings: () => ({ auto_assign_on_create: false, default_sidebar_view: "diff" as const }),
     };
@@ -419,6 +621,10 @@ describe("WorkspaceTerminalView hostVisible", () => {
         const el = document.querySelector(".header-btn.danger");
         expect(el).not.toBeNull();
       }, WAIT);
+
+      // Finish the empty-workspace prompt before testing sidebar shortcuts.
+      await expect.element(page.getByRole("dialog", { name: "Launch a session" })).toBeInTheDocument();
+      await userEvent.keyboard("{Escape}");
 
       // Visible: the window-level shortcut opens the right sidebar. The
       // clamp against the (small) test viewport may legitimately shrink
@@ -469,6 +675,7 @@ describe("WorkspaceTerminalView hostVisible", () => {
 
     const settingsStore = {
       getTerminalFontSize: () => DEFAULT_TERMINAL_SETTINGS.font_size,
+      getQuickActions: () => [],
       getTerminalSettings: () => DEFAULT_TERMINAL_SETTINGS,
       getWorkspaceSettings: () => ({ auto_assign_on_create: false, default_sidebar_view: "diff" as const }),
     };
@@ -539,6 +746,7 @@ describe("WorkspaceTerminalView hostVisible", () => {
     // back through the store — so the stub needs a setter too.
     const settingsStore = {
       getTerminalFontSize: () => DEFAULT_TERMINAL_SETTINGS.font_size,
+      getQuickActions: () => [],
       getTerminalSettings: () => DEFAULT_TERMINAL_SETTINGS,
       getWorkspaceSettings: () => ({ auto_assign_on_create: false, default_sidebar_view: "diff" as const }),
       setTerminalSettings: () => {},
@@ -567,6 +775,9 @@ describe("WorkspaceTerminalView hostVisible", () => {
         const el = document.querySelector(".header-btn.danger");
         expect(el).not.toBeNull();
       }, WAIT);
+
+      await expect.element(page.getByRole("dialog", { name: "Launch a session" })).toBeInTheDocument();
+      await userEvent.keyboard("{Escape}");
 
       // Terminal options popover, then the font picker Modal nested inside
       // it — the deepest overlay stack a toolbar menu can build.
@@ -628,6 +839,7 @@ describe("WorkspaceTerminalView hostVisible", () => {
 
     const settingsStore = {
       getTerminalFontSize: () => terminalSettings.font_size,
+      getQuickActions: () => [],
       getTerminalSettings: () => terminalSettings,
       getWorkspaceSettings: () => ({ auto_assign_on_create: false, default_sidebar_view: "diff" as const }),
       setTerminalSettings: (settings: typeof DEFAULT_TERMINAL_SETTINGS) => {
@@ -653,7 +865,7 @@ describe("WorkspaceTerminalView hostVisible", () => {
       }, WAIT);
 
       await page.getByRole("button", { name: "Terminal options" }).click();
-      await page.getByRole("textbox", { name: "Monospace font family" }).fill("Iosevka Term");
+      await page.getByRole("textbox", { name: "Monospace font family", exact: false }).fill("Iosevka Term");
       await page.getByRole("button", { name: "Save" }).click();
       await expect.element(page.getByRole("button", { name: "Saving..." })).toBeVisible();
 
@@ -695,6 +907,7 @@ describe("WorkspaceTerminalView hostVisible", () => {
 
     const settingsStore = {
       getTerminalFontSize: () => terminalSettings.font_size,
+      getQuickActions: () => [],
       getTerminalSettings: () => terminalSettings,
       getWorkspaceSettings: () => ({ auto_assign_on_create: false, default_sidebar_view: "diff" as const }),
       setTerminalSettings: (settings: typeof DEFAULT_TERMINAL_SETTINGS) => {
@@ -747,6 +960,7 @@ describe("WorkspaceTerminalView hostVisible", () => {
 
     const settingsStore = {
       getTerminalFontSize: () => DEFAULT_TERMINAL_SETTINGS.font_size,
+      getQuickActions: () => [],
       getTerminalSettings: () => DEFAULT_TERMINAL_SETTINGS,
       getWorkspaceSettings: () => ({ auto_assign_on_create: false, default_sidebar_view: "diff" as const }),
     };
@@ -771,7 +985,9 @@ describe("WorkspaceTerminalView hostVisible", () => {
           return hostVisible;
         },
       },
-      context: new Map([[STORES_KEY, { events: eventsStore, settings: settingsStore }]]),
+      context: new Map([
+        [STORES_KEY, { events: eventsStore, settings: settingsStore, detail: { isPullMerging: () => false } }],
+      ]),
     });
 
     try {

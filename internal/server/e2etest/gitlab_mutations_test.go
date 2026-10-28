@@ -17,6 +17,8 @@ import (
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/testutil/servertest"
 	"go.kenn.io/forge/internal/tokenauth"
 	"go.kenn.io/forge/platform"
@@ -42,6 +44,7 @@ type recordedGitLabRequest struct {
 type gitlabAPIRecorder struct {
 	mu       sync.Mutex
 	requests []recordedGitLabRequest
+	recorded chan struct{}
 }
 
 func (rec *gitlabAPIRecorder) record(r *http.Request) recordedGitLabRequest {
@@ -54,6 +57,10 @@ func (rec *gitlabAPIRecorder) record(r *http.Request) recordedGitLabRequest {
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
 	rec.requests = append(rec.requests, entry)
+	select {
+	case rec.recorded <- struct{}{}:
+	default:
+	}
 	return entry
 }
 
@@ -68,18 +75,18 @@ func (rec *gitlabAPIRecorder) find(method, path string) (recordedGitLabRequest, 
 	return recordedGitLabRequest{}, false
 }
 
-// findEventually polls for a request issued from a background goroutine
-// (e.g. the resync triggered after a stale mutation).
-func (rec *gitlabAPIRecorder) findEventually(method, path string) bool {
-	deadline := time.Now().Add(3 * time.Second)
+func (rec *gitlabAPIRecorder) waitForRequest(method, path string, budget time.Duration) bool {
+	deadline := time.NewTimer(budget)
+	defer deadline.Stop()
 	for {
-		if _, ok := rec.find(method, path); ok {
+		if _, found := rec.find(method, path); found {
 			return true
 		}
-		if time.Now().After(deadline) {
+		select {
+		case <-rec.recorded:
+		case <-deadline.C:
 			return false
 		}
-		time.Sleep(25 * time.Millisecond)
 	}
 }
 
@@ -94,7 +101,7 @@ func setupGitLabMutationServer(
 	ctx := t.Context()
 	now := time.Now().UTC().Truncate(time.Second)
 
-	recorder := &gitlabAPIRecorder{}
+	recorder := &gitlabAPIRecorder{recorded: make(chan struct{}, 1)}
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		request := recorder.record(r)
 		w.Header().Set("Content-Type", "application/json")
@@ -307,13 +314,13 @@ func setupGitLabMutationServer(
 	require.NoError(err)
 
 	database := dbtest.Open(t)
-	repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
-		Platform:       "gitlab",
-		PlatformHost:   "gitlab.com",
-		PlatformRepoID: "4242",
-		Owner:          "acme",
-		Name:           "widget",
-		RepoPath:       "acme/widget",
+	repoID, err := reposeed.Seed(ctx, database, db.RepoIdentity{
+		Platform:     "gitlab",
+		PlatformHost: "gitlab.com",
+		Key:          platform.RepositoryIDKey(4242),
+		Owner:        "acme",
+		Name:         "widget",
+		RepoPath:     "acme/widget",
 	})
 	require.NoError(err)
 
@@ -374,13 +381,12 @@ func setupGitLabMutationServer(
 	}}))
 
 	repo := ghclient.RepoRef{
-		Platform:           platform.KindGitLab,
-		Owner:              "acme",
-		Name:               "widget",
-		PlatformHost:       "gitlab.com",
-		RepoPath:           "acme/widget",
-		PlatformRepoID:     4242,
-		PlatformExternalID: "4242",
+		Platform:     platform.KindGitLab,
+		Owner:        "acme",
+		Name:         "widget",
+		PlatformHost: "gitlab.com",
+		RepoPath:     "acme/widget",
+		Key:          platform.RepositoryIDKey(4242),
 	}
 	syncer := ghclient.NewSyncerWithRegistry(
 		registry, database, nil, []ghclient.RepoRef{repo}, time.Minute, nil, nil,
@@ -440,7 +446,7 @@ func doGitLabJSON(
 	if body != "" {
 		reader = strings.NewReader(body)
 	}
-	req := httptest.NewRequest(method, path, reader)
+	req := httptest.NewRequestWithContext(t.Context(), method, path, reader)
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -456,6 +462,7 @@ func assertNoGitLabRepoPathLookup(t *testing.T, recorder *gitlabAPIRecorder) {
 }
 
 func TestGitLabMutationCommentPostAndEdit(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database, recorder, repoID := setupGitLabMutationServer(t)
@@ -515,6 +522,7 @@ func TestGitLabMutationCommentPostAndEdit(t *testing.T) {
 }
 
 func TestGitLabMutationContentEdits(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, _, recorder, _ := setupGitLabMutationServer(t)
@@ -546,6 +554,7 @@ func TestGitLabMutationContentEdits(t *testing.T) {
 }
 
 func TestGitLabMutationIssueCommentEdit(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, _, recorder, _ := setupGitLabMutationServer(t)
@@ -562,6 +571,7 @@ func TestGitLabMutationIssueCommentEdit(t *testing.T) {
 }
 
 func TestGitLabMutationMergeSquash(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database, recorder, repoID := setupGitLabMutationServer(t)
@@ -594,6 +604,7 @@ func TestGitLabMutationMergeSquash(t *testing.T) {
 }
 
 func TestGitLabMutationMergeRebaseReturnsTypedCapabilityError(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, _, recorder, _ := setupGitLabMutationServer(t)
@@ -619,6 +630,7 @@ func TestGitLabMutationMergeRebaseReturnsTypedCapabilityError(t *testing.T) {
 }
 
 func TestGitLabMutationStateChange(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database, recorder, repoID := setupGitLabMutationServer(t)
@@ -641,6 +653,7 @@ func TestGitLabMutationStateChange(t *testing.T) {
 }
 
 func TestGitLabMutationIssueStateChange(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, _, recorder, _ := setupGitLabMutationServer(t)
@@ -657,6 +670,7 @@ func TestGitLabMutationIssueStateChange(t *testing.T) {
 }
 
 func TestGitLabMutationApprove(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database, recorder, repoID := setupGitLabMutationServer(t)
@@ -705,6 +719,7 @@ func TestGitLabMutationApprove(t *testing.T) {
 }
 
 func TestGitLabMutationApproveAllowsOmittedHeadPin(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, _, recorder, _ := setupGitLabMutationServer(t)
@@ -721,6 +736,7 @@ func TestGitLabMutationApproveAllowsOmittedHeadPin(t *testing.T) {
 }
 
 func TestGitLabMutationApproveStaleHeadReturnsConflict(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database, recorder, repoID := setupGitLabMutationServer(t)
@@ -751,6 +767,7 @@ func TestGitLabMutationApproveStaleHeadReturnsConflict(t *testing.T) {
 }
 
 func TestGitLabMutationMergeStaleHeadReturnsConflict(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database, recorder, repoID := setupGitLabMutationServer(t)
@@ -777,10 +794,8 @@ func TestGitLabMutationMergeStaleHeadReturnsConflict(t *testing.T) {
 	require.NotNil(mr)
 	assert.Equal("open", string(mr.State), "stale merge must not mark the MR merged locally")
 
-	assert.True(
-		recorder.findEventually(http.MethodGet, "/api/v4/projects/4242/merge_requests/7"),
-		"stale merge must trigger an MR resync",
-	)
+	assert.True(recorder.waitForRequest(http.MethodGet, "/api/v4/projects/4242/merge_requests/7", 3*time.Second),
+		"stale merge must trigger an MR resync")
 }
 
 // When the head goes stale only after the approval note posted (a push
@@ -788,6 +803,7 @@ func TestGitLabMutationMergeStaleHeadReturnsConflict(t *testing.T) {
 // 409 must tell the client the note side effect survived: a blind retry
 // repeats the comment.
 func TestGitLabMutationStaleApproveAfterNoteSurfacesContext(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, _, recorder, _ := setupGitLabMutationServer(t)
@@ -816,6 +832,7 @@ func TestGitLabMutationStaleApproveAfterNoteSurfacesContext(t *testing.T) {
 }
 
 func TestGitLabMutationReviewDraftPartialStaleApproveCleansPublishedComment(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database, recorder, repoID := setupGitLabMutationServer(t)
@@ -884,6 +901,7 @@ func TestGitLabMutationReviewDraftPartialStaleApproveCleansPublishedComment(t *t
 // /approve and /merge and fail closed before any provider draft note
 // or approval is sent.
 func TestGitLabReviewDraftApproveRejectsStaleBaseSnapshot(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database, recorder, repoID := setupGitLabMutationServer(t)
@@ -943,6 +961,7 @@ func TestGitLabReviewDraftApproveRejectsStaleBaseSnapshot(t *testing.T) {
 // stale stored head, surface as a stale_state conflict, persist nothing
 // locally, and trigger the re-review resync.
 func TestGitLabMutationBodylessStaleApproveReliesOnShaBinding(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database, recorder, repoID := setupGitLabMutationServer(t)
@@ -979,16 +998,15 @@ func TestGitLabMutationBodylessStaleApproveReliesOnShaBinding(t *testing.T) {
 		assert.NotEqual("review", event.EventType, "stale approval must not persist a review event")
 	}
 
-	assert.True(
-		recorder.findEventually(http.MethodGet, "/api/v4/projects/4242/merge_requests/7"),
-		"stale approval must trigger an MR resync",
-	)
+	assert.True(recorder.waitForRequest(http.MethodGet, "/api/v4/projects/4242/merge_requests/7", 3*time.Second),
+		"stale approval must trigger an MR resync")
 }
 
 // GitLab projects with squash_option=always must stop offering the
 // non-squash accept path all the way through sync, SQLite, and the repo
 // settings API the merge modal reads.
 func TestGitLabSquashAlwaysProjectDisallowsMergeCommitE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	ctx := t.Context()
@@ -1053,6 +1071,7 @@ func TestGitLabSquashAlwaysProjectDisallowsMergeCommitE2E(t *testing.T) {
 // pin: an omitted pin would silently bind to whatever the cache holds now,
 // which may be newer than what the user reviewed.
 func TestGitLabMergeOmittedHeadPinRejected(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	tests := []struct {
 		name         string
 		path         string
@@ -1096,6 +1115,7 @@ func TestGitLabMergeOmittedHeadPinRejected(t *testing.T) {
 // actually carry the head: both the list row and the detail object must
 // expose platform_head_sha.
 func TestGitLabMutationResponsesExposeHeadSHA(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, _, _, _ := setupGitLabMutationServer(t)
@@ -1124,6 +1144,7 @@ func TestGitLabMutationResponsesExposeHeadSHA(t *testing.T) {
 // client's render and click, the client's expected_head_sha assertion
 // must reject merge before any provider call.
 func TestGitLabMergeClientExpectedHeadMismatchFailsClosed(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	tests := []struct {
 		name         string
 		path         string
@@ -1171,6 +1192,7 @@ func TestGitLabMergeClientExpectedHeadMismatchFailsClosed(t *testing.T) {
 // persisting a newer head would let a retry from the same stale UI merge
 // a commit nobody reviewed.
 func TestGitLabMutationGenericMergeConflictDoesNotResync(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, _, recorder, _ := setupGitLabMutationServer(t)
@@ -1189,10 +1211,19 @@ func TestGitLabMutationGenericMergeConflictDoesNotResync(t *testing.T) {
 	require.NotNil(problem.Details)
 	assert.Equal("conflict", problem.Details["reason"])
 
-	// Give a wrongly-scheduled background sync time to surface.
-	time.Sleep(300 * time.Millisecond)
-	_, synced := recorder.find(http.MethodGet, "/api/v4/projects/4242/merge_requests/7")
-	assert.False(synced, "generic conflicts must not resync on head-binding providers")
+	deadline := time.NewTimer(300 * time.Millisecond) //nolint:kennlint // 300ms HTTP observation window checks that the MR-resync GET remains absent after a generic conflict
+	defer deadline.Stop()
+	for {
+		select {
+		case <-recorder.recorded:
+			_, found := recorder.find(http.MethodGet, "/api/v4/projects/4242/merge_requests/7")
+			require.False(found, "generic conflicts must not resync on head-binding providers")
+		case <-deadline.C:
+			_, found := recorder.find(http.MethodGet, "/api/v4/projects/4242/merge_requests/7")
+			assert.False(found, "generic conflicts must not resync on head-binding providers")
+			return
+		}
+	}
 }
 
 // A legacy or partially synced row with no head SHA fails closed for merge:
@@ -1201,6 +1232,7 @@ func TestGitLabMutationGenericMergeConflictDoesNotResync(t *testing.T) {
 // immediate retry from the same stale UI mutate a commit nobody reviewed —
 // so consecutive requests keep failing identically.
 func TestGitLabMergeMissingHeadSHAFailsClosed(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	tests := []struct {
 		name         string
 		path         string
@@ -1254,6 +1286,7 @@ func TestGitLabMergeMissingHeadSHAFailsClosed(t *testing.T) {
 }
 
 func TestGitLabMutationDiscussionReplyThroughRealClient(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, _, recorder, _ := setupGitLabMutationServer(t)
@@ -1282,6 +1315,7 @@ func TestGitLabMutationDiscussionReplyThroughRealClient(t *testing.T) {
 }
 
 func TestGitLabMutationDiscussionResolveAndUnresolve(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database, recorder, repoID := setupGitLabMutationServer(t)
@@ -1328,6 +1362,7 @@ func TestGitLabMutationDiscussionResolveAndUnresolve(t *testing.T) {
 }
 
 func TestGitLabMutationRequestChangesUnsupported(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, _, _, _ := setupGitLabMutationServer(t)
@@ -1351,6 +1386,7 @@ func TestGitLabMutationRequestChangesUnsupported(t *testing.T) {
 }
 
 func TestGitLabMutationCreateIssueAndComment(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, database, recorder, repoID := setupGitLabMutationServer(t)

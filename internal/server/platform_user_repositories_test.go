@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 )
 
 func ghUserReposCall(pageSize, page int) string {
@@ -23,23 +24,24 @@ func ghUserReposCall(pageSize, page int) string {
 
 func decodeUserRepositories(
 	t *testing.T, ts *httptest.Server, path string,
-) (*http.Response, []byte) {
+) (int, []byte) {
 	t.Helper()
-	resp := httpDo(t, ts, http.MethodGet, path, nil)
+	resp := serverfake.HttpDo(t, ts, http.MethodGet, path, nil)
 	defer resp.Body.Close()
 	var buf json.RawMessage
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&buf))
-	return resp, buf
+	return resp.StatusCode, buf
 }
 
 // TestListUserRepositories covers GET /api/v1/platform/user-repositories:
 // the gh listing translates to the wire shape with snake_case fields and
 // the default branch flattened.
 func TestListUserRepositories(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
-	srv, _ := setupTestServer(t)
+	srv, _, _ := setupTestServer(t)
 	runner := &recordingToolingRunner{
 		outputs: map[string]string{
 			ghUserReposCall(100, 1): `[
@@ -52,10 +54,10 @@ func TestListUserRepositories(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	resp, body := decodeUserRepositories(
+	status, body := decodeUserRepositories(
 		t, ts, "/api/v1/platform/user-repositories",
 	)
-	require.Equal(http.StatusOK, resp.StatusCode)
+	require.Equal(http.StatusOK, status)
 
 	var decoded struct {
 		Repositories []struct {
@@ -75,9 +77,10 @@ func TestListUserRepositories(t *testing.T) {
 // TestListUserRepositoriesClampsLimit pins the limit fallback: zero
 // and limits beyond the 1000 cap fall back to the default of 100.
 func TestListUserRepositoriesClampsLimit(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 
-	srv, _ := setupTestServer(t)
+	srv, _, _ := setupTestServer(t)
 	runner := &recordingToolingRunner{
 		outputs: map[string]string{
 			ghUserReposCall(100, 1): "[]",
@@ -92,8 +95,8 @@ func TestListUserRepositoriesClampsLimit(t *testing.T) {
 		"/api/v1/platform/user-repositories?limit=5",
 		"/api/v1/platform/user-repositories?limit=5000",
 	} {
-		resp, _ := decodeUserRepositories(t, ts, path)
-		require.Equal(http.StatusOK, resp.StatusCode, path)
+		status, _ := decodeUserRepositories(t, ts, path)
+		require.Equal(http.StatusOK, status, path)
 	}
 	// per_page stays constant at 100 regardless of limit; small
 	// limits truncate after the fetch.
@@ -108,6 +111,7 @@ func TestListUserRepositoriesClampsLimit(t *testing.T) {
 // missing gh binary and an unauthenticated gh map to distinct problem
 // codes so the UI can offer the right fix.
 func TestListUserRepositoriesProblemCodes(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -134,7 +138,7 @@ func TestListUserRepositoriesProblemCodes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, _ := setupTestServer(t)
+			srv, _, _ := setupTestServer(t)
 			runner := &recordingToolingRunner{
 				errs: map[string]error{
 					ghUserReposCall(100, 1): tc.err,
@@ -144,10 +148,10 @@ func TestListUserRepositoriesProblemCodes(t *testing.T) {
 			ts := httptest.NewServer(srv)
 			defer ts.Close()
 
-			resp, body := decodeUserRepositories(
+			status, body := decodeUserRepositories(
 				t, ts, "/api/v1/platform/user-repositories",
 			)
-			require.Equal(tc.wantStatus, resp.StatusCode)
+			require.Equal(tc.wantStatus, status)
 			var problem struct {
 				Code string `json:"code"`
 			}
@@ -162,19 +166,20 @@ func TestListUserRepositoriesProblemCodes(t *testing.T) {
 // unimplemented provider gets a typed unsupportedCapability problem
 // instead of silently listing the wrong platform.
 func TestListUserRepositoriesRejectsUnimplementedProvider(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 
-	srv, _ := setupTestServer(t)
+	srv, _, _ := setupTestServer(t)
 	runner := &recordingToolingRunner{}
 	srv.toolingRun = runner.run
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	resp, body := decodeUserRepositories(
+	status, body := decodeUserRepositories(
 		t, ts, "/api/v1/platform/user-repositories?provider=gitlab",
 	)
-	require.Equal(http.StatusConflict, resp.StatusCode)
+	require.Equal(http.StatusConflict, status)
 	var problem struct {
 		Code    string `json:"code"`
 		Details struct {
@@ -192,6 +197,7 @@ func TestListUserRepositoriesRejectsUnimplementedProvider(t *testing.T) {
 // short page, and a platform_host routes every page through gh's
 // --hostname so self-hosted deployments list their own repositories.
 func TestListUserRepositoriesPaginatesAndTargetsHost(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -212,7 +218,7 @@ func TestListUserRepositoriesPaginatesAndTargetsHost(t *testing.T) {
 		)
 	}
 
-	srv, _ := setupTestServer(t)
+	srv, _, _ := setupTestServer(t)
 	runner := &recordingToolingRunner{
 		outputs: map[string]string{
 			hostCall(100, 1): repoJSON(100),
@@ -223,9 +229,9 @@ func TestListUserRepositoriesPaginatesAndTargetsHost(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	resp, body := decodeUserRepositories(t, ts,
+	status, body := decodeUserRepositories(t, ts,
 		"/api/v1/platform/user-repositories?limit=150&platform_host=ghe.example.com")
-	require.Equal(http.StatusOK, resp.StatusCode)
+	require.Equal(http.StatusOK, status)
 
 	var decoded struct {
 		Repositories []struct {
@@ -243,13 +249,14 @@ func TestListUserRepositoriesPaginatesAndTargetsHost(t *testing.T) {
 // (page offsets are per_page-relative) and truncates the appended
 // results instead of shrinking the final request.
 func TestListUserRepositoriesTruncatesMidPageLimit(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 
 	full := make([]string, 0, 100)
 	for i := range 100 {
 		full = append(full, fmt.Sprintf(`{"full_name":"acme/r%d"}`, i))
 	}
-	srv, _ := setupTestServer(t)
+	srv, _, _ := setupTestServer(t)
 	runner := &recordingToolingRunner{
 		outputs: map[string]string{
 			ghUserReposCall(100, 1): "[" + strings.Join(full, ",") + "]",
@@ -260,9 +267,9 @@ func TestListUserRepositoriesTruncatesMidPageLimit(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	resp, body := decodeUserRepositories(t, ts,
+	status, body := decodeUserRepositories(t, ts,
 		"/api/v1/platform/user-repositories?limit=150")
-	require.Equal(http.StatusOK, resp.StatusCode)
+	require.Equal(http.StatusOK, status)
 	var decoded struct {
 		Repositories []struct {
 			NameWithOwner string `json:"name_with_owner"`
@@ -282,10 +289,11 @@ func TestListUserRepositoriesTruncatesMidPageLimit(t *testing.T) {
 // upstream contract: a generic gh failure against a platform_host
 // surfaces as a 502 upstreamError whose details carry that host.
 func TestListUserRepositoriesUpstreamErrorCarriesHost(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	assert := assert.New(t)
 
-	srv, _ := setupTestServer(t)
+	srv, _, _ := setupTestServer(t)
 	runner := &recordingToolingRunner{
 		errs: map[string]error{
 			"gh api --hostname ghe.example.com user/repos?per_page=100&page=1&affiliation=owner,collaborator,organization_member&sort=updated": errors.New(
@@ -297,9 +305,9 @@ func TestListUserRepositoriesUpstreamErrorCarriesHost(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	resp, body := decodeUserRepositories(t, ts,
+	status, body := decodeUserRepositories(t, ts,
 		"/api/v1/platform/user-repositories?platform_host=ghe.example.com")
-	require.Equal(http.StatusBadGateway, resp.StatusCode)
+	require.Equal(http.StatusBadGateway, status)
 	var problem struct {
 		Code    string `json:"code"`
 		Details struct {

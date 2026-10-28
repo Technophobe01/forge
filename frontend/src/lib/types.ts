@@ -1,9 +1,10 @@
 import type { WorkspaceItemIdentity } from "./workspace-inline.js";
+import type { WorkspaceItemSearchStore } from "./stores/workspace-item-search.svelte.js";
 
 export interface NavigateEvent {
   path: string;
   route: {
-    page: "pulls" | "issues" | "activity" | "diff" | "reviews" | "inbox";
+    page: "pulls" | "issues" | "activity" | "diff" | "inbox";
     view?: string;
     tab?: string;
     presentation?: "fullLayout" | "focus";
@@ -86,8 +87,10 @@ import type { DaemonStore } from "./stores/roborev/daemon.svelte.js";
 import type { JobsStore } from "./stores/roborev/jobs.svelte.js";
 import type { ReviewStore } from "./stores/roborev/review.svelte.js";
 import type { LogStore } from "./stores/roborev/log.svelte.js";
+import type { WorklistsStore } from "./stores/worklists.svelte.js";
 
 export interface StoreInstances {
+  workspaceItemSearch: WorkspaceItemSearchStore;
   pulls: PullsStore;
   issues: IssuesStore;
   detail: DetailStore;
@@ -102,6 +105,7 @@ export interface StoreInstances {
   settings: SettingsStore;
   events: EventsStore;
   workflowActions: WorkflowActionsStore;
+  worklists: WorklistsStore;
   roborevDaemon?: DaemonStore;
   roborevJobs?: JobsStore;
   roborevReview?: ReviewStore;

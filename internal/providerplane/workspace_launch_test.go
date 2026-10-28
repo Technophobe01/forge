@@ -6,7 +6,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"go.kenn.io/forge/internal/db"
+	"go.kenn.io/forge/platform"
 )
 
 func workspaceLaunchResponseForTest() (WorkspaceLaunchRequest, db.WorkspaceLaunchSpec) {
@@ -22,7 +24,7 @@ func workspaceLaunchResponseForTest() (WorkspaceLaunchRequest, db.WorkspaceLaunc
 		Version: db.WorkspaceLaunchSpecVersion,
 		Repository: db.WorkspaceLaunchRepository{
 			Provider: "github", PlatformHost: "github.com",
-			PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget",
+			Key: platform.RepositoryIDKey(1001), Owner: "acme", Name: "widget",
 			CloneURL: "https://github.com/acme/widget.git", DefaultBranch: "main",
 		},
 		ItemType: db.WorkspaceItemTypePullRequest, ItemNumber: 42,
@@ -103,14 +105,14 @@ func TestWorkspaceLaunchResponseValidatesExactGitIdentity(t *testing.T) {
 
 func TestWorkspaceLaunchRefreshAcceptsRenamedStableRepository(t *testing.T) {
 	request, spec := workspaceLaunchResponseForTest()
-	request.PlatformRepoID = spec.Repository.PlatformRepoID
+	request.RepoKey = spec.Repository.Key
 	spec.Repository.Owner = "acme-renamed"
 	spec.Repository.Name = "widget-renamed"
 	spec.Repository.CloneURL = "https://github.com/acme-renamed/widget-renamed.git"
 
 	require.NoError(t, ValidateFederationWorkspaceLaunchSpecResponse(request, spec))
 
-	spec.Repository.PlatformRepoID = "different-repository"
+	spec.Repository.Key = platform.RepositoryIDKey(1002)
 	require.ErrorContains(
 		t, ValidateFederationWorkspaceLaunchSpecResponse(request, spec),
 		"repository identity",
@@ -125,16 +127,14 @@ func TestWorkspaceLaunchRefreshAcceptsRenamedStableRepository(t *testing.T) {
 			edit: func(spec *db.WorkspaceLaunchSpec) {
 				spec.Repository.Provider = "gitlab"
 				spec.Repository.PlatformHost = "gitlab.com"
-				spec.Repository.CloneURL =
-					"https://gitlab.com/acme-renamed/widget-renamed.git"
+				spec.Repository.CloneURL = "https://gitlab.com/acme-renamed/widget-renamed.git"
 			},
 		},
 		{
 			name: "platform host mismatch",
 			edit: func(spec *db.WorkspaceLaunchSpec) {
 				spec.Repository.PlatformHost = "github.example.test"
-				spec.Repository.CloneURL =
-					"https://github.example.test/acme-renamed/widget-renamed.git"
+				spec.Repository.CloneURL = "https://github.example.test/acme-renamed/widget-renamed.git"
 			},
 		},
 	} {
@@ -142,8 +142,7 @@ func TestWorkspaceLaunchRefreshAcceptsRenamedStableRepository(t *testing.T) {
 			_, candidate := workspaceLaunchResponseForTest()
 			candidate.Repository.Owner = "acme-renamed"
 			candidate.Repository.Name = "widget-renamed"
-			candidate.Repository.CloneURL =
-				"https://github.com/acme-renamed/widget-renamed.git"
+			candidate.Repository.CloneURL = "https://github.com/acme-renamed/widget-renamed.git"
 			test.edit(&candidate)
 			require.ErrorContains(
 				t, ValidateFederationWorkspaceLaunchSpecResponse(request, candidate),

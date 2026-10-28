@@ -15,9 +15,11 @@ import (
 	"go.kenn.io/forge/internal/apiclient"
 	"go.kenn.io/forge/internal/apiclient/generated"
 	"go.kenn.io/forge/internal/db"
+	"go.kenn.io/forge/internal/testutil"
 	"go.kenn.io/forge/internal/testutil/gitfixture"
+	"go.kenn.io/forge/internal/testutil/gitsafe"
 	"go.kenn.io/forge/internal/workspace"
-	gitcmd "go.kenn.io/kit/git/cmd"
+	"go.kenn.io/forge/platform"
 )
 
 func setupLifecycleWorkspaceServer(t *testing.T) (*apiclient.Client, *db.DB, string, string) {
@@ -805,7 +807,7 @@ func TestWorkspaceCreateSameRepoHeadCloneURLTracksOriginBranchE2E(t *testing.T) 
 func requireGitRefMissing(t *testing.T, dir, ref string) {
 	t.Helper()
 
-	_, stderr, err := gitcmd.New().Run(
+	_, stderr, err := gitsafe.Runner().Run(
 		t.Context(), dir, nil, "show-ref", "--verify", "--quiet", ref,
 	)
 	var exitErr *exec.ExitError
@@ -847,7 +849,7 @@ func TestWorkspaceRetryUnknownHeadRepoFailsClosedE2E(t *testing.T) {
 		Version: db.WorkspaceLaunchSpecVersion,
 		Repository: db.WorkspaceLaunchRepository{
 			Provider: "github", PlatformHost: "github.com",
-			PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget",
+			Key: platform.RepositoryIDKey(testutil.FixtureRepoID("acme", "widget")), Owner: "acme", Name: "widget",
 			CloneURL: "https://github.com/acme/widget.git", DefaultBranch: "main",
 		},
 		ItemType: db.WorkspaceItemTypePullRequest, ItemNumber: 2,
@@ -1185,14 +1187,14 @@ func TestWorkspaceDeleteDirty(t *testing.T) {
 	assert.Equal(http.StatusNotFound, get2.StatusCode)
 }
 
-func TestWorkspaceForceDeleteToleratesMissingWorktreeCommonDirE2E(
+func TestWorkspaceForceDeleteToleratesMissingWorktreeCommonDirE2E( //nolint:paralleltest // t.Setenv writes PATH, KENN_FORGE_TEST_REAL_GIT through installGitCommonDirReadFailure
 	t *testing.T,
 ) {
 	require := require.New(t)
 	assert := assert.New(t)
 
 	client, database, _, _ := setupLifecycleWorkspaceServer(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	ws := createReadyWorkspace(t, ctx, client)
 	installGitCommonDirReadFailure(t)
 

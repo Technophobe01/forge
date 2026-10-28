@@ -10,9 +10,78 @@ import (
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/db"
 	ghclient "go.kenn.io/forge/internal/github"
+	"go.kenn.io/forge/internal/telemetry"
+	"go.kenn.io/kit/telemetry/posthog"
 )
 
 const databaseOptimizeInterval = 24 * time.Hour
+
+const setupFinishedKey = "telemetry.setup_finished"
+
+type setupFinished struct {
+	gateOnce sync.Once
+	gate     chan struct{}
+	database *db.DB
+	reporter telemetry.Client
+	hasWork  func(context.Context) (bool, error)
+	accepted bool
+	done     bool
+}
+
+func (s *setupFinished) capture(ctx context.Context) error {
+	s.gateOnce.Do(func() { s.gate = make(chan struct{}, 1) })
+	select {
+	case s.gate <- struct{}{}:
+		defer func() { <-s.gate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil || s.done {
+		return err
+	}
+	if !s.accepted {
+		_, found, err := s.database.AppMetadataValue(ctx, setupFinishedKey)
+		if err != nil || found {
+			s.done = found
+			return err
+		}
+		ready, err := s.hasWork(ctx)
+		if err != nil || !ready {
+			return err
+		}
+		reportCtx, reportCancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		status, err := s.reporter.Report(reportCtx, "setup_finished", nil)
+		reportCancel()
+		if err != nil {
+			return err
+		}
+		if status != posthog.StatusQueued {
+			s.done = true
+			return nil
+		}
+		s.accepted = true
+	}
+	markerCtx, markerCancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer markerCancel()
+	_, err := s.database.GetOrCreateAppMetadataValue(markerCtx, setupFinishedKey, func() (string, error) { return "queued", nil })
+	s.done = err == nil
+	return err
+}
+
+func startSetupFinished(handle *backgroundLoopHandle, executionWorker bool, database *db.DB, reporter telemetry.Client, hasWork func(context.Context) (bool, error)) *setupFinished {
+	if executionWorker || !reporter.Enabled() {
+		return nil
+	}
+	setup := &setupFinished{database: database, reporter: reporter, hasWork: hasWork}
+	// Setup telemetry is best effort, and spokes retry an unreachable hub every minute.
+	handle.startTicker("capture setup finished", time.Minute, func(ctx context.Context) error {
+		if err := setup.capture(ctx); err != nil && ctx.Err() == nil {
+			slog.Debug("capture setup finished", "err", err)
+		}
+		return nil
+	})
+	return setup
+}
 
 type backgroundLoopHandle struct {
 	ctx    context.Context
@@ -50,9 +119,42 @@ func startBackgroundLoops(ctx context.Context, database *db.DB) *backgroundLoopH
 	return handle
 }
 
+// startTelemetryHeartbeat reports daemon_active daily so long-running servers
+// keep counting as active, not just at startup.
+func startTelemetryHeartbeat(handle *backgroundLoopHandle, reporter telemetry.Client, repoCount func() int) {
+	handle.startTickerAfterInterval("telemetry heartbeat", telemetry.HeartbeatInterval, func(context.Context) error {
+		return captureDaemonActive(reporter, repoCount)
+	})
+}
+
+func captureDaemonActive(reporter telemetry.Client, repoCount func() int) error {
+	return reporter.Capture("daemon_active", map[string]any{"repo_count": telemetry.RepoCountBucket(repoCount())})
+}
+
+func wireSyncFailed(syncer *ghclient.Syncer, reporter telemetry.Client) {
+	if syncer == nil {
+		return
+	}
+	syncer.SetOnSyncFailed(syncFailedCapture(reporter))
+}
+
+func syncFailedCapture(reporter telemetry.Client) func(source, reason string) {
+	if !reporter.Enabled() {
+		return nil
+	}
+	return func(source, reason string) {
+		if err := reporter.Capture("sync_failed", map[string]any{"sync_source": source, "reason": reason}); err != nil {
+			slog.Warn("capture telemetry event", "err", err)
+		}
+	}
+}
+
 func startNotificationLoops(handle *backgroundLoopHandle, syncer *ghclient.Syncer, cfg *config.Config) {
 	settings := notificationLoopSettingsFromConfig(cfg)
 	handle.startTicker("notification sync", settings.syncInterval, func(runCtx context.Context) error {
+		if !syncer.AutomaticSyncEnabled() {
+			return nil
+		}
 		return syncer.RunNotificationSync(runCtx)
 	})
 	handle.startTicker("notification read propagation", settings.propagationInterval, func(runCtx context.Context) error {

@@ -7,7 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/testutil/dbtest"
-	gitcmd "go.kenn.io/kit/git/cmd"
+	"go.kenn.io/forge/internal/testutil/gitsafe"
 )
 
 // TestSetupDiffRepoDoesNotLeakIntoHostGitDir guards against regression
@@ -22,20 +22,20 @@ import (
 // This test simulates the hook context by pointing GIT_DIR /
 // GIT_WORK_TREE at a throwaway "host" repo and asserts SetupDiffRepo
 // leaves it untouched.
-func TestSetupDiffRepoDoesNotLeakIntoHostGitDir(t *testing.T) {
-	r := require.New(t)
+func TestSetupDiffRepoDoesNotLeakIntoHostGitDir(t *testing.T) { //nolint:paralleltest // t.Setenv writes GIT_DIR, GIT_WORK_TREE
+	require := require.New(t)
 
 	host := t.TempDir()
-	initCmd := gitcmd.New().Command(t.Context(), "", "init", "-q", "-b", "main", host)
+	initCmd := gitsafe.Runner().Command(t.Context(), "", "init", "-q", "-b", "main", host)
 	initCmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
 	}
-	r.NoError(initCmd.Run(), "seed host repo")
+	require.NoError(initCmd.Run(), "seed host repo")
 
 	hostConfig := filepath.Join(host, ".git", "config")
 	before, err := os.ReadFile(hostConfig)
-	r.NoError(err)
+	require.NoError(err)
 
 	t.Setenv("GIT_DIR", filepath.Join(host, ".git"))
 	t.Setenv("GIT_WORK_TREE", host)
@@ -50,8 +50,8 @@ func TestSetupDiffRepoDoesNotLeakIntoHostGitDir(t *testing.T) {
 	_, setupErr := SetupDiffRepo(t.Context(), fixtureDir, database)
 
 	after, err := os.ReadFile(hostConfig)
-	r.NoError(err)
-	r.Equal(string(before), string(after),
+	require.NoError(err)
+	require.Equal(string(before), string(after),
 		"SetupDiffRepo mutated the host .git/config via leaked GIT_DIR")
-	r.NoError(setupErr, "SetupDiffRepo should succeed under hook-simulated env")
+	require.NoError(setupErr, "SetupDiffRepo should succeed under hook-simulated env")
 }

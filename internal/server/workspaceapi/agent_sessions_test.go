@@ -19,11 +19,11 @@ import (
 	"go.kenn.io/forge/internal/ptyowner"
 	ptyownerruntime "go.kenn.io/forge/internal/ptyowner/runtime"
 	"go.kenn.io/forge/internal/testutil/dbtest"
-	"go.kenn.io/forge/internal/workspace"
+	"go.kenn.io/forge/internal/testutil/workspacetest"
 	"go.kenn.io/forge/internal/workspace/localruntime"
 )
 
-func TestListWorkspaceAgentSessionsProjectsOnlySupportedLiveAgentReports(t *testing.T) {
+func TestListWorkspaceAgentSessionsProjectsOnlySupportedLiveAgentReports(t *testing.T) { //nolint:paralleltest // t.Setenv writes KENN_FORGE_AGENT_SESSION_HELPER
 	assert := assert.New(t)
 	require := require.New(t)
 	t.Setenv("KENN_FORGE_AGENT_SESSION_HELPER", "1")
@@ -82,7 +82,7 @@ func TestListWorkspaceAgentSessionsProjectsOnlySupportedLiveAgentReports(t *test
 		SessionID: "shared-session", CWD: worktree,
 		HookEventName: "Stop",
 	}, agentRuntime.Key))
-	require.NoError(activity.HandleEvent("opencode", agentactivity.HookEvent{
+	require.NoError(activity.HandleEvent("unsupported-agent", agentactivity.HookEvent{
 		SessionID: "unsupported", CWD: worktree,
 		HookEventName: "UserPromptSubmit",
 	}, agentRuntime.Key))
@@ -105,7 +105,7 @@ func TestListWorkspaceAgentSessionsProjectsOnlySupportedLiveAgentReports(t *test
 		CreatedAt: agentRuntime.CreatedAt,
 	}))
 	handler := New(Deps{
-		DB: database, Workspaces: workspace.NewManager(database, t.TempDir()),
+		DB: database, Workspaces: workspacetest.NewManager(t, database, t.TempDir()),
 		Runtime: runtime, AgentActivity: activity,
 	})
 	_, reserved := handler.reserveInitialMessageAttempt(
@@ -120,7 +120,7 @@ func TestListWorkspaceAgentSessionsProjectsOnlySupportedLiveAgentReports(t *test
 	)
 	handler.Register(api)
 	recorder := httptest.NewRecorder()
-	mux.ServeHTTP(recorder, httptest.NewRequest(
+	mux.ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(),
 		http.MethodGet, "/api/v1/workspaces/"+workspaceID+"/agent-sessions", nil,
 	))
 	require.Equal(http.StatusOK, recorder.Code, recorder.Body.String())
@@ -166,7 +166,7 @@ func TestListWorkspaceAgentSessionsProjectsOnlySupportedLiveAgentReports(t *test
 	assert.Nil(handler.workspaceReference(summary).AgentState)
 }
 
-func TestWorkspaceAgentSessionHelper(t *testing.T) {
+func TestWorkspaceAgentSessionHelper(t *testing.T) { //nolint:paralleltest // subprocess entry point; owns the helper process's stdio and lifetime
 	if os.Getenv("KENN_FORGE_AGENT_SESSION_HELPER") != "1" {
 		return
 	}
@@ -182,5 +182,5 @@ func TestWorkspaceAgentSessionHelper(t *testing.T) {
 		_, _ = fmt.Fprintln(os.Stderr, "unknown helper mode")
 		os.Exit(2)
 	}
-	time.Sleep(time.Hour)
+	time.Sleep(time.Hour) //nolint:kennlint // keeps the agent subprocess alive until runtime cleanup
 }

@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 import type { ProblemError } from "../../src/lib/api/generated/models/index.js";
+import type { ResolveRepoOutputBody } from "../../src/lib/api/roborev/generated/models/index.js";
 import { createMockApiHandler } from "../../src/test/mockApiFetch.js";
 import { mockApi } from "./support/mockApi";
 
@@ -233,6 +234,7 @@ async function setupTerminalMocks(
     roborevJobs?: typeof roborevJobs;
     roborevStatus?: typeof roborevStatus;
     roborevReview?: typeof roborevReview;
+    roborevResolution?: ResolveRepoOutputBody;
     workspaceDetailResponses?: Array<{
       status: number;
       body?: unknown;
@@ -432,17 +434,20 @@ async function setupTerminalMocks(
     },
   );
 
-  await page.route(`**/api/v1/workspaces/${ws.id}/runtime`, async (route) => {
-    if (route.request().method() === "GET") {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify(runtime),
-      });
-      return;
-    }
-    await route.fulfill({ status: 405 });
-  });
+  await page.route(
+    (url) => url.pathname === `/api/v1/workspaces/${ws.id}/runtime`,
+    async (route) => {
+      if (route.request().method() === "GET") {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify(runtime),
+        });
+        return;
+      }
+      await route.fulfill({ status: 405 });
+    },
+  );
 
   await page.route(`**/api/v1/workspaces/${ws.id}/runtime/sessions`, async (route) => {
     if (route.request().method() !== "POST") {
@@ -548,6 +553,17 @@ async function setupTerminalMocks(
     (url) => url.pathname.startsWith("/api/roborev/"),
     async (route) => {
       const url = new URL(route.request().url());
+      if (url.pathname.endsWith("/api/repos/resolve")) {
+        const repo = rrRepos.repos[0];
+        await route.fulfill({
+          json:
+            opts?.roborevResolution ??
+            (repo && url.searchParams.get("path") === ws.worktree_path
+              ? { tracked: true, repo: { ...repo, identity: "" } }
+              : { tracked: false }),
+        });
+        return;
+      }
       if (url.pathname.endsWith("/api/repos")) {
         await route.fulfill({
           status: 200,
@@ -1061,12 +1077,12 @@ test("phone workspace list keeps its selected terminal alive through linked PR n
 
   await page.goto("/m/workspaces");
 
-  await expect(page.getByRole("combobox", { name: /Phone mode/ })).toHaveText("Workspaces");
+  await expect(page.locator(".mobile-workspace-list").getByRole("button", { name: "Menu" })).toBeVisible();
   await expect(page.getByRole("searchbox", { name: "Filter workspaces" })).toBeVisible();
-  await page.getByRole("button", { name: "View workspace options" }).click();
-  await expect(page.getByRole("dialog", { name: "View workspace options" })).toBeVisible();
+  await page.getByRole("button", { name: "Workspace filters" }).click();
+  await expect(page.getByRole("dialog", { name: "Workspace filters" })).toBeVisible();
   await expect(page.getByRole("radio", { name: /Org \/ repo/ })).toBeChecked();
-  await page.getByRole("button", { name: "Close View options" }).click();
+  await page.getByRole("button", { name: "Close filters" }).click();
 
   await page.getByRole("searchbox", { name: "Filter workspaces" }).fill("feature/auth");
   await expect(page.getByRole("button", { name: "Open workspace Add auth middleware" })).toBeVisible();
@@ -1171,13 +1187,16 @@ test("phone keeps the durable workspace terminal available when runtime discover
   await page.setViewportSize({ width: 390, height: 844 });
   await installControllableTerminalWebSockets(page);
   await setupTerminalMocks(page);
-  await page.route("**/api/v1/workspaces/ws-123/runtime", async (route) => {
-    await route.fulfill({
-      status: 503,
-      contentType: "application/problem+json",
-      body: JSON.stringify(problem("serviceUnavailable", 503, "runtime discovery unavailable")),
-    });
-  });
+  await page.route(
+    (url) => url.pathname === "/api/v1/workspaces/ws-123/runtime",
+    async (route) => {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/problem+json",
+        body: JSON.stringify(problem("serviceUnavailable", 503, "runtime discovery unavailable")),
+      });
+    },
+  );
 
   await page.goto("/m/workspaces/local/ws-123");
 
@@ -1445,6 +1464,17 @@ test("phone terminal clears a draft before falling back to another session", asy
   await page.getByRole("button", { name: "Open terminal composer" }).click();
   await page.getByRole("textbox", { name: "Terminal command" }).fill("do not send elsewhere");
 
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (
+          window as unknown as {
+            __kenn_forgeControllableTerminalSockets: Array<{ url: string }>;
+          }
+        ).__kenn_forgeControllableTerminalSockets.some(({ url }) => url.includes(encodeURIComponent("ws-123:codex"))),
+      ),
+    )
+    .toBe(true);
   mocked.runtime.sessions = mocked.runtime.sessions.filter(({ key }) => key !== "ws-123:codex");
   await emitTerminalControl(page, "ws-123:codex", { type: "exited", code: 0 });
 
@@ -1571,7 +1601,7 @@ test("phone list item tabs open a workspace that returns to the list", async ({ 
 
   await page.goto("/m/workspaces");
   await page.getByRole("button", { name: "Open linked item #42" }).click();
-  await page.getByRole("tab", { name: "Files changed" }).click();
+  await page.getByRole("tab", { name: "Files" }).click();
   await page.getByRole("tab", { name: "Conversation" }).click();
   await page.getByRole("button", { name: "Open Workspace" }).click();
 
@@ -1598,7 +1628,7 @@ test("direct phone workspace item tabs return to the workspace terminal", async 
 
   await page.goto("/m/workspaces");
   await page.goto("/m/workspaces/local/ws-123/item");
-  await page.getByRole("tab", { name: "Files changed" }).click();
+  await page.getByRole("tab", { name: "Files" }).click();
   await expect(page).toHaveURL(/\/m\/workspaces\/local\/ws-123\/item\/files$/);
 
   await page.getByRole("button", { name: "Back to workspace terminal" }).click();
@@ -1606,6 +1636,79 @@ test("direct phone workspace item tabs return to the workspace terminal", async 
 
   await page.evaluate(() => history.back());
   await expect(page).toHaveURL(/\/m\/workspaces$/);
+});
+
+test("phone workspace item fits its tabs and diff controls in two rows", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await setupTerminalMocks(page);
+
+  await page.route("**/api/v1/pulls/github/acme/widgets/42/commits", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        commits: [
+          {
+            sha: "abc1234567890123456789012345678901234567",
+            message: "commit one",
+            authored_at: "2026-04-01T00:00:00Z",
+            author_name: "user-a",
+          },
+        ],
+      }),
+    });
+  });
+
+  await page.goto("/m/workspaces/local/ws-123/item/files");
+
+  const header = page.locator(".mobile-workspace-item__toolbar");
+  await expect(header.getByRole("button", { name: "Back to workspace terminal" })).toBeVisible();
+  await expect(header.getByRole("tab", { name: "Files" })).toHaveAttribute("aria-selected", "true");
+  await expect(header.getByRole("button", { name: "Menu" })).toBeVisible();
+
+  const toolbar = page.locator(".diff-toolbar");
+  const category = toolbar.getByRole("combobox", { name: /^Files: All/ });
+  const scope = toolbar.getByRole("button", { name: /Select commit range/ });
+  const jump = toolbar.getByRole("button", { name: "Jump to file" });
+  const more = toolbar.getByRole("button", { name: "More diff filters" });
+  for (const control of [category, scope, jump, more]) await expect(control).toBeVisible();
+
+  // Every diff control shares one row and stays on screen.
+  const boxes = await Promise.all([category, scope, jump, more].map((control) => control.boundingBox()));
+  const tops = boxes.map((box) => Math.round(box!.y));
+  expect(new Set(tops).size).toBe(1);
+  for (const box of boxes) expect(box!.x + box!.width).toBeLessThanOrEqual(390);
+
+  // The file tree starts hidden; the overflow menu brings it back.
+  await expect(page.locator(".files-sidebar")).toHaveCount(0);
+
+  // The commit menu opens from mid-toolbar but must stay on screen, Clear included.
+  await scope.click();
+  const scopeMenu = page.locator(".diff-scope-picker__menu");
+  const commitRow = scopeMenu.getByRole("button", { name: /commit one/ });
+  await expect(commitRow).toBeVisible();
+  for (const element of [scopeMenu, commitRow]) {
+    const box = await element.boundingBox();
+    expect(box!.x).toBeGreaterThanOrEqual(0);
+    expect(box!.x + box!.width).toBeLessThanOrEqual(390);
+  }
+  await commitRow.click();
+  const clear = scopeMenu.getByRole("button", { name: "Clear" });
+  await expect(clear).toBeVisible();
+  const clearBox = await clear.boundingBox();
+  expect(clearBox!.x + clearBox!.width).toBeLessThanOrEqual(390);
+  await clear.click();
+  await expect(toolbar.getByRole("button", { name: /Select commit range: HEAD/ })).toBeVisible();
+  await scope.click();
+
+  await category.click();
+  await page.getByRole("option", { name: /^Code/ }).click();
+  await expect(toolbar.getByRole("combobox", { name: /^Files: Code/ })).toBeVisible();
+
+  await more.click();
+  await expect(page.getByRole("button", { name: /(Collapse|Expand) all diffs/ })).toBeVisible();
+  await page.getByRole("switch", { name: "File list" }).click();
+  await expect(page.locator(".files-sidebar")).toBeVisible();
 });
 
 test("phone Fleet workspace keeps its linked item as passive metadata", async ({ page }) => {
@@ -1618,13 +1721,16 @@ test("phone Fleet workspace keeps its linked item as passive metadata", async ({
       body: JSON.stringify(testWorkspace),
     });
   });
-  await page.route("**/api/v1/fleet/hosts/member/workspaces/ws-123/runtime", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify(workspaceRuntime),
-    });
-  });
+  await page.route(
+    (url) => url.pathname === "/api/v1/fleet/hosts/member/workspaces/ws-123/runtime",
+    async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(workspaceRuntime),
+      });
+    },
+  );
 
   await page.goto("/m/workspaces/fleet/member/ws-123");
 
@@ -1763,13 +1869,16 @@ test("typed workspace deletion returns the phone workflow to the workspace list"
 test("missing phone workspace runtime returns to the workspace list", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await setupTerminalMocks(page);
-  await page.route("**/api/v1/workspaces/ws-123/runtime", async (route) => {
-    await route.fulfill({
-      status: 404,
-      contentType: "application/problem+json",
-      body: JSON.stringify({ status: 404, code: "workspaceNotFound", detail: "workspace not found" }),
-    });
-  });
+  await page.route(
+    (url) => url.pathname === "/api/v1/workspaces/ws-123/runtime",
+    async (route) => {
+      await route.fulfill({
+        status: 404,
+        contentType: "application/problem+json",
+        body: JSON.stringify({ status: 404, code: "workspaceNotFound", detail: "workspace not found" }),
+      });
+    },
+  );
 
   await page.goto("/m/workspaces/local/ws-123");
 
@@ -1805,13 +1914,16 @@ test("unavailable Fleet runtime stays in context with Reconnect", async ({ page 
       body: JSON.stringify(testWorkspace),
     });
   });
-  await page.route("**/api/v1/fleet/hosts/member/workspaces/ws-123/runtime", async (route) => {
-    await route.fulfill({
-      status: 404,
-      contentType: "application/problem+json",
-      body: JSON.stringify({ status: 404, code: "notFound", detail: "Fleet host unavailable" }),
-    });
-  });
+  await page.route(
+    (url) => url.pathname === "/api/v1/fleet/hosts/member/workspaces/ws-123/runtime",
+    async (route) => {
+      await route.fulfill({
+        status: 404,
+        contentType: "application/problem+json",
+        body: JSON.stringify({ status: 404, code: "notFound", detail: "Fleet host unavailable" }),
+      });
+    },
+  );
 
   await page.goto("/m/workspaces/fleet/member/ws-123");
 
@@ -2426,7 +2538,7 @@ test.describe("terminal state icons", () => {
   });
 });
 
-test.describe("workspace launch home", () => {
+test.describe("workspace launcher", () => {
   test.beforeEach(async ({ page }) => {
     await page.addInitScript(clearWorkspaceSidebarTabStorage);
     await page.addInitScript(() => {
@@ -2437,7 +2549,7 @@ test.describe("workspace launch home", () => {
     await setupTerminalMocks(page);
   });
 
-  test("shows Worktree Home and does not attach a terminal by default", async ({ page }) => {
+  test("shows launch choices without attaching a terminal in an empty workspace", async ({ page }) => {
     const terminalSockets: string[] = [];
     page.on("websocket", (socket) => {
       const url = socket.url();
@@ -2448,7 +2560,7 @@ test.describe("workspace launch home", () => {
 
     await page.goto("/terminal/ws-123");
 
-    await expect(page.getByRole("tab", { name: "Home" })).toBeVisible();
+    await expect(page.getByRole("region", { name: "Session launcher" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Launch" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Codex" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Shell", exact: true })).toBeEnabled();
@@ -2461,7 +2573,7 @@ test.describe("workspace launch home", () => {
     await expect.poll(() => terminalSockets.length).toBe(0);
   });
 
-  test("does not attach restored runtime sessions until selected", async ({ page }) => {
+  test("shows a restored runtime session immediately", async ({ page }) => {
     await setupTerminalMocks(page, {
       runtime: {
         ...workspaceRuntime,
@@ -2501,19 +2613,6 @@ test.describe("workspace launch home", () => {
 
     const tabs = page.getByRole("region", { name: "Workflow panes" });
     await expect(tabs.getByRole("tab", { name: "Codex" })).toBeVisible();
-    const initialTerminalSockets = await page.evaluate(() =>
-      (
-        (
-          window as unknown as {
-            __kenn_forgeWebSocketUrls: string[];
-          }
-        ).__kenn_forgeWebSocketUrls ?? []
-      ).filter((url) => url.includes("/ws/v1/workspaces/ws-123/")),
-    );
-    expect(initialTerminalSockets).toEqual([]);
-
-    await tabs.getByRole("tab", { name: "Codex" }).click();
-
     await expect(page.locator(".terminal-container")).toBeVisible();
     await expect
       .poll(async () => {
@@ -2531,7 +2630,7 @@ test.describe("workspace launch home", () => {
       .toBe(true);
   });
 
-  test("selects the top-docked terminal when moving an inactive workflow tab into it", async ({ page }) => {
+  test("selects the top-docked terminal when moving a workflow session into it", async ({ page }) => {
     await setupTerminalMocks(page, {
       runtime: {
         ...workspaceRuntime,
@@ -2550,7 +2649,7 @@ test.describe("workspace launch home", () => {
     });
     await page.addInitScript((layout) => {
       localStorage.setItem("kenn-forge-workspace-terminal-layout:ws-123", JSON.stringify(layout));
-      localStorage.setItem("kenn-forge-workspace-active-tab:ws-123", "home");
+      localStorage.setItem("kenn-forge-workspace-active-tab:ws-123", "session:ws-123:codex");
     }, topDockedTerminalWorkflowLayout());
 
     await page.goto("/terminal/ws-123");
@@ -2558,7 +2657,7 @@ test.describe("workspace launch home", () => {
     const workflow = page.getByRole("region", {
       name: "Workflow panes",
     });
-    await expect(workflow.getByRole("tab", { name: "Home" })).toHaveAttribute("aria-selected", "true");
+    await expect(workflow.getByRole("tab", { name: "Codex" })).toHaveAttribute("aria-selected", "true");
     await expect(workflow.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "false");
 
     await workflow.getByRole("button", { name: "Move Codex to terminal" }).click();
@@ -2598,10 +2697,10 @@ test.describe("workspace launch home", () => {
       name: "Terminal",
     });
     await expect(terminalTab).toBeVisible();
-    await expect(terminalTab).toHaveAttribute("aria-selected", "false");
+    await expect(terminalTab).toHaveAttribute("aria-selected", "true");
     await expect(page.locator(".tabbed-panel-leaf .terminal-container")).toHaveCount(0);
 
-    await terminalTab.click();
+    await workflow.getByRole("button", { name: "Open terminal panel", exact: true }).click();
 
     await expect(terminalTab).toHaveAttribute("aria-selected", "true");
     await expect(page.locator(".tabbed-panel-leaf .terminal-container")).toBeVisible();
@@ -2643,28 +2742,25 @@ test.describe("workspace launch home", () => {
 
     const metrics = await page.evaluate(() => {
       const titleBar = document.querySelector(".header-bar");
-      const toolbar = document.querySelector(".workspace-toolbar");
       const stage = document.querySelector(".workspace-stage");
       const split = document.querySelector(".workspace-stage .tabbed-panel-split");
       const firstLeaf = document.querySelector(".workspace-stage .tabbed-panel-leaf");
-      if (!titleBar || !toolbar || !stage || !split || !firstLeaf) {
+      if (!titleBar || !stage || !split || !firstLeaf) {
         throw new Error("Missing workflow header, stage, or split panel");
       }
 
       const titleBarRect = titleBar.getBoundingClientRect();
-      const toolbarRect = toolbar.getBoundingClientRect();
       const stageRect = stage.getBoundingClientRect();
       const splitRect = split.getBoundingClientRect();
       const firstLeafRect = firstLeaf.getBoundingClientRect();
       const titleBarStyles = getComputedStyle(titleBar);
-      const toolbarStyles = getComputedStyle(toolbar);
       const stageStyles = getComputedStyle(stage);
 
       return {
+        firstLeafBorderLeft: getComputedStyle(firstLeaf).borderLeftWidth,
         titleBorderLeft: titleBarStyles.borderLeftWidth,
-        toolbarBorderLeft: toolbarStyles.borderLeftWidth,
-        titleToToolbarLeft: toolbarRect.left - titleBarRect.left,
-        toolbarToFirstLeafLeft: firstLeafRect.left - toolbarRect.left,
+        titleToFirstLeafLeft: firstLeafRect.left - titleBarRect.left,
+        titleToStageTop: stageRect.top - titleBarRect.bottom,
         padding: [stageStyles.paddingTop, stageStyles.paddingRight, stageStyles.paddingBottom, stageStyles.paddingLeft],
         delta: {
           left: splitRect.left - stageRect.left,
@@ -2675,10 +2771,11 @@ test.describe("workspace launch home", () => {
       };
     });
 
-    expect(metrics.titleBorderLeft).toBe("1px");
-    expect(metrics.toolbarBorderLeft).toBe("1px");
-    expect(Math.abs(metrics.titleToToolbarLeft)).toBeLessThanOrEqual(0.5);
-    expect(Math.abs(metrics.toolbarToFirstLeafLeft)).toBeLessThanOrEqual(0.5);
+    // The workspace list's split handle is the divider beside the header and panes.
+    expect(metrics.titleBorderLeft).toBe("0px");
+    expect(metrics.firstLeafBorderLeft).toBe("0px");
+    expect(Math.abs(metrics.titleToFirstLeafLeft)).toBeLessThanOrEqual(0.5);
+    expect(Math.abs(metrics.titleToStageTop)).toBeLessThanOrEqual(0.5);
     expect(metrics.padding).toEqual(["0px", "0px", "0px", "0px"]);
     expect(Math.abs(metrics.delta.left)).toBeLessThanOrEqual(0.5);
     expect(Math.abs(metrics.delta.top)).toBeLessThanOrEqual(0.5);
@@ -2764,7 +2861,7 @@ test.describe("workspace launch home", () => {
   });
 
   test("shows one Workspaces option in the compact page menu on terminal routes", async ({ page }) => {
-    await page.setViewportSize({ width: 1000, height: 720 });
+    await page.setViewportSize({ width: 820, height: 720 });
     await setupTerminalMocks(page, {
       runtime: workflowDragRuntime(),
     });
@@ -3343,7 +3440,7 @@ test.describe("workspace launch home", () => {
     await expect(page.locator(".terminal-panel.open .terminal-container")).toBeVisible();
     const dividerMetrics = await page.evaluate(() => {
       const panel = document.querySelector(".terminal-panel.bottom.open");
-      const resizer = document.querySelector(".terminal-panel.bottom.open .panel-resizer");
+      const resizer = document.querySelector(".terminal-panel.bottom.open > .kit-split-resize-handle");
       const stage = document.querySelector(".workspace-stage");
       if (!panel || !resizer || !stage) {
         throw new Error("Missing bottom dock panel, resizer, or workspace stage");
@@ -3354,21 +3451,24 @@ test.describe("workspace launch home", () => {
       const stageRect = stage.getBoundingClientRect();
       const panelStyles = getComputedStyle(panel);
       const resizerStyles = getComputedStyle(resizer);
-      const stripeStyles = getComputedStyle(resizer, "::before");
+      const stageStyles = getComputedStyle(stage);
       return {
         panelBorderTop: panelStyles.borderTopWidth,
         resizerCursor: resizerStyles.cursor,
         resizerHeight: Math.round(resizerRect.height),
+        resizerToPanelTop: Math.round(resizerRect.top - panelRect.top),
+        stageBorderBottom: stageStyles.borderBottomWidth,
         stageToPanel: Math.round(panelRect.top - stageRect.bottom),
-        stripeHeight: stripeStyles.height,
       };
     });
+    // The handle is the whole divider: 4px, flush with the stage, no borders beside it.
     expect(dividerMetrics).toEqual({
       panelBorderTop: "0px",
       resizerCursor: "row-resize",
       resizerHeight: 4,
+      resizerToPanelTop: 0,
+      stageBorderBottom: "0px",
       stageToPanel: 0,
-      stripeHeight: "3px",
     });
     await expect
       .poll(() => terminalSockets.some((url) => url.includes("/runtime/sessions/ws-123%3Aplain_shell/terminal")))
@@ -3493,7 +3593,15 @@ test.describe("workspace launch home", () => {
     await expect(page.locator(".terminal-panel.open .terminal-leaf")).toHaveCount(2);
     await expect(page.locator(".terminal-panel.open .xterm-viewport")).toHaveCount(2);
 
-    const splitMetrics = await page.evaluate(() => {
+    const accentBlue = await page.evaluate(() => {
+      const probe = document.createElement("div");
+      probe.style.color = "var(--accent-blue)";
+      document.body.append(probe);
+      const color = getComputedStyle(probe).color;
+      probe.remove();
+      return color;
+    });
+    const splitMetrics = await page.evaluate((accent) => {
       const body = document.querySelector(".terminal-panel.bottom.open .panel-body");
       const tree = document.querySelector(".terminal-panel.bottom.open .terminal-tree");
       const selector = document.querySelector(".terminal-panel.bottom.open .terminal-selector");
@@ -3505,7 +3613,9 @@ test.describe("workspace launch home", () => {
       const secondLeaf = document.querySelector(
         ".terminal-panel.bottom.open .terminal-split.horizontal > .split-child.second > .terminal-leaf",
       );
-      const divider = document.querySelector(".terminal-panel.bottom.open .terminal-split.horizontal > .split-divider");
+      const divider = document.querySelector(
+        ".terminal-panel.bottom.open .terminal-split.horizontal > .kit-split-resize-handle",
+      );
       if (
         !body ||
         !tree ||
@@ -3537,7 +3647,7 @@ test.describe("workspace launch home", () => {
       const activeHeaderStyles = getComputedStyle(activeHeader);
       return {
         activeHeaderBoxShadow: activeHeaderStyles.boxShadow,
-        activeLeftBorderUsesAccent: activeLeafStyles.borderLeftColor === "rgb(37, 99, 235)",
+        activeLeftBorderUsesAccent: activeLeafStyles.borderLeftColor === accent,
         activeLeafBorderTopWidth: activeLeafStyles.borderTopWidth,
         firstLeafBorderRight: firstLeafStyles.borderRightWidth,
         firstLeafToSplitLeft: Math.round(firstLeafRect.left - splitRect.left),
@@ -3549,28 +3659,33 @@ test.describe("workspace launch home", () => {
         splitToTreeLeft: Math.round(splitRect.left - treeRect.left),
         splitToTreeTop: Math.round(splitRect.top - treeRect.top),
         splitterBackgroundVisible: dividerStyles.backgroundColor !== "rgba(0, 0, 0, 0)",
-        splitterHitWidth: Math.round(dividerRect.width),
+        splitterWidth: Math.round(dividerRect.width),
+        // The grab margin must reach over the xterm canvases on both sides.
+        splitterGrabsBesideLine: [dividerRect.left - 1, dividerRect.right + 1].every(
+          (x) => document.elementFromPoint(x, dividerRect.top + dividerRect.height / 2) === divider,
+        ),
         treePadding: [treeStyles.paddingTop, treeStyles.paddingRight, treeStyles.paddingBottom, treeStyles.paddingLeft],
         treeToBodyLeft: Math.round(treeRect.left - bodyRect.left),
         treeToBodyTop: Math.round(treeRect.top - bodyRect.top),
         treeToSelector: Math.round(selectorRect.left - treeRect.right),
       };
-    });
+    }, accentBlue);
     expect(splitMetrics).toEqual({
-      activeHeaderBoxShadow: "rgb(37, 99, 235) 0px 2px 0px 0px inset",
+      activeHeaderBoxShadow: `${accentBlue} 0px 2px 0px 0px inset`,
       activeLeafBorderTopWidth: "0px",
       activeLeftBorderUsesAccent: false,
       firstLeafBorderRight: "0px",
       firstLeafToSplitLeft: 0,
       firstLeafToSplitTop: 0,
-      firstViewportBackground: "rgb(13, 17, 23)",
+      firstViewportBackground: "rgb(217, 215, 211)",
       firstViewportToLeafRight: 0,
       secondLeafBorderLeft: "0px",
       splitToTreeBottom: 0,
       splitToTreeLeft: 0,
       splitToTreeTop: 0,
       splitterBackgroundVisible: true,
-      splitterHitWidth: 3,
+      splitterGrabsBesideLine: true,
+      splitterWidth: 4,
       treePadding: ["0px", "0px", "0px", "0px"],
       treeToBodyLeft: 0,
       treeToBodyTop: 0,
@@ -3620,7 +3735,7 @@ test.describe("workspace launch home", () => {
     expect(afterSwitch).toMatchObject([
       {
         active: true,
-        headerBoxShadow: "rgb(37, 99, 235) 0px 2px 0px 0px inset",
+        headerBoxShadow: `${accentBlue} 0px 2px 0px 0px inset`,
         label: "Shell",
       },
       {
@@ -3700,10 +3815,12 @@ test.describe("sidebar toggle behavior", () => {
     const listSidebar = page.locator(".workspace-list-sidebar");
     await expect(listSidebar).toBeVisible();
 
-    const prBtn = page.locator(".panel-toggle-btn", {
+    await page.getByRole("button", { name: "Workspace controls", exact: true }).click();
+    const prBtn = page.getByRole("dialog", { name: "Workspace controls" }).locator(".panel-toggle-btn", {
       hasText: "PR",
     });
     await prBtn.click();
+    await page.keyboard.press("Escape");
     const rightSidebar = page.locator(".right-sidebar");
     await expect(rightSidebar).toBeVisible();
 
@@ -3755,31 +3872,28 @@ test.describe("sidebar toggle behavior", () => {
     // Sidebar should now be visible
     await expect(page.locator(".right-sidebar")).toBeVisible();
     const workflowPanelMetrics = await page.evaluate(() => {
-      const handle = document.querySelector(".sidebar-resize-handle");
-      const tabPanel = document.querySelector(".workspace-stage .tabbed-panel-tab-panel.active");
-      const workspaceHome = document.querySelector(".workspace-stage .workspace-home");
-      if (!handle || !tabPanel || !workspaceHome) {
-        throw new Error("Missing handle, active panel, or workspace home");
+      const handle = document.querySelector('[role="separator"][aria-label="Resize workspace details"]');
+      const stage = document.querySelector(".workspace-stage");
+      const launcher = document.querySelector(".workspace-stage .launcher-overlay");
+      if (!handle || !stage || !launcher) {
+        throw new Error("Missing handle, workspace stage, or session launcher");
       }
 
       const handleRect = handle.getBoundingClientRect();
-      const panelRect = tabPanel.getBoundingClientRect();
-      const homeRect = workspaceHome.getBoundingClientRect();
-      const panelStyles = getComputedStyle(tabPanel);
+      const stageRect = stage.getBoundingClientRect();
+      const launcherRect = launcher.getBoundingClientRect();
       return {
         handleWidth: Math.round(handleRect.width),
-        homeToPanelRight: Math.round(panelRect.right - homeRect.right),
-        homeToSplitter: Math.round(handleRect.left - homeRect.right),
-        panelOverflowY: panelStyles.overflowY,
+        launcherToStageRight: Math.round(stageRect.right - launcherRect.right),
+        launcherToSplitter: Math.round(handleRect.left - launcherRect.right),
+        stageOverflowY: getComputedStyle(stage).overflowY,
       };
     });
     expect(workflowPanelMetrics).toEqual({
       handleWidth: 4,
-      homeToPanelRight: 0,
-      // Leaf border plus the 1px ring the leaf reserves for the pane focus
-      // marker (see TabbedPanelTree); pane content sits inside both.
-      homeToSplitter: 2,
-      panelOverflowY: "hidden",
+      launcherToStageRight: 0,
+      launcherToSplitter: 0,
+      stageOverflowY: "hidden",
     });
     // PR button should be active
     await expect(prBtn).toHaveClass(/active/);
@@ -3793,7 +3907,7 @@ test.describe("sidebar toggle behavior", () => {
         name: "Open terminal panel",
       })
       .click();
-    await expect(page.locator(".terminal-panel.bottom.open .panel-resizer")).toBeVisible();
+    await expect(page.locator(".terminal-panel.bottom.open > .kit-split-resize-handle")).toBeVisible();
 
     const prBtn = page.locator(".panel-toggle-btn", {
       hasText: "PR",
@@ -3810,7 +3924,7 @@ test.describe("sidebar toggle behavior", () => {
     ).toBeVisible();
 
     const topElementIsModal = await page.evaluate(() => {
-      const resizer = document.querySelector(".terminal-panel.bottom.open .panel-resizer");
+      const resizer = document.querySelector(".terminal-panel.bottom.open > .kit-split-resize-handle");
       if (!(resizer instanceof HTMLElement)) {
         throw new Error("Missing bottom terminal panel resizer");
       }
@@ -3820,6 +3934,35 @@ test.describe("sidebar toggle behavior", () => {
     });
 
     expect(topElementIsModal).toBe(true);
+  });
+
+  test("label picker paints over the workspace details splitter", async ({ page }) => {
+    await page.goto("/terminal/ws-123");
+    await page.locator(".panel-toggle-btn", { hasText: "PR" }).click();
+    await expect(page.locator(".right-sidebar .detail-title")).toContainText("Add browser regression coverage");
+
+    await page.locator(".right-sidebar .chips-row").getByRole("button", { name: "Labels", exact: true }).click();
+    const picker = page.getByRole("dialog", { name: "Edit labels" });
+    await expect(picker).toBeVisible();
+
+    // The picker opens leftward from the Labels chip, across the splitter
+    // into the terminal area. Where the two overlap, the picker must be on top.
+    const overlap = await page.evaluate(() => {
+      const handle = document.querySelector('[role="separator"][aria-label="Resize workspace details"]');
+      const popover = document.querySelector(".label-editor-popover");
+      if (!(handle instanceof HTMLElement) || !(popover instanceof HTMLElement)) {
+        throw new Error("Missing workspace details splitter or label picker");
+      }
+      const handleRect = handle.getBoundingClientRect();
+      const popoverRect = popover.getBoundingClientRect();
+      const x = handleRect.left + handleRect.width / 2;
+      const y = popoverRect.top + popoverRect.height / 2;
+      return {
+        crossesSplitter: popoverRect.left < handleRect.left && popoverRect.right > handleRect.right,
+        pickerOnTop: document.elementFromPoint(x, y)?.closest(".label-editor-popover") === popover,
+      };
+    });
+    expect(overlap).toEqual({ crossesSplitter: true, pickerOnTop: true });
   });
 
   test("clicking the active toggle closes the sidebar", async ({ page }) => {
@@ -3925,6 +4068,9 @@ test.describe("sidebar toggle behavior", () => {
 
   test("Cmd+] toggles sidebar open and closed", async ({ page }) => {
     await page.goto("/terminal/ws-123");
+    await expect(page.getByRole("dialog", { name: "Launch a session" })).toBeVisible();
+    await page.keyboard.press("Escape");
+    await page.locator(".terminal-view").focus();
 
     // Start closed
     await expect(page.locator(".right-sidebar")).toHaveCount(0);
@@ -3940,6 +4086,8 @@ test.describe("sidebar toggle behavior", () => {
 
   test("Cmd+] leaves the workspace sidebar closed while the command palette owns focus", async ({ page }) => {
     await page.goto("/terminal/ws-123");
+    await expect(page.getByRole("dialog", { name: "Launch a session" })).toBeVisible();
+    await page.keyboard.press("Escape");
 
     await page.keyboard.press("Meta+K");
     const palette = page.getByRole("dialog", { name: "Command palette" });
@@ -3954,6 +4102,7 @@ test.describe("sidebar toggle behavior", () => {
 
   test("Cmd+] leaves the workspace sidebar closed while application chrome owns focus", async ({ page }) => {
     await page.goto("/terminal/ws-123");
+    await expect(page.getByRole("dialog", { name: "Launch a session" })).toBeVisible();
     const settings = page.getByRole("button", { name: "Settings" });
     await settings.focus();
     await expect(settings).toBeFocused();
@@ -3982,6 +4131,10 @@ test.describe("sidebar toggle behavior", () => {
   test("moving the focused bottom terminal into Workflow returns focus to the workspace", async ({ page }) => {
     await page.goto("/terminal/ws-123");
     await page.getByRole("button", { name: "Open terminal panel" }).click();
+    // Opening the panel hands the keyboard to its terminal. Wait for that
+    // focus to land before taking it for the move control, or the queued
+    // explicit request arrives after the button focus and takes it back.
+    await expect(page.locator(".terminal-panel.bottom .xterm-helper-textarea")).toBeFocused();
 
     const moveToWorkflow = page.getByRole("button", { name: "Move terminal panel to workflow" });
     await moveToWorkflow.focus();
@@ -4080,16 +4233,19 @@ test.describe("workspace list fleet inventory", () => {
         body: JSON.stringify(remoteWorkspace),
       });
     });
-    await page.route(`**/api/v1/fleet/hosts/${remoteHostKey}/workspaces/member-ws-23/runtime`, async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          launch_targets: [],
-          sessions: [],
-        }),
-      });
-    });
+    await page.route(
+      (url) => url.pathname === `/api/v1/fleet/hosts/${remoteHostKey}/workspaces/member-ws-23/runtime`,
+      async (route) => {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            launch_targets: [],
+            sessions: [],
+          }),
+        });
+      },
+    );
 
     await page.goto("/workspaces");
 
@@ -4103,7 +4259,8 @@ test.describe("workspace list fleet inventory", () => {
     await row.click();
 
     await expect(page).toHaveURL(new RegExp(`/terminal/fleet/${remoteHostKey}/member-ws-23$`));
-    await expect(page.locator(".workspace-home")).toContainText("Member workspace");
+    await page.getByRole("button", { name: "Workspace info", exact: true }).click();
+    await expect(page.getByRole("dialog", { name: "Workspace info", exact: true })).toContainText("Member workspace");
   });
 
   test("hides singleton self fleet host status", async ({ page }) => {
@@ -4219,7 +4376,7 @@ test.describe("sidebar persistence", () => {
     await page.locator(".panel-toggle-btn", { hasText: "PR" }).click();
     await expect(page.locator(".right-sidebar")).toBeVisible();
 
-    const handle = page.locator(".sidebar-resize-handle");
+    const handle = page.getByRole("separator", { name: "Resize workspace details" });
     const box = await handle.boundingBox();
     expect(box).toBeTruthy();
 
@@ -4263,7 +4420,7 @@ test.describe("sidebar persistence", () => {
     await page.setViewportSize({ width: 900, height: 720 });
     await expect.poll(() => rightSidebar.evaluate((el) => el.offsetWidth)).toBeLessThan(280);
 
-    const handle = page.locator(".sidebar-resize-handle");
+    const handle = page.getByRole("separator", { name: "Resize workspace details" });
     const box = await handle.boundingBox();
     expect(box).toBeTruthy();
     if (box) {
@@ -4308,6 +4465,222 @@ test.describe("sidebar PR tab", () => {
 
     // PR detail component should show PR title
     await expect(page.locator(".right-sidebar .detail-title")).toContainText("Add browser regression coverage");
+  });
+
+  test("stack links change the workspace sidebar PR without leaving the workspace", async ({ page }) => {
+    const api = createMockApiHandler();
+    const members = [
+      { number: 42, title: "Add browser regression coverage", position: 1, base_branch: "main" },
+      { number: 55, title: "Refactor theme system", position: 2, base_branch: "feature/coverage" },
+    ].map((member) => ({
+      ...member,
+      state: "open",
+      ci_status: "success",
+      review_decision: "APPROVED",
+      mergeable_state: "clean",
+      is_draft: false,
+      blocked_by: null,
+    }));
+    await page.route(
+      /\/api\/v1\/pulls\/github\/acme\/widgets\/(42|55)(?:\/stack|\/sync(?:\/async)?)?$/,
+      async (route) => {
+        const url = new URL(route.request().url());
+        const number = Number(url.pathname.split("/")[7]);
+        const stack = {
+          stack_id: 1,
+          stack_name: "theme",
+          position: number === 42 ? 1 : 2,
+          size: 2,
+          health: "healthy",
+          members,
+        };
+        if (url.pathname.endsWith("/stack")) {
+          await route.fulfill({ json: stack });
+          return;
+        }
+        const detail = await api
+          .handle({ method: "GET", url: new URL(`/api/v1/pulls/github/acme/widgets/${number}`, url), bodyText: "" })
+          .json();
+        await route.fulfill({ json: { ...detail, stack } });
+      },
+    );
+
+    await page.goto("/workspaces");
+    await page.locator(".workspace-list-sidebar .ws-row .item-bubble").click();
+    await expect(page).toHaveURL(/\/terminal\/ws-123$/);
+    const sidebar = page.locator(".right-sidebar");
+    await sidebar.getByTestId("stack-chip").click();
+    await sidebar.getByRole("button", { name: "#55 Refactor theme system" }).click();
+
+    await expect(page).toHaveURL(/\/terminal\/ws-123$/);
+    await expect(sidebar.locator(".detail-title")).toHaveText("Refactor theme system");
+    await expect(sidebar.locator(".stack-row--current")).toContainText("#55 Refactor theme system");
+    await page.screenshot({ path: test.info().outputPath("workspace-stack-navigation.png") });
+    await sidebar.getByRole("button", { name: "#42 Add browser regression coverage" }).click();
+    await expect(sidebar.locator(".detail-title")).toHaveText("Add browser regression coverage");
+    await sidebar.getByRole("button", { name: "#55 Refactor theme system" }).click();
+
+    await page.reload();
+    await page.locator(".panel-toggle-btn", { hasText: "PR" }).click();
+    await expect(sidebar.locator(".detail-title")).toHaveText("Refactor theme system");
+    await expect(page).toHaveURL(/\/terminal\/ws-123$/);
+  });
+
+  test("searches PRs by title and zero-padded number and remembers the viewed PR after reload", async ({ page }) => {
+    const searches: URL[] = [];
+    const api = createMockApiHandler();
+    await page.route("**/api/v1/pulls?**", async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.has("limit") && url.searchParams.get("limit") !== "30") return route.fallback();
+      searches.push(url);
+      expect(url.searchParams.has("repo")).toBe(false);
+      const response = api.handle({ method: "GET", url, bodyText: "" });
+      const pulls = await response.json();
+      await route.fulfill({
+        json: pulls
+          .filter((pull: { Number: number }) => pull.Number === 55 && url.searchParams.get("state") === "all")
+          .map((pull: object) => ({
+            ...pull,
+            State: "merged",
+            MergedAt: null,
+          })),
+      });
+    });
+    await page.goto("/terminal/ws-123");
+    await page.locator(".panel-toggle-btn", { hasText: "PR" }).click();
+    const sidebar = page.locator(".right-sidebar");
+    const searchButton = page.getByRole("button", { name: "Search PRs and issues", exact: true });
+    await expect(searchButton).toBeVisible();
+    await expect(sidebar.locator(".detail-title")).toHaveText("Add browser regression coverage");
+    await page.screenshot({ path: test.info().outputPath("workspace-pr-search-button.png") });
+    await searchButton.click();
+    const search = page.getByRole("combobox", { name: "Search PRs and issues", exact: true });
+    await expect(search).toBeFocused();
+    await search.fill("theme");
+    await expect(page.getByRole("option", { name: /#55.*Refactor theme system/ })).toHaveCount(0);
+    await page.getByRole("checkbox", { name: "Include closed" }).check();
+    await expect(page.getByRole("option", { name: /#55.*Refactor theme system.*Merged/ })).toBeVisible();
+    await expect.poll(() => searches.some((url) => url.searchParams.get("q") === "theme")).toBe(true);
+    await search.fill("#0055");
+    await expect.poll(() => searches.some((url) => url.searchParams.get("q") === "#0055")).toBe(true);
+    await expect(page.getByRole("option", { name: /#55.*Refactor theme system/ })).toBeVisible();
+    await page.screenshot({ path: test.info().outputPath("workspace-pr-picker.png") });
+    await search.press("ArrowDown");
+    await search.press("ArrowUp");
+    await search.press("Enter");
+    await expect(sidebar.locator(".detail-title")).toHaveText("Refactor theme system");
+    await expect(search).toBeHidden();
+    await expect(searchButton).toBeFocused();
+    await searchButton.click();
+    await search.press("Escape");
+    await expect(search).toBeHidden();
+    await expect(searchButton).toBeFocused();
+
+    await page.reload();
+    await page.locator(".panel-toggle-btn", { hasText: "PR" }).click();
+    await expect(sidebar.locator(".detail-title")).toHaveText("Refactor theme system");
+    await page.getByRole("button", { name: "Refresh workspace details" }).click();
+    await expect(sidebar.locator(".detail-title")).toHaveText("Refactor theme system");
+    await searchButton.click();
+    await page.getByRole("checkbox", { name: "Include closed" }).check();
+    await search.fill("#0055");
+    await expect(page.getByRole("option", { name: /#55.*Refactor theme system/ })).toBeVisible();
+    await search.press("Enter");
+    await expect(search).toBeHidden();
+    await expect(sidebar.locator(".detail-title")).toHaveText("Refactor theme system");
+    await searchButton.click();
+    await page.getByRole("option", { name: "Use linked PR", exact: true }).click();
+    await expect(sidebar.locator(".detail-title")).toHaveText("Add browser regression coverage");
+  });
+
+  test("searches open PRs and issues across repositories and remembers each selection", async ({ page }) => {
+    const api = createMockApiHandler();
+    const pullDetail = await api
+      .handle({ method: "GET", url: new URL("http://localhost/api/v1/pulls/github/acme/widgets/55"), bodyText: "" })
+      .json();
+    const issueDetail = await api
+      .handle({ method: "GET", url: new URL("http://localhost/api/v1/issues/github/acme/widgets/7"), bodyText: "" })
+      .json();
+    const repo = {
+      ...pullDetail.repo,
+      ...workspaceRepoRef("other", "gadgets", "example.com"),
+      platform_repo_id: 1900,
+    };
+    const identity = { repo, repo_owner: "other", repo_name: "gadgets", platform_host: "example.com" };
+    const foreignPR = {
+      ...pullDetail.merge_request,
+      ...identity,
+      Number: 55,
+      Title: "Cross-repository PR",
+      URL: "https://example.com/other/gadgets/pull/55",
+    };
+    const foreignIssue = {
+      ...issueDetail.issue,
+      ...identity,
+      Number: 55,
+      Title: "Cross-repository issue",
+      URL: "https://example.com/other/gadgets/issues/55",
+    };
+    const searches: URL[] = [];
+    await page.route(/\/api\/v1\/(pulls|issues)\?/, async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.has("limit")) return route.fallback();
+      searches.push(url);
+      expect(url.searchParams.has("repo")).toBe(false);
+      expect(url.searchParams.get("state")).toBe("open");
+      await route.fulfill({
+        json: url.pathname.endsWith("/pulls") ? [pullDetail.merge_request, foreignPR] : [foreignIssue],
+      });
+    });
+    await page.route(
+      /\/api\/v1\/host\/example\.com\/(pulls|issues)\/github\/other\/gadgets\/55(?:\/sync(?:\/async)?)?$/,
+      async (route) => {
+        const isPR = new URL(route.request().url()).pathname.includes("/pulls/");
+        await route.fulfill({
+          json: isPR
+            ? { ...pullDetail, ...identity, merge_request: foreignPR }
+            : { ...issueDetail, ...identity, issue: foreignIssue },
+        });
+      },
+    );
+    await page.goto("/terminal/ws-123");
+    const searchButton = page.getByRole("button", { name: "Search PRs and issues", exact: true });
+    const sidebar = page.locator(".right-sidebar");
+    await expect(searchButton).toBeVisible();
+    const initialRequests = searches.length;
+    expect(initialRequests).toBeGreaterThan(0);
+    await searchButton.click();
+    const search = page.getByRole("combobox", { name: "Search PRs and issues", exact: true });
+    await search.fill("#55");
+    const externalPR = page.getByRole("option", { name: /#55.*Cross-repository PR/ });
+    const externalIssue = page.getByRole("option", { name: /#55.*Cross-repository issue/ });
+    await expect(externalPR).toContainText("other/gadgets");
+    await expect(externalIssue).toContainText("other/gadgets");
+    await expect(page.getByRole("option", { name: /#55.*Refactor theme system/ })).toBeVisible();
+    expect(searches).toHaveLength(initialRequests);
+    expect(searches.every((url) => !url.searchParams.has("q"))).toBe(true);
+    await page.screenshot({ path: test.info().outputPath("workspace-item-search.png") });
+    await externalPR.click();
+    await expect(sidebar.locator(".detail-title")).toHaveText("Cross-repository PR");
+
+    await searchButton.click();
+    await externalIssue.click();
+    const issueTab = page.getByRole("button", { name: "Issue", exact: true });
+    await expect(issueTab).toHaveClass(/active/);
+    await expect(sidebar.locator(".detail-title")).toHaveText("Cross-repository issue");
+    await page.screenshot({ path: test.info().outputPath("workspace-selected-issue.png") });
+    await page.reload();
+    await issueTab.click();
+    await expect(sidebar.locator(".detail-title")).toHaveText("Cross-repository issue");
+    await page.getByRole("button", { name: "PR", exact: true }).click();
+    await expect(sidebar.locator(".detail-title")).toHaveText("Cross-repository PR");
+    await searchButton.click();
+    await page.getByRole("option", { name: "Clear issue selection", exact: true }).click();
+    await expect(issueTab).toHaveCount(0);
+    await expect(sidebar.locator(".detail-title")).toHaveText("Cross-repository PR");
+    await searchButton.click();
+    await page.getByRole("option", { name: "Use linked PR", exact: true }).click();
+    await expect(sidebar.locator(".detail-title")).toHaveText("Add browser regression coverage");
   });
 
   for (const item of [
@@ -4378,19 +4751,48 @@ test.describe("sidebar PR tab", () => {
     });
   }
 
-  test("workspace without associated PR hides malformed PR tab", async ({ page }) => {
-    const noLinkedPR = {
-      ...testIssueWorkspace,
-      associated_pr_number: null,
-    };
-    await setupTerminalMocks(page, {
-      workspace: noLinkedPR,
+  for (const itemType of ["issue", "adhoc"] as const) {
+    test(`${itemType} workspace gains a PR tab only after choosing a PR`, async ({ page }) => {
+      const noLinkedPR = {
+        ...testIssueWorkspace,
+        item_type: itemType,
+        item_number: itemType === "issue" ? 7 : 0,
+        associated_pr_number: null,
+      };
+      await setupTerminalMocks(page, { workspace: noLinkedPR });
+      await page.goto("/terminal/ws-issue-7");
+
+      const prTab = page.getByRole("button", { name: "PR", exact: true });
+      const searchButton = page.getByRole("button", { name: "Search PRs and issues", exact: true });
+      const originalTab = page.getByRole("button", { name: itemType === "issue" ? "Issue" : "Diff", exact: true });
+      await expect(prTab).toHaveCount(0);
+      await originalTab.click();
+      if (itemType === "adhoc")
+        await page.screenshot({ path: test.info().outputPath("workspace-pr-no-selection.png") });
+      await searchButton.click();
+      await expect(originalTab).toHaveClass(/active/);
+      await expect(prTab).toHaveCount(0);
+      await page.getByRole("combobox", { name: "Search PRs and issues", exact: true }).press("Escape");
+      await expect(prTab).toHaveCount(0);
+      await expect(originalTab).toHaveClass(/active/);
+
+      await searchButton.click();
+      await page.getByRole("option", { name: /#55.*Refactor theme system/ }).click();
+      await expect(prTab).toHaveClass(/active/);
+      const sidebar = page.locator(".right-sidebar");
+      await expect(sidebar.locator(".detail-title")).toHaveText("Refactor theme system");
+      if (itemType === "adhoc") await page.screenshot({ path: test.info().outputPath("workspace-pr-selected.png") });
+      await page.reload();
+      await prTab.click();
+      await expect(sidebar.locator(".detail-title")).toHaveText("Refactor theme system");
+      await page.getByRole("button", { name: "Diff", exact: true }).click();
+      await expect(sidebar.getByRole("button", { name: "Compare with merge target" })).toHaveCount(0);
+      await searchButton.click();
+      await page.getByRole("option", { name: "Clear PR selection", exact: true }).click();
+      await expect(prTab).toHaveCount(0);
+      await expect(searchButton).toBeVisible();
     });
-
-    await page.goto("/terminal/ws-issue-7");
-
-    await expect(page.locator(".panel-toggle-btn", { hasText: "PR" })).toHaveCount(0);
-  });
+  }
 });
 
 // -------------------------------------------------------
@@ -4507,16 +4909,19 @@ test.describe("workspace list bubble opens right sidebar", () => {
         }
         await route.fulfill({ status: 204 });
       });
-      await page.route(`**/api/v1/workspaces/${ws.id}/runtime`, async (route) => {
-        await route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          body: JSON.stringify({
-            launch_targets: [],
-            sessions: [],
-          }),
-        });
-      });
+      await page.route(
+        (url) => url.pathname === `/api/v1/workspaces/${ws.id}/runtime`,
+        async (route) => {
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({
+              launch_targets: [],
+              sessions: [],
+            }),
+          });
+        },
+      );
     }
 
     await page.goto(`/terminal/${wsA.id}`);
@@ -4669,16 +5074,19 @@ test.describe("workspace list bubble opens right sidebar", () => {
         }
         await route.fulfill({ status: 204 });
       });
-      await page.route(`**/api/v1/workspaces/${ws.id}/runtime`, async (route) => {
-        await route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          body: JSON.stringify({
-            launch_targets: [],
-            sessions: [],
-          }),
-        });
-      });
+      await page.route(
+        (url) => url.pathname === `/api/v1/workspaces/${ws.id}/runtime`,
+        async (route) => {
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({
+              launch_targets: [],
+              sessions: [],
+            }),
+          });
+        },
+      );
     }
 
     await page.goto("/workspaces");
@@ -4929,6 +5337,7 @@ test.describe("workspace list sorting", () => {
     id: "ws-new",
     item_number: 3,
     mr_title: "Newest created",
+    item_author: "alice",
     created_at: "2026-05-12T12:00:00Z",
     tmux_last_output_at: "2026-05-12T13:00:00Z",
   };
@@ -4940,6 +5349,7 @@ test.describe("workspace list sorting", () => {
     repo: workspaceRepoRef("kenn-io", "agentsview"),
     item_number: 2,
     mr_title: "Most recently active",
+    item_author: "bob",
     created_at: "2026-05-11T12:00:00Z",
     tmux_last_output_at: "2026-05-14T09:00:00Z",
   };
@@ -4973,6 +5383,45 @@ test.describe("workspace list sorting", () => {
     });
   });
 
+  test("filters workspaces by author and clears back to anyone", async ({ page }) => {
+    await page.goto("/workspaces");
+    const names = page.locator(".workspace-list-sidebar .ws-name");
+    await expect(names).toHaveCount(3);
+    await page.getByTitle("Filter workspaces", { exact: true }).click();
+    await page.getByRole("button", { name: "Filter authors: Anyone" }).click();
+    await page.getByRole("option", { name: "alice", exact: true }).click();
+    await expect(names).toHaveText(["Newest created"]);
+    await expect(page.getByRole("button", { name: "Filters · alice" })).toBeVisible();
+    await page.getByRole("button", { name: "Filters · alice" }).click();
+    await page.getByRole("button", { name: "Filter authors: alice" }).click();
+    await page.getByRole("option", { name: "bob", exact: true }).click();
+    await expect(names).toHaveText(["Most recently active"]);
+    await page.getByRole("button", { name: "Filters · bob" }).click();
+    await page.getByRole("button", { name: "Reset filters" }).click();
+    await expect(names).toHaveCount(3);
+  });
+
+  test("shift-click selects a row range instead of text and offers bulk deletion", async ({ page }) => {
+    await page.goto("/workspaces");
+    const sidebar = page.locator(".workspace-list-sidebar");
+    const rows = sidebar.locator(".ws-row");
+    await expect(rows).toHaveCount(3);
+
+    await rows.filter({ hasText: "Newest created" }).click({ modifiers: ["Shift"] });
+    await rows.filter({ hasText: "Most recently active" }).click({ modifiers: ["Shift"] });
+
+    await expect(sidebar.locator(".ws-row.multi-selected .ws-name")).toHaveText([
+      "Newest created",
+      "Oldest without activity",
+      "Most recently active",
+    ]);
+    expect(await page.evaluate(() => window.getSelection()?.toString() ?? "")).toBe("");
+    await expect(page).toHaveURL(/\/workspaces$/);
+
+    await rows.filter({ hasText: "Oldest without activity" }).click({ button: "right" });
+    await expect(page.getByRole("menuitem", { name: "Delete 3 workspaces..." })).toBeVisible();
+  });
+
   test("offers creation and activity sorts and persists the choice across reloads", async ({ page }) => {
     await page.goto("/workspaces");
 
@@ -4981,9 +5430,9 @@ test.describe("workspace list sorting", () => {
     await expect(names).toHaveText(["Newest created", "Oldest without activity", "Most recently active"]);
     await expect(headers).toHaveCount(2);
 
-    const sortTrigger = page.getByTitle("View workspace options");
+    const sortTrigger = page.getByTitle("Filter workspaces");
     await sortTrigger.click();
-    await page.locator(".kit-filter-dropdown__panel").getByRole("button", { name: "Created" }).click();
+    await page.getByLabel("Workspace filters", { exact: true }).getByRole("radio", { name: "Created" }).click();
 
     await expect(names).toHaveText(["Newest created", "Most recently active", "Oldest without activity"]);
     await expect(headers).toHaveCount(0);
@@ -4991,7 +5440,10 @@ test.describe("workspace list sorting", () => {
     await expect(page.locator(".workspace-list-sidebar .repo-context").first()).toContainText("acme/widgets");
 
     await sortTrigger.click();
-    await page.locator(".kit-filter-dropdown__panel").getByRole("button", { name: "Activity", exact: true }).click();
+    await page
+      .getByLabel("Workspace filters", { exact: true })
+      .getByRole("radio", { name: "Activity", exact: true })
+      .click();
 
     // ws-old has no tmux output and falls back to creation time.
     await expect(names).toHaveText(["Most recently active", "Newest created", "Oldest without activity"]);
@@ -5002,10 +5454,54 @@ test.describe("workspace list sorting", () => {
     await expect(headers).toHaveCount(0);
 
     await sortTrigger.click();
-    await page.locator(".kit-filter-dropdown__panel").getByRole("button", { name: "Org / repo" }).click();
+    await page.getByLabel("Workspace filters", { exact: true }).getByRole("radio", { name: "Org / repo" }).click();
 
     await expect(headers).toHaveCount(2);
     await expect(names).toHaveText(["Newest created", "Oldest without activity", "Most recently active"]);
+  });
+
+  test("pins workspaces from different projects above the list and remembers unpinning", async ({ page }, testInfo) => {
+    await page.route("**/api/v1/snapshot**", async (route) => {
+      await route.fulfill({
+        json: {
+          workspaces: [
+            wsNew,
+            {
+              ...wsMid,
+              repo_owner: "acme",
+              repo_name: "web",
+              repo: workspaceRepoRef("acme", "web"),
+            },
+            wsOld,
+          ],
+        },
+      });
+    });
+    await page.goto("/workspaces");
+    const sidebar = page.locator(".workspace-list-sidebar");
+    const names = sidebar.locator(".ws-name");
+    await sidebar.locator(".ws-row").filter({ hasText: "Most recently active" }).click({ button: "right" });
+    await page.getByRole("menuitem", { name: "Pin workspace", exact: true }).click();
+    await sidebar.locator(".ws-row").filter({ hasText: "Oldest without activity" }).click({ button: "right" });
+    await page.getByRole("menuitem", { name: "Pin workspace", exact: true }).click();
+
+    await expect(names).toHaveText(["Most recently active", "Oldest without activity", "Newest created"]);
+    const pinned = sidebar
+      .locator(".sidebar-list-group")
+      .filter({ has: page.getByRole("button", { name: "Pinned 2" }) });
+    await expect(pinned.locator(".repo-context-name")).toHaveText(["acme/web", "acme/widgets"]);
+    await expect(pinned).toBeInViewport();
+    await sidebar.screenshot({ path: testInfo.outputPath("pinned-workspaces.png") });
+
+    await page.reload();
+    await expect(names).toHaveText(["Most recently active", "Oldest without activity", "Newest created"]);
+    await sidebar.locator(".ws-row").filter({ hasText: "Most recently active" }).click({ button: "right" });
+    await page.getByRole("menuitem", { name: "Unpin workspace", exact: true }).click();
+    await sidebar.locator(".ws-row").filter({ hasText: "Oldest without activity" }).click({ button: "right" });
+    await page.getByRole("menuitem", { name: "Unpin workspace", exact: true }).click();
+    await page.reload();
+    await expect(names).toHaveText(["Newest created", "Oldest without activity", "Most recently active"]);
+    await expect(sidebar.getByRole("button", { name: /^Pinned/ })).toHaveCount(0);
   });
 
   test("toggles visibility options and persists provider-aware labels", async ({ page }) => {
@@ -5060,9 +5556,9 @@ test.describe("workspace list sorting", () => {
     ]);
     await expect(page.locator(".workspace-list-sidebar .workspace-diff-stats")).toHaveCount(3);
 
-    const viewTrigger = page.getByTitle("View workspace options");
+    const viewTrigger = page.getByTitle("Filter workspaces");
     await viewTrigger.click();
-    await page.locator(".kit-filter-dropdown__panel").getByRole("button", { name: "Hide org name" }).click();
+    await page.getByLabel("Workspace filters", { exact: true }).getByRole("button", { name: "Hide org name" }).click();
 
     await expect(groupLabels).toHaveText([
       "github/github.com/acme/widgets",
@@ -5070,7 +5566,10 @@ test.describe("workspace list sorting", () => {
       "kenn-forge",
     ]);
 
-    await page.locator(".kit-filter-dropdown__panel").getByRole("button", { name: "Show PR diff stats" }).click();
+    await page
+      .getByLabel("Workspace filters", { exact: true })
+      .getByRole("button", { name: "Show PR diff stats" })
+      .click();
     await expect(page.locator(".workspace-list-sidebar .workspace-diff-stats")).toHaveCount(0);
 
     await page.reload();
@@ -5083,10 +5582,10 @@ test.describe("workspace list sorting", () => {
     await expect(page.locator(".workspace-list-sidebar .workspace-diff-stats")).toHaveCount(0);
   });
 
-  test("view trigger hugs the collapse toggle and the dropdown opens end-aligned", async ({ page }) => {
+  test("filter trigger hugs the collapse toggle and the dropdown opens end-aligned", async ({ page }) => {
     await page.goto("/workspaces");
 
-    const trigger = page.getByTitle("View workspace options");
+    const trigger = page.getByTitle("Filter workspaces");
     const toggle = page.getByRole("button", { name: "Collapse Workspaces sidebar" });
     await expect(trigger).toBeVisible();
     await expect(toggle).toBeVisible();
@@ -5105,12 +5604,12 @@ test.describe("workspace list sorting", () => {
     expect(gap).toBeLessThanOrEqual(12);
 
     await trigger.click();
-    const dropdown = page.locator(".kit-filter-dropdown__panel");
+    const dropdown = page.getByLabel("Workspace filters", { exact: true });
     await expect(dropdown).toBeVisible();
     const dropdownBox = await dropdown.boundingBox();
     expect(dropdownBox).not.toBeNull();
 
-    // The wider View menu is end-aligned so it stays inside the
+    // The filter menu is end-aligned so it stays inside the
     // rail while the trigger remains beside the collapse toggle.
     expect(Math.abs(dropdownBox!.x + dropdownBox!.width - (triggerBox!.x + triggerBox!.width))).toBeLessThanOrEqual(
       1.5,
@@ -5183,16 +5682,19 @@ test.describe("delayed-response navigation", () => {
       }
       await route.fulfill({ status: 204 });
     });
-    await page.route(`**/api/v1/workspaces/${wsA.id}/runtime`, async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          launch_targets: [],
-          sessions: [],
-        }),
-      });
-    });
+    await page.route(
+      (url) => url.pathname === `/api/v1/workspaces/${wsA.id}/runtime`,
+      async (route) => {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            launch_targets: [],
+            sessions: [],
+          }),
+        });
+      },
+    );
 
     // wsB — delayed. Resolved manually below so the test can
     // observe the in-place transition.
@@ -5212,17 +5714,20 @@ test.describe("delayed-response navigation", () => {
       }
       await route.fulfill({ status: 204 });
     });
-    await page.route(`**/api/v1/workspaces/${wsB.id}/runtime`, async (route) => {
-      await bDelay;
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          launch_targets: [],
-          sessions: [],
-        }),
-      });
-    });
+    await page.route(
+      (url) => url.pathname === `/api/v1/workspaces/${wsB.id}/runtime`,
+      async (route) => {
+        await bDelay;
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            launch_targets: [],
+            sessions: [],
+          }),
+        });
+      },
+    );
 
     await page.goto(`/terminal/${wsA.id}`);
 
@@ -5308,16 +5813,19 @@ test.describe("delayed-response navigation", () => {
         }
         await route.fulfill({ status: 204 });
       });
-      await page.route(`**/api/v1/workspaces/${ws.id}/runtime`, async (route) => {
-        await route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          body: JSON.stringify({
-            ...workspaceRuntime,
-            sessions: [shellSession(ws.id)],
-          }),
-        });
-      });
+      await page.route(
+        (url) => url.pathname === `/api/v1/workspaces/${ws.id}/runtime`,
+        async (route) => {
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({
+              ...workspaceRuntime,
+              sessions: [shellSession(ws.id)],
+            }),
+          });
+        },
+      );
     }
 
     await page.goto(`/terminal/${wsA.id}`);
@@ -5398,16 +5906,19 @@ test.describe("delayed-response navigation", () => {
       }
       await route.fulfill({ status: 204 });
     });
-    await page.route(`**/api/v1/workspaces/${wsA.id}/runtime`, async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          ...workspaceRuntime,
-          sessions: [sessionA],
-        }),
-      });
-    });
+    await page.route(
+      (url) => url.pathname === `/api/v1/workspaces/${wsA.id}/runtime`,
+      async (route) => {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            ...workspaceRuntime,
+            sessions: [sessionA],
+          }),
+        });
+      },
+    );
     // wsB: workspace GET is fast, runtime GET is held.
     await page.route(`**/api/v1/workspaces/${wsB.id}`, async (route) => {
       if (route.request().method() === "GET") {
@@ -5424,14 +5935,17 @@ test.describe("delayed-response navigation", () => {
     const bRuntimeDelay = new Promise<void>((resolve) => {
       releaseBRuntime = resolve;
     });
-    await page.route(`**/api/v1/workspaces/${wsB.id}/runtime`, async (route) => {
-      await bRuntimeDelay;
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify(workspaceRuntime),
-      });
-    });
+    await page.route(
+      (url) => url.pathname === `/api/v1/workspaces/${wsB.id}/runtime`,
+      async (route) => {
+        await bRuntimeDelay;
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify(workspaceRuntime),
+        });
+      },
+    );
 
     await page.goto(`/terminal/${wsA.id}`);
     // A's session tab should be visible.
@@ -5510,13 +6024,16 @@ test.describe("delayed-response navigation", () => {
         }
         await route.fulfill({ status: 204 });
       });
-      await page.route(`**/api/v1/workspaces/${ws.id}/runtime`, async (route) => {
-        await route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          body: JSON.stringify({ launch_targets: [], sessions: [] }),
-        });
-      });
+      await page.route(
+        (url) => url.pathname === `/api/v1/workspaces/${ws.id}/runtime`,
+        async (route) => {
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({ launch_targets: [], sessions: [] }),
+          });
+        },
+      );
     }
     // A's retry never resolves so retryingSetup stays true across the
     // navigation to B.
@@ -5639,13 +6156,16 @@ test.describe("delayed-response navigation", () => {
       }
       await route.fulfill({ status: 204 });
     });
-    await page.route(`**/api/v1/workspaces/${localWorkspace.id}/runtime`, async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({ launch_targets: [], sessions: [] }),
-      });
-    });
+    await page.route(
+      (url) => url.pathname === `/api/v1/workspaces/${localWorkspace.id}/runtime`,
+      async (route) => {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ launch_targets: [], sessions: [] }),
+        });
+      },
+    );
     for (const suffix of ["files", "diff"]) {
       await page.route(`**/api/v1/workspaces/${localWorkspace.id}/${suffix}*`, async (route) => {
         await route.fulfill({
@@ -5673,14 +6193,17 @@ test.describe("delayed-response navigation", () => {
         });
       },
     );
-    await page.route(`**/api/v1/fleet/hosts/member/workspaces/${memberWorkspace.id}/runtime`, async (route) => {
-      await bDelay;
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({ launch_targets: [], sessions: [] }),
-      });
-    });
+    await page.route(
+      (url) => url.pathname === `/api/v1/fleet/hosts/member/workspaces/${memberWorkspace.id}/runtime`,
+      async (route) => {
+        await bDelay;
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ launch_targets: [], sessions: [] }),
+        });
+      },
+    );
 
     await page.goto(`/terminal/${localWorkspace.id}`);
     await expect(page.locator(".terminal-main .header-name")).toContainText("Local A");
@@ -5731,7 +6254,7 @@ test.describe("issue workspace sidebar", () => {
     });
   });
 
-  test("issue workspaces show an Issue toggle instead of PR and Reviews when no PR is linked", async ({ page }) => {
+  test("issue workspaces offer PR search without an empty PR tab", async ({ page }) => {
     await setupTerminalMocks(page, {
       workspace: testIssueWorkspace,
     });
@@ -5739,6 +6262,7 @@ test.describe("issue workspace sidebar", () => {
 
     await expect(page.locator(".panel-toggle-btn", { hasText: "Issue" })).toBeVisible();
     await expect(page.locator(".panel-toggle-btn", { hasText: "PR" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Search PRs and issues" })).toBeVisible();
     await expect(page.locator(".panel-toggle-btn", { hasText: "Reviews" })).toHaveCount(0);
   });
 
@@ -5760,6 +6284,7 @@ test.describe("issue workspace sidebar", () => {
 
     await expect(page.locator(".panel-toggle-btn", { hasText: "Issue" })).toBeVisible();
     await expect(page.locator(".panel-toggle-btn", { hasText: "PR" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Search PRs and issues" })).toBeVisible();
 
     const refreshButton = page.getByRole("button", { name: "Refresh workspace details" });
     await expect(refreshButton).toHaveAttribute("aria-label", "Refresh workspace details");
@@ -5809,6 +6334,7 @@ test.describe("issue workspace sidebar", () => {
       },
       events: [],
       platform_host: "example.com",
+      repo: workspaceRepoRef("acme", "widgets", "example.com"),
       repo_owner: "acme",
       repo_name: "widgets",
       detail_loaded: true,
@@ -5870,7 +6396,7 @@ test.describe("issue workspace sidebar", () => {
     ).toHaveCount(0);
   });
 
-  test("issue workspace gains PR tab after workspace_status refetch and keeps manual PR selection", async ({
+  test("issue workspace gains a linked PR after workspace_status refetch and keeps the selected tab", async ({
     page,
   }) => {
     let currentWorkspace: WorkspaceFixture = {
@@ -5992,6 +6518,46 @@ test.describe("sidebar Reviews tab", () => {
     });
   });
 
+  test("loads local reviews on display and explicit refresh, then stops when hidden", async ({ page }) => {
+    await setupTerminalMocks(page);
+    const reviewRequests: string[] = [];
+    page.on("request", (request) => {
+      const path = new URL(request.url()).pathname;
+      if (path.startsWith("/api/roborev/") || path === "/api/v1/roborev/status") {
+        reviewRequests.push(path);
+      }
+    });
+    await page.clock.install();
+    await page.goto("/terminal/ws-123");
+    const reviewsTab = page.locator(".panel-toggle-btn", { hasText: "Reviews" });
+    await expect(reviewsTab).toBeVisible();
+    expect(reviewRequests).toEqual([]);
+
+    await reviewsTab.click();
+    await expect(page.locator(".right-sidebar .job-row")).toBeVisible();
+    const refresh = page.getByRole("button", { name: "Refresh local reviews" });
+    await expect(refresh).toBeEnabled();
+    const requestsWhileOpen = reviewRequests.length;
+    await page.clock.fastForward("01:00");
+    expect(reviewRequests).toHaveLength(requestsWhileOpen);
+    const jobsBeforeRefresh = reviewRequests.filter((path) => path.endsWith("/api/jobs")).length;
+    await refresh.click();
+    await expect
+      .poll(() => reviewRequests.filter((path) => path.endsWith("/api/jobs")).length)
+      .toBeGreaterThan(jobsBeforeRefresh);
+    await expect(refresh).toBeEnabled();
+
+    await reviewsTab.click();
+    await expect(page.locator(".right-sidebar")).toBeHidden();
+    const requestsWhileClosed = reviewRequests.length;
+    await page.clock.fastForward("01:00");
+    expect(reviewRequests).toHaveLength(requestsWhileClosed);
+
+    await reviewsTab.click();
+    await expect(page.locator(".right-sidebar .job-row")).toBeVisible();
+    expect(reviewRequests.length).toBeGreaterThan(requestsWhileClosed);
+  });
+
   test("Reviews tab preserves a daemon version that already starts with v", async ({ page }) => {
     await setupTerminalMocks(page, {
       roborevStatus: {
@@ -6007,8 +6573,78 @@ test.describe("sidebar Reviews tab", () => {
     await expect(page.locator('.right-sidebar .daemon-status [title="Daemon version"]')).toHaveText("v0.52.0");
   });
 
-  test("Reviews tab shows job list when roborev repo matches", async ({ page }) => {
+  test("closing a local review refreshes the visible filtered job list", async ({ page }) => {
     await setupTerminalMocks(page);
+    let closed = false;
+    await page.route("**/api/roborev/api/review/close", async (route) => {
+      closed = true;
+      await route.fulfill({ json: { success: true } });
+    });
+    await page.route(
+      (url) => url.pathname === "/api/roborev/api/review",
+      (route) => route.fulfill({ json: { ...roborevReview, closed } }),
+    );
+    await page.route(
+      (url) => url.pathname === "/api/roborev/api/jobs",
+      (route) => {
+        const url = new URL(route.request().url());
+        const jobs = closed && url.searchParams.get("closed") === "false" ? [] : roborevJobs.jobs;
+        return route.fulfill({ json: { ...roborevJobs, jobs } });
+      },
+    );
+    await page.goto("/terminal/ws-123");
+    await page.locator(".panel-toggle-btn", { hasText: "Reviews" }).click();
+    await page.getByRole("checkbox", { name: "Hide closed" }).check();
+    await page.locator(".right-sidebar .job-row").click();
+    await page.getByRole("button", { name: "Close Review", exact: true }).click();
+    await expect(page.getByRole("button", { name: "Reopen", exact: true })).toBeVisible();
+    await expect(page.locator(".right-sidebar .job-row")).toHaveCount(0);
+  });
+
+  test("local review comments remain accepted and show a warning when refresh fails", async ({ page }) => {
+    await setupTerminalMocks(page);
+    const comment = "Review comment with an unavailable refresh";
+    let acceptedComments = 0;
+    await page.route("**/api/roborev/api/comment", async (route) => {
+      acceptedComments += 1;
+      await route.fulfill({
+        status: 201,
+        json: {
+          id: 2,
+          job_id: 1,
+          responder: "web",
+          response: route.request().postDataJSON().comment,
+          created_at: "2026-04-10T12:01:00Z",
+        },
+      });
+    });
+    await page.route("**/api/roborev/api/comments?**", (route) =>
+      acceptedComments > 0 ? route.abort("failed") : route.fulfill({ json: { responses: [] } }),
+    );
+    await page.goto("/terminal/ws-123");
+    await page.locator(".panel-toggle-btn", { hasText: "Reviews" }).click();
+    await page.locator(".right-sidebar .job-row").click();
+    const textarea = page.locator(".comment-input .comment-textarea");
+    await textarea.fill(comment);
+    await page.locator(".submit-btn").click();
+
+    await expect(page.locator(".response-item", { hasText: comment })).toHaveCount(1);
+    await expect(textarea).toHaveValue("");
+    await expect(page.locator(".kit-flash-banner")).toContainText(
+      "Comment was added, but the refreshed review is unavailable",
+    );
+    expect(acceptedComments).toBe(1);
+  });
+
+  test("Reviews tab resolves the workspace path before showing local jobs", async ({ page }) => {
+    await setupTerminalMocks(page);
+    const resolvedPaths: string[] = [];
+    const jobRepositories: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (url.pathname.endsWith("/api/repos/resolve")) resolvedPaths.push(url.searchParams.get("path") ?? "");
+      if (url.pathname === "/api/roborev/api/jobs") jobRepositories.push(url.searchParams.get("repo") ?? "");
+    });
     await page.goto("/terminal/ws-123");
 
     // Open Reviews tab
@@ -6020,6 +6656,25 @@ test.describe("sidebar Reviews tab", () => {
     await expect(page.locator(".right-sidebar .job-row")).toContainText("Add auth middleware");
     await expect(page.locator(".right-sidebar .job-table thead")).toContainText("Cost");
     await expect(page.locator(".right-sidebar .job-row")).toContainText("~$0.42");
+    expect(resolvedPaths).toContain(testWorkspace.worktree_path);
+    expect(jobRepositories).toContain(roborevRepos.repos[0]!.root_path);
+  });
+
+  test("local reviews do not guess a repository from a matching name", async ({ page }) => {
+    await setupTerminalMocks(page, {
+      roborevRepos: { repos: [{ name: "widgets", root_path: "/tmp/other/widgets", count: 1 }], total_count: 1 },
+      roborevResolution: { tracked: false },
+    });
+    const jobRequests: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (url.pathname === "/api/roborev/api/jobs") jobRequests.push(request.url());
+    });
+    await page.goto("/terminal/ws-123");
+    await page.locator(".panel-toggle-btn", { hasText: "Reviews" }).click();
+
+    await expect(page.locator(".right-sidebar .kit-empty-state")).toContainText("No reviews for this worktree");
+    expect(jobRequests).toEqual([]);
   });
 
   test("Reviews tab shows empty state when no repo matches", async ({ page }) => {
@@ -6034,6 +6689,25 @@ test.describe("sidebar Reviews tab", () => {
 
     // Should show empty/no-reviews message
     await expect(page.locator(".right-sidebar .kit-empty-state")).toContainText("No reviews");
+  });
+
+  test("local reviews allow choosing a repository when the workspace is untracked", async ({ page }) => {
+    await setupTerminalMocks(page, {
+      roborevRepos: {
+        repos: [
+          { name: "widgets", root_path: "/tmp/clone-a/acme/widgets", count: 1 },
+          { name: "widgets", root_path: "/tmp/clone-b/acme/widgets", count: 1 },
+        ],
+        total_count: 2,
+      },
+      roborevResolution: { tracked: false },
+    });
+    await page.goto("/terminal/ws-123");
+    await page.locator(".panel-toggle-btn", { hasText: "Reviews" }).click();
+    await expect(page.locator(".right-sidebar .kit-empty-state")).toContainText("No reviews for this worktree");
+    await page.locator('.right-sidebar .picker-button[title="Filter by repository"]').click();
+    await page.locator(".right-sidebar .dropdown-item.repo-item").first().click();
+    await expect(page.locator(".right-sidebar .job-row")).toBeVisible();
   });
 
   test("branch picker shows and clears branch filter", async ({ page }) => {

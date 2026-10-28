@@ -1,20 +1,11 @@
 <script lang="ts">
+  import { preventShiftTextSelection } from "../../utils/range-selection.svelte.js";
   import type { PullRequest } from "../../api/types.js";
   import { getStores, getHostState } from "../../context.js";
   import { formatRelativeTime } from "@kenn-io/kit-ui";
   import { hashColor } from "@kenn-io/kit-ui";
-  import { parseCIChecks, bucketCIChecks, safeDiagnosticText } from "../../utils/ci-buckets.js";
-  import {
-    warnOnUnknownConclusions,
-    warnOnMalformedCIChecksJSON,
-  } from "../../utils/ci-buckets-warn.js";
-  import CITokenCluster, { composeAriaLabel } from "../shared/CITokenCluster.svelte";
-  import CircleAlertIcon from "@lucide/svelte/icons/circle-alert";
-  import CircleCheckBigIcon from "@lucide/svelte/icons/circle-check-big";
-  import Layers2Icon from "@lucide/svelte/icons/layers-2";
-  import OctagonXIcon from "@lucide/svelte/icons/octagon-x";
   import LabelRow from "../shared/LabelRow.svelte";
-  import WorkspaceIndicator from "../shared/WorkspaceIndicator.svelte";
+  import PullStatusIcons from "../shared/PullStatusIcons.svelte";
   import AgentStatusIndicator from "../shared/AgentStatusIndicator.svelte";
   import SidebarTitlePopover from "./SidebarTitlePopover.svelte";
   import { repoIdentityKey } from "../../utils/repo-label.js";
@@ -28,7 +19,10 @@
     selected: boolean;
     showRepo: boolean;
     repoLabel: string;
-    onclick: () => void;
+    /** Part of a shift/Cmd-click multi-row selection. */
+    multiSelected?: boolean;
+    onclick: (event: MouseEvent) => void;
+    oncontextmenu?: (event: MouseEvent) => void;
   }
 
   const {
@@ -36,7 +30,9 @@
     selected,
     showRepo,
     repoLabel,
+    multiSelected = false,
     onclick,
+    oncontextmenu,
   }: Props = $props();
 
   function handleStarClick(e: MouseEvent): void {
@@ -99,50 +95,18 @@
     name: pr.repo.name,
     repoPath: pr.repo.repo_path,
   }));
-  const reviewDecision = $derived(pr.ReviewDecision.trim().toUpperCase());
-  const reviewIndicator = $derived.by(
-    ():
-      | { kind: "approved"; label: string }
-      | { kind: "changes-requested"; label: string }
-      | null => {
-      if (reviewDecision === "APPROVED") {
-        return { kind: "approved", label: "PR approved" };
-      }
-      if (reviewDecision === "CHANGES_REQUESTED") {
-        return { kind: "changes-requested", label: "Changes requested" };
-      }
-      return null;
-    },
-  );
-
-  const parsed = $derived(parseCIChecks(pr.CIChecksJSON));
-  const bucketed = $derived(bucketCIChecks(parsed.checks));
-
-  $effect(() => {
-    if (parsed.error !== null) {
-      warnOnMalformedCIChecksJSON(pr.CIChecksJSON, parsed.error, {
-        repo: `${pr.repo_owner}/${pr.repo_name}`,
-        number: pr.Number,
-      });
-    }
-  });
-
-  $effect(() => {
-    if (bucketed.unknown.length > 0) {
-      warnOnUnknownConclusions(bucketed.unknown, {
-        repo: `${pr.repo_owner}/${pr.repo_name}`,
-        number: pr.Number,
-      });
-    }
-  });
 </script>
 
 <button
   class="pull-item pr-list-row"
   class:selected
   class:active-worktree={isActiveWorktree}
+  class:multi-selected={multiSelected}
+  aria-pressed={multiSelected || undefined}
   bind:this={el}
+  onmousedown={preventShiftTextSelection}
   onclick={onclick}
+  {oncontextmenu}
 >
   <p class="title">
     <span class="state-dot" style="background: {stateColors[prState]}"></span>
@@ -162,60 +126,7 @@
       <span class="meta-text">{pr.Author}</span>
     </span>
     <span class="meta-right">
-      {#if pr.workspace}
-        <WorkspaceIndicator status={pr.workspace.status} />
-      {/if}
-      {#if reviewIndicator}
-        <span
-          class={["review-indicator", `review-indicator--${reviewIndicator.kind}`]}
-          aria-label={reviewIndicator.label}
-          title={reviewIndicator.label}
-        >
-          {#if reviewIndicator.kind === "approved"}
-            <CircleCheckBigIcon size={13} strokeWidth={2.2} aria-hidden="true" />
-          {:else}
-            <OctagonXIcon size={13} strokeWidth={2.2} aria-hidden="true" />
-          {/if}
-        </span>
-      {/if}
-      {#if pr.stack}
-        <span
-          class="stack-indicator"
-          aria-label={`Stacked: ${pr.stack.position}/${pr.stack.size}`}
-          title={`Stacked: ${pr.stack.position}/${pr.stack.size}`}
-        >
-          <Layers2Icon size={13} strokeWidth={2.2} aria-hidden="true" />
-          <span class="stack-indicator-count" aria-hidden="true">{pr.stack.position}/{pr.stack.size}</span>
-        </span>
-      {/if}
-      {#if parsed.error !== null}
-        <span
-          class="ci ci-unavailable"
-          data-testid="ci-token-unavailable"
-          title={`CI unavailable: ${safeDiagnosticText(parsed.error)}`}
-          aria-hidden="true"
-        >
-          <CircleAlertIcon size={10} strokeWidth={2.5} />
-        </span>
-        <span class="kit-sr-only">CI unavailable: {safeDiagnosticText(parsed.error)}</span>
-      {:else if bucketed.all.length > 0}
-        <span class="ci" aria-hidden="true">
-          <CITokenCluster {bucketed} size="compact" pendingStyle="static" />
-        </span>
-        <span class="kit-sr-only">{composeAriaLabel(bucketed)}</span>
-      {/if}
-      {#if pr.MergeableState === "dirty"}
-        <span class="conflict-icon" title="Has merge conflicts">
-          <!-- git-merge-conflict icon, ISC License, Copyright (c) Lucide Icons and Contributors -->
-          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 6h4a2 2 0 0 1 2 2v7" />
-            <path d="M6 12v9" />
-            <path d="M9 3 3 9" />
-            <path d="M9 9 3 3" />
-            <circle cx="18" cy="18" r="3" />
-          </svg>
-        </span>
-      {/if}
+      <PullStatusIcons {pr} />
       <span
         class="star-btn"
         role="button"
@@ -268,6 +179,11 @@
 
   .pull-item.selected:hover {
     background: var(--sidebar-row-hover-bg, var(--bg-surface-hover));
+  }
+
+  .pull-item.multi-selected,
+  .pull-item.multi-selected:hover {
+    background: color-mix(in srgb, var(--accent-blue) 14%, var(--sidebar-row-bg, var(--bg-surface)));
   }
 
   .pull-item:focus-visible {
@@ -380,59 +296,6 @@
     color: var(--text-muted);
   }
 
-  .review-indicator {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex: 0 0 auto;
-  }
-
-  .review-indicator--approved {
-    color: var(--accent-green);
-  }
-
-  .review-indicator--changes-requested {
-    color: var(--accent-red);
-  }
-
-  .stack-indicator {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-1);
-    flex: 0 0 auto;
-    color: var(--text-muted);
-  }
-
-  .stack-indicator-count {
-    font-size: var(--font-size-2xs);
-    font-weight: 500;
-    font-variant-numeric: tabular-nums;
-    line-height: 1;
-  }
-
-  .ci-unavailable {
-    color: var(--state-warn, var(--accent-amber, #c08a2a));
-    opacity: 0.85;
-  }
-
-  .pull-item .ci {
-    display: inline-flex;
-    align-items: center;
-    flex-shrink: 0;
-    gap: var(--space-2);
-  }
-
-  :global(.mobile-main) .pull-item .ci {
-    gap: var(--space-1);
-  }
-
-  .conflict-icon {
-    display: flex;
-    align-items: center;
-    color: var(--accent-amber);
-    flex-shrink: 0;
-  }
-
   .star-btn {
     display: flex;
     align-items: center;
@@ -469,7 +332,7 @@
   }
 
   :global(.mobile-main) .pull-item {
-    min-height: calc(var(--focus-mobile-hit-target, 37px) * 1.95);
+    min-height: var(--focus-mobile-hit-target, 44px);
     font-size: var(--font-size-md);
     padding: var(--focus-mobile-space-sm, 10px) var(--focus-mobile-space-md, 13px);
     border-bottom: thin solid var(--border-muted);
@@ -502,7 +365,6 @@
 
   :global(.mobile-main) .meta-text,
   :global(.mobile-main) .time,
-  :global(.mobile-main) .stack-indicator-count,
   :global(.mobile-main) .item-number,
   :global(.mobile-main) .repo-name {
     font-size: var(--font-size-sm);

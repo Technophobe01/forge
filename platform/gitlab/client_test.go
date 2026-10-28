@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"go.kenn.io/forge/internal/platformdb"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -14,11 +13,14 @@ import (
 	"testing"
 	"time"
 
+	"go.kenn.io/forge/internal/platformdb"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	ghsync "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/ratelimit"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
 	"go.kenn.io/forge/platform"
 )
 
@@ -54,13 +56,13 @@ func TestClientLooksUpProjectByRawPathAndUsesNumericIDAfterLookup(t *testing.T) 
 	client := newTestClient(t, server.URL)
 	ref := platform.RepoRef{Platform: platform.KindGitLab, Host: "gitlab.example.com", RepoPath: "group/subgroup/project"}
 
-	repo, err := client.GetRepository(context.Background(), ref)
+	repo, err := client.GetRepository(t.Context(), ref)
 	require.NoError(t, err)
-	assert.Equal(int64(42), repo.Ref.PlatformID)
+	assert.Equal(platform.RepositoryIDKey(42), repo.Ref.Key)
 	assert.Equal("group/subgroup", repo.Ref.Owner)
 	assert.Equal("project", repo.Ref.Name)
 
-	mrs, err := client.ListOpenMergeRequests(context.Background(), repo.Ref)
+	mrs, err := client.ListOpenMergeRequests(t.Context(), repo.Ref)
 	require.NoError(t, err)
 	require.Len(t, mrs, 1)
 	assert.Equal(7, mrs[0].Number)
@@ -68,6 +70,38 @@ func TestClientLooksUpProjectByRawPathAndUsesNumericIDAfterLookup(t *testing.T) 
 		"/api/v4/projects/group%2Fsubgroup%2Fproject",
 		"/api/v4/projects/42/merge_requests",
 	}, paths)
+}
+
+func TestClientGetRepositoryWithPinnedIDFetchesProjectByIDAndReturnsRenamedRoute(t *testing.T) {
+	assert := assert.New(t)
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.EscapedPath())
+		if r.URL.EscapedPath() != "/api/v4/projects/1001" {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, `{
+			"id": 1001,
+			"path": "new-name",
+			"path_with_namespace": "new-group/new-name",
+			"name": "New Name"
+		}`)
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	repo, err := client.GetRepository(t.Context(), platform.RepoRef{
+		Platform: platform.KindGitLab, Host: "gitlab.example.com",
+		RepoPath: "old-group/old-name", Key: platform.RepositoryIDKey(1001),
+	})
+	require.NoError(t, err)
+
+	assert.Equal([]string{"/api/v4/projects/1001"}, paths)
+	assert.Equal("new-group", repo.Ref.Owner)
+	assert.Equal("new-name", repo.Ref.Name)
+	assert.Equal("new-group/new-name", repo.Ref.RepoPath)
+	assert.Equal(platform.RepositoryIDKey(1001), repo.Ref.Key)
 }
 
 func TestClientTestHelperDisablesRetries(t *testing.T) {
@@ -81,7 +115,7 @@ func TestClientTestHelperDisablesRetries(t *testing.T) {
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	_, err := client.GetRepository(context.Background(), platform.RepoRef{
+	_, err := client.GetRepository(t.Context(), platform.RepoRef{
 		Platform: platform.KindGitLab,
 		Host:     "gitlab.example.com",
 		RepoPath: "group/project",
@@ -137,14 +171,14 @@ func TestClientListOpenMergeRequestsPopulatesForkHeadRepoCloneURL(t *testing.T) 
 
 	client := newTestClient(t, server.URL)
 	ref := platform.RepoRef{
-		Platform:   platform.KindGitLab,
-		Host:       "gitlab.example.com",
-		RepoPath:   "group/project",
-		PlatformID: 42,
-		CloneURL:   "https://gitlab.example.com/group/project.git",
+		Platform: platform.KindGitLab,
+		Host:     "gitlab.example.com",
+		RepoPath: "group/project",
+		Key:      platform.RepositoryIDKey(42),
+		CloneURL: "https://gitlab.example.com/group/project.git",
 	}
 
-	mrs, err := client.ListOpenMergeRequests(context.Background(), ref)
+	mrs, err := client.ListOpenMergeRequests(t.Context(), ref)
 	require.NoError(err)
 	require.Len(mrs, 4)
 	assert.Equal("https://gitlab.example.com/fork/project.git", mrs[0].HeadRepoCloneURL)
@@ -195,14 +229,14 @@ func TestClientListOpenMergeRequestsEnrichmentStaysOptional(t *testing.T) {
 	budget.Spend(27)
 	client := newTestClient(t, server.URL, WithTransport(ghsync.WrapSyncBudgetTransport(http.DefaultTransport, budget)))
 	ref := platform.RepoRef{
-		Platform:   platform.KindGitLab,
-		Host:       "gitlab.example.com",
-		RepoPath:   "group/project",
-		PlatformID: 42,
-		CloneURL:   "https://gitlab.example.com/group/project.git",
+		Platform: platform.KindGitLab,
+		Host:     "gitlab.example.com",
+		RepoPath: "group/project",
+		Key:      platform.RepositoryIDKey(42),
+		CloneURL: "https://gitlab.example.com/group/project.git",
 	}
 
-	ctx := ghsync.WithEssentialSyncBudget(ghsync.WithSyncBudget(context.Background()))
+	ctx := ghsync.WithEssentialSyncBudget(ghsync.WithSyncBudget(t.Context()))
 	mrs, err := client.ListOpenMergeRequests(ctx, ref)
 	require.NoError(err,
 		"a budget-refused enrichment must not discard the fetched list")
@@ -235,14 +269,16 @@ func TestClientListOpenMergeRequestsContinuesWhenForkHeadRepoLookupFails(t *test
 
 			client := newTestClient(t, server.URL)
 			ref := platform.RepoRef{
-				Platform:   platform.KindGitLab,
-				Host:       "gitlab.example.com",
-				RepoPath:   "group/project",
-				PlatformID: 42,
-				CloneURL:   "https://gitlab.example.com/group/project.git",
+				Platform: platform.KindGitLab,
+				Host:     "gitlab.example.com",
+				Owner:    "group",
+				Name:     "project",
+				RepoPath: "group/project",
+				Key:      platform.RepositoryIDKey(42),
+				CloneURL: "https://gitlab.example.com/group/project.git",
 			}
 
-			mrs, err := client.ListOpenMergeRequests(context.Background(), ref)
+			mrs, err := client.ListOpenMergeRequests(t.Context(), ref)
 			require.NoError(err)
 			require.Len(mrs, 1)
 			assert.Equal(7, mrs[0].Number)
@@ -251,7 +287,7 @@ func TestClientListOpenMergeRequestsContinuesWhenForkHeadRepoLookupFails(t *test
 				"an unavailable fork project must preserve any stored clone URL")
 
 			database := dbtest.Open(t)
-			repoID, err := database.UpsertRepo(t.Context(), platformdb.DBRepoIdentity(ref))
+			repoID, err := reposeed.Seed(t.Context(), database, platformdb.DBRepoIdentity(ref))
 			require.NoError(err)
 			known := platformdb.DBMergeRequest(repoID, mrs[0])
 			known.HeadRepoCloneURL = "https://gitlab.example.com/fork/project.git"
@@ -287,14 +323,14 @@ func TestClientListOpenMergeRequestsPropagatesTransientForkHeadRepoLookupFailure
 
 	client := newTestClient(t, server.URL)
 	ref := platform.RepoRef{
-		Platform:   platform.KindGitLab,
-		Host:       "gitlab.example.com",
-		RepoPath:   "group/project",
-		PlatformID: 42,
-		CloneURL:   "https://gitlab.example.com/group/project.git",
+		Platform: platform.KindGitLab,
+		Host:     "gitlab.example.com",
+		RepoPath: "group/project",
+		Key:      platform.RepositoryIDKey(42),
+		CloneURL: "https://gitlab.example.com/group/project.git",
 	}
 
-	_, err := client.ListOpenMergeRequests(context.Background(), ref)
+	_, err := client.ListOpenMergeRequests(t.Context(), ref)
 	require.Error(err)
 	var platformErr *platform.Error
 	assert.NotErrorAs(err, &platformErr)
@@ -328,18 +364,19 @@ func TestClientGetMergeRequestContinuesWhenForkHeadRepoLookupFails(t *testing.T)
 
 	client := newTestClient(t, server.URL)
 	ref := platform.RepoRef{
-		Platform:   platform.KindGitLab,
-		Host:       "gitlab.example.com",
-		RepoPath:   "group/project",
-		PlatformID: 42,
-		CloneURL:   "https://gitlab.example.com/group/project.git",
+		Platform: platform.KindGitLab,
+		Host:     "gitlab.example.com",
+		RepoPath: "group/project",
+		Key:      platform.RepositoryIDKey(42),
+		CloneURL: "https://gitlab.example.com/group/project.git",
 	}
 
-	mr, err := client.GetMergeRequest(context.Background(), ref, 7)
+	mr, err := client.GetMergeRequest(t.Context(), ref, 7)
 	require.NoError(err)
 	assert.Equal(7, mr.Number)
 	assert.Empty(mr.HeadRepoCloneURL)
 }
+
 func TestClientGetMergeRequestUsesMergedByFallback(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -369,9 +406,9 @@ func TestClientGetMergeRequestUsesMergedByFallback(t *testing.T) {
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	ref := platform.RepoRef{Platform: platform.KindGitLab, Host: "gitlab.example.com", PlatformID: 42}
+	ref := platform.RepoRef{Platform: platform.KindGitLab, Host: "gitlab.example.com", Key: platform.RepositoryIDKey(42)}
 
-	mr, err := client.GetMergeRequest(context.Background(), ref, 7)
+	mr, err := client.GetMergeRequest(t.Context(), ref, 7)
 	require.NoError(err)
 	assert.Equal("legacy-admin", mr.MergedBy)
 }
@@ -397,7 +434,7 @@ func TestClientRecordsRateLimitRequests(t *testing.T) {
 
 	rt := ratelimit.NewPlatformRateTracker(database, "gitlab", "gitlab.example.com", "host", "rest")
 	client := newTestClient(t, server.URL, WithRateTracker(rt))
-	_, err := client.GetRepository(context.Background(), platform.RepoRef{
+	_, err := client.GetRepository(t.Context(), platform.RepoRef{
 		Platform: platform.KindGitLab,
 		Host:     "gitlab.example.com",
 		RepoPath: "group/project",
@@ -436,7 +473,7 @@ func TestClientDoesNotSynthesizeRateLimitResetWhenHeaderMissing(t *testing.T) {
 
 	rt := ratelimit.NewPlatformRateTracker(database, "gitlab", "gitlab.example.com", "host", "rest")
 	client := newTestClient(t, server.URL, WithRateTracker(rt))
-	_, err := client.GetRepository(context.Background(), platform.RepoRef{
+	_, err := client.GetRepository(t.Context(), platform.RepoRef{
 		Platform: platform.KindGitLab,
 		Host:     "gitlab.example.com",
 		RepoPath: "group/project",
@@ -551,10 +588,10 @@ func TestClientReadsTokenSourceForEachRequest(t *testing.T) {
 		RepoPath: "group/project",
 	}
 
-	_, err = client.GetRepository(context.Background(), ref)
+	_, err = client.GetRepository(t.Context(), ref)
 	require.NoError(err)
 	source.token = "second-token"
-	_, err = client.GetRepository(context.Background(), ref)
+	_, err = client.GetRepository(t.Context(), ref)
 	require.NoError(err)
 
 	assert.Equal([]string{"first-token", "second-token"}, tokens)
@@ -563,7 +600,7 @@ func TestClientReadsTokenSourceForEachRequest(t *testing.T) {
 func TestClientRejectsAlreadyEscapedProjectPathBeforeDoubleEscaping(t *testing.T) {
 	client := newTestClient(t, "http://127.0.0.1")
 
-	_, err := client.GetRepository(context.Background(), platform.RepoRef{
+	_, err := client.GetRepository(t.Context(), platform.RepoRef{
 		Platform: platform.KindGitLab,
 		Host:     "gitlab.example.com",
 		RepoPath: "group%2Fproject",
@@ -596,7 +633,7 @@ func TestPreviewNamespaceUsesGroupFirstFallbackPaginatesAndFiltersArchived(t *te
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	preview, err := client.PreviewNamespace(context.Background(), "kenn-forge", PreviewOptions{Limit: 10})
+	preview, err := client.PreviewNamespace(t.Context(), "kenn-forge", PreviewOptions{Limit: 10})
 	require.NoError(t, err)
 
 	require.Len(t, preview.Repositories, 2)
@@ -628,7 +665,7 @@ func TestListRepositoriesIncludesArchivedProjects(t *testing.T) {
 
 	client := newTestClient(t, server.URL)
 	repos, err := client.ListRepositories(
-		context.Background(), "kenn-forge",
+		t.Context(), "kenn-forge",
 		platform.RepositoryListOptions{IncludeArchived: true},
 	)
 	require.NoError(t, err)
@@ -651,7 +688,7 @@ func TestListRepositoriesFiltersArchivedByDefault(t *testing.T) {
 
 	client := newTestClient(t, server.URL)
 	repos, err := client.ListRepositories(
-		context.Background(), "kenn-forge", platform.RepositoryListOptions{},
+		t.Context(), "kenn-forge", platform.RepositoryListOptions{},
 	)
 	require.NoError(t, err)
 
@@ -679,7 +716,7 @@ func TestPreviewNamespaceFallsBackToUserProjectsAfterGroupNotFound(t *testing.T)
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	preview, err := client.PreviewNamespace(context.Background(), "alice", PreviewOptions{})
+	preview, err := client.PreviewNamespace(t.Context(), "alice", PreviewOptions{})
 	require.NoError(t, err)
 
 	require.Len(t, preview.Repositories, 1)
@@ -699,7 +736,7 @@ func TestPreviewNamespaceHonorsCancellationAndForegroundTimeout(t *testing.T) {
 		defer server.Close()
 
 		client := newTestClient(t, server.URL)
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
 
 		_, err := client.PreviewNamespace(ctx, "kenn-forge", PreviewOptions{})
@@ -710,14 +747,13 @@ func TestPreviewNamespaceHonorsCancellationAndForegroundTimeout(t *testing.T) {
 	})
 
 	t.Run("foreground timeout cancels slow request", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			time.Sleep(50 * time.Millisecond)
-			writeJSON(w, `[]`)
+		server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			<-r.Context().Done()
 		}))
 		defer server.Close()
 
 		client := newTestClient(t, server.URL, WithForegroundTimeoutForTesting(time.Nanosecond))
-		_, err := client.PreviewNamespace(context.Background(), "kenn-forge", PreviewOptions{})
+		_, err := client.PreviewNamespace(t.Context(), "kenn-forge", PreviewOptions{})
 
 		require.Error(t, err)
 		require.ErrorIs(t, err, context.DeadlineExceeded)
@@ -746,7 +782,7 @@ func TestPreviewNamespaceTruncatesAtLimitAndCapsAtHardLimit(t *testing.T) {
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	preview, err := client.PreviewNamespace(context.Background(), "kenn-forge", PreviewOptions{Limit: 2_000})
+	preview, err := client.PreviewNamespace(t.Context(), "kenn-forge", PreviewOptions{Limit: 2_000})
 	require.NoError(t, err)
 
 	assert.Equal(maxPreviewLimit, preview.Limit)
@@ -772,7 +808,7 @@ func TestPreviewNamespaceReturnsPartialMetadataAfterLaterPageFailure(t *testing.
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	preview, err := client.PreviewNamespace(context.Background(), "kenn-forge", PreviewOptions{Limit: 10})
+	preview, err := client.PreviewNamespace(t.Context(), "kenn-forge", PreviewOptions{Limit: 10})
 	require.NoError(err)
 
 	require.Len(preview.Repositories, 1)
@@ -830,21 +866,21 @@ func TestReadClientFetchesMergeRequestsIssuesEventsReleasesTagsAndPipelines(t *t
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	ref := platform.RepoRef{Platform: platform.KindGitLab, Host: "gitlab.example.com", RepoPath: "kenn-forge/project", PlatformID: 42}
+	ref := platform.RepoRef{Platform: platform.KindGitLab, Host: "gitlab.example.com", RepoPath: "kenn-forge/project", Key: platform.RepositoryIDKey(42)}
 
-	mrs, err := client.ListOpenMergeRequests(context.Background(), ref)
+	mrs, err := client.ListOpenMergeRequests(t.Context(), ref)
 	require.NoError(err)
 	require.Len(mrs, 1)
 	assert.Equal(7, mrs[0].Number)
 	assert.Empty(mrs[0].CIStatus)
 
-	mr, err := client.GetMergeRequest(context.Background(), ref, 7)
+	mr, err := client.GetMergeRequest(t.Context(), ref, 7)
 	require.NoError(err)
 	assert.Equal("MR detail", mr.Title)
 	assert.True(mr.IsDraft)
 	assert.Equal("success", mr.CIStatus)
 
-	mrEvents, err := client.ListMergeRequestEvents(context.Background(), ref, 7)
+	mrEvents, err := client.ListMergeRequestEvents(t.Context(), ref, 7)
 	require.NoError(err)
 	require.Len(mrEvents, 3)
 	assert.Equal("issue_comment", mrEvents[0].EventType)
@@ -852,16 +888,16 @@ func TestReadClientFetchesMergeRequestsIssuesEventsReleasesTagsAndPipelines(t *t
 	assert.Equal("maintainer", mrEvents[1].Author)
 	assert.Equal("commit", mrEvents[2].EventType)
 
-	issues, err := client.ListOpenIssues(context.Background(), ref)
+	issues, err := client.ListOpenIssues(t.Context(), ref)
 	require.NoError(err)
 	require.Len(issues, 1)
 	assert.Equal(5, issues[0].Number)
 
-	issue, err := client.GetIssue(context.Background(), ref, 5)
+	issue, err := client.GetIssue(t.Context(), ref, 5)
 	require.NoError(err)
 	assert.Equal("Issue detail", issue.Title)
 
-	issueEvents, err := client.ListIssueEvents(context.Background(), ref, 5)
+	issueEvents, err := client.ListIssueEvents(t.Context(), ref, 5)
 	require.NoError(err)
 	require.Len(issueEvents, 2)
 	assert.Equal("issue_comment", issueEvents[0].EventType)
@@ -876,17 +912,17 @@ func TestReadClientFetchesMergeRequestsIssuesEventsReleasesTagsAndPipelines(t *t
 		"is_cross_repository":true
 	}`, issueEvents[1].MetadataJSON)
 
-	releases, err := client.ListReleases(context.Background(), ref)
+	releases, err := client.ListReleases(t.Context(), ref)
 	require.NoError(err)
 	require.Len(releases, 1)
 	assert.Equal("v1.0.0", releases[0].TagName)
 
-	tags, err := client.ListTags(context.Background(), ref)
+	tags, err := client.ListTags(t.Context(), ref)
 	require.NoError(err)
 	require.Len(tags, 1)
 	assert.Equal("abc", tags[0].SHA)
 
-	checks, err := client.ListCIChecks(context.Background(), ref, "abc")
+	checks, err := client.ListCIChecks(t.Context(), ref, "abc")
 	require.NoError(err)
 	require.Len(checks, 1)
 	assert.Equal("in_progress", checks[0].Status)
@@ -944,16 +980,16 @@ func TestReadClientSeparatesDiscussionEventsFromReviewThreads(t *testing.T) {
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	ref := platform.RepoRef{Platform: platform.KindGitLab, Host: "gitlab.example.com", PlatformID: 42}
+	ref := platform.RepoRef{Platform: platform.KindGitLab, Host: "gitlab.example.com", Key: platform.RepositoryIDKey(42)}
 
-	events, err := client.ListMergeRequestEvents(context.Background(), ref, 7)
+	events, err := client.ListMergeRequestEvents(t.Context(), ref, 7)
 	require.NoError(err)
 	require.Len(events, 1)
 	assert.Equal("issue_comment", events[0].EventType)
 	assert.Equal("discussion reply", events[0].Body)
 	assert.Equal("discussion-1", events[0].ThreadID)
 
-	threads, err := client.ListMergeRequestReviewThreads(context.Background(), ref, 7)
+	threads, err := client.ListMergeRequestReviewThreads(t.Context(), ref, 7)
 	require.NoError(err)
 	require.Len(threads, 1)
 	assert.Equal("discussion-1", threads[0].ProviderThreadID)
@@ -971,11 +1007,11 @@ func TestListCIChecksReturnsEmptyWhenNoPipelineExists(t *testing.T) {
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	checks, err := client.ListCIChecks(context.Background(), platform.RepoRef{
-		Platform:   platform.KindGitLab,
-		Host:       "gitlab.example.com",
-		RepoPath:   "kenn-forge/project",
-		PlatformID: 42,
+	checks, err := client.ListCIChecks(t.Context(), platform.RepoRef{
+		Platform: platform.KindGitLab,
+		Host:     "gitlab.example.com",
+		RepoPath: "kenn-forge/project",
+		Key:      platform.RepositoryIDKey(42),
 	}, "missing")
 
 	require.NoError(t, err)

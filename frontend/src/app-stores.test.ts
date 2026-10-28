@@ -116,6 +116,7 @@ vi.mock("./lib/stores/activity.svelte.js", () => ({
     loadActivity,
     loadActivityEffect,
     reconcileActivityEffect,
+    isInitialized: () => false,
     hydrateDefaults: vi.fn(),
     getActivity: () => [],
     isLoading: () => false,
@@ -127,6 +128,7 @@ vi.mock("./lib/stores/sync.svelte.js", () => ({
     getSyncState: () => null,
     getProviderAvailable: () => true,
     setProviderAvailable,
+    setLiveUpdatesConnected: vi.fn(),
     onNextSyncComplete: vi.fn(),
     subscribeSyncComplete: vi.fn(() => () => undefined),
     refreshSyncStatus: vi.fn(async () => undefined),
@@ -146,6 +148,8 @@ vi.mock("./lib/stores/detail.svelte.js", () => ({
       loadDetail: vi.fn(),
       refreshDetailOnly,
       refreshDetailOnlyEffect,
+      refreshActiveDetailEffect: () => Effect.void,
+      isDetailFromCache: () => false,
       isDetailLoading: () => false,
       getDetail: () => currentDetail,
     };
@@ -176,6 +180,8 @@ vi.mock("./lib/stores/settings.svelte.js", () => ({
     };
     const store = {
       getConfiguredRepos: () => configuredRepos,
+      getAirplaneMode: () => false,
+      setAirplaneMode: vi.fn(),
       setConfiguredRepos: vi.fn(),
       setRepoPresets: vi.fn(),
       getPullRequestSettings: () => ({
@@ -185,6 +191,7 @@ vi.mock("./lib/stores/settings.svelte.js", () => ({
       setPullRequestSettings: vi.fn(),
       getDetailSettings: () => ({ initial_timeline_entry_limit: 50 }),
       setDetailSettings: vi.fn(),
+      setACPSettings: vi.fn(),
       getWorkspaceSettings: () => workspaceSettings,
       setWorkspaceSettings: vi.fn((value: typeof workspaceSettings) => {
         workspaceSettings = value;
@@ -197,7 +204,6 @@ vi.mock("./lib/stores/settings.svelte.js", () => ({
         docs: false,
         pulls: true,
         issues: true,
-        reviews: true,
         workspaces: true,
       }),
       setModeVisibility: vi.fn(),
@@ -235,7 +241,13 @@ const getSettings = vi.fn();
 let runtime: OwnedAppRuntime;
 
 beforeEach(() => {
-  runtime = makeTestAppRuntime(makeGeneratedClient({ SettingsService: { getSettings: getSettings as never } }));
+  runtime = makeTestAppRuntime(
+    makeGeneratedClient({
+      SettingsService: { getSettings: getSettings as never },
+      PullRequestsService: { listPulls: async () => [] },
+      IssuesService: { listIssues: async () => [] },
+    }),
+  );
   captured.store = null;
   captured.settings = null;
   captured.detailOptions = null;
@@ -305,7 +317,7 @@ describe("app store event wiring", () => {
     const event = captured.store?.options.onDataChanged?.();
     expect(event).toBeDefined();
     let acknowledged = false;
-    const completion = Effect.runPromise(event ?? Effect.void).then(() => {
+    const completion = acceptEvent(event).then(() => {
       acknowledged = true;
     });
     await vi.waitFor(() => expect(loadPulls).toHaveBeenCalledOnce());
@@ -471,8 +483,8 @@ describe("app store event wiring", () => {
 
     await acceptEvent(captured.store?.options.onReconnectStale?.({}));
 
-    expect(loadPulls).toHaveBeenCalledTimes(1);
-    expect(loadIssues).toHaveBeenCalledTimes(1);
+    expect(loadPulls).not.toHaveBeenCalled();
+    expect(loadIssues).not.toHaveBeenCalled();
     expect(loadActivity).toHaveBeenCalledTimes(1);
     expect(refreshDetailOnly).toHaveBeenCalledTimes(1);
     expect(refreshDetailOnly).toHaveBeenCalledWith("acme", "widget", 42, {
@@ -535,8 +547,8 @@ describe("app store event wiring", () => {
 
     refresh.resolve();
     await Effect.runPromise(execution.await.pipe(Effect.flatMap((exit) => exit)));
-    expect(loadIssues).toHaveBeenCalledOnce();
-    expect(loadActivity).toHaveBeenCalledOnce();
+    expect(loadIssues).not.toHaveBeenCalled();
+    expect(loadActivity).not.toHaveBeenCalled();
     expect(setProviderAvailable).toHaveBeenLastCalledWith(true);
   });
 
@@ -686,6 +698,30 @@ describe("app store event wiring", () => {
 
     expect(onError).toHaveBeenCalledWith("Deferred merge for acme/widget#42 failed: checks did not pass");
     expect(onNotification).not.toHaveBeenCalled();
+  });
+
+  it("reports a deferred merge that joined the merge queue as a notification, not a failure", async () => {
+    const onError = vi.fn();
+    const onNotification = vi.fn();
+    compose({ onError, onNotification });
+
+    await acceptEvent(
+      captured.store?.options.onDeferredMergeCompleted?.({
+        provider: "github",
+        platform_host: "github.com",
+        repo_path: "acme/widget",
+        owner: "acme",
+        name: "widget",
+        number: 42,
+        head_sha: "2222222",
+        status: "queued",
+        merged: false,
+        completed_at: "2026-07-10T15:00:00Z",
+      }),
+    );
+
+    expect(onNotification).toHaveBeenCalledWith("acme/widget#42 was added to the merge queue after CI passed.");
+    expect(onError).not.toHaveBeenCalled();
   });
 
   it("routes merged workspace cleanup failures through the warning callback", async () => {

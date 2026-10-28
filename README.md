@@ -86,9 +86,18 @@ Forgejo, and Gitea hosts reuse an authenticated `glab` or `fj` session the same
 way. Configure explicit credentials through environment variables or
 `~/.kenn/forge/config.toml`; see [Configuration](docs/configuration.md).
 
+For Docker or Umbrel, use the [local image and startup settings](docs/configuration.md#container-startup).
+
 Local workspaces require Git and tmux on a Unix-like host. The Windows release
 supports the dashboard and provider actions. Use WSL or a remote Unix-like
 kenn-forge host when you need workspace sessions.
+
+## GitHub CLI shim
+
+A `gh` symlink to `kenn-forge` (or `kenn-forge gh ...`) is an opt-in stand-in
+for `gh` that answers piped `gh pr list` and `gh pr view <number>` JSON queries
+from synced Forge data and passes everything else to the real `gh`. See the [GitHub CLI shim guide](docs/gh-shim.md) for
+setup, supported queries, and debug logging.
 
 ## Documentation
 
@@ -98,6 +107,7 @@ kenn-forge host when you need workspace sessions.
 - [Configuration](docs/configuration.md)
 - [Commands](docs/commands.md)
 - [MCP companion](docs/kenn-forge-mcp.md)
+- [GitHub CLI shim](docs/gh-shim.md)
 - [Troubleshooting](docs/troubleshooting.md)
 
 kenn-forge is licensed under the [Elastic License 2.0](LICENSE). Contributions

@@ -24,8 +24,9 @@ import (
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/server/workspaceapi"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/gitsafe"
+	"go.kenn.io/forge/internal/testutil/workspacetest"
 	"go.kenn.io/forge/internal/workspace"
-	gitcmd "go.kenn.io/kit/git/cmd"
 )
 
 type mockGH struct{}
@@ -146,7 +147,7 @@ func newKataTestServer(
 	resolver := httpapi.NewRepositoryResolver(httpapi.RepositoryResolverDeps{DB: database})
 	var workspaces *workspace.Manager
 	if options.WorktreeDir != "" {
-		workspaces = workspace.NewManager(database, options.WorktreeDir)
+		workspaces = workspacetest.NewManager(t, database, options.WorktreeDir)
 		workspaces.SetTmuxCommand(kataAPITestTmuxCommand)
 	}
 	workspaceHandler := workspaceapi.New(workspaceapi.Deps{
@@ -229,7 +230,7 @@ func doJSON(
 	if body != nil {
 		require.NoError(t, json.NewEncoder(&buf).Encode(body))
 	}
-	req := httptest.NewRequest(method, path, &buf)
+	req := httptest.NewRequestWithContext(t.Context(), method, path, &buf)
 	if method != http.MethodGet {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -247,14 +248,14 @@ func decodeProblem(t *testing.T, rr *httptest.ResponseRecorder) httpapi.ProblemE
 
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	runner := gitcmd.New().WithConfig("init.defaultBranch", "main")
+	runner := gitsafe.Runner().WithConfig("init.defaultBranch", "main")
 	out, stderr, err := runner.Run(t.Context(), dir, nil, args...)
 	require.NoError(t, err, "git %v failed: %s%s", args, out, stderr)
 }
 
 func gitOutput(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	out, stderr, err := gitcmd.New().Run(t.Context(), dir, nil, args...)
+	out, stderr, err := gitsafe.Runner().Run(t.Context(), dir, nil, args...)
 	require.NoError(t, err, "git %v failed: %s%s", args, out, stderr)
 	return strings.TrimSpace(string(out))
 }

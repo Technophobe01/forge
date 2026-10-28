@@ -259,6 +259,42 @@ test.describe("workspace create-and-launch full stack", () => {
     }
   });
 
+  test("narrow PR workspaces show new agents and keep their tabs draggable", async ({ page }) => {
+    test.skip(!hasCommand("git") || !hasCommand("tmux", ["-V"]) || !hasCommand("sh", ["-c", ":"]));
+    let server: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    try {
+      server = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({ baseURL: server.info.base_url });
+      await configureAgent(page, server.info.base_url);
+      const settings = await (await api.get("/api/v1/settings")).json();
+      await api.put("/api/v1/settings", {
+        data: { terminal: { ...settings.terminal, hide_tmux_status: true } },
+      });
+      await page.setViewportSize({ width: 1000, height: 900 });
+      const workspace = await createPullRequestWorkspaceWithAgent(page, server.info.base_url);
+      await expect.poll(() => runtimeTargets(api!, workspace.id)).toEqual([agentKey]);
+      const terminal = page.locator(".detail-pane-workspace-slot .terminal-container");
+      await expect(terminal).toBeVisible();
+      await expect(page.locator(".detail-pane-workspace-slot .header-bar")).toHaveCount(0);
+      await expect(page.getByRole("region", { name: "Pull request conversation" })).toBeVisible();
+      await terminal.evaluate((element) => element.setAttribute("data-continuity", "pr-agent"));
+      const agentTab = page.getByRole("tab", { name: new RegExp(agentLabel) });
+      await expect(agentTab).toHaveAttribute("draggable", "true");
+      await agentTab.dragTo(page.getByRole("tab", { name: "Files changed", exact: true }));
+      await expect(page.locator('.session-terminal-slot [data-continuity="pr-agent"]')).toBeVisible();
+      await expect(page.locator('.detail-pane-workspace-slot [data-continuity="pr-agent"]')).toHaveCount(0);
+      await page.setViewportSize({ width: 1400, height: 900 });
+      await page.setViewportSize({ width: 1000, height: 900 });
+      await expect(page.locator('[data-continuity="pr-agent"]')).toBeVisible();
+      await expect.poll(() => runtimeTargets(api!, workspace.id)).toEqual([agentKey]);
+      await page.screenshot({ path: test.info().outputPath("narrow-pr-agent.png") });
+    } finally {
+      await api?.dispose();
+      await server?.stop();
+    }
+  });
+
   test("explicit PR agent selection never opens a transient dialog and fits the narrow drawer", async ({ page }) => {
     test.skip(
       !hasCommand("git") || !hasCommand("tmux", ["-V"]) || !hasCommand("sh", ["-c", ":"]),
@@ -457,12 +493,12 @@ test.describe("workspace create-and-launch full stack", () => {
       );
 
       await phonePage.goto(`${server.info.base_url}/m/workspaces`);
-      await phonePage.getByRole("button", { name: "View workspace options" }).tap();
-      const viewSheet = phonePage.getByRole("dialog", { name: "View workspace options" });
+      await phonePage.getByRole("button", { name: "Workspace filters" }).tap();
+      const viewSheet = phonePage.getByRole("dialog", { name: "Workspace filters" });
       await expect(viewSheet).toBeVisible();
       await phonePage.keyboard.press("Meta+K");
       await expect(phonePage.getByRole("dialog", { name: "Command palette" })).toHaveCount(0);
-      await viewSheet.getByRole("button", { name: "Close View options" }).tap();
+      await viewSheet.getByRole("button", { name: "Close filters" }).tap();
       await phonePage.getByRole("button", { name: "New workspace" }).tap();
       const dialog = phonePage.getByRole("dialog", { name: "New workspace" });
       await expect(dialog).toBeVisible();
@@ -896,7 +932,7 @@ test.describe("workspace create-and-launch full stack", () => {
       await phonePage.goto(`${server.info.base_url}/m/workspaces`);
       await phonePage.getByRole("button", { name: "Open linked item #1" }).tap();
       await expect(phonePage).toHaveURL(new RegExp(`/m/workspaces/local/${created.id}/item$`));
-      await phonePage.getByRole("tab", { name: "Files changed" }).tap();
+      await phonePage.getByRole("tab", { name: "Files", exact: true }).tap();
       await phonePage.getByRole("tab", { name: "Conversation" }).tap();
       await phonePage.getByRole("button", { name: "Open Workspace" }).tap();
 
@@ -932,22 +968,26 @@ test.describe("workspace create-and-launch full stack", () => {
       const runtimeGate = new Promise<void>((resolve) => {
         releaseRuntime = resolve;
       });
-      await phonePage.route("**/api/v1/workspaces/*/runtime", async (route) => {
-        if (route.request().method() !== "GET") {
-          await route.continue();
-          return;
-        }
-        await runtimeGate;
-        await route.fulfill({
-          status: 503,
-          contentType: "application/problem+json",
-          body: JSON.stringify({
+      // Match the path alone: the showing page adds ?viewing=true.
+      await phonePage.route(
+        (url) => /^\/api\/v1\/workspaces\/[^/]+\/runtime$/.test(url.pathname),
+        async (route) => {
+          if (route.request().method() !== "GET") {
+            await route.continue();
+            return;
+          }
+          await runtimeGate;
+          await route.fulfill({
             status: 503,
-            code: "serviceUnavailable",
-            detail: "runtime discovery unavailable",
-          }),
-        });
-      });
+            contentType: "application/problem+json",
+            body: JSON.stringify({
+              status: 503,
+              code: "serviceUnavailable",
+              detail: "runtime discovery unavailable",
+            }),
+          });
+        },
+      );
 
       const createResponsePromise = phonePage.waitForResponse(
         (response) =>

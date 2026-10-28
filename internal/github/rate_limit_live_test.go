@@ -6,18 +6,20 @@ import (
 	"testing"
 	"time"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
 )
 
 func TestLiveGitHubRateLimitSnapshotUsesGoGitHub(t *testing.T) {
+	t.Parallel()
+
 	skipUnlessLiveGitHubTests(t)
 	require := require.New(t)
 	assert := assert.New(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
 
 	client, err := gh.NewClient()

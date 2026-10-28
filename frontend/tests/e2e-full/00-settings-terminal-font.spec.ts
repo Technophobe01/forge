@@ -70,7 +70,7 @@ test.afterAll(async () => {
 
 test("settings saves and reloads workspace terminal options", async ({ page }) => {
   await page.goto(`${isolatedServer!.info.base_url}/settings`);
-  await openSettingsPanel(page, "Terminal");
+  await openSettingsPanel(page, "Workspaces");
 
   const input = page.getByLabel("Monospace font family");
   const fontSize = page.getByRole("spinbutton", { name: "Font size", exact: true });
@@ -79,7 +79,7 @@ test("settings saves and reloads workspace terminal options", async ({ page }) =
   const letterSpacing = page.getByLabel("Letter spacing");
   const retainedSessions = page.getByLabel("Retained terminal sessions");
   const cursorBlink = page.getByLabel("Cursor blink");
-  const saveButton = page.getByRole("button", {
+  const saveButton = page.getByRole("region", { name: "Terminal", exact: true }).getByRole("button", {
     name: "Save",
     exact: true,
   });
@@ -88,7 +88,7 @@ test("settings saves and reloads workspace terminal options", async ({ page }) =
   await expect(scrollback).toHaveValue("1000");
   await expect(lineHeight).toHaveValue("1");
   await expect(letterSpacing).toHaveValue("0");
-  await expect(retainedSessions).toHaveValue("10");
+  await expect(retainedSessions).toHaveValue("50");
   await expect(cursorBlink).toBeChecked();
 
   await fontSize.fill("18");
@@ -149,7 +149,7 @@ test("settings saves and reloads workspace terminal options", async ({ page }) =
     });
 
   await page.reload();
-  await openSettingsPanel(page, "Terminal");
+  await openSettingsPanel(page, "Workspaces");
   await expect(page.getByLabel("Monospace font family")).toHaveValue('"Iosevka Term", monospace');
   await expect(page.getByRole("spinbutton", { name: "Font size", exact: true })).toHaveValue("18");
   await expect(page.getByLabel("Scrollback")).toHaveValue("5000");
@@ -195,8 +195,10 @@ test("settings saves visible modes and hides disabled nav entries", async ({ pag
 
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto(`${isolatedServer!.info.base_url}/m`);
-    await page.getByRole("combobox", { name: /Phone mode/ }).click();
-    await expect(page.getByRole("option", { name: "PRs" })).toHaveCount(0);
+    await page.getByRole("button", { name: "Menu" }).click();
+    const phoneModes = page.getByRole("navigation", { name: "Phone mode" });
+    await expect(phoneModes.getByRole("button", { name: "Activity" })).toBeVisible();
+    await expect(phoneModes.getByRole("button", { name: "PRs" })).toHaveCount(0);
   } finally {
     const restore = await api.put("/api/v1/settings", { data: { modes: originalModes } });
     expect(restore.ok()).toBe(true);

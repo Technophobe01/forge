@@ -3,9 +3,11 @@ import type { WorkspaceEventsNotification } from "../../stores/events.svelte.js"
 
 export type WorkspaceEventSignal =
   | { readonly _tag: "Open" }
-  | { readonly _tag: "Status"; readonly workspaceId?: string | undefined }
+  | { readonly _tag: "Status"; readonly workspaceId?: string | undefined; readonly status?: string | undefined }
   | { readonly _tag: "Associated"; readonly workspaceId?: string | undefined }
   | { readonly _tag: "ReconnectStale" }
+  // Synced PR or issue data changed, which can move a linked item's state.
+  | { readonly _tag: "ItemDataChanged" }
   | {
       readonly _tag: "DiffReady" | "DiffChanged";
       readonly workspaceId?: string | undefined;
@@ -13,18 +15,20 @@ export type WorkspaceEventSignal =
     };
 
 type WorkspaceEventsSubscription = (subscriber: (event: WorkspaceEventsNotification) => void) => () => void;
-type WorkspaceSelection = () => () => void;
 
 function workspaceEventSignal(event: WorkspaceEventsNotification): WorkspaceEventSignal | undefined {
   switch (event.type) {
     case "open":
       return { _tag: "Open" };
     case "workspace_status":
-      return { _tag: "Status", workspaceId: event.payload.id };
+      return { _tag: "Status", workspaceId: event.payload.id, status: event.payload.status };
     case "workspace_pr_associated":
       return { _tag: "Associated", workspaceId: event.payload.workspace_id };
     case "reconnect.stale":
       return { _tag: "ReconnectStale" };
+    case "data_changed":
+    case "pr_detail_refreshed":
+      return { _tag: "ItemDataChanged" };
     case "workspace_diff_ready":
       return {
         _tag: "DiffReady",
@@ -42,10 +46,7 @@ function workspaceEventSignal(event: WorkspaceEventsNotification): WorkspaceEven
   }
 }
 
-export const workspaceEventStream = (
-  subscribe: WorkspaceEventsSubscription,
-  selectWorkspace?: WorkspaceSelection,
-): Stream.Stream<WorkspaceEventSignal> =>
+export const workspaceEventStream = (subscribe: WorkspaceEventsSubscription): Stream.Stream<WorkspaceEventSignal> =>
   Stream.callback<WorkspaceEventSignal>((queue) =>
     Effect.gen(function* () {
       const offer = (signal: WorkspaceEventSignal): void => {
@@ -58,9 +59,5 @@ export const workspaceEventStream = (
         }),
       );
       yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
-      if (selectWorkspace !== undefined) {
-        const releaseSelection = yield* Effect.sync(selectWorkspace);
-        yield* Effect.addFinalizer(() => Effect.sync(releaseSelection));
-      }
     }),
   );

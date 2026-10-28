@@ -25,6 +25,7 @@ import (
 	"go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
 	"go.kenn.io/forge/internal/tokenauth"
 	"go.kenn.io/forge/platform"
 )
@@ -334,7 +335,11 @@ func TestBuildProviderControlPlaneDeduplicatesGitHubIdentityRuntimes(t *testing.
 	}
 	require.NoError(cfg.Validate())
 
-	set := tokenauth.NewSourceSet(tokenauth.Options{})
+	set := tokenauth.NewSourceSet(tokenauth.Options{
+		GitHubApp: func(context.Context, tokenauth.Candidate) (string, time.Time, error) {
+			return "app-token", time.Now().Add(time.Hour), nil
+		},
+	})
 	sources, err := collectProviderTokenSources(t.Context(), cfg, set)
 	require.NoError(err)
 	resolver := fakeGitHubIdentityResolver{byEnv: map[string]github.GitHubIdentity{
@@ -405,6 +410,11 @@ func TestBuildProviderControlPlaneDeduplicatesGitHubIdentityRuntimes(t *testing.
 	require.NoError(err)
 	assert.Equal("APP_WRITE_PAT-secret", gitToken,
 		"managed Git must use the user PAT, never the App installation token")
+	readToken, err := gitRoutes.ReadSourceForRepo("github", "github.com", "org-d", "four").
+		Token(t.Context())
+	require.NoError(err)
+	assert.Equal("app-token", readToken,
+		"clone-store reads prefer the covering App even when the route has a user PAT")
 }
 
 // Rate-limit snapshot refresh deduplicates by the route's credential key, so
@@ -826,7 +836,7 @@ func TestSelectedGitHubAppSupportsOwnerPreviewWithoutPATFallback(t *testing.T) {
 		TokenSources: set, HostCheckAllowLoopbackAnyPort: true,
 	})
 
-	req := httptest.NewRequest(
+	req := httptest.NewRequestWithContext(t.Context(),
 		http.MethodPost, "/api/v1/repos/preview",
 		strings.NewReader(fmt.Sprintf(
 			`{"provider":"github","host":%q,"owner":"acme","pattern":"*"}`,
@@ -982,11 +992,18 @@ func TestProductionStartupRoutesTwoOwnersThroughSyncAndMutationAPI(t *testing.T)
 			return
 		}
 
-		if !strings.HasPrefix(r.URL.Path, "/api/v3/repos/") {
+		repoPath := r.URL.Path
+		switch repoPath {
+		case "/api/v3/repositories/101":
+			repoPath = "/api/v3/repos/org-a/one"
+		case "/api/v3/repositories/202":
+			repoPath = "/api/v3/repos/org-b/two"
+		}
+		if !strings.HasPrefix(repoPath, "/api/v3/repos/") {
 			http.NotFound(w, r)
 			return
 		}
-		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v3/repos/"), "/")
+		parts := strings.Split(strings.TrimPrefix(repoPath, "/api/v3/repos/"), "/")
 		if len(parts) < 2 {
 			http.NotFound(w, r)
 			return
@@ -1077,8 +1094,8 @@ func TestProductionStartupRoutesTwoOwnersThroughSyncAndMutationAPI(t *testing.T)
 	}, caps.Archive)
 
 	repos := []github.RepoRef{
-		{Platform: "github", PlatformHost: host, Owner: "org-a", Name: "one"},
-		{Platform: "github", PlatformHost: host, Owner: "org-b", Name: "two"},
+		{Platform: "github", PlatformHost: host, Key: platform.RepositoryIDKey(101), Owner: "org-a", Name: "one"},
+		{Platform: "github", PlatformHost: host, Key: platform.RepositoryIDKey(202), Owner: "org-b", Name: "two"},
 	}
 	syncer := github.NewSyncerWithRegistry(
 		startup.registry, database, nil, repos, time.Minute,
@@ -1195,14 +1212,14 @@ func TestProductionStartupRoutesExposeRotatedPATThroughRepoAPI(t *testing.T) {
 	assert.Equal("user:123", uncoveredRoute.writeIdentity.Principal)
 
 	repos := []github.RepoRef{
-		{Owner: "acme", Name: "covered", PlatformHost: "github.com", PlatformExternalID: "repo-acme-covered"},
-		{Owner: "acme", Name: "uncovered", PlatformHost: "github.com", PlatformExternalID: "repo-acme-uncovered"},
+		{Owner: "acme", Name: "covered", PlatformHost: "github.com", Key: platform.RepositoryIDKey(1001)},
+		{Owner: "acme", Name: "uncovered", PlatformHost: "github.com", Key: platform.RepositoryIDKey(1002)},
 	}
 	for _, repo := range repos {
-		_, err := database.UpsertRepo(
-			t.Context(), db.RepoIdentity{
+		_, err := reposeed.Seed(
+			t.Context(), database, db.RepoIdentity{
 				Platform: "github", PlatformHost: repo.PlatformHost,
-				PlatformRepoID: repo.PlatformExternalID, Owner: repo.Owner, Name: repo.Name,
+				Key: repo.Key, Owner: repo.Owner, Name: repo.Name,
 			},
 		)
 		require.NoError(err)
@@ -1226,7 +1243,14 @@ func TestProductionStartupRoutesExposeRotatedPATThroughRepoAPI(t *testing.T) {
 	// the PAT-backed owner route through the real repository API.
 	t.Setenv("ACME_PAT", "writer-b")
 	for _, name := range []string{"covered", "uncovered"} {
-		resp, err := http.Get(httpServer.URL + "/api/v1/repo/github/acme/" + name)
+		req, err := http.NewRequestWithContext(
+			t.Context(),
+			http.MethodGet,
+			httpServer.URL+"/api/v1/repo/github/acme/"+name,
+			nil,
+		)
+		require.NoError(err)
+		resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
 		require.NoError(err)
 		var body struct {
 			Operations struct {
@@ -1239,6 +1263,96 @@ func TestProductionStartupRoutesExposeRotatedPATThroughRepoAPI(t *testing.T) {
 		require.NoError(resp.Body.Close())
 		assert.Equal(http.StatusOK, resp.StatusCode)
 		assert.Equal("write_credential_error", body.Operations.AddComment.Code)
+	}
+}
+
+// An App-only route has no user identity, so workspace Git stays refused while
+// clones into Forge's own store use the owner's installation token. Another
+// owner's repository must never borrow that installation.
+func TestAppOnlyRouteClonesWithInstallationTokenButKeepsWorkspaceGitClosed(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	database := dbtest.Open(t)
+	t.Setenv("UNSET_PAT", "")
+	auth := make(chan string, 4)
+	gitServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if username, password, ok := r.BasicAuth(); ok {
+			select {
+			case auth <- username + "\x00" + password:
+			default:
+			}
+		}
+		w.Header().Set("WWW-Authenticate", `Basic realm="git"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer gitServer.Close()
+	host := gitServer.Listener.Addr().String()
+	cfg := &config.Config{
+		SyncInterval: "5m", Host: "127.0.0.1", Port: 8091, BasePath: "/",
+		Activity: config.Activity{ViewMode: "flat", TimeRange: "7d"},
+		Platforms: []config.PlatformConfig{{
+			Type: "github", Host: host, TokenEnv: "UNSET_PAT",
+		}},
+		Repos: []config.Repo{{
+			Platform: "github", PlatformHost: host, Owner: "org-app", Name: "one",
+		}},
+		GitHubApps: []config.GitHubAppConfig{{
+			Host: host, AppID: 7, PrivateKeyPath: "/keys/app.pem",
+			InstallationID: 789, InstallationAccount: "org-app",
+			RepositorySelection: "all",
+		}},
+	}
+	require.NoError(cfg.Validate())
+	set := tokenauth.NewSourceSet(tokenauth.Options{
+		GitHubCLI: func(context.Context, string) (string, error) {
+			return "", tokenauth.ErrMissingToken
+		},
+		GitHubApp: func(context.Context, tokenauth.Candidate) (string, time.Time, error) {
+			return "app-token", time.Now().Add(time.Hour), nil
+		},
+	})
+	sources, err := collectProviderTokenSources(t.Context(), cfg, set)
+	require.NoError(err)
+	startup, err := buildProviderControlPlane(
+		t.Context(), database, cfg, set, sources, defaultProviderFactories(),
+		fakeGitHubIdentityResolver{},
+	)
+	require.NoError(err)
+	gitRoutes := gitRoutesForProviderControlPlaneTest(t, cfg, set, &startup)
+
+	_, err = gitRoutes.SourceForRepo("github", host, "org-app", "one").Token(t.Context())
+	require.ErrorIs(err, github.ErrMissingWriteIdentity,
+		"workspace Git must keep requiring a user identity")
+	token, err := gitRoutes.ReadSourceForRepo("github", host, "org-app", "one").Token(t.Context())
+	require.NoError(err)
+	assert.Equal("app-token", token)
+	otherToken, otherErr := gitRoutes.ReadSourceForRepo("github", host, "other-owner", "two").
+		Token(t.Context())
+	assert.NotEqual("app-token", otherToken,
+		"another owner's repository must not borrow this installation")
+	workspaceToken, workspaceErr := gitRoutes.SourceForRepo("github", host, "other-owner", "two").
+		Token(t.Context())
+	assert.Equal(workspaceToken, otherToken)
+	assert.Equal(workspaceErr == nil, otherErr == nil,
+		"without an installation for the owner, reads keep the workspace route's behavior")
+
+	manager := gitclone.New(t.TempDir(), gitRoutes)
+	require.NoError(manager.RequireReadCredentialRoute(t.Context(), "github", host, "org-app", "one"))
+	require.ErrorIs(
+		manager.RequireCredentialRoute(t.Context(), "github", host, "org-app", "one"),
+		github.ErrMissingWriteIdentity,
+	)
+	manager.SetAllowInsecureHTTP("github", host, true)
+	err = manager.EnsureClone(
+		t.Context(), "github", host, "org-app", "one", gitServer.URL+"/org-app/one.git",
+	)
+	require.Error(err, "the controlled endpoint rejects the clone")
+	assert.NotContains(err.Error(), github.ErrMissingWriteIdentity.Error())
+	select {
+	case got := <-auth:
+		assert.Equal("x-access-token\x00app-token", got)
+	default:
+		require.Fail("the clone did not send the installation token")
 	}
 }
 
@@ -1375,7 +1489,7 @@ func TestBuildProviderControlPlaneReportsSafeGitHubIdentityResolutionFailure(t *
 	_, err = buildProviderControlPlane(
 		t.Context(), database, cfg, set, sources, defaultProviderFactories(),
 		fakeGitHubIdentityResolver{err: map[string]error{
-			"ORG_A_TOKEN": fmt.Errorf("identity lookup failed"),
+			"ORG_A_TOKEN": errors.New("identity lookup failed"),
 		}},
 	)
 	require.Error(err)
@@ -1613,7 +1727,7 @@ func TestSelectedGitHubAppKeepsOwnerDiscoveryWhenRepoOverridesPAT(t *testing.T) 
 		},
 	)
 
-	req := httptest.NewRequest(
+	req := httptest.NewRequestWithContext(t.Context(),
 		http.MethodPost, "/api/v1/repos/preview",
 		strings.NewReader(fmt.Sprintf(
 			`{"provider":"github","host":%q,"owner":"acme","pattern":"*"}`,

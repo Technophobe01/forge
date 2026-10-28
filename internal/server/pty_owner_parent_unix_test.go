@@ -15,11 +15,14 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
 	"go.kenn.io/forge/internal/procutil"
 	"go.kenn.io/forge/internal/ptyowner"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 )
 
 func TestServerPtyOwnerHelperStopsWhenParentKilled(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	root := t.TempDir()
 	session := "test-parent-loss"
@@ -30,7 +33,7 @@ func TestServerPtyOwnerHelperStopsWhenParentKilled(t *testing.T) {
 		os.Args[0],
 		"-test.run=TestServerPtyOwnerParentHelperProcess",
 		"--",
-		serverPtyOwnerParentHelperMarker,
+		serverfake.ServerPtyOwnerParentHelperMarker,
 		"-root", root,
 		"-session", session,
 	)
@@ -44,7 +47,7 @@ func TestServerPtyOwnerHelperStopsWhenParentKilled(t *testing.T) {
 			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
 		}
-		stopCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Second)
 		defer cancel()
 		_ = ptyowner.NewClient(root, []string{"/bin/sh"}).Stop(stopCtx, session)
 	})
@@ -75,11 +78,11 @@ func TestServerPtyOwnerHelperStopsWhenParentKilled(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond, "owner survived parent loss: %s", output.String())
 }
 
-func TestServerPtyOwnerParentHelperProcess(t *testing.T) {
+func TestServerPtyOwnerParentHelperProcess(t *testing.T) { //nolint:paralleltest // subprocess entry point; owns the helper process's stdio and lifetime
 	args := os.Args
 	sep := slices.Index(args, "--")
 	if sep < 0 || len(args) <= sep+1 ||
-		args[sep+1] != serverPtyOwnerParentHelperMarker {
+		args[sep+1] != serverfake.ServerPtyOwnerParentHelperMarker {
 		return
 	}
 	args = args[sep+2:]
@@ -96,7 +99,7 @@ func TestServerPtyOwnerParentHelperProcess(t *testing.T) {
 		Command: []string{"/bin/sh"},
 	}
 	require.NoError(t, client.Ensure(context.Background(), *session, os.TempDir()))
-	blockServerRuntimeHelper()
+	serverfake.BlockServerRuntimeHelper()
 }
 
 func testPtyOwnerParentContext(parentPID int) (context.Context, context.CancelFunc) {

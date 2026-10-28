@@ -8,13 +8,9 @@ import (
 	"time"
 )
 
-type workspaceRuntimeSessionExecer interface {
-	ExecContext(context.Context, string, ...any) (sql.Result, error)
-}
-
 func upsertWorkspaceRuntimeSession(
 	ctx context.Context,
-	execer workspaceRuntimeSessionExecer,
+	execer execer,
 	session *WorkspaceRuntimeSession,
 ) error {
 	createdAt := canonicalUTCTime(session.CreatedAt)
@@ -54,7 +50,7 @@ func (d *DB) RecordWorkspaceRuntimeSession(
 		if err := upsertWorkspaceRuntimeSession(ctx, tx, session); err != nil {
 			return err
 		}
-		if session.Kind != "agent" {
+		if session.Kind != "agent" && session.Kind != "acp" {
 			return nil
 		}
 		createdAt := canonicalUTCTime(session.CreatedAt)

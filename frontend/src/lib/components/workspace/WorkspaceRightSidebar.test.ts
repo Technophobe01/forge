@@ -1,16 +1,25 @@
+import { startTestTelemetry } from "../../testing/telemetry.js";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { tick } from "svelte";
 import { Effect } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { makeAppRuntime, type OwnedAppRuntime } from "../../app/runtime.js";
 import { STORES_KEY } from "../../context.js";
 import { createDiffStore } from "../../stores/diff.svelte.js";
+import { createAppStores } from "../../app-stores.svelte.js";
+import { createMockApiFetch } from "../../../test/mockApiFetch.js";
+import type { IssueDetail, PullDetail } from "../../api/types.js";
 import type { StoreInstances } from "../../types.js";
 import WorkspaceRightSidebarTestHarness from "./WorkspaceRightSidebarTestHarness.svelte";
+import type { WorkspaceDiffGitState } from "./workspace-diff-default.js";
 
+const coreActions = vi.fn(async (_body: unknown, _options?: unknown) => ({ status: "queued" }));
 let runtime: OwnedAppRuntime;
 
-beforeEach(() => {
+beforeEach(async () => {
+  coreActions.mockClear();
   runtime = makeAppRuntime();
+  await startTestTelemetry(runtime, coreActions).ready;
 });
 
 vi.mock("../kata/KataLinksPanel.svelte", async () => ({
@@ -19,6 +28,7 @@ vi.mock("../kata/KataLinksPanel.svelte", async () => ({
 
 function makeStores(): Pick<StoreInstances, "diff"> & Partial<StoreInstances> {
   return {
+    detail: createAppStores({ runtime }).stores.detail,
     diff: createDiffStore({ runtime }),
     roborevDaemon: {
       isAvailable: () => false,
@@ -26,10 +36,13 @@ function makeStores(): Pick<StoreInstances, "diff"> & Partial<StoreInstances> {
   };
 }
 
-function renderSidebar(refreshToken = 0) {
+function renderSidebar(refreshToken = 0, gitState: WorkspaceDiffGitState = {}) {
   const sidebarProps = {
-    activeTab: "diff" as const,
+    gitState,
+    activeTab: "diff" as "diff" | "reviews",
+    workspaceHostKey: undefined as string | undefined,
     workspaceID: "ws-1",
+    worktreePath: "/tmp/worktrees/ws-1",
     provider: "github",
     platformHost: "github.com",
     repoOwner: "acme",
@@ -63,6 +76,7 @@ function renderDisabledSidebar() {
       sidebarProps: {
         activeTab: "diff",
         workspaceID: "ws-1",
+        worktreePath: "/tmp/worktrees/ws-1",
         provider: "github",
         platformHost: "github.com",
         repoOwner: "acme",
@@ -87,6 +101,7 @@ function renderKataSidebarWithoutPR() {
       sidebarProps: {
         activeTab: "diff",
         workspaceID: "ws-kata-1",
+        worktreePath: "/tmp/worktrees/ws-kata-1",
         provider: "github",
         platformHost: "github.com",
         repoOwner: "acme",
@@ -113,6 +128,7 @@ function renderKataLinksSidebar(
       sidebarProps: {
         activeTab: "kata",
         workspaceID: "ws-linked-1",
+        worktreePath: "/tmp/worktrees/ws-linked-1",
         workspaceHostKey,
         provider: "github",
         platformHost: "github.com",
@@ -130,12 +146,325 @@ function renderKataLinksSidebar(
   });
 }
 
+function mockEmptyWorkspaceDiff(): string[] {
+  const calls: string[] = [];
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    calls.push(url);
+    if (url.includes("/api/roborev/api/repos")) {
+      return Response.json({ repos: [] });
+    }
+    if (url.includes("/api/v1/workspaces/ws-1/commits")) {
+      return Response.json({ commits: [] });
+    }
+    if (url.includes("/api/v1/workspaces/ws-1/files") || url.includes("/api/v1/workspaces/ws-1/diff")) {
+      return Response.json({ stale: false, whitespace_only_count: 0, files: [] });
+    }
+    return Response.json({}, { status: 404 });
+  });
+  return calls;
+}
+
 describe("WorkspaceRightSidebar", () => {
   afterEach(async () => {
     cleanup();
     vi.restoreAllMocks();
     await Effect.runPromise(runtime.disposeEffect);
   });
+
+  it("selects tracked provider targets and disables unavailable Kata targets", async () => {
+    const onselect = vi.fn();
+    const repo = {
+      provider: "github",
+      platform_host: "github.com",
+      platform_repo_id: 1002,
+      owner: "acme",
+      name: "other",
+      repo_path: "acme/other",
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({
+        kata_available: false,
+        targets: [
+          {
+            id: 1,
+            type: "pr",
+            number: 42,
+            repo,
+            title: "Stack base",
+            state: "open",
+            source: "tracked",
+            url: "https://github.com/acme/other/pull/42",
+            unavailable: false,
+          },
+          {
+            id: 2,
+            type: "issue",
+            number: 42,
+            repo,
+            title: "Follow up",
+            state: "open",
+            source: "tracked",
+            url: "https://github.com/acme/other/issues/42",
+            unavailable: false,
+          },
+          {
+            id: 3,
+            type: "kata",
+            number: 0,
+            title: "Task",
+            state: "open",
+            source: "tracked",
+            url: "",
+            unavailable: true,
+            kata: { daemon_id: "local", project_uid: "project-a", issue_uid: "task-a", reference: "Task A" },
+          },
+        ],
+      }),
+    );
+    render(WorkspaceRightSidebarTestHarness, {
+      props: {
+        runtime,
+        sidebarProps: {
+          activeTab: "pr",
+          workspaceID: "ws-targets",
+          worktreePath: "",
+          provider: "github",
+          repoOwner: "acme",
+          repoName: "widget",
+          repoPath: "acme/widget",
+          ownerItemType: "adhoc",
+          ownerItemNumber: 0,
+          associatedPRNumber: null,
+          branch: "work",
+          roborevBaseUrl: "/api/roborev",
+          onselect,
+        },
+      },
+      context: new Map([[STORES_KEY, makeStores()]]),
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Targets/ }).textContent).toContain("3"));
+    await fireEvent.click(screen.getByText("Targets"));
+    await fireEvent.click(screen.getByRole("button", { name: "Stack base PR #42 acme/other open" }));
+    expect(onselect).toHaveBeenLastCalledWith(
+      "pr",
+      expect.objectContaining({ owner: "acme", name: "other", number: 42 }),
+    );
+    await fireEvent.click(screen.getByRole("button", { name: "Follow up Issue #42 acme/other open" }));
+    expect(onselect).toHaveBeenLastCalledWith("issue", expect.objectContaining({ number: 42 }));
+    expect((screen.getByRole("button", { name: /Task A/ }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("displays a selected PR without changing the workspace's linked PR", async () => {
+    const api = createMockApiFetch();
+    vi.spyOn(globalThis, "fetch").mockImplementation(api.fetch);
+    const { stores } = createAppStores({ runtime });
+    const sidebarProps = {
+      activeTab: "pr" as const,
+      workspaceID: "ws-1",
+      worktreePath: "/tmp/worktrees/ws-1",
+      provider: "github",
+      platformHost: "github.com",
+      repoOwner: "acme",
+      repoName: "widgets",
+      repoPath: "acme/widgets",
+      ownerItemType: "pull_request" as const,
+      ownerItemNumber: 42,
+      associatedPRNumber: 42,
+      viewedPR: {
+        provider: "github",
+        platformHost: "github.com",
+        owner: "acme",
+        name: "widgets",
+        repoPath: "acme/widgets",
+        number: 55,
+      },
+      branch: "feature/widgets",
+      roborevBaseUrl: "/api/roborev",
+    };
+    const view = render(WorkspaceRightSidebarTestHarness, {
+      props: { runtime, sidebarProps },
+      context: new Map([[STORES_KEY, stores]]),
+    });
+    await screen.findByRole("heading", { name: "Refactor theme system" });
+    await view.rerender({ runtime, sidebarProps: { ...sidebarProps, viewedPR: null } });
+    await screen.findByRole("heading", { name: "Add browser regression coverage" });
+    expect(api.requests.filter(({ method }) => method === "PATCH" || method === "PUT")).toEqual([]);
+  });
+
+  it("counts a hidden failed PR view once when shown", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      createMockApiFetch([
+        (request) =>
+          request.url.pathname === "/api/v1/pulls/github/acme/widgets/42"
+            ? Response.json({ code: "forbidden", title: "Read denied", status: 403 }, { status: 403 })
+            : undefined,
+      ]).fetch,
+    );
+    const { stores } = createAppStores({ runtime });
+    const sidebarProps = {
+      activeTab: "pr" as const,
+      workspaceID: "ws-1",
+      worktreePath: "",
+      provider: "github",
+      platformHost: "github.com",
+      repoOwner: "acme",
+      repoName: "widgets",
+      repoPath: "acme/widgets",
+      ownerItemType: "pull_request" as const,
+      ownerItemNumber: 42,
+      associatedPRNumber: 42,
+      branch: "work",
+      roborevBaseUrl: "/api/roborev",
+      visible: false,
+      refreshToken: 0,
+    };
+    const view = render(WorkspaceRightSidebarTestHarness, {
+      props: { runtime, sidebarProps },
+      context: new Map([[STORES_KEY, stores]]),
+    });
+    await screen.findByText("Error: Read denied");
+    expect(coreActions).not.toHaveBeenCalled();
+    await view.rerender({ runtime, sidebarProps: { ...sidebarProps, visible: true } });
+    await waitFor(() =>
+      expect(coreActions).toHaveBeenCalledExactlyOnceWith(
+        { event: "error_shown", properties: { surface: "web", kind: "pr_viewed" } },
+        {},
+      ),
+    );
+  });
+
+  it("counts visible PR detail on the PR tab even while actions are disabled", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(createMockApiFetch().fetch);
+    const { stores } = createAppStores({ runtime });
+    const sidebarProps = {
+      activeTab: "diff" as "diff" | "pr",
+      workspaceID: "ws-1",
+      worktreePath: "",
+      provider: "github",
+      platformHost: "github.com",
+      repoOwner: "acme",
+      repoName: "widgets",
+      repoPath: "acme/widgets",
+      ownerItemType: "pull_request" as const,
+      ownerItemNumber: 42,
+      associatedPRNumber: 42,
+      branch: "work",
+      roborevBaseUrl: "/api/roborev",
+    };
+    const view = render(WorkspaceRightSidebarTestHarness, {
+      props: { runtime, sidebarProps },
+      context: new Map([[STORES_KEY, stores]]),
+    });
+    await tick();
+    expect(coreActions).not.toHaveBeenCalled();
+    await view.rerender({ runtime, sidebarProps: { ...sidebarProps, activeTab: "pr", disabled: true } });
+    await screen.findByRole("heading", { name: "Add browser regression coverage" });
+    await waitFor(() => expect(coreActions).toHaveBeenCalledTimes(1));
+    expect(coreActions.mock.calls[0]?.[0]).toMatchObject({ event: "pr_viewed" });
+  });
+
+  it.each([
+    ["pr", "pulls", "merge_request", 42],
+    ["issue", "issues", "issue", 7],
+  ] as const)(
+    "shows only the selected %s while workspace detail reads are pending",
+    async (activeTab, resource, itemField, number) => {
+      const api = createMockApiFetch();
+      const pathA = `/api/v1/${resource}/github/acme/widgets/${number}`;
+      const pathB = `/api/v1/${resource}/github/acme/widgets/${number + 1}`;
+      const fixture = (await (await api.fetch(pathA)).json()) as {
+        repo: PullDetail["repo"];
+        merge_request?: PullDetail["merge_request"];
+        issue?: IssueDetail["issue"];
+      };
+      const item = fixture[itemField];
+      const repo = { ...fixture.repo, platform_repo_id: 1001 };
+      const snapshots = new Map([
+        [pathA, { ...fixture, repo, [itemField]: { ...item, Number: number, Title: "Workspace A detail" } }],
+        [pathB, { ...fixture, repo, [itemField]: { ...item, Number: number + 1, Title: "Workspace B detail" } }],
+      ]);
+      let pendingRead: ReturnType<typeof Promise.withResolvers<void>> | null = null;
+      let heldPath = "";
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+        const request =
+          input instanceof Request ? input : new Request(new URL(String(input), window.location.href), init);
+        const path = new URL(request.url).pathname;
+        const snapshot = snapshots.get(path.replace(/\/sync(?:\/async)?$/, ""));
+        if (!snapshot) return api.fetch(input, init);
+        if (request.method === "GET" && pendingRead) {
+          heldPath = path;
+          await pendingRead.promise;
+        }
+        return Response.json(snapshots.get(path) ?? snapshot);
+      });
+      const { stores } = createAppStores({ runtime });
+      const sidebarProps = {
+        activeTab,
+        workspaceID: "ws-a",
+        worktreePath: "/tmp/worktrees/ws-a",
+        provider: "github",
+        platformHost: "github.com",
+        repositoryKey: { kind: "id", id: 1001 },
+        repoOwner: "acme",
+        repoName: "widgets",
+        repoPath: "acme/widgets",
+        ownerItemType: activeTab === "pr" ? ("pull_request" as const) : ("issue" as const),
+        ownerItemNumber: number,
+        associatedPRNumber: activeTab === "pr" ? number : null,
+        branch: "feature/widgets",
+        roborevBaseUrl: "/api/roborev",
+      };
+      const otherSidebarProps = {
+        ...sidebarProps,
+        workspaceID: "ws-b",
+        worktreePath: "/tmp/worktrees/ws-b",
+        ownerItemNumber: number + 1,
+        associatedPRNumber: activeTab === "pr" ? number + 1 : null,
+      };
+      const view = render(WorkspaceRightSidebarTestHarness, {
+        props: { runtime, sidebarProps },
+        context: new Map([[STORES_KEY, stores]]),
+      });
+      try {
+        await screen.findByRole("heading", { name: "Workspace A detail" });
+        pendingRead = Promise.withResolvers<void>();
+        await view.rerender({ runtime, sidebarProps: otherSidebarProps });
+        await waitFor(() => expect(heldPath).toBe(pathB));
+        expect(screen.queryByRole("heading", { name: "Workspace A detail" })).toBeNull();
+        expect(screen.getByText(/^Loading/)).toBeTruthy();
+        pendingRead.resolve();
+        pendingRead = null;
+        await screen.findByRole("heading", { name: "Workspace B detail" });
+
+        pendingRead = Promise.withResolvers<void>();
+        await view.rerender({ runtime, sidebarProps });
+        await waitFor(() => expect(heldPath).toBe(pathA));
+        expect(screen.getByRole("heading", { name: "Workspace A detail" })).toBeTruthy();
+        expect(screen.queryByRole("heading", { name: "Workspace B detail" })).toBeNull();
+        expect(screen.queryByTitle("Star")).toBeNull();
+        snapshots.set(pathA, {
+          ...fixture,
+          repo,
+          [itemField]: { ...item, Number: number, Title: "Workspace A refreshed" },
+        });
+        pendingRead.resolve();
+        pendingRead = null;
+        await screen.findByRole("heading", { name: "Workspace A refreshed" });
+        expect(screen.getByTitle("Star")).toBeTruthy();
+
+        pendingRead = Promise.withResolvers<void>();
+        await view.rerender({ runtime, sidebarProps: otherSidebarProps });
+        await waitFor(() => expect(heldPath).toBe(pathB));
+        expect(screen.getByRole("heading", { name: "Workspace B detail" })).toBeTruthy();
+        expect(screen.queryByRole("heading", { name: "Workspace A refreshed" })).toBeNull();
+        expect(screen.queryByTitle("Star")).toBeNull();
+      } finally {
+        pendingRead?.resolve();
+      }
+      await screen.findByTitle("Star");
+    },
+  );
 
   it.each(["pull_request", "issue", "kata_task", "adhoc"] as const)(
     "shows Forge-owned Kata links for a %s workspace",
@@ -158,6 +487,61 @@ describe("WorkspaceRightSidebar", () => {
 
     expect(screen.queryByTestId("kata-links-panel")).toBeNull();
     expect(screen.getByText("Kata links are unavailable for remote workspaces")).toBeTruthy();
+  });
+
+  it("does not read local reviews for a remote workspace", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ files: [], commits: [] }));
+    const { rerender } = renderSidebar();
+    await rerender({ activeTab: "reviews", workspaceHostKey: "member" });
+
+    expect(screen.getByText("Local reviews are unavailable for remote workspaces")).toBeTruthy();
+    expect(
+      fetch.mock.calls.filter(([input]) => (input instanceof Request ? input.url : String(input)).includes("roborev")),
+    ).toHaveLength(0);
+  });
+
+  it.each([
+    ["a dirty worktree", { worktreeDirty: true, commitsAhead: 2 }, "head", "Compare with HEAD"],
+    ["unpushed commits", { worktreeDirty: false, commitsAhead: 2 }, "pushed", "Compare with pushed branch"],
+    ["a fully pushed branch", { worktreeDirty: false, commitsAhead: 0 }, "merge-target", "Compare with merge target"],
+    ["a never-pushed branch", { worktreeDirty: false }, "merge-target", "Compare with merge target"],
+    [
+      "commits counted against a fork PR head",
+      { worktreeDirty: false, commitsAhead: 2, commitsVsPRHead: true },
+      "merge-target",
+      "Compare with merge target",
+    ],
+  ] as const)("opens the diff for %s on the matching base", async (_label, gitState, base, buttonName) => {
+    const calls = mockEmptyWorkspaceDiff();
+
+    renderSidebar(0, gitState);
+
+    await waitFor(() => {
+      expect(calls.some((url) => url.endsWith(`/api/v1/workspaces/ws-1/diff?base=${base}`))).toBe(true);
+    });
+    expect(calls.filter((url) => url.includes("/api/v1/workspaces/ws-1/diff?")).length).toBe(1);
+    expect(screen.getByRole("button", { name: buttonName }).getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("keeps the user's diff base when the workspace git state changes", async () => {
+    const calls = mockEmptyWorkspaceDiff();
+
+    const { rerender } = renderSidebar(0, { worktreeDirty: true });
+    await waitFor(() => {
+      expect(calls.some((url) => url.endsWith("/api/v1/workspaces/ws-1/diff?base=head"))).toBe(true);
+    });
+
+    await rerender({ gitState: { worktreeDirty: false, commitsAhead: 1 } });
+    await waitFor(() => {
+      expect(calls.some((url) => url.endsWith("/api/v1/workspaces/ws-1/diff?base=pushed"))).toBe(true);
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Compare with HEAD" }));
+    calls.length = 0;
+    await rerender({ gitState: { worktreeDirty: false, commitsAhead: 0 } });
+
+    expect(screen.getByRole("button", { name: "Compare with HEAD" }).getAttribute("aria-pressed")).toBe("true");
+    expect(calls.some((url) => url.includes("base=merge-target"))).toBe(false);
   });
 
   it("preserves the workspace diff base and selected commit across refreshes", async () => {

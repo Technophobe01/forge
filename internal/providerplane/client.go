@@ -14,10 +14,12 @@ import (
 	"strings"
 	"time"
 
+	gitremote "go.kenn.io/kit/git/remote"
+
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/federation"
 	"go.kenn.io/forge/internal/federationauth"
-	gitremote "go.kenn.io/kit/git/remote"
+	"go.kenn.io/forge/platform"
 )
 
 const (
@@ -61,6 +63,14 @@ type Client interface {
 	Do(context.Context, federationauth.Scope, *http.Request) (*http.Response, error)
 }
 
+// StreamingClient sends a provider request whose response body may stream
+// for as long as the caller reads it, such as markdown video. Connect, TLS,
+// and response-header bounds still apply; only the whole-request timeout is
+// lifted.
+type StreamingClient interface {
+	DoStream(context.Context, federationauth.Scope, *http.Request) (*http.Response, error)
+}
+
 // WriteAdmitter is the narrow mutation-admission contract shared by HTTP,
 // MCP, workspace automation, and deferred work without coupling those
 // packages to the gate's concrete implementation.
@@ -72,14 +82,31 @@ type WriteAdmitter interface {
 // hub to issue an immutable workspace launch specification. The
 // provider facts themselves are returned in the specification and are never
 // supplied by a spoke.
+//
+// RepoKey, when set, pins the request to that repository: the hub resolves
+// by key and rejects a route now held by a different repository. Its JSON
+// encoding is WorkspaceLaunchRequestJSON.
 type WorkspaceLaunchRequest struct {
-	Repository      RepositoryRoute `json:"repository"`
-	PlatformRepoID  string          `json:"platform_repo_id,omitempty"`
-	ItemType        string          `json:"item_type"`
-	ItemNumber      int             `json:"item_number"`
-	ItemKey         string          `json:"item_key,omitempty"`
-	GitHeadRef      string          `json:"git_head_ref,omitempty"`
-	IssueBranchSlug bool            `json:"issue_branch_slug,omitempty"`
+	Repository      RepositoryRoute        `json:"repository"`
+	RepoKey         platform.RepositoryKey `json:"-" repokey:"platform_repo_id,bitbucket_repository_uuid,omitempty"`
+	ItemType        string                 `json:"item_type"`
+	ItemNumber      int                    `json:"item_number"`
+	ItemKey         string                 `json:"item_key,omitempty"`
+	GitHeadRef      string                 `json:"git_head_ref,omitempty"`
+	IssueBranchSlug bool                   `json:"issue_branch_slug,omitempty"`
+	// ForCreation checks the selected route before creating or reusing a workspace.
+	// Existing workspace refreshes follow their durable repository identity instead.
+	ForCreation bool `json:"for_creation,omitempty"`
+}
+
+func (r WorkspaceLaunchRequest) MarshalJSON() ([]byte, error) {
+	type plain WorkspaceLaunchRequest
+	return platform.MarshalKeyedJSON(plain(r))
+}
+
+func (r *WorkspaceLaunchRequest) UnmarshalJSON(data []byte) error {
+	type plain WorkspaceLaunchRequest
+	return platform.UnmarshalKeyedJSON(data, (*plain)(r))
 }
 
 // WorkspaceLaunchSpecResolver is the single authority used to resolve initial
@@ -120,15 +147,14 @@ func ValidateWorkspaceLaunchSpecResponse(
 	if specRoute != canonicalSpecRoute {
 		return errors.New("workspace launch repository route is not canonical")
 	}
-	stableRepoID := strings.TrimSpace(request.PlatformRepoID)
-	if stableRepoID != "" && spec.Repository.PlatformRepoID != stableRepoID {
+	if !request.RepoKey.IsZero() && spec.Repository.Key != request.RepoKey {
 		return errors.New("workspace launch repository identity does not match the request")
 	}
 	if canonicalSpecRoute.Provider != requestedRoute.Provider ||
 		canonicalSpecRoute.PlatformHost != requestedRoute.PlatformHost {
 		return errors.New("workspace launch repository route does not match the request")
 	}
-	if (stableRepoID == "" &&
+	if (request.RepoKey.IsZero() &&
 		(canonicalSpecRoute.Owner != requestedRoute.Owner ||
 			canonicalSpecRoute.Name != requestedRoute.Name)) ||
 		spec.ItemType != request.ItemType ||
@@ -142,16 +168,17 @@ func ValidateWorkspaceLaunchSpecResponse(
 		spec.GitHeadRef != requestedHead {
 		return errors.New("workspace launch branch does not match the request")
 	}
-	if err := gitremote.ValidateRemoteIdentity(gitremote.Identity{
-		Host:  spec.Repository.PlatformHost,
-		Owner: spec.Repository.Owner,
-		Name:  spec.Repository.Name,
+	if err := platform.ValidateRemoteIdentity(platform.RepoRef{
+		Platform: platform.Kind(spec.Repository.Provider),
+		Host:     spec.Repository.PlatformHost,
+		Owner:    spec.Repository.Owner,
+		Name:     spec.Repository.Name,
 	}, spec.Repository.CloneURL); err != nil {
 		return fmt.Errorf("workspace launch clone URL: %w", err)
 	}
 	if spec.Pull != nil && spec.Pull.HeadRepoKind == "fork" {
-		if err := gitremote.ValidateRemoteHost(
-			spec.Repository.PlatformHost, spec.Pull.HeadRepoCloneURL,
+		if err := platform.ValidateRemoteHost(
+			platform.Kind(spec.Repository.Provider), spec.Repository.PlatformHost, spec.Pull.HeadRepoCloneURL,
 		); err != nil {
 			return fmt.Errorf("workspace launch fork clone URL: %w", err)
 		}
@@ -222,7 +249,7 @@ func validateFederationNetworkRemote(remoteURL string) error {
 func FederationRemoteRepositoryRoute(
 	provider, host, remoteURL string,
 ) (RepositoryRoute, error) {
-	repoPath := gitremote.RemoteRepoPath(remoteURL)
+	repoPath := platform.RemoteRepoPath(platform.Kind(provider), host, remoteURL)
 	lastSlash := strings.LastIndex(repoPath, "/")
 	if lastSlash <= 0 || lastSlash == len(repoPath)-1 {
 		return RepositoryRoute{}, errors.New("federation clone URL must identify a repository owner and name")
@@ -297,7 +324,7 @@ type hubClient struct {
 func NewClient(options Options) (Client, error) {
 	localNodeID := strings.TrimSpace(options.LocalNodeID)
 	if !federation.ValidNodeID(localNodeID) {
-		return nil, fmt.Errorf("local node ID is invalid")
+		return nil, errors.New("local node ID is invalid")
 	}
 	hub, err := options.Hub.validate()
 	if err != nil {
@@ -327,6 +354,23 @@ func (c *hubClient) Do(
 	scope federationauth.Scope,
 	request *http.Request,
 ) (*http.Response, error) {
+	return c.do(ctx, scope, request, scope == federationauth.ScopeEventsRead)
+}
+
+func (c *hubClient) DoStream(
+	ctx context.Context,
+	scope federationauth.Scope,
+	request *http.Request,
+) (*http.Response, error) {
+	return c.do(ctx, scope, request, true)
+}
+
+func (c *hubClient) do(
+	ctx context.Context,
+	scope federationauth.Scope,
+	request *http.Request,
+	stream bool,
+) (*http.Response, error) {
 	if scope != federationauth.ScopeProviderRead &&
 		scope != federationauth.ScopeProviderWrite &&
 		scope != federationauth.ScopeProviderHandoff &&
@@ -337,7 +381,7 @@ func (c *hubClient) Do(
 		return nil, errors.New("provider request is required")
 	}
 	if !strings.HasPrefix(request.URL.Path, "/api/v1/") {
-		return nil, fmt.Errorf("provider request path must be under /api/v1")
+		return nil, errors.New("provider request path must be under /api/v1")
 	}
 	if c.credentials == nil {
 		return nil, ErrCredentialUnavailable
@@ -373,12 +417,12 @@ func (c *hubClient) Do(
 	}
 
 	httpClient := c.httpClient
-	if scope == federationauth.ScopeEventsRead {
+	if stream {
 		httpClient = c.streamClient
 	}
 	response, err := httpClient.Do(proxied)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrHubUnavailable, err)
+		return nil, fmt.Errorf("%w: %w", ErrHubUnavailable, err)
 	}
 	return response, nil
 }

@@ -68,6 +68,10 @@ export class WorkspaceDeletedEvent extends Schema.Class<WorkspaceDeletedEvent>("
   item_type: Schema.String,
 }) {}
 
+export class WorklistsChangedEvent extends Schema.Class<WorklistsChangedEvent>("WorklistsChangedEvent")({
+  worklist_id: Schema.Number,
+}) {}
+
 export class WorkspacePRRefreshQueuedEvent extends Schema.Class<WorkspacePRRefreshQueuedEvent>(
   "WorkspacePRRefreshQueuedEvent",
 )({
@@ -99,11 +103,19 @@ export class PRCIRefreshedEvent extends Schema.Class<PRCIRefreshedEvent>("PRCIRe
   warnings: Schema.Array(Schema.String),
 }) {}
 
+export class WorkflowRunsChangedEvent extends Schema.Class<WorkflowRunsChangedEvent>("WorkflowRunsChangedEvent")({
+  provider: Schema.String,
+  platform_host: Schema.String,
+  platform_repo_id: Schema.Number,
+  bitbucket_repository_uuid: Schema.optionalKey(Schema.String),
+}) {}
+
 export class WorkflowDispatchProgressEvent extends Schema.Class<WorkflowDispatchProgressEvent>(
   "WorkflowDispatchProgressEvent",
 )({
   provider: Schema.String,
-  platform_repo_id: Schema.String,
+  platform_repo_id: Schema.Number,
+  bitbucket_repository_uuid: Schema.optionalKey(Schema.String),
   platform_host: Schema.String,
   repo_path: Schema.String,
   owner: Schema.String,
@@ -119,7 +131,7 @@ export class DeferredMergeCompletedEvent extends Schema.Class<DeferredMergeCompl
 )({
   ...providerItemFields,
   head_sha: Schema.String,
-  status: Schema.Literals(["merged", "failed"]),
+  status: Schema.Literals(["merged", "failed", "queued"]),
   merged: Schema.optionalKey(Schema.Boolean),
   sha: Schema.optionalKey(Schema.String),
   message: Schema.optionalKey(Schema.String),
@@ -135,15 +147,24 @@ export class SyncStatusEvent extends Schema.Class<SyncStatusEvent>("SyncStatusEv
   last_error: Schema.optionalKey(Schema.String),
   last_run_at: Schema.optionalKey(Schema.String),
   progress: Schema.optionalKey(Schema.String),
+  detail_refresh_overdue: Schema.optionalKey(Schema.Number),
   relay: Schema.optionalKey(
     Schema.Struct({
       connected: Schema.Boolean,
+      incompatible: Schema.optionalKey(Schema.Boolean),
       recent: Schema.mutable(
         Schema.Array(
           Schema.Struct({
             id: Schema.Number,
             repository: Schema.String,
-            target: Schema.Literals(["pull_request", "pull_request_checks", "issue", "repository_refs", "repository"]),
+            target: Schema.Literals([
+              "pull_request",
+              "pull_request_checks",
+              "workflow_runs",
+              "issue",
+              "repository_refs",
+              "repository",
+            ]),
             number: Schema.Number,
             received_at: Schema.String,
           }),
@@ -182,7 +203,9 @@ export type ProviderEvent =
   | { readonly type: "pr_ci_refresh_queued"; readonly payload: PRCIRefreshQueuedEvent }
   | { readonly type: "pr_ci_refreshed"; readonly payload: PRCIRefreshedEvent }
   | { readonly type: "deferred_merge_completed"; readonly payload: DeferredMergeCompletedEvent }
-  | { readonly type: "workflow_dispatch_progress"; readonly payload: WorkflowDispatchProgressEvent };
+  | { readonly type: "workflow_runs_changed"; readonly payload: WorkflowRunsChangedEvent }
+  | { readonly type: "workflow_dispatch_progress"; readonly payload: WorkflowDispatchProgressEvent }
+  | { readonly type: "worklists_changed"; readonly payload: WorklistsChangedEvent };
 
 export type ProviderEventsError = ApiProblemError | InvalidExternalPayload | TransientTransportError;
 
@@ -292,6 +315,8 @@ const providerEventTypes: ReadonlyArray<ProviderEventType> = [
   "pr_ci_refreshed",
   "deferred_merge_completed",
   "workflow_dispatch_progress",
+  "workflow_runs_changed",
+  "worklists_changed",
 ];
 
 interface ProviderEventFrame {
@@ -392,6 +417,13 @@ const decodeProviderEvent = Effect.fn("ProviderEvents.decodeFrame")(function* (f
           Effect.mapError((cause) => invalidFrame(frame, cause)),
         ),
       } satisfies ProviderEvent;
+    case "worklists_changed":
+      return {
+        type: "worklists_changed",
+        payload: yield* Schema.decodeUnknownEffect(WorklistsChangedEvent)(payload).pipe(
+          Effect.mapError((cause) => invalidFrame(frame, cause)),
+        ),
+      } satisfies ProviderEvent;
     case "workspace_deleted":
       return {
         type: "workspace_deleted",
@@ -445,6 +477,13 @@ const decodeProviderEvent = Effect.fn("ProviderEvents.decodeFrame")(function* (f
       return {
         type: "deferred_merge_completed",
         payload: yield* Schema.decodeUnknownEffect(DeferredMergeCompletedEvent)(payload).pipe(
+          Effect.mapError((cause) => invalidFrame(frame, cause)),
+        ),
+      } satisfies ProviderEvent;
+    case "workflow_runs_changed":
+      return {
+        type: "workflow_runs_changed",
+        payload: yield* Schema.decodeUnknownEffect(WorkflowRunsChangedEvent)(payload).pipe(
           Effect.mapError((cause) => invalidFrame(frame, cause)),
         ),
       } satisfies ProviderEvent;

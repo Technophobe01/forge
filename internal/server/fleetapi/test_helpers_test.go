@@ -13,6 +13,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -23,7 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"go.kenn.io/forge/internal/testutil/gitsafe"
-	gitcmd "go.kenn.io/kit/git/cmd"
+	"go.kenn.io/forge/internal/testutil/workspacetest"
 
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/db"
@@ -33,6 +35,7 @@ import (
 	"go.kenn.io/forge/internal/server/workspaceapi"
 	"go.kenn.io/forge/internal/testutil/dbtest"
 	"go.kenn.io/forge/internal/workspace"
+	"go.kenn.io/forge/platform"
 )
 
 const (
@@ -128,7 +131,7 @@ func setupTestServer(t *testing.T) (*Handler, *db.DB) {
 func newTestHandlerWithWorkspaceManager(t *testing.T, database *db.DB) *Handler {
 	t.Helper()
 	h := newTestHandler(t, database, config.Fleet{})
-	manager := workspace.NewManager(database, t.TempDir())
+	manager := workspacetest.NewManager(t, database, t.TempDir())
 	h.workspaceSnapshot = workspaceSnapshotFromManager(manager)
 	return h
 }
@@ -163,8 +166,14 @@ func newTestHandler(t *testing.T, database *db.DB, fleetConfig config.Fleet) *Ha
 		WorkspaceSnapshot:      workspaceAPI.FleetSnapshot,
 		WorkspaceStatsSnapshot: workspaceAPI.FleetStatsSnapshot,
 		RuntimeSnapshot:        workspaceAPI.RuntimeSnapshot,
+		RuntimeExited:          workspaceAPI.RuntimeExited,
 	})
 	apiConfig := huma.DefaultConfig("fleet test", "0.0.0")
+	identityType := reflect.TypeFor[platform.RepositoryIdentity]()
+	identityWire, ok, err := platform.RepositoryKeyWireType(identityType)
+	require.NoError(t, err)
+	require.True(t, ok)
+	apiConfig.Components.Schemas.RegisterTypeAlias(identityType, identityWire)
 	apiConfig.OpenAPIPath = ""
 	apiConfig.DocsPath = ""
 	apiConfig.SchemasPath = ""
@@ -188,11 +197,11 @@ func doJSON(
 	t.Helper()
 	var req *http.Request
 	if body == nil {
-		req = httptest.NewRequest(method, path, nil)
+		req = httptest.NewRequestWithContext(t.Context(), method, path, nil)
 	} else {
 		raw, err := json.Marshal(body)
 		require.NoError(t, err)
-		req = httptest.NewRequest(method, path, bytes.NewReader(raw))
+		req = httptest.NewRequestWithContext(t.Context(), method, path, bytes.NewReader(raw))
 		req.Header.Set("Content-Type", "application/json")
 	}
 	w := httptest.NewRecorder()
@@ -234,7 +243,8 @@ func (h *testEventHub) count(kind string) int {
 
 func workspaceSnapshotFromManager(manager interface {
 	ListSummaries(context.Context) ([]db.WorkspaceSummary, error)
-}) func(context.Context) (workspaceapi.FleetSnapshot, error) {
+},
+) func(context.Context) (workspaceapi.FleetSnapshot, error) {
 	return func(ctx context.Context) (workspaceapi.FleetSnapshot, error) {
 		summaries, err := manager.ListSummaries(ctx)
 		if err != nil {
@@ -264,8 +274,8 @@ func rawWorkspaceForAdapterTest(summary db.WorkspaceSummary) fleet.RawWorkspace 
 		ID: summary.ID,
 		Repository: fleet.RepositoryIdentity{
 			Provider: summary.Platform, PlatformHost: summary.PlatformHost,
-			PlatformRepoID: summary.RepoPlatformID,
-			Owner:          summary.RepoOwner, Name: summary.RepoName,
+			Key:   summary.RepoKey,
+			Owner: summary.RepoOwner, Name: summary.RepoName,
 		},
 		ItemType: summary.ItemType, ItemNumber: summary.ItemNumber,
 		SourceItemVisible: summary.SourceItemVisible,
@@ -301,12 +311,12 @@ func repoRoot(t *testing.T) string {
 
 func freeLoopbackPort(t *testing.T) string {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer listener.Close()
 	addr, ok := listener.Addr().(*net.TCPAddr)
 	require.True(t, ok)
-	return fmt.Sprint(addr.Port)
+	return strconv.Itoa(addr.Port)
 }
 
 func containerLogs(ctx context.Context, container testcontainers.Container) string {
@@ -323,7 +333,7 @@ func containerLogs(ctx context.Context, container testcontainers.Container) stri
 }
 
 func initLocalOnlyGitRepo(ctx context.Context, dir string) error {
-	return gitcmd.New().Command(ctx, dir, "init", "-q").Run()
+	return gitsafe.Runner().Command(ctx, dir, "init", "-q").Run()
 }
 
 func mustMarshal(t *testing.T, value any) []byte {

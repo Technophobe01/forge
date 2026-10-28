@@ -1,0 +1,431 @@
+import { createServer, request as httpRequest } from "node:http";
+import path from "node:path";
+import { devices, expect, request, test } from "@playwright/test";
+import { startIsolatedWorkspaceE2EServer } from "./support/e2eServer";
+import { openSettingsPanel } from "./support/settingsPanel";
+
+test.use({ launchOptions: { args: ["--host-resolver-rules=MAP acp.test 127.0.0.1"] } });
+
+test("ACP workspace streams, approves tools, and reconnects on desktop and phone", async ({
+  page,
+  browser,
+  browserName,
+}, testInfo) => {
+  test.skip(browserName !== "chromium", "Phone profile uses Chromium");
+  test.setTimeout(120_000);
+  const server = await startIsolatedWorkspaceE2EServer();
+  const api = await request.newContext({ baseURL: server.info.base_url });
+  // A non-localhost HTTP name is insecure even though Chromium resolves it to loopback.
+  const upstream = new URL(server.info.base_url);
+  const host = "acp.test";
+  let origin = "";
+  const sockets = new Set<{ destroy(): void }>();
+  const proxy = createServer((incoming, outgoing) => {
+    const headers = { ...incoming.headers, host: upstream.host };
+    if (headers.origin === origin) headers.origin = upstream.origin;
+    const forwarded = httpRequest(
+      new URL(incoming.url ?? "/", upstream),
+      { method: incoming.method, headers },
+      (response) => {
+        outgoing.writeHead(response.statusCode ?? 502, response.headers);
+        response.pipe(outgoing);
+      },
+    );
+    forwarded.on("error", () => {
+      outgoing.writeHead(502);
+      outgoing.end();
+    });
+    incoming.pipe(forwarded);
+  });
+  proxy.on("upgrade", (incoming, client, head) => {
+    const headers = { ...incoming.headers, host: upstream.host };
+    if (headers.origin === origin) headers.origin = upstream.origin;
+    const forwarded = httpRequest(new URL(incoming.url ?? "/", upstream), { headers });
+    sockets.add(client);
+    client.on("close", () => sockets.delete(client));
+    client.on("error", () => forwarded.destroy());
+    forwarded.on("error", () => client.destroy());
+    forwarded.on("upgrade", (response, peer, peerHead) => {
+      sockets.add(peer);
+      peer.on("close", () => sockets.delete(peer));
+      peer.on("error", () => client.destroy());
+      client.on("close", () => peer.destroy());
+      peer.on("close", () => client.destroy());
+      const responseHeaders = response.rawHeaders.reduce<string[]>((lines, value, index) => {
+        if (index % 2 === 0) lines.push(`${value}: ${response.rawHeaders[index + 1]}`);
+        return lines;
+      }, []);
+      client.write(`HTTP/1.1 101 Switching Protocols\r\n${responseHeaders.join("\r\n")}\r\n\r\n`);
+      if (head.length) peer.write(head);
+      if (peerHead.length) client.write(peerHead);
+      client.pipe(peer);
+      peer.pipe(client);
+    });
+    forwarded.end();
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      proxy.once("error", reject);
+      proxy.listen(0, "127.0.0.1", resolve);
+    });
+    const address = proxy.address();
+    if (!address || typeof address === "string") throw new Error("Missing proxy address");
+    origin = `http://${host}:${address.port}`;
+    await page.goto(`${server.info.base_url}/settings`);
+    await openSettingsPanel(page, "Workspace agents");
+    await page.getByRole("button", { name: "Add custom agent" }).click();
+    await page.getByLabel("Custom agent key").fill("chat-fixture");
+    await page.getByLabel("Custom agent label").fill("Workspace Chat");
+    await page.getByRole("combobox", { name: "Workspace Chat experience: Terminal" }).click();
+    await page.getByRole("option", { name: "ACP chat" }).click();
+    await page.getByLabel("Workspace Chat binary").fill("/usr/local/bin/acp-agent");
+    await page.getByLabel("Workspace Chat arguments").fill("--mode review");
+    for (const width of [1280, 1024, 600]) {
+      await page.setViewportSize({ width, height: 900 });
+      const fields = page.locator(".agent-row--custom .field");
+      for (const field of await fields.all()) {
+        const box = await field.boundingBox();
+        const control = await field.locator("input, [role=combobox]").boundingBox();
+        if (!box || !control) throw new Error("Agent field is not visible");
+        expect(control.x).toBeGreaterThanOrEqual(box.x);
+        expect(control.x + control.width).toBeLessThanOrEqual(box.x + box.width + 1);
+      }
+      await page.screenshot({ path: testInfo.outputPath(`agent-settings-${width}.png`), fullPage: true });
+    }
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.getByLabel("Workspace Chat binary").fill(process.execPath);
+    await page.getByLabel("Workspace Chat arguments").fill('-e "process.exit(0)"');
+    await page.getByRole("button", { name: "Test ACP connection" }).click();
+    await expect(page.getByText(/initialize ACP agent:/)).toBeVisible();
+    await page
+      .getByLabel("Workspace Chat arguments")
+      .fill(JSON.stringify(path.resolve("tests/fixtures/acp-agent.mjs")));
+    await page.getByRole("button", { name: "Test ACP connection" }).click();
+    await expect(page.getByText("ACP connection verified on this host.")).toBeVisible();
+    // A command change invalidates the explicit test and is checked again on save.
+    await page
+      .getByLabel("Workspace Chat arguments")
+      .fill(`${JSON.stringify(path.resolve("tests/fixtures/acp-agent.mjs"))} --acp`);
+    const automaticCheck = page.waitForResponse((response) => response.url().endsWith("/settings/agents/test-acp"));
+    const save = page.waitForResponse(
+      (response) => response.request().method() === "PUT" && response.url().endsWith("/api/v1/settings"),
+    );
+    await page.getByRole("button", { name: "Save workspace agents" }).click();
+    expect((await automaticCheck).status()).toBe(200);
+    expect((await save).status()).toBe(200);
+    const created = await api.post("/api/v1/issues/github/acme/widgets/10/workspace", { data: {} });
+    expect(created.status()).toBe(202);
+    const workspace = await created.json();
+    await expect
+      .poll(async () => (await (await api.get(`/api/v1/workspaces/${workspace.id}`)).json()).status)
+      .toBe("ready");
+    const launched = await api.post(`/api/v1/workspaces/${workspace.id}/runtime/sessions`, {
+      data: { target_key: "chat-fixture" },
+    });
+    expect(launched.status(), await launched.text()).toBe(200);
+    const session = await launched.json();
+    expect(session.kind).toBe("acp");
+    expect((await api.put("/api/v1/settings", { data: { acp: { font_size: 20 } } })).status()).toBe(200);
+    const terminalAppearance = (await (await api.get("/api/v1/settings")).json()).terminal;
+    await page.goto(`${origin}/terminal/${workspace.id}`);
+    expect(await page.evaluate(() => window.isSecureContext)).toBe(false);
+    expect(await page.evaluate(() => typeof crypto.randomUUID)).toBe("undefined");
+    await page.getByRole("tab", { name: /Workspace Chat/ }).click();
+    const chat = page.getByRole("region", { name: "Workspace Chat chat" });
+    await expect(chat).toBeVisible();
+    const composer = chat.getByRole("textbox", { name: "Message agent" });
+    const zoom = page.getByRole("group", { name: "ACP font size" });
+    const appFontSize = await page.locator("body").evaluate((element) => getComputedStyle(element).fontSize);
+    await expect(zoom.getByRole("button", { name: "Reset ACP font size" })).toHaveText("20px");
+    await zoom.getByRole("button", { name: "Increase ACP font size" }).click();
+    await expect(composer).toHaveCSS("font-size", "21px");
+    await expect(chat.getByRole("button", { name: "Model: Fast" })).toHaveCSS("font-size", "19.3846px");
+    await page.reload();
+    await expect(composer).toHaveCSS("font-size", "21px");
+    await page.screenshot({ path: testInfo.outputPath("acp-toolbar-font-size.png") });
+    await zoom.getByRole("button", { name: "Decrease ACP font size" }).click();
+    await expect(composer).toHaveCSS("font-size", "20px");
+    await zoom.getByRole("button", { name: "Reset ACP font size" }).click();
+    await expect(composer).toHaveCSS("font-size", "13px");
+    await expect(page.locator("body")).toHaveCSS("font-size", appFontSize);
+    expect((await (await api.get("/api/v1/settings")).json()).terminal).toEqual(terminalAppearance);
+    await chat.getByRole("textbox", { name: "Message agent" }).fill("Interrupt tool call");
+    await chat.getByRole("button", { name: "Send", exact: true }).click();
+    await expect(chat.getByRole("alert")).toContainText("Tool call interrupted");
+    await expect(chat.getByRole("alert")).toContainText("No result returned");
+    await page.screenshot({ path: testInfo.outputPath("acp-dismiss-error.png") });
+    await chat.getByRole("button", { name: "Dismiss error" }).click();
+    await expect(chat.getByRole("alert")).toHaveCount(0);
+    await page.reload();
+    await expect(chat.getByRole("textbox", { name: "Message agent" })).toBeVisible();
+    await expect(chat.getByRole("alert")).toHaveCount(0);
+    await expect(chat.getByRole("log").getByText("Interrupt tool call", { exact: true })).toBeVisible();
+    await chat.getByRole("button", { name: "Model: Fast" }).click();
+    await page.getByRole("menuitemradio", { name: "Deep" }).click();
+    await expect(chat.getByRole("button", { name: "Model: Deep" })).toBeVisible();
+    await chat.getByRole("button", { name: "Effort: Low" }).click();
+    await page.getByRole("menuitemradio", { name: "High" }).click();
+    await expect(chat.getByRole("button", { name: "Effort: High" })).toBeVisible();
+    await chat.getByRole("button", { name: "Agent settings", exact: true }).click();
+    await chat.getByRole("combobox", { name: "Mode: Ask" }).click();
+    await page.getByRole("option", { name: "Plan", exact: true }).click();
+    await expect(chat.getByRole("combobox", { name: "Mode: Plan" })).toBeVisible();
+    await chat.getByRole("button", { name: "Agent settings", exact: true }).click();
+    const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP1cAAAAASUVORK5CYII=";
+    await chat.getByRole("textbox", { name: "Message agent" }).evaluate((element, data) => {
+      const clipboardData = new DataTransfer();
+      clipboardData.items.add(
+        new File([Uint8Array.from(atob(data), (byte) => byte.charCodeAt(0))], "screenshot.png", { type: "image/png" }),
+      );
+      element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData }));
+    }, imageData);
+    await expect(chat.getByRole("img", { name: "screenshot.png" })).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath("acp-pasted-image.png") });
+    await chat.getByRole("button", { name: "Send", exact: true }).click();
+    await expect(chat.getByRole("log").getByText(`Received image: image/png ${imageData}`)).toBeVisible();
+    await expect(chat.getByRole("button", { name: "Remove screenshot.png" })).toHaveCount(0);
+    await expect(chat.getByRole("log").getByRole("img", { name: "screenshot.png" })).toBeVisible();
+    await page.reload();
+    await expect(chat.getByRole("log").getByRole("img", { name: "screenshot.png" })).toBeVisible();
+    await chat.getByRole("textbox", { name: "Message agent" }).fill("Show screenshot");
+    await chat.getByRole("button", { name: "Send", exact: true }).click();
+    const screenshot = chat.getByRole("img", { name: "Panel screenshot" });
+    await expect(screenshot).toBeVisible();
+    await expect.poll(() => screenshot.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBe(640);
+    await page.reload();
+    await expect(screenshot).toBeVisible();
+    await expect.poll(() => screenshot.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBe(640);
+    await page.screenshot({ path: testInfo.outputPath("acp-view-image-reloaded.png") });
+    await chat.getByRole("textbox", { name: "Message agent" }).fill("Inspect the workspace");
+    await chat.getByRole("button", { name: "Send", exact: true }).click();
+    await expect(
+      chat.getByRole("log", { name: "Conversation" }).getByText("I am working in the", { exact: false }),
+    ).toBeVisible();
+    await expect(chat.getByRole("button", { name: "Allow once" })).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath("acp-desktop.png") });
+    await chat.getByRole("button", { name: "Allow once" }).click();
+    // An answered permission prompt leaves the conversation.
+    await expect(chat.getByRole("button", { name: "Allow once" })).toHaveCount(0);
+    await expect(
+      chat.getByRole("log", { name: "Conversation" }).getByText("Permission received. The turn is complete."),
+    ).toBeVisible();
+    await page.reload();
+    await expect(
+      chat.getByRole("log", { name: "Conversation" }).getByText("Permission received. The turn is complete."),
+    ).toBeVisible();
+    // Prompts have no size limit, even once JSON escapes double their frame.
+    await chat.getByRole("textbox", { name: "Message agent" }).fill('"'.repeat(256 * 1024));
+    await chat.getByRole("button", { name: "Send", exact: true }).click();
+    await expect(chat.getByRole("button", { name: "Allow once" })).toBeVisible();
+    await chat.getByRole("button", { name: "Allow once" }).click();
+    await expect(chat.getByRole("button", { name: "Stop reply" })).toHaveCount(0);
+
+    // The fixture agent authors a component and calls the real Forge publishing
+    // tool. Its tagged text travels through ACP and reads the seeded cache.
+    await chat.getByRole("textbox", { name: "Message agent" }).fill("Build a PR dashboard");
+    await chat.getByRole("button", { name: "Send", exact: true }).click();
+    const dashboard = page.frameLocator('iframe[title="PR attention dashboard"]').frameLocator("iframe");
+    await expect(dashboard.getByRole("button", { name: "Refresh cache view" })).toBeVisible();
+    await dashboard.getByRole("combobox", { name: "Repository" }).selectOption({ label: "github · acme/widgets" });
+    await expect(dashboard.locator(".pull").first()).toBeVisible();
+    const seededCI = await api.post("/__e2e/pr-ci-state/pending");
+    expect(seededCI.status()).toBe(200);
+    await expect(dashboard.locator("#freshness")).toContainText("open PRs shown");
+    const refreshRead = page.waitForResponse(
+      (response) =>
+        response.url().endsWith("/mcp-apps/call-tool") &&
+        response.request().postDataJSON().name === "kenn_forge_list_pull_contexts",
+    );
+    await dashboard.getByRole("button", { name: "Refresh cache view" }).click();
+    expect((await refreshRead).status()).toBe(200);
+    await expect(dashboard.locator("#problem")).toBeEmpty();
+    const firstPR = dashboard.locator(".pull").filter({ has: dashboard.getByRole("button", { name: /^#1 / }) });
+    await expect(firstPR).toContainText("CI: pending");
+    expect((await api.post("/__e2e/pr-ci-state/success")).status()).toBe(200);
+    await dashboard.getByRole("button", { name: "Refresh cache view" }).click();
+    await expect(firstPR).toContainText("CI: success");
+    expect(
+      await dashboard.locator("body").evaluate(() => {
+        try {
+          return window.top?.document.title;
+        } catch {
+          return "isolated";
+        }
+      }),
+    ).toBe("isolated");
+    await page.screenshot({ path: testInfo.outputPath("mcp-app-dashboard.png") });
+    await page.reload();
+    await expect(dashboard.locator(".pull").first()).toBeVisible();
+
+    await dashboard.getByRole("button", { name: /^#1 / }).click();
+    const widgetURL = "https://github.com/acme/tools/pull/1";
+    await page
+      .context()
+      .route(widgetURL, (route) => route.fulfill({ contentType: "text/html", body: "Provider destination" }));
+    const widgetPopup = page.waitForEvent("popup");
+    await chat.locator(".link-request a").click();
+    const providerPage = await widgetPopup;
+    await expect(providerPage).toHaveURL(widgetURL);
+    await expect(providerPage.locator("body")).toHaveText("Provider destination");
+    await providerPage.close();
+    await expect(page).toHaveURL(`${origin}/terminal/${workspace.id}`);
+
+    for (const url of ["https://example.com/documentation", "https://github.com/untracked/repo/pull/9"]) {
+      await page
+        .context()
+        .route(url, (route) => route.fulfill({ contentType: "text/html", body: "External destination" }));
+      await page.evaluate((href) => {
+        const anchor = document.createElement("a");
+        anchor.id = "external-link-probe";
+        anchor.href = href;
+        anchor.target = "_blank";
+        anchor.textContent = "Open external link";
+        document.body.append(anchor);
+      }, url);
+      const opened = page.waitForEvent("popup");
+      await page.locator("#external-link-probe").click();
+      const external = await opened;
+      await expect(external).toHaveURL(url);
+      await expect(external.locator("body")).toHaveText("External destination");
+      await external.close();
+      await page.locator("#external-link-probe").evaluate((anchor) => anchor.remove());
+    }
+    await page.goto(`${origin}/terminal/${workspace.id}`);
+    await expect(dashboard.locator(".pull").first()).toBeVisible();
+
+    const phone = await browser.newContext({ ...devices["iPhone 13"] });
+    try {
+      const mobile = await phone.newPage();
+      await mobile.goto(`${origin}/m/workspaces/local/${workspace.id}`);
+      // Select the chat session in the phone's single-session workspace view.
+      const mobileChat = mobile.getByRole("region", { name: "Workspace Chat chat" });
+      if (!(await mobileChat.isVisible())) {
+        await mobile.getByRole("combobox", { name: /(?:Terminal|Chat) session:/ }).click();
+        await mobile.getByRole("option", { name: /Workspace Chat/ }).click();
+      }
+      await expect(mobileChat).toBeVisible();
+      // The oversized prompt separates the recent snapshot from the screenshot.
+      // Load its page, then the older messages, through the real history control.
+      await expect(mobileChat.getByRole("button", { name: "Load earlier messages" })).toBeVisible();
+      await expect(mobileChat.getByRole("img", { name: "Panel screenshot" })).toHaveCount(0);
+      for (let pageIndex = 0; pageIndex < 2; pageIndex++) {
+        const messageCount = await mobileChat.locator(".message-body").count();
+        const historyButton = mobileChat.getByRole("button", { name: "Load earlier messages" });
+        await expect(historyButton).toBeEnabled();
+        await historyButton.dispatchEvent("click");
+        await expect.poll(() => mobileChat.locator(".message-body").count()).toBeGreaterThan(messageCount);
+      }
+      await expect(mobileChat.getByRole("img", { name: "Panel screenshot" })).toBeVisible();
+      await expect(mobileChat.getByRole("button", { name: "Model: Deep" })).toBeVisible();
+      await expect(mobileChat.getByRole("button", { name: "Effort: High" })).toBeVisible();
+      await expect(mobile.getByRole("button", { name: "Open terminal composer" })).toHaveCount(0);
+      await mobileChat.getByRole("textbox", { name: "Message agent" }).fill("Review a change from the phone");
+      await mobileChat.getByRole("button", { name: "Send", exact: true }).tap();
+      await expect(mobileChat.getByRole("button", { name: "Allow once" })).toBeVisible();
+      expect(await mobile.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+      // A running turn never locks the composer; its primary action queues instead.
+      await expect(mobileChat.getByRole("textbox", { name: "Message agent" })).toBeEnabled();
+      const queue = await mobileChat.getByRole("button", { name: "Queue message", exact: true }).boundingBox();
+      expect(queue?.height).toBe(40);
+      await expect(mobileChat.getByRole("textbox", { name: "Message agent" })).toHaveCSS("font-size", "16px");
+      await expect(mobileChat.locator(".message-body").last()).toHaveCSS("font-size", "14px");
+      await mobile.screenshot({ path: testInfo.outputPath("acp-phone.png") });
+      await mobileChat.getByRole("button", { name: "Allow once" }).tap();
+      await expect(mobileChat.getByRole("button", { name: "Stop reply" })).toHaveCount(0);
+      // Android gesture navigation reports a bottom inset inside the viewport.
+      // The workspace shell reserves it; the composer must not reserve it again.
+      const mobileCDP = await phone.newCDPSession(mobile);
+      await mobileCDP.send("Emulation.setSafeAreaInsetsOverride", { insets: { bottom: 32 } });
+      for (const viewport of [
+        { width: 1280, height: 800 },
+        { width: 800, height: 1280 },
+      ]) {
+        await mobile.setViewportSize(viewport);
+        await expect
+          .poll(() =>
+            mobileChat.locator(".composer").evaluate((composer) => {
+              const gutter = Number.parseFloat(getComputedStyle(composer.parentElement!).paddingRight);
+              return Math.round(window.innerHeight - composer.getBoundingClientRect().bottom - gutter);
+            }),
+          )
+          .toBe(32);
+      }
+      await mobile.setViewportSize({ width: 1280, height: 800 });
+      await mobile.goto(`${origin}/terminal/${workspace.id}?desktop=1`);
+      await mobile.getByRole("tab", { name: /Workspace Chat/ }).click();
+      await expect
+        .poll(() =>
+          mobileChat.locator(".dock").evaluate((dock) => {
+            const composer = dock.querySelector(".composer")!;
+            const gutter = Number.parseFloat(getComputedStyle(dock).paddingRight);
+            return Math.round(dock.getBoundingClientRect().bottom - composer.getBoundingClientRect().bottom - gutter);
+          }),
+        )
+        .toBe(0);
+      await mobile.goto(`${origin}/m/workspaces/local/${workspace.id}`);
+      await mobileCDP.send("Emulation.setSafeAreaInsetsOverride", { insets: { bottom: 0 } });
+      await mobile.setViewportSize(devices["iPhone 13"].viewport);
+      await mobileCDP.detach();
+      await mobile.getByRole("button", { name: "Chat options" }).tap();
+      await mobile.getByRole("button", { name: "Stop chat Workspace Chat", exact: true }).tap();
+      await expect(mobile.getByText(`Stop chat "Workspace Chat"?`)).toBeVisible();
+      await expect(mobile.getByText("This terminates the agent process running in this chat session.")).toBeVisible();
+      await mobile.getByRole("button", { name: "Cancel" }).tap();
+    } finally {
+      await phone.close();
+    }
+    // A provider link the agent writes opens the item in Forge, even from
+    // another repository; other links open a browser tab, a modifier click
+    // opens the Forge item in one, and an untracked item opens at the provider.
+    await chat.getByRole("textbox", { name: "Message agent" }).fill("Link a pull request");
+    await chat.getByRole("button", { name: "Send", exact: true }).click();
+    const conversation = chat.getByRole("log", { name: "Conversation" });
+    const prLink = conversation.getByRole("link", { name: "the tools PR" });
+    await expect(prLink).toBeVisible();
+    const guideURL = "https://example.com/guide";
+    await page
+      .context()
+      .route(guideURL, (route) => route.fulfill({ contentType: "text/html", body: "Guide destination" }));
+    const guidePopup = page.waitForEvent("popup");
+    await conversation.getByRole("link", { name: "the guide" }).click();
+    const guide = await guidePopup;
+    await expect(guide).toHaveURL(guideURL);
+    await guide.close();
+    // Inside a workspace, an item link opens beside the chat and becomes a target.
+    await prLink.click();
+    await expect(page.getByRole("heading", { name: "Add CLI flag parser" })).toBeVisible();
+    await expect(page).toHaveURL(`${origin}/terminal/${workspace.id}`);
+    await expect
+      .poll(async () => JSON.stringify(await (await api.get(`/api/v1/workspaces/${workspace.id}/targets`)).json()))
+      .toContain('"title":"Add CLI flag parser"');
+    const modifiedTab = page.context().waitForEvent("page");
+    await prLink.click({ modifiers: ["ControlOrMeta"] });
+    const modified = await modifiedTab;
+    await expect(modified).toHaveURL(`${origin}/pulls/github/acme/tools/1`);
+    await modified.close();
+    // Playwright reports no URL for this cross-origin tab, so the routed
+    // request is the evidence of where it went.
+    const upstreamURL = "https://github.com/example-org/library/issues/3";
+    const upstreamRequested = new Promise<void>((resolve) => {
+      void page.context().route(upstreamURL, (route) => {
+        resolve();
+        return route.fulfill({ contentType: "text/html", body: "Upstream destination" });
+      });
+    });
+    const upstreamTab = page.context().waitForEvent("page");
+    await conversation.getByRole("link", { name: "an upstream issue" }).click({ button: "middle" });
+    const upstream = await upstreamTab;
+    await upstreamRequested;
+    await expect(page).toHaveURL(`${origin}/terminal/${workspace.id}`);
+    await upstream.close();
+    await chat.getByRole("textbox", { name: "Message agent" }).fill("exit");
+    await chat.getByRole("button", { name: "Send", exact: true }).click();
+    await expect(page.getByRole("tab", { name: /Workspace Chat/ })).toHaveCount(0);
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    proxy.closeAllConnections();
+    await new Promise<void>((resolve, reject) => proxy.close((error) => (error ? reject(error) : resolve())));
+    await api.dispose();
+    await server.stop();
+  }
+});

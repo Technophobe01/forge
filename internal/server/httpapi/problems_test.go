@@ -15,6 +15,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"go.kenn.io/forge/internal/tokenauth"
 	"go.kenn.io/forge/platform"
 )
@@ -434,6 +435,26 @@ func TestMapPlatformError(t *testing.T) {
 			wantCode:   CodeBadRequest,
 		},
 		{
+			name:       "UnsupportedMediaType",
+			input:      &platform.Error{Code: platform.ErrCodeUnsupportedMediaType, Provider: "github", PlatformHost: "github.com"},
+			wantStatus: http.StatusUnsupportedMediaType,
+			wantCode:   CodeUnsupportedMediaType,
+			wantDetails: map[string]any{
+				"provider":     "github",
+				"platformHost": "github.com",
+			},
+		},
+		{
+			name:       "RangeNotSatisfiable",
+			input:      &platform.Error{Code: platform.ErrCodeRangeNotSatisfiable, Provider: "gitlab", PlatformHost: "gitlab.com"},
+			wantStatus: http.StatusRequestedRangeNotSatisfiable,
+			wantCode:   CodeRangeNotSatisfiable,
+			wantDetails: map[string]any{
+				"provider":     "gitlab",
+				"platformHost": "gitlab.com",
+			},
+		},
+		{
 			name:       "InvalidRepoRef",
 			input:      &platform.Error{Code: platform.ErrCodeInvalidRepoRef},
 			wantStatus: http.StatusBadRequest,
@@ -554,7 +575,7 @@ func TestHumaNewErrorIsReplaced(t *testing.T) {
 	assert.Equal("oops", pe.Detail)
 
 	// huma.NewError with non-nil errs[i] populates Errors[] for parity.
-	got = huma.Error400BadRequest("oops", fmt.Errorf("inner"))
+	got = huma.Error400BadRequest("oops", errors.New("inner"))
 	pe = got.(*ProblemError)
 	require.Len(pe.Errors, 1)
 	assert.Equal("inner", pe.Errors[0].Message)

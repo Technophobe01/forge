@@ -5,13 +5,14 @@ import type { ProviderCapabilitiesResponse } from "./providerCapabilitiesRespons
 import type { RepoOperations } from "./repoOperations.ts";
 
 export interface RepoRefResponse {
+  bitbucket_repository_uuid?: string;
   capabilities: ProviderCapabilitiesResponse;
   default_branch?: string;
   name: string;
   operations?: RepoOperations;
   owner: string;
   platform_host: string;
-  platform_repo_id?: string;
+  platform_repo_id?: number;
   provider: string;
   repo_path: string;
 }

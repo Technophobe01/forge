@@ -10,6 +10,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/forge/platform"
 )
 
 func TestGetItemDiffSummaryUsesBackendWithoutReturningPatches(t *testing.T) {
@@ -34,11 +36,11 @@ func TestGetItemDiffSummaryUsesBackendWithoutReturningPatches(t *testing.T) {
 	s := newMCPTestServer(t, backend)
 
 	out, err := s.getItemDiff(t.Context(), getItemDiffInput{
-		Item: itemRefInput{Type: "pr", Provider: "github", PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget", Number: 42},
+		Item: itemRefInput{Type: "pr", Provider: "github", PlatformRepoID: 1001, Owner: "acme", Name: "widget", Number: 42},
 	})
 
 	require.NoError(err)
-	assert.Equal(ItemIdentity{Type: "pr", Provider: "github", PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget", Number: 42}, got)
+	assert.Equal(ItemIdentity{Type: "pr", Provider: "github", RepoKey: platform.RepositoryIDKey(1001), Owner: "acme", Name: "widget", Number: 42}, got)
 	assert.False(includePatches)
 	assert.True(out.Stale)
 	assert.Equal(8, out.TotalAdditions)
@@ -77,7 +79,7 @@ func TestGetItemDiffEmitWritesOneBackendSnapshotAndOverwrites(t *testing.T) {
 	s := newMCPTestServer(t, backend)
 	input := getItemDiffInput{
 		Item: itemRefInput{
-			Type: "pr", Provider: "gitlab", PlatformRepoID: "gitlab-project", PlatformHost: "git.example.test",
+			Type: "pr", Provider: "gitlab", PlatformRepoID: 2001, PlatformHost: "git.example.test",
 			Owner: "group/sub", Name: "project", Number: 42,
 		},
 		EmitDiffFile: true,
@@ -126,7 +128,7 @@ func TestGetItemDiffClassifiesUnavailableIdentityAndLocalFailures(t *testing.T) 
 			}}
 			s := newMCPTestServer(t, backend)
 			_, err := s.getItemDiff(t.Context(), getItemDiffInput{
-				Item: itemRefInput{Type: "pr", Provider: "github", PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget", Number: 42},
+				Item: itemRefInput{Type: "pr", Provider: "github", PlatformRepoID: 1001, Owner: "acme", Name: "widget", Number: 42},
 			})
 			assertBackendErrorKind(t, err, tt.want)
 		})
@@ -134,7 +136,7 @@ func TestGetItemDiffClassifiesUnavailableIdentityAndLocalFailures(t *testing.T) 
 
 	s := newMCPTestServer(t, &fakeBackend{})
 	_, err := s.getItemDiff(t.Context(), getItemDiffInput{
-		Item: itemRefInput{Type: "issue", Provider: "github", PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget", Number: 7},
+		Item: itemRefInput{Type: "issue", Provider: "github", PlatformRepoID: 1001, Owner: "acme", Name: "widget", Number: 7},
 	})
 	assertBackendErrorKind(t, err, "invalid_request")
 }
@@ -157,7 +159,7 @@ func TestGetItemDiffEmitSynthesizesEvidenceForFilesWithoutTextPatches(t *testing
 
 	out, err := s.getItemDiff(t.Context(), getItemDiffInput{
 		Item: itemRefInput{
-			Type: "pr", Provider: "github", PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget", Number: 42,
+			Type: "pr", Provider: "github", PlatformRepoID: 1001, Owner: "acme", Name: "widget", Number: 42,
 		},
 		EmitDiffFile: true,
 	})
@@ -187,7 +189,7 @@ func TestGetItemDiffRejectsOversizedTempFile(t *testing.T) {
 	s := newMCPTestServer(t, backend)
 
 	_, err := s.getItemDiff(t.Context(), getItemDiffInput{
-		Item:         itemRefInput{Type: "pr", Provider: "github", PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget", Number: 2},
+		Item:         itemRefInput{Type: "pr", Provider: "github", PlatformRepoID: 1001, Owner: "acme", Name: "widget", Number: 2},
 		EmitDiffFile: true,
 	})
 
@@ -207,7 +209,7 @@ func TestGetItemDiffRejectsFileLargerThanConfiguredCache(t *testing.T) {
 
 	_, err = s.getItemDiff(t.Context(), getItemDiffInput{
 		Item: itemRefInput{
-			Type: "pr", Provider: "github", PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget", Number: 2,
+			Type: "pr", Provider: "github", PlatformRepoID: 1001, Owner: "acme", Name: "widget", Number: 2,
 		},
 		EmitDiffFile: true,
 	})
@@ -217,31 +219,31 @@ func TestGetItemDiffRejectsFileLargerThanConfiguredCache(t *testing.T) {
 
 func TestDiffFileNameCanonicalizesAndSeparatesIdentities(t *testing.T) {
 	assert := assert.New(t)
-	omittedHost := diffFileName(itemRefInput{
-		Type: "pr", Provider: "gh", PlatformRepoID: "repo-acme-widget",
+	omittedHost := diffFileName(ItemIdentity{
+		Type: "pr", Provider: "gh", RepoKey: platform.RepositoryIDKey(1001),
 		Owner: "Acme", Name: "Widget", Number: 7,
 	})
-	explicitHost := diffFileName(itemRefInput{
-		Type: "pr", Provider: "github", PlatformRepoID: "repo-acme-widget", PlatformHost: "GITHUB.COM",
+	explicitHost := diffFileName(ItemIdentity{
+		Type: "pr", Provider: "github", RepoKey: platform.RepositoryIDKey(1001), PlatformHost: "GITHUB.COM",
 		Owner: "acme", Name: "widget", Number: 7,
 	})
-	collisionCandidate := diffFileName(itemRefInput{
-		Type: "pr", Provider: "github", PlatformRepoID: "repo-acme-widget", Owner: "acme_widget", Name: "x", Number: 7,
+	collisionCandidate := diffFileName(ItemIdentity{
+		Type: "pr", Provider: "github", RepoKey: platform.RepositoryIDKey(1001), Owner: "acme_widget", Name: "x", Number: 7,
 	})
-	forgejoUpper := diffFileName(itemRefInput{
-		Type: "pr", Provider: "forgejo", PlatformRepoID: "forgejo-widget", PlatformHost: "forge.example.test",
+	forgejoUpper := diffFileName(ItemIdentity{
+		Type: "pr", Provider: "forgejo", RepoKey: platform.RepositoryIDKey(3001), PlatformHost: "forge.example.test",
 		Owner: "Team", Name: "Widget", Number: 7,
 	})
-	forgejoLower := diffFileName(itemRefInput{
-		Type: "pr", Provider: "forgejo", PlatformRepoID: "forgejo-widget", PlatformHost: "forge.example.test",
+	forgejoLower := diffFileName(ItemIdentity{
+		Type: "pr", Provider: "forgejo", RepoKey: platform.RepositoryIDKey(3001), PlatformHost: "forge.example.test",
 		Owner: "team", Name: "widget", Number: 7,
 	})
-	giteaUpper := diffFileName(itemRefInput{
-		Type: "pr", Provider: "gitea", PlatformRepoID: "gitea-widget", PlatformHost: "git.example.test",
+	giteaUpper := diffFileName(ItemIdentity{
+		Type: "pr", Provider: "gitea", RepoKey: platform.RepositoryIDKey(4001), PlatformHost: "git.example.test",
 		Owner: "Team", Name: "Widget", Number: 7,
 	})
-	giteaLower := diffFileName(itemRefInput{
-		Type: "pr", Provider: "gitea", PlatformRepoID: "gitea-widget", PlatformHost: "git.example.test",
+	giteaLower := diffFileName(ItemIdentity{
+		Type: "pr", Provider: "gitea", RepoKey: platform.RepositoryIDKey(4001), PlatformHost: "git.example.test",
 		Owner: "team", Name: "widget", Number: 7,
 	})
 	assert.Equal(omittedHost, explicitHost)

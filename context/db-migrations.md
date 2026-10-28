@@ -8,6 +8,8 @@ schema migrations.
 
 `go run ./tools/migrationhistorycheck` enforces edits to the comparison base, duplicate migration numbers, and multiple new migrations. In GitHub's synthetic PR merge checkout, CI compares against the merge commit's first parent so migrations added to the target branch after the PR opened remain inherited; other PR and local-hook runs use the supplied comparison ref. This preserves one migration per stacked PR while local hooks inspect staged changes. The checker cannot identify production use or refs it was not given, so refresh tags and release branches before deciding a migration is PR-local. When uncertain, treat it as immutable.
 
+Two pull requests can each pass the check and still merge the same migration number. golang-migrate then refuses to load any migration, so no database can have applied either duplicate version past that point. Repair it by renaming the later-merged migration's files to the next number, keeping each file's direction, description, and content; that pure renumbering is the only change the checker allows to a base migration (`tools/migrationhistorycheck/main.go::isPureRenumbering`). Every change is also checked against the resulting history, the base with the change applied: no number may name two migrations, numbers must run from 000001 without gaps, and migration files must sit directly in the migration directory.
+
 ## Rules
 
 - New migrations use the next sequential `NNNNNN_description.up.sql` and matching `.down.sql` file.
@@ -16,9 +18,14 @@ schema migrations.
 - Keep `.down.sql` honest. If the data cleanup is one-way, say that in the down migration and only undo reversible schema artifacts such as triggers or indexes.
 - Validate migrations through `db.Open()` and application-level tests. Do not test `golang-migrate` internals.
 - For SQLite, remember that adding constraints to existing columns usually requires a table rebuild. Do not add fill, repair, or validation triggers as a shortcut around fixing current write paths or rebuilding a table when a real schema invariant is required.
+- Do not add SQL `CHECK` constraints to enforce application invariants;
+  express them in Go types and write-path validation (maintainer decision,
+  `internal/db/types.go::ActiveRepo`).
 - SQLite `CHECK` expressions accept a `NULL` result; when a nullable value is
   conditionally required, assert `IS NOT NULL` before validating its content
   (`internal/db/migrations/000048_kata_issue_links.up.sql:16`).
+  Kit `sqlcheck` is disabled because those constraints are intentional
+  (`.golangci.overlay.yml`).
 - A SQLite parent-table rebuild must drop and recreate dependent triggers, and
   foreign keys must be disabled before golang-migrate starts its transaction
   (`internal/db/migrations.go::runRepositoryCatalogMigration`).
@@ -49,9 +56,6 @@ schema migrations.
   `stmtCache`, never `d.ro`/`d.rw` directly outside `BeginTx`; direct pool
   calls skip the prepared-statement cache and recompile on every call
   (`internal/db/stmt_cache.go::stmtCache`).
-- `rwExecContext` and its query siblings intentionally bypass the repository
-  route fence that `execContext` enforces; keep that split when moving a write
-  between them (`internal/db/db.go::rwExecContext`).
 - Per-connection pragmas live only in `connectionDSN`; idle limits equal open
   limits so pooled connections and their compiled statements persist
   (`internal/db/db.go::openPool`).
@@ -66,6 +70,17 @@ schema migrations.
   `json_each(?)`, or batch it
   (`internal/db/queries_stacks.go::ListStackPlacementsForMRs`,
   `internal/db/queries.go::GetWorktreeLinksForMRs`).
+- In a `UNION ALL` that feeds a `*time.Time` destination, put a real column
+  reference (not a literal `NULL`, `CAST(NULL AS ...)`, or any other
+  expression) in that position's **first** arm. `sqlite3_column_decltype`
+  only returns a non-empty type for a bare column reference, and
+  modernc.org/sqlite caches one decltype per column position from the first
+  arm for the life of the prepared statement; a blank decltype there makes
+  every arm's real datetime text fail `Scan` into `*time.Time`, even rows
+  from a later arm with a properly typed column
+  (`internal/db/queries_archive_snapshot.go::LoadArchiveSnapshotItems`, where
+  the pull-request arm reads its own real `closed_at` column instead of a
+  literal `NULL` so the issue arm's `closed_at` still scans).
 
 ## Federation Spoke Preparation
 

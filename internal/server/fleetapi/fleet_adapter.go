@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
-	"strings"
 	"time"
 
 	"go.kenn.io/forge/internal/db"
@@ -186,7 +185,8 @@ func (s *Handler) buildLocalRaw(ctx context.Context) (fleet.RawSnapshot, error) 
 		raw.Workspaces = slices.Clone(summaries)
 		for i := range summaries {
 			sum := summaries[i]
-			projKey, ok := "", false
+			var projKey string
+			var ok bool
 			if stableKey := stableIdentityKey(sum.Repository); stableKey != "" {
 				projKey, ok = projByStableIdentity[stableKey]
 			} else {
@@ -284,11 +284,11 @@ func (s *Handler) syncedRepoDefaultBranch(ctx context.Context, sum fleet.RawWork
 		return ""
 	}
 	repo, err := s.db.GetRepoByIdentity(ctx, db.RepoIdentity{
-		Platform:       sum.Repository.Provider,
-		PlatformHost:   sum.Repository.PlatformHost,
-		PlatformRepoID: sum.Repository.PlatformRepoID,
-		Owner:          sum.Repository.Owner,
-		Name:           sum.Repository.Name,
+		Platform:     sum.Repository.Provider,
+		PlatformHost: sum.Repository.PlatformHost,
+		Key:          sum.Repository.Key,
+		Owner:        sum.Repository.Owner,
+		Name:         sum.Repository.Name,
 	})
 	if err != nil || repo == nil {
 		return ""
@@ -315,7 +315,7 @@ func (s *Handler) projectRepositoryIdentity(
 		return fleet.RepositoryIdentity{}, err
 	}
 	if repository != nil {
-		out.PlatformRepoID = repository.PlatformRepoID
+		out.Key = repository.Key
 	}
 	return out, nil
 }
@@ -413,6 +413,11 @@ func ownedTmuxSessionsForWorkspace(
 			continue
 		}
 		key := storedSession.SessionKey
+		// A kept record of an exited session, such as a supervised chat
+		// awaiting restore, has nothing running.
+		if s.runtimeExited != nil && s.runtimeExited(key) {
+			continue
+		}
 		session := fleetOwnedTmuxSession{
 			Name:             storedSession.TmuxSession,
 			WorktreeKey:      wtKey,
@@ -596,10 +601,11 @@ func normPath(p string) string {
 }
 
 func stableIdentityKey(identity fleet.RepositoryIdentity) string {
-	if strings.TrimSpace(identity.PlatformRepoID) == "" {
+	if identity.Key.IsZero() {
 		return ""
 	}
-	return identity.Provider + "\x00" + identity.PlatformHost + "\x00" + identity.PlatformRepoID
+	return identity.Provider + "\x00" + identity.PlatformHost + "\x00" +
+		identity.Key.String()
 }
 
 func routeIdentityKey(identity fleet.RepositoryIdentity) string {

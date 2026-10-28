@@ -41,10 +41,12 @@ function pullDetail(): PullDetail {
     workflow_dispatch: true,
     read_labels: true,
     read_markdown_images: true,
+    read_markdown_media: true,
     read_authenticated_user: true,
     comment_mutation: false,
     state_mutation: true,
     merge_mutation: true,
+    merge_queue_mutation: false,
     label_mutation: true,
     assignee_mutation: false,
     reviewer_mutation: false,
@@ -95,7 +97,7 @@ function pullDetail(): PullDetail {
     owner: "acme",
     name: "widgets",
     repo_path: "acme/widgets",
-    platform_repo_id: "widgets-repo-id",
+    platform_repo_id: 1005,
     default_branch: "main",
     capabilities,
     operations,
@@ -188,9 +190,10 @@ afterEach(async () => {
 });
 
 async function renderWorkflowDetail() {
-  const state = $state<{ detail: PullDetail; loading: boolean; error: string | null }>({
+  const state = $state<{ detail: PullDetail; loading: boolean; syncing: boolean; error: string | null }>({
     detail: pullDetail(),
     loading: false,
+    syncing: false,
     error: null,
   });
   const detail = state.detail;
@@ -237,9 +240,10 @@ async function renderWorkflowDetail() {
     stopDetailPolling: vi.fn(),
     getDetail: () => state.detail,
     getDetailEnvelopeTick: () => 0,
+    isDetailFromCache: () => false,
     isDetailLoading: () => state.loading,
     getDetailError: () => state.error,
-    isDetailSyncing: () => false,
+    isDetailSyncing: () => state.syncing,
     getDetailLoaded: () => true,
     getDiscussionLoaded: () => true,
     updateKanbanState: vi.fn(),
@@ -254,6 +258,7 @@ async function renderWorkflowDetail() {
     markPullReady: vi.fn(),
     approvePullWorkflows: vi.fn(),
     mergePull: vi.fn(),
+    isPullMerging: () => false,
     editComment: vi.fn(),
     savePRBodyInBackground: vi.fn(),
     setLocalPRBody: vi.fn(),
@@ -302,9 +307,43 @@ async function renderWorkflowDetail() {
 }
 
 describe("PullDetail provider workflow actions", () => {
+  it("keeps the header and actions stationary when background sync toggles in narrow panels", async () => {
+    const viewport = { width: window.innerWidth, height: window.innerHeight };
+    await page.viewport(1280, 900);
+    try {
+      const { state, wrapper } = await renderWorkflowDetail();
+      await vi.waitFor(() => expect(visibleButton("Run workflow")).not.toBeNull(), WAIT);
+      await document.fonts.ready;
+
+      const metadata = wrapper.querySelector<HTMLElement>(".meta-row")!;
+      const chips = wrapper.querySelector<HTMLElement>(".chips-row")!;
+      for (let width = 320; width <= 900; width += 20) {
+        wrapper.style.width = `${width}px`;
+        await new Promise(requestAnimationFrame);
+        const metadataHeight = metadata.getBoundingClientRect().height;
+        const chipsTop = chips.getBoundingClientRect().top;
+
+        state.syncing = true;
+        await tick();
+        await expect.element(page.getByRole("status", { name: "Syncing from GitHub" })).toBeVisible();
+        expect(metadata.getBoundingClientRect().height, `metadata height at ${width}px`).toBe(metadataHeight);
+        expect(chips.getBoundingClientRect().top).toBe(chipsTop);
+
+        state.syncing = false;
+        await tick();
+        await expect.element(page.getByRole("status", { name: "Syncing from GitHub" })).not.toBeInTheDocument();
+        expect(metadata.getBoundingClientRect().height).toBe(metadataHeight);
+        expect(chips.getBoundingClientRect().top).toBe(chipsTop);
+      }
+      wrapper.remove();
+    } finally {
+      await page.viewport(viewport.width, viewport.height);
+    }
+  });
+
   it("keeps review menus usable across compact and phone layouts", async () => {
     const { state, detailProps, wrapper } = await renderWorkflowDetail();
-    state.detail.repo.capabilities.supported_review_actions = ["request_changes"];
+    state.detail.repo.capabilities.supported_review_actions = ["comment", "request_changes"];
     await tick();
     const live = page.getByRole("button", { name: "Review options" });
     await expect.element(live).toBeVisible();
@@ -375,6 +414,28 @@ describe("PullDetail provider workflow actions", () => {
     }, WAIT);
   });
 
+  it("compacts workflow dispatch with the measured action rows before anything collapses", async () => {
+    const { wrapper } = await renderWorkflowDetail();
+
+    await vi.waitFor(() => expect(visibleButton("Run workflow")).not.toBeNull(), WAIT);
+    const host = document.querySelector<HTMLElement>(".primary-actions-fit")!;
+    const [full, compact] = Array.from(
+      host.querySelectorAll<HTMLElement>(".kit-fit-stages__probe"),
+      (probe) => probe.getBoundingClientRect().width,
+    );
+    expect(compact).toBeLessThan(full!);
+    const chrome = wrapper.getBoundingClientRect().width - host.getBoundingClientRect().width;
+    wrapper.style.width = `${Math.ceil(compact!) + chrome + 1}px`;
+
+    await vi.waitFor(() => {
+      const workflowTrigger = document.querySelector<HTMLButtonElement>(".workflow-actions-control > button");
+      expect(workflowTrigger?.textContent?.trim()).toBe("Workflow");
+      expect(workflowTrigger!.getAttribute("aria-label")).toBe("Run workflow");
+      expect(visibleButton("Actions")).toBeNull();
+      expect(document.querySelector(".pull-detail-content--actions-menu")).toBeNull();
+    }, WAIT);
+  });
+
   it("places workflow dispatch beside workspace tools while primary actions collapse only under pressure", async () => {
     const { wrapper } = await renderWorkflowDetail();
 
@@ -389,6 +450,7 @@ describe("PullDetail provider workflow actions", () => {
       expect(workflowTrigger!.closest(".actions-row--utility")).toBe(
         workspaceTrigger!.closest(".actions-row--utility"),
       );
+      expect(workflowTrigger!.getBoundingClientRect().height).toBe(workspaceTrigger!.getBoundingClientRect().height);
       expect(visibleButton("Actions")).toBeNull();
       expect(visibleButton("Approve")).not.toBeNull();
       expect(visibleButton("Squash and merge")).not.toBeNull();
@@ -470,7 +532,7 @@ describe("PullDetail provider workflow actions", () => {
     state.detail = {
       ...state.detail,
       repo_name: "gadgets",
-      repo: { ...state.detail.repo, name: "gadgets", repo_path: "acme/gadgets", platform_repo_id: "gadgets-repo-id" },
+      repo: { ...state.detail.repo, name: "gadgets", repo_path: "acme/gadgets", platform_repo_id: 1006 },
       merge_request: { ...state.detail.merge_request, HeadBranch: "feature/gadgets" },
     };
     await vi.waitFor(() => expect(visibleButton("Run workflow")).not.toBeNull(), WAIT);
@@ -484,7 +546,11 @@ describe("PullDetail provider workflow actions", () => {
     document.querySelector<HTMLButtonElement>("button[type='submit']")!.click();
     expect(workflowActions.dispatch).toHaveBeenCalledWith(
       expect.objectContaining({
-        ref: expect.objectContaining({ name: "gadgets", repoPath: "acme/gadgets", platformRepoId: "gadgets-repo-id" }),
+        ref: expect.objectContaining({
+          name: "gadgets",
+          repoPath: "acme/gadgets",
+          repositoryKey: { kind: "id", id: 1006 },
+        }),
         dispatchRef: "feature/gadgets",
       }),
     );
@@ -517,11 +583,11 @@ describe("PullDetail provider workflow actions", () => {
     await tick();
     expect(document.querySelector<HTMLInputElement>("input[aria-label='Git ref']")?.value).toBe("old-repository-draft");
 
-    state.detail = { ...state.detail, repo: { ...state.detail.repo, platform_repo_id: "replacement-repo-id" } };
+    state.detail = { ...state.detail, repo: { ...state.detail.repo, platform_repo_id: 1002 } };
     await tick();
     expect(document.querySelector("input[aria-label='Git ref']")).toBeNull();
     expect(workflowActions.loadCatalog).toHaveBeenLastCalledWith(
-      expect.objectContaining({ platformRepoId: "replacement-repo-id" }),
+      expect.objectContaining({ repositoryKey: { kind: "id", id: 1002 } }),
     );
     visibleButton("Run workflow")!.click();
     await vi.waitFor(() => expect(visibleButton("Release")).not.toBeNull(), WAIT);
@@ -536,7 +602,7 @@ describe("PullDetail provider workflow actions", () => {
     document.querySelector<HTMLButtonElement>("button[type='submit']")!.click();
     expect(workflowActions.dispatch).toHaveBeenCalledWith(
       expect.objectContaining({
-        ref: expect.objectContaining({ platformRepoId: "replacement-repo-id" }),
+        ref: expect.objectContaining({ repositoryKey: { kind: "id", id: 1002 } }),
         dispatchRef: "feature/workflow-actions",
       }),
     );

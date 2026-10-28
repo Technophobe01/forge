@@ -14,6 +14,9 @@
   import { getStores } from "../../context.js";
   import { showFlash } from "../../stores/flash.svelte.js";
   import { pushModalFrame } from "../../stores/keyboard/modal-stack.svelte.js";
+  import type { NativeStackMergeScope } from "./stack-merge.js";
+  import type { RepositoryKey } from "../../api/repository-key.js";
+  import { defaultMergeCommit } from "./merge-policy.js";
 
   const { detail } = getStores();
 
@@ -25,6 +28,7 @@
     number: number;
     provider: string;
     platformHost?: string | undefined;
+    repositoryKey?: RepositoryKey | undefined;
     repoPath: string;
     prTitle: string;
     prBody: string;
@@ -42,6 +46,8 @@
     deferUntilChecksPass?: boolean;
     /** Warn before an immediate merge when aggregate CI has failed. */
     ciFailed?: boolean;
+    /** Providers refuse to merge a draft, so the modal blocks it and says why. */
+    isDraft?: boolean;
     /**
      * True while a background merge is already queued for this PR. The
      * deferred action is withheld (the server would 409 on a second
@@ -50,12 +56,21 @@
     alreadyQueued?: boolean;
     /** Exact workspace to delete after a successful merge. */
     workspaceId?: string | undefined;
-    /** Warning shown when the configured override permits a mid-stack merge. */
-    midStackWarning?: string | undefined;
+    /** Stack context shown when merging a pull request. */
+    stackNote?: string | undefined;
+    /**
+     * Set when the provider owns the stack: the merge also lands every
+     * unmerged pull request below this one, so the modal names them all.
+     */
+    nativeStackMerge?: NativeStackMergeScope | undefined;
+    /**
+     * Set when the base branch uses a merge queue: submitting adds the
+     * pull request to the queue, which merges it with its own configured
+     * method, so method and commit text do not apply. A requested workspace
+     * deletion waits for the queue's merge.
+     */
+    mergeQueue?: { branch: string; mergeMethod: string } | undefined;
     onclose: () => void;
-    onmerged: (cleanupWarning?: string) => void;
-    /** Called when a deferred merge was accepted and now waits on CI. */
-    onqueued: () => void;
     onstateconflict?: ((
       reason: Exclude<ConflictReason, "conflict">,
       context: string | undefined,
@@ -67,18 +82,49 @@
   }
 
   const {
-    owner, name, number, provider, platformHost, repoPath, prTitle, prBody,
+    owner, name, number, provider, platformHost, repositoryKey, repoPath, prTitle, prBody,
     prAuthor, prAuthorDisplayName,
     allowSquash, allowMerge, allowRebase,
     expectedHeadSha, requireHeadPin = false, routeGeneration = 0,
     deferUntilChecksPass = false,
     ciFailed = false,
-    alreadyQueued = false, workspaceId, midStackWarning,
-    onclose, onmerged, onqueued, onstateconflict,
+    isDraft = false,
+    alreadyQueued = false, workspaceId, stackNote, nativeStackMerge, mergeQueue,
+    onclose, onstateconflict,
   }: Props = $props();
 
   // Offer to queue a deferred merge only when none is queued yet.
   const offerDeferredMerge = $derived(deferUntilChecksPass && !alreadyQueued);
+
+  const queueMethodLabels: Record<string, string> = {
+    merge: "a merge commit",
+    squash: "squash and merge",
+    rebase: "rebase and merge",
+  };
+
+  // The queue's merge method is omitted while Forge has not read it yet.
+  const queueMethodPhrase = $derived(
+    mergeQueue?.mergeMethod
+      ? ` using ${queueMethodLabels[mergeQueue.mergeMethod] ?? mergeQueue.mergeMethod}`
+      : "",
+  );
+
+  // More than one pull request lands, so the action is a stack merge.
+  const stackLandingCount = $derived.by(() => {
+    const count = nativeStackMerge?.landing.length ?? 0;
+    return count > 1 ? count : 0;
+  });
+
+  function numberList(numbers: number[]): string {
+    const refs = numbers.map(n => `#${n}`);
+    if (refs.length <= 2) return refs.join(" and ");
+    return `${refs.slice(0, -1).join(", ")}, and ${refs.at(-1)}`;
+  }
+
+  function modalTitle(): string {
+    if (mergeQueue) return stackLandingCount ? "Add Stack to Merge Queue" : "Add to Merge Queue";
+    return stackLandingCount ? "Merge Stack" : "Merge Pull Request";
+  }
 
   // Captured once when the modal opens: a background detail refresh
   // must not silently rebind the pin to a head the user has not seen
@@ -90,6 +136,8 @@
   // A head-binding provider cannot merge without a pinned head; the user
   // must wait for sync and re-review before merging.
   const headPinMissing = untrack(() => requireHeadPin) && pinnedHeadShaAtOpen === "";
+
+  const mergeBlocked = $derived(headPinMissing || isDraft);
 
   type Method = "merge" | "squash" | "rebase";
   type MethodOption = { value: Method; label: string };
@@ -112,30 +160,19 @@
 
   const methods = buildMethods();
 
-  function initialCommitTitle(): string {
-    return `${prTitle} (#${number})`;
-  }
-
-  function initialCoAuthor(): string {
-    const coAuthorName = prAuthorDisplayName || prAuthor;
-    return `Co-authored-by: ${coAuthorName} <${prAuthor}@users.noreply.github.com>`;
-  }
-
-  function initialCommitMessage(): string {
-    const coAuthor = initialCoAuthor();
-    return prBody ? `${prBody}\n\n${coAuthor}` : coAuthor;
-  }
-
   // Props are stable for the lifetime of this modal, so these
   // editable fields intentionally capture their initial values.
   let selectedMethod = $state<Method>(methods[0]?.value ?? "squash");
-  let commitTitle = $state(initialCommitTitle());
-  let commitMessage = $state(initialCommitMessage());
+  const initialCommit = untrack(() => defaultMergeCommit({
+    number,
+    title: prTitle,
+    body: prBody,
+    author: prAuthor,
+    authorDisplayName: prAuthorDisplayName,
+  }));
+  let commitTitle = $state(initialCommit.title);
+  let commitMessage = $state(initialCommit.message);
   let deleteWorkspaceAfterMerge = $state(true);
-
-  let activeMergeSubmission = $state<"deferred" | "immediate" | null>(null);
-  let error = $state<string | null>(null);
-  const merging = $derived(activeMergeSubmission !== null);
 
   function mergeParams(): MergeParams {
     return {
@@ -147,52 +184,29 @@
     };
   }
 
-  function handleMergeProblem(problem: ProblemBody): boolean {
+  function handleMergeProblem(problem: ProblemBody): void {
     const reason = isProblem(problem) ? problemConflictReason(problem) : undefined;
     if (reason && reason !== "conflict") {
       onstateconflict?.(
         reason,
         isProblem(problem) ? problemConflictContext(problem) : undefined,
         pinnedHeadShaAtOpen,
-        { provider, platformHost, owner, name, repoPath },
+        { provider, platformHost, repositoryKey, owner, name, repoPath },
         number,
         routeGenerationAtOpen,
       );
-      onclose();
-      return true;
     }
-    const message = problem.detail ?? problem.title ?? "failed to merge pull request";
-    if (reason === "conflict") {
-      error = message;
-      return true;
-    }
-    return false;
   }
 
   function submitMerge(deferred: boolean): void {
-    if (headPinMissing) return;
-    activeMergeSubmission = deferred ? "deferred" : "immediate";
-    error = null;
-    let problemHandled = false;
+    if (mergeBlocked) return;
     const params = mergeParams();
-    detail.mergePull({ provider, platformHost, owner, name, repoPath }, number, params, deferred, {
-      onProblem: (problem) => {
-        problemHandled = handleMergeProblem(problem);
-      },
-      onFailure: (message) => {
-        if (!problemHandled) showFlash(message, { tone: "danger" });
-      },
-      onSuccess: (outcome) => {
-        if (outcome._tag === "Queued") {
-          onqueued();
-          return;
-        }
-        onmerged(outcome.cleanupWarning);
-      },
-      onSettled: () => {
-        activeMergeSubmission = null;
-      },
+    const target = `${repoPath} #${number}`;
+    detail.mergePull({ provider, platformHost, repositoryKey, owner, name, repoPath }, number, params, deferred, {
+      onProblem: handleMergeProblem,
+      onFailure: (message) => showFlash(`${target}: ${message}`, { tone: "danger" }),
     });
+    onclose();
   }
 
   function handleMerge(): void {
@@ -215,31 +229,60 @@
   }
 
   function primaryButtonLabel(): string {
-    if (activeMergeSubmission === "deferred") return "Merge scheduled...";
-    if (activeMergeSubmission === "immediate" && !offerDeferredMerge) return "Merging...";
+    if (mergeQueue) {
+      return offerDeferredMerge ? "Add to merge queue after CI is complete" : "Add to merge queue";
+    }
     if (offerDeferredMerge) return "Merge after CI is complete";
-    return ciFailed ? "Merge Anyway" : methodLabel();
+    if (ciFailed) return "Merge Anyway";
+    return stackLandingCount ? `${methodLabel()} ${stackLandingCount} pull requests` : methodLabel();
   }
 
-  function mergeAnywayButtonLabel(): string {
-    return activeMergeSubmission === "immediate" ? "Merging..." : "Merge Anyway";
-  }
 </script>
 
 <Modal
-  title="Merge Pull Request"
+  title={modalTitle()}
   width="min(560px, 92vw)"
   maxWidth="min(560px, 92vw)"
   {onclose}
 >
   <div class="merge-body">
-      {#if midStackWarning}
-        <div class="mid-stack-warning" role="alert">
-          <strong>Warning: this is a mid-stack merge.</strong>
-          <span>{midStackWarning} Merging now can leave the remaining stack based on an unexpected branch.</span>
+      {#if nativeStackMerge}
+        <div class="stack-merge-note">
+          {#if stackLandingCount}
+            <p>
+              {#if mergeQueue}
+                This adds {stackLandingCount} pull requests to the merge queue as one
+                group: {numberList(nativeStackMerge.landing)}.
+              {:else}
+                This merges {stackLandingCount} pull requests into
+                <code>{nativeStackMerge.baseBranch}</code> as one GitHub stack
+                merge: {numberList(nativeStackMerge.landing)}.
+              {/if}
+            </p>
+            {#if !mergeQueue}
+              <p>GitHub merges the stack asynchronously. Forge shows the result when GitHub finishes.</p>
+            {/if}
+          {:else}
+            <p>Only this pull request merges.</p>
+          {/if}
+          {#if nativeStackMerge.remaining.length > 0}
+            <p>
+              {numberList(nativeStackMerge.remaining)}
+              {nativeStackMerge.remaining.length === 1 ? "stays" : "stay"} open and
+              GitHub rebases {nativeStackMerge.remaining.length === 1 ? "it" : "them"}
+              onto <code>{nativeStackMerge.baseBranch}</code>.
+            </p>
+          {/if}
         </div>
+      {:else if stackNote}
+        <p class="stack-note">{stackNote}</p>
       {/if}
-      {#if methods.length > 1}
+      {#if mergeQueue}
+        <p class="merge-queue-note">
+          <code>{mergeQueue.branch}</code> uses a merge queue. This adds the pull request
+          to the queue, which merges it{queueMethodPhrase} once its checks pass.
+        </p>
+      {:else if methods.length > 1}
         <div class="field" role="group" aria-label="Merge method">
           <span class="field-label">Merge method</span>
           <div class="method-options">
@@ -261,29 +304,31 @@
         </div>
       {/if}
 
-      <div class="field">
-        <label class="field-label" for="commit-title">
-          Commit title
-        </label>
-        <input
-          id="commit-title"
-          class="field-input"
-          type="text"
-          bind:value={commitTitle}
-        />
-      </div>
+      {#if !mergeQueue}
+        <div class="field">
+          <label class="field-label" for="commit-title">
+            Commit title
+          </label>
+          <input
+            id="commit-title"
+            class="field-input"
+            type="text"
+            bind:value={commitTitle}
+          />
+        </div>
 
-      <div class="field">
-        <label class="field-label" for="commit-message">
-          Commit message
-        </label>
-        <textarea
-          id="commit-message"
-          class="field-textarea"
-          bind:value={commitMessage}
-          rows={8}
-        ></textarea>
-      </div>
+        <div class="field">
+          <label class="field-label" for="commit-message">
+            Commit message
+          </label>
+          <textarea
+            id="commit-message"
+            class="field-textarea"
+            bind:value={commitMessage}
+            rows={8}
+          ></textarea>
+        </div>
+      {/if}
 
       {#if workspaceId}
         <Checkbox
@@ -295,23 +340,39 @@
         />
       {/if}
 
-      {#if error}
-        <p class="merge-error">{error}</p>
+      {#if isDraft}
+        <div class="ci-defer-note" role="alert">
+          This pull request is a draft. Mark it ready for review before merging.
+        </div>
       {/if}
       {#if ciFailed}
         <div class="ci-defer-note" role="alert">
-          CI has failed. Merging now will include changes with failing checks.
+          {#if mergeQueue}
+            CI has failed. The merge queue may remove the pull request if required checks fail.
+          {:else}
+            CI has failed. Merging now will include changes with failing checks.
+          {/if}
         </div>
       {/if}
       {#if alreadyQueued}
         <div class="ci-defer-note">
-          A merge is already queued; it runs only if the CI checks that were
-          pending when it was queued pass. Merging here merges immediately
-          instead.
+          {#if mergeQueue}
+            A request is already waiting to add this pull request to the merge
+            queue if the CI checks that were pending when it was made pass.
+            Adding it here adds it to the queue immediately instead.
+          {:else}
+            A merge is already queued; it runs only if the CI checks that were
+            pending when it was queued pass. Merging here merges immediately
+            instead.
+          {/if}
         </div>
       {:else if deferUntilChecksPass}
         <div class="ci-defer-note">
-          CI is still running. This will merge only if the checks that are pending now pass.
+          {#if mergeQueue}
+            CI is still running. This adds the pull request to the merge queue only if the checks that are pending now pass.
+          {:else}
+            CI is still running. This will merge only if the checks that are pending now pass.
+          {/if}
         </div>
       {/if}
 
@@ -327,7 +388,6 @@
     <Button
       class="btn btn--secondary"
       onclick={onclose}
-      disabled={merging}
       tone="neutral"
       surface="outline"
     >
@@ -336,7 +396,7 @@
     <Button
       class="btn btn--primary btn--green"
       onclick={handleMerge}
-      disabled={merging || headPinMissing}
+      disabled={mergeBlocked}
       tone="success"
       surface="solid"
     >
@@ -346,32 +406,43 @@
       <Button
         class="btn btn--merge-anyway"
         onclick={handleMergeAnyway}
-        disabled={merging || headPinMissing}
+        disabled={mergeBlocked}
         tone="success"
         surface="soft"
       >
-        {mergeAnywayButtonLabel()}
+        {mergeQueue ? "Add to queue now" : "Merge Anyway"}
       </Button>
     {/if}
   {/snippet}
 </Modal>
 
 <style>
-  .mid-stack-warning {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding: 10px 12px;
-    border: 1px solid var(--accent-amber-soft, rgba(217, 119, 6, 0.45));
-    border-radius: var(--radius-sm);
-    background: var(--accent-amber-soft, rgba(217, 119, 6, 0.12));
+  .stack-note {
+    margin: 0;
     color: var(--text-secondary);
     font-size: var(--font-size-sm);
     line-height: 1.4;
   }
 
-  .mid-stack-warning strong {
+  .stack-merge-note {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px 10px;
+    border: 1px solid color-mix(in srgb, var(--accent-blue) 40%, transparent);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
     color: var(--text-primary);
+    font-size: var(--font-size-sm);
+    line-height: 1.4;
+  }
+
+  .stack-merge-note p {
+    margin: 0;
+  }
+
+  .stack-merge-note code {
+    font-family: var(--font-mono);
   }
 
   .ci-defer-note {
@@ -382,6 +453,18 @@
     color: var(--text-secondary);
     font-size: var(--font-size-sm);
     line-height: 1.35;
+  }
+
+  .merge-queue-note {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    line-height: 1.4;
+  }
+
+  .merge-queue-note code {
+    font-family: var(--font-mono);
+    color: var(--text-primary);
   }
 
   .head-pin-note {
@@ -466,16 +549,6 @@
     );
     border-color: var(--accent-blue);
     color: var(--accent-blue);
-  }
-
-  .merge-error {
-    font-size: var(--font-size-sm);
-    color: var(--accent-red);
-    padding: 8px 10px;
-    background: color-mix(
-      in srgb, var(--accent-red) 8%, transparent
-    );
-    border-radius: var(--radius-sm);
   }
 
 </style>

@@ -114,8 +114,8 @@ func archiveInventoryFeatureDisabled(err error, itemType db.ArchiveItemType) boo
 	if !errors.Is(err, platform.ErrRepositoryFeatureDisabled) {
 		return false
 	}
-	var platformErr *platform.Error
-	if !errors.As(err, &platformErr) {
+	platformErr, ok := errors.AsType[*platform.Error](err)
+	if !ok {
 		return false
 	}
 	switch itemType {
@@ -187,6 +187,9 @@ func (s *Service) recordScanFailure(
 	); err != nil {
 		return errors.Join(cause, err)
 	}
+	if decision.Code == db.ArchiveErrorCodeBudgetExhausted {
+		return &admissionDeferredError{providerAttempted: true}
+	}
 	return cause
 }
 
@@ -204,6 +207,9 @@ func (s *Service) recordInventoryFailure(ctx context.Context, repoID int64, caus
 		ctx, repoID, decision.Code, cause.Error(), decision.RetryAt, s.now(),
 	); err != nil {
 		return errors.Join(cause, err)
+	}
+	if decision.Code == db.ArchiveErrorCodeBudgetExhausted {
+		return errAdmissionDeferred
 	}
 	return cause
 }

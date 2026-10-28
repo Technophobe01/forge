@@ -1,7 +1,7 @@
 <script lang="ts">
+  import QuerySearchInput from "./shared/QuerySearchInput.svelte";
   import {
     EmptyState,
-    SearchInput,
     Spinner,
     Toggle,
     type TypeaheadOption,
@@ -21,7 +21,7 @@
   } from "../stores/activity.svelte.js";
   import { getStores, getNavigate } from "../context.js";
   import ActivityThreaded from "./ActivityThreaded.svelte";
-  import ActivityFilters from "./ActivityFilters.svelte";
+  import ItemFilters from "./shared/ItemFilters.svelte";
   import { ScrollBox } from "@kenn-io/kit-ui";
   import {
     isDefaultBranchActivity,
@@ -30,6 +30,7 @@
     isCollapsedActivityRow,
     isClosedOrMergedActivity,
     collapseActivityRuns,
+    activityAuthor,
     notificationReasonLabel,
     shortSha,
   } from "./activityRows.js";
@@ -124,6 +125,7 @@
     + (activity.getShowNotifications() ? 0 : 1)
     + (activity.getHideClosedMerged() ? 1 : 0)
     + (activity.getHideBots() ? 1 : 0)
+    + (activity.getHideDrafts() ? 1 : 0)
     + (activity.getHideDefaultBranchActivity() ? 1 : 0)
     + (grouping.getHideOrgName() ? 1 : 0)
     + (activity.getInvolvesMe() ? 1 : 0)
@@ -135,8 +137,8 @@
   onMount(() => {
     activity.initializeFromMount();
     searchInput = activity.getActivitySearch() ?? "";
-    activity.loadActivity(true);
-    activity.startActivityPolling();
+    activity.setActivityPageLimit(undefined);
+    activity.ensureActivityLoaded();
     unsubSync = sync.subscribeSyncComplete(() => {
       runtime.runCommand(activity.reconcileActivityEffect(), {
         operation: "reconcile activity after sync",
@@ -147,7 +149,6 @@
   });
 
   onDestroy(() => {
-    activity.stopActivityPolling();
     unsubSync?.();
     debounceExecution?.interrupt();
   });
@@ -268,10 +269,6 @@
     return item.branch_name || "default branch";
   }
 
-  function activityAuthor(item: ActivityItem): string {
-    return item.author_name || item.author;
-  }
-
   function branchActivityTitle(item: ActivityItem): string {
     if (isDefaultBranchForcePushActivity(item)) {
       const before = shortSha(item.before_sha);
@@ -372,6 +369,7 @@
     activity.setShowNotifications(true);
     activity.setHideClosedMerged(false);
     activity.setHideBots(false);
+    activity.setHideDrafts(false);
     activity.setHideDefaultBranchActivity(false);
     grouping.setHideOrgName(false);
     activity.setInvolvesMe(false);
@@ -456,6 +454,16 @@
           color: "var(--accent-purple)",
           onSelect: () => {
             activity.setHideBots(!activity.getHideBots());
+            activity.loadActivity();
+          },
+        },
+        {
+          id: "hide-drafts",
+          label: "Hide drafts",
+          active: activity.getHideDrafts(),
+          color: "var(--accent-amber)",
+          onSelect: () => {
+            activity.setHideDrafts(!activity.getHideDrafts());
             activity.loadActivity();
           },
         },
@@ -676,7 +684,9 @@
     </div>
 
     <div class="filters-wrap">
-      <ActivityFilters
+      <ItemFilters
+        panelLabel="Activity filters"
+        title="View and filter activity"
         author={activity.getActivityAuthor() ?? ""}
         {authorOptions}
         authorLoading={activity.isActivityAuthorsLoading()}
@@ -727,7 +737,7 @@
     {/if}
 
     <div class="search-wrap">
-      <SearchInput
+      <QuerySearchInput
         bind:value={searchInput}
         size="sm"
         block
@@ -1315,8 +1325,8 @@
     padding: 6px 0 4px;
     font-size: var(--font-size-2xs);
     font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
+    text-transform: var(--label-transform, uppercase);
+    letter-spacing: var(--letter-spacing-label, 0.5px);
     color: var(--text-muted);
     border-bottom: 1px solid var(--border-default);
     position: sticky;

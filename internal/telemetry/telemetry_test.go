@@ -1,54 +1,72 @@
 package telemetry
 
 import (
-	"runtime"
+	"context"
+	"os"
+	"strconv"
 	"testing"
+	"time"
 
-	"github.com/posthog/posthog-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/kit/telemetry/posthog"
 )
 
-type fakePostHogClient struct {
-	message posthog.Message
+type capturedEvent struct {
+	event      string
+	properties map[string]any
 }
 
-func (f *fakePostHogClient) Enqueue(message posthog.Message) error {
-	f.message = message
+type fakeKitClient struct {
+	captures []capturedEvent
+	closed   bool
+}
+
+func (f *fakeKitClient) Capture(event string, properties map[string]any) error {
+	f.captures = append(f.captures, capturedEvent{event: event, properties: properties})
 	return nil
 }
 
-func (f *fakePostHogClient) Close() error { return nil }
+func (f *fakeKitClient) Report(_ context.Context, event string, properties map[string]any) (posthog.Status, error) {
+	return posthog.StatusQueued, f.Capture(event, properties)
+}
 
-func TestNewReporterDisabledByEnvDoesNotCreateInstallID(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
+func (f *fakeKitClient) Close() error {
+	f.closed = true
+	return nil
+}
 
-	t.Setenv(EnabledEnv, "0")
-	database := dbtest.Open(t)
+func (f *fakeKitClient) Enabled() bool {
+	return true
+}
 
-	reporter, err := NewReporter(Options{Database: database})
-	require.NoError(err)
-
-	assert.False(reporter.Enabled())
-	_, found, err := database.AppMetadataValue(t.Context(), installIDMetadataKey)
-	require.NoError(err)
-	assert.False(found)
+func enableTelemetryEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv(EnabledEnv, "1")
+	t.Setenv("KENN_FORGE_TELEMETRY_ENABLED", "1")
+	t.Setenv("DO_NOT_TRACK", "0")
+	ci, present := os.LookupEnv("CI")
+	require.NoError(t, os.Unsetenv("CI"))
+	t.Cleanup(func() {
+		if present {
+			require.NoError(t, os.Setenv("CI", ci)) //nolint:usetesting // t.Setenv would undo this restoration during its own cleanup.
+		}
+	})
 }
 
 func TestNewReporterDisabledInGoTestEvenWhenEnvEnabled(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	t.Setenv(EnabledEnv, "1")
+	enableTelemetryEnv(t)
 	database := dbtest.Open(t)
 
-	reporter, err := NewReporter(Options{Database: database})
+	reporter, err := NewReporter(Options{Database: database, Version: "v1.2.3"})
 	require.NoError(err)
 
 	assert.False(reporter.Enabled())
-	_, found, err := database.AppMetadataValue(t.Context(), installIDMetadataKey)
+	_, found, err := database.AppMetadataValue(t.Context(), InstallIDMetadataKey)
 	require.NoError(err)
 	assert.False(found)
 }
@@ -59,115 +77,170 @@ func TestLoadOrCreateInstallIDIsStableAndAnonymous(t *testing.T) {
 
 	database := dbtest.Open(t)
 
-	first, err := loadOrCreateInstallID(t.Context(), database)
+	first, _, err := loadOrCreateInstallID(t.Context(), database, time.Now())
 	require.NoError(err)
-	second, err := loadOrCreateInstallID(t.Context(), database)
+	second, _, err := loadOrCreateInstallID(t.Context(), database, time.Now())
 	require.NoError(err)
 
 	assert.Len(first, 32)
 	assert.Equal(first, second)
 
-	stored, found, err := database.AppMetadataValue(t.Context(), installIDMetadataKey)
+	stored, found, err := database.AppMetadataValue(t.Context(), InstallIDMetadataKey)
 	require.NoError(err)
 	assert.True(found)
 	assert.Equal(first, stored)
 }
 
-func TestReporterCaptureUsesAnonymousDistinctID(t *testing.T) {
+func TestRepoCountBucket(t *testing.T) {
+	for _, tt := range []struct {
+		count int
+		want  string
+	}{
+		{0, "0-5"},
+		{1, "0-5"},
+		{5, "0-5"},
+		{6, "6-20"},
+		{20, "6-20"},
+		{21, "21-100"},
+		{37, "21-100"},
+		{100, "21-100"},
+		{101, "over-100"},
+	} {
+		t.Run(tt.want+"/"+strconv.Itoa(tt.count), func(t *testing.T) {
+			bucket := RepoCountBucket(tt.count)
+			require.Equal(t, tt.want, bucket)
+			value, valid := allowedEvents["daemon_active"]["repo_count"](bucket)
+			assert.True(t, valid)
+			assert.Equal(t, tt.want, value)
+		})
+	}
+	for _, invalid := range []any{nil, 37, "37", "", "0", "1", "2-5"} {
+		_, valid := allowedEvents["daemon_active"]["repo_count"](invalid)
+		assert.False(t, valid, "repo_count %v", invalid)
+	}
+}
+
+func TestReporterRoutesEventsBySource(t *testing.T) {
+	tests := []struct {
+		name        string
+		event       string
+		wantErr     error
+		wantDaemon  int
+		wantBackend int
+	}{
+		{name: "daemon_active goes to daemon", event: "daemon_active", wantDaemon: 1},
+		{name: "sync_failed goes to daemon", event: "sync_failed", wantDaemon: 1},
+		{name: "setup_finished goes to daemon", event: "setup_finished", wantDaemon: 1},
+		{name: "app_opened goes to backend", event: " app_opened ", wantBackend: 1},
+		{name: "search_empty goes to backend", event: "search_empty", wantBackend: 1},
+		{name: "error_shown goes to backend", event: "error_shown", wantBackend: 1},
+		{name: "unsupported event", event: "server_started", wantErr: ErrUnsupportedEvent},
+		{name: "empty event", event: " "},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			daemon := &fakeKitClient{}
+			backend := &fakeKitClient{}
+			reporter := &Reporter{daemon: daemon, backend: backend}
+
+			err := reporter.Capture(tt.event, map[string]any{"repo_count": "0-5"})
+			switch {
+			case tt.wantErr != nil:
+				require.ErrorIs(t, err, tt.wantErr)
+			case tt.wantDaemon+tt.wantBackend == 0:
+				require.Error(t, err)
+			default:
+				require.NoError(t, err)
+			}
+
+			assert.Len(daemon.captures, tt.wantDaemon)
+			assert.Len(backend.captures, tt.wantBackend)
+		})
+	}
+}
+
+func TestReporterCloseClosesBothClients(t *testing.T) {
+	daemon := &fakeKitClient{}
+	backend := &fakeKitClient{}
+	reporter := &Reporter{daemon: daemon, backend: backend}
+
+	require.NoError(t, reporter.Close())
+
+	assert.True(t, daemon.closed)
+	assert.True(t, backend.closed)
+}
+
+func TestDisabledReporterIsNoOp(t *testing.T) {
+	assert := assert.New(t)
+
+	for _, reporter := range []*Reporter{nil, DisabledReporter()} {
+		assert.False(reporter.Enabled())
+		assert.NoError(reporter.Capture("server_started", nil))
+		assert.NoError(reporter.Close())
+	}
+}
+
+func TestUIEventAllowedAdmitsOnlyBackendEvents(t *testing.T) {
+	assert := assert.New(t)
+
+	assert.True(UIEventAllowed(" app_opened "))
+	assert.True(UIEventAllowed("session_ended"))
+	assert.False(UIEventAllowed("daemon_active"))
+	assert.False(UIEventAllowed("setup_finished"))
+	assert.False(UIEventAllowed("app_loaded"))
+}
+
+func TestLoadOrCreateInstallIDRecordsCreationTimeOnce(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	client := &fakePostHogClient{}
-	reporter := &Reporter{
-		client:     client,
-		distinctID: "anonymous-install-id",
-		enabled:    true,
-		version:    "1.2.3",
-		commit:     "abc123",
-	}
+	database := dbtest.Open(t)
+	created := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
 
-	err := reporter.Capture("daemon_active", map[string]any{
-		"$geoip_disable":          false,
-		"$process_person_profile": true,
-		"application":             "caller-app",
-		"app":                     "caller-app",
-		"distinct_id":             "user-provided",
-		"repo":                    "owner/name",
-		"repo_count":              7,
-		"source":                  "caller",
-		"version":                 "caller-version",
+	_, first, err := loadOrCreateInstallID(t.Context(), database, created)
+	require.NoError(err)
+	_, second, err := loadOrCreateInstallID(t.Context(), database, created.Add(48*time.Hour))
+	require.NoError(err)
+
+	assert.True(created.Equal(first))
+	assert.True(created.Equal(second))
+}
+
+func TestLoadOrCreateInstallIDLeavesPreexistingIDWithoutCreationTime(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	database := dbtest.Open(t)
+	_, err := database.GetOrCreateAppMetadataValue(t.Context(), InstallIDMetadataKey, func() (string, error) {
+		return "existing-install-id", nil
 	})
 	require.NoError(err)
 
-	capture, ok := client.message.(posthog.Capture)
-	require.True(ok)
-	assert.Equal("anonymous-install-id", capture.DistinctId)
-	assert.Equal("daemon_active", capture.Event)
-	assert.Equal(7, capture.Properties["repo_count"])
-	assert.NotContains(capture.Properties, "distinct_id")
-	assert.NotContains(capture.Properties, "repo")
-	assert.NotContains(capture.Properties, "app")
-	assert.False(capture.Properties["$process_person_profile"].(bool))
-	assert.True(capture.Properties["$geoip_disable"].(bool))
-	assert.Equal("kenn-forge", capture.Properties["application"])
-	assert.Equal("1.2.3", capture.Properties["version"])
-	assert.Equal("abc123", capture.Properties["commit"])
-	assert.Equal(runtime.GOOS, capture.Properties["goos"])
-	assert.Equal(runtime.GOARCH, capture.Properties["goarch"])
-	assert.Equal("daemon", capture.Properties["source"])
-}
-
-func TestReporterCaptureRejectsUnsupportedEvents(t *testing.T) {
-	require := require.New(t)
-
-	client := &fakePostHogClient{}
-	reporter := &Reporter{
-		client:     client,
-		distinctID: "anonymous-install-id",
-		enabled:    true,
-	}
-
-	err := reporter.Capture("server_started", map[string]any{"repo_count": 7})
-	require.ErrorIs(err, ErrUnsupportedEvent)
-}
-
-func TestReporterCaptureDropsUnsafePropertyValues(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-
-	client := &fakePostHogClient{}
-	reporter := &Reporter{
-		client:     client,
-		distinctID: "anonymous-install-id",
-		enabled:    true,
-	}
-
-	err := reporter.Capture("app_loaded", map[string]any{"view": "owner/repo"})
+	id, installedAt, err := loadOrCreateInstallID(t.Context(), database, time.Now())
 	require.NoError(err)
 
-	capture, ok := client.message.(posthog.Capture)
-	require.True(ok)
-	assert.NotContains(capture.Properties, "view")
-	assert.False(capture.Properties["$process_person_profile"].(bool))
-	assert.True(capture.Properties["$geoip_disable"].(bool))
-	assert.Equal("kenn-forge", capture.Properties["application"])
-	assert.Equal("backend", capture.Properties["source"])
+	assert.Equal("existing-install-id", id)
+	assert.True(installedAt.IsZero())
+	_, found, err := database.AppMetadataValue(t.Context(), installedAtKey)
+	require.NoError(err)
+	assert.False(found)
 }
 
-func TestSanitizePropertiesAddsNonOverridablePrivacyAndApplication(t *testing.T) {
+func TestLoadOrCreateInstallIDTreatsUnparseableTimeAsUnknown(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	properties, err := SanitizeProperties("app_loaded", map[string]any{
-		"$geoip_disable":          false,
-		"$process_person_profile": true,
-		"application":             "caller-app",
-		"view":                    "pulls",
+	database := dbtest.Open(t)
+	_, err := database.GetOrCreateAppMetadataValue(t.Context(), installedAtKey, func() (string, error) {
+		return "not-a-time", nil
 	})
 	require.NoError(err)
 
-	assert.Equal("pulls", properties["view"])
-	assert.False(properties["$process_person_profile"].(bool))
-	assert.True(properties["$geoip_disable"].(bool))
-	assert.Equal("kenn-forge", properties["application"])
+	id, installedAt, err := loadOrCreateInstallID(t.Context(), database, time.Now())
+	require.NoError(err)
+
+	assert.Len(id, 32)
+	assert.True(installedAt.IsZero())
 }

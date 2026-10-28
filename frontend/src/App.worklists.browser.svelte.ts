@@ -1,0 +1,321 @@
+import { afterEach, expect, it, vi } from "vite-plus/test";
+import { page } from "vite-plus/test/browser";
+import {
+  emitBrowserEventSource,
+  mountBrowserApp,
+  pressKey,
+  resetKeyboardModuleState,
+  type MountedBrowserApp,
+} from "./test/browserAppHarness.js";
+import { navigate } from "./lib/stores/router.svelte.js";
+import { jsonResponse, mockSettings, type MockRouteOverride } from "./test/mockApiFetch.js";
+import { WORKLIST_HANDLED_AT, worklistResponse, worklistRoutes, type WorklistServer } from "./test/worklistFixtures.js";
+
+let mounted: MountedBrowserApp | undefined;
+
+afterEach(async () => {
+  mounted?.unmount();
+  mounted = undefined;
+  localStorage.clear();
+  sessionStorage.clear();
+  await resetKeyboardModuleState();
+});
+
+it("opens an agent's new list from the Worklists tab", async () => {
+  await page.viewport(1400, 900);
+  const server: WorklistServer = { lists: [], requests: [] };
+  mounted = await mountBrowserApp("/", { overrides: [worklistRoutes(server)] });
+  await expect.element(page.getByRole("button", { name: "Activity", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Worklists", exact: true }).click();
+
+  server.lists = [worklistResponse(5, "Review queue")];
+  emitBrowserEventSource("worklists_changed", { worklist_id: 5 });
+  await page.getByRole("button", { name: "Worklists", exact: true }).click();
+
+  await vi.waitFor(() =>
+    expect(window.location.pathname + window.location.search).toBe(
+      "/worklists/5?selected=pr%3A42&provider=github&platform_host=github.com&repo_path=acme%2Fwidgets&platform_repo_id=1001",
+    ),
+  );
+  const strip = page.getByRole("region", { name: "Worklist item context" });
+  await expect.element(strip.getByText("Approved and green; only a docs nit left.")).toBeVisible();
+  await expect.element(page.getByRole("tab", { name: "Conversation" })).toBeVisible();
+
+  pressKey("j");
+  await vi.waitFor(() => expect(window.location.search).toContain("selected=pr%3A84"));
+  await expect.element(strip.getByText("Review notes may cover an older head")).toBeVisible();
+});
+
+it("does not loop or re-read the open list on the agent status poll", async () => {
+  await page.viewport(1400, 900);
+  const errors: unknown[] = [];
+  const onError = (event: ErrorEvent): void => {
+    errors.push(event.error ?? event.message);
+  };
+  window.addEventListener("error", onError);
+  const server: WorklistServer = { lists: [worklistResponse(5, "Review queue")], requests: [] };
+  const agentStatusSettings: MockRouteOverride = (request) => {
+    if (request.method !== "GET" || request.url.pathname !== "/api/v1/settings") return null;
+    return jsonResponse({
+      ...mockSettings,
+      workspaces: { ...mockSettings.workspaces, show_agent_status_in_lists: true },
+    });
+  };
+  try {
+    mounted = await mountBrowserApp("/worklists/5", { overrides: [agentStatusSettings, worklistRoutes(server)] });
+    await expect.element(page.getByRole("heading", { name: "Review queue" })).toBeVisible();
+    // Showing a hidden page runs the poll at once.
+    let visibility: DocumentVisibilityState = "hidden";
+    vi.spyOn(document, "visibilityState", "get").mockImplementation(() => visibility);
+    document.dispatchEvent(new Event("visibilitychange"));
+    visibility = "visible";
+    document.dispatchEvent(new Event("visibilitychange"));
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    // Only opening the list reads it; a loop or a poll refresh would read again.
+    const detailReads = () => server.requests.filter((request) => request === "GET /api/v1/worklists/5").length;
+    expect(detailReads()).toBe(1);
+    expect(errors).toEqual([]);
+
+    // A workspace status event still refreshes the rows' agent status.
+    emitBrowserEventSource("workspace_status", { id: "ws-1", status: "ready" });
+    await vi.waitFor(() => expect(detailReads()).toBe(2));
+  } finally {
+    window.removeEventListener("error", onError);
+    vi.restoreAllMocks();
+  }
+});
+
+it("keeps j and k working while the rail is collapsed", async () => {
+  await page.viewport(1400, 900);
+  localStorage.setItem("kenn-forge-sidebar", "collapsed");
+  const server: WorklistServer = { lists: [worklistResponse(5, "Review queue")], requests: [] };
+  mounted = await mountBrowserApp("/worklists/5", { overrides: [worklistRoutes(server)] });
+  await vi.waitFor(() => expect(window.location.search).toContain("selected=pr%3A42"));
+  await expect.element(page.getByRole("region", { name: "Worklist item context" })).toBeVisible();
+  expect(document.querySelector('[aria-label="Review queue items"]')).toBeNull();
+
+  pressKey("j");
+  await vi.waitFor(() => expect(window.location.search).toContain("selected=pr%3A84"));
+  pressKey("k");
+  await vi.waitFor(() => expect(window.location.search).toContain("selected=pr%3A42"));
+});
+
+it("fits every row in the rail at its narrowest width", async () => {
+  await page.viewport(1400, 900);
+  localStorage.setItem("kenn-forge-sidebar-width", "200");
+  const long = "A very long agent note that keeps going well past the width of a narrow rail ".repeat(3);
+  const list = worklistResponse(5, "Review queue");
+  list.items = list.items.map((item) => ({
+    ...item,
+    note: long,
+    caveat: long,
+    pull: item.pull && {
+      ...item.pull,
+      MergeableState: "dirty",
+      ReviewDecision: "APPROVED",
+      stack: { stack_id: 1, position: 12, size: 14 },
+      merge_queue: {
+        position: 3,
+        state: "awaiting_checks",
+        enqueued_at: "2026-10-19T12:00:00Z",
+        observed_at: "2026-10-19T12:01:00Z",
+      },
+      workspace: { id: `ws-${item.number}`, status: "ready", agent_state: "working" },
+      labels: [{ name: "a-rather-long-label-name", color: "0e8a16" }],
+    },
+    issue: item.issue && {
+      ...item.issue,
+      workspace: { id: `ws-${item.number}`, status: "ready", agent_state: "input" },
+      labels: [{ name: "a-rather-long-label-name", color: "d73a4a" }],
+    },
+  })) as typeof list.items;
+  const server: WorklistServer = { lists: [list, worklistResponse(4, "Stale issues", [])], requests: [] };
+  mounted = await mountBrowserApp("/worklists/5", { overrides: [worklistRoutes(server)] });
+  const rail = page.getByRole("region", { name: "Review queue items" });
+  await expect.element(rail.getByRole("button", { name: "Theme toggle does not stick" })).toBeVisible();
+
+  const region = rail.element();
+  expect(region.getBoundingClientRect().width).toBeLessThanOrEqual(200);
+  expect(region.scrollWidth).toBeLessThanOrEqual(region.clientWidth);
+  const railRight = region.getBoundingClientRect().right;
+  for (const row of region.querySelectorAll<HTMLElement>("li > button")) {
+    expect(row.scrollWidth).toBeLessThanOrEqual(row.clientWidth);
+    for (const part of row.querySelectorAll<HTMLElement>("*")) {
+      expect(part.getBoundingClientRect().right).toBeLessThanOrEqual(railRight + 0.5);
+    }
+  }
+});
+
+it("announces a caveat's level only when the agent raised it above info", async () => {
+  const list = worklistResponse(5, "Review queue");
+  list.items[0] = { ...list.items[0]!, caveat: "The migration drops a column.", caveat_level: "critical" };
+  const server: WorklistServer = { lists: [list], requests: [] };
+  mounted = await mountBrowserApp("/worklists/5", { overrides: [worklistRoutes(server)] });
+  const rail = page.getByRole("region", { name: "Review queue items" });
+
+  await expect
+    .element(rail.getByRole("button", { name: "Add browser regression coverage" }))
+    .toHaveAccessibleDescription(/Critical: ?The migration drops a column\./);
+  const info = rail.getByRole("button", { name: "Theme toggle does not stick" });
+  await expect.element(info).toHaveAccessibleDescription(/Could be a duplicate of an older report\./);
+  await expect.element(info).not.toHaveAccessibleDescription(/Warning|Critical/);
+});
+
+it("marks the open item handled with d and moves on in rank order", async () => {
+  await page.viewport(1400, 900);
+  const list = worklistResponse(5, "Review queue");
+  list.items = list.items.map((item) => (item.number === 84 ? { ...item, handled_at: WORKLIST_HANDLED_AT } : item));
+  const server: WorklistServer = { lists: [list], requests: [], marks: [] };
+  mounted = await mountBrowserApp("/worklists/5", { overrides: [worklistRoutes(server)] });
+  await vi.waitFor(() => expect(window.location.search).toContain("selected=pr%3A42"));
+  const rail = page.getByRole("region", { name: "Review queue items" });
+  await expect.element(rail.getByRole("button", { name: "Add browser regression coverage" })).toBeVisible();
+
+  pressKey("d");
+
+  await vi.waitFor(() => expect(window.location.search).toContain("selected=pr%3A84"));
+  await expect.element(page.getByText("3 of 4 done")).toBeVisible();
+  expect(server.marks?.map((mark) => mark.items.map((item) => item.number))).toEqual([[42]]);
+
+  pressKey("d");
+
+  await vi.waitFor(() => expect(window.location.search).toContain("selected=issue%3A7"));
+  expect(server.marks).toHaveLength(1);
+  const handledRow = rail.getByRole("button", { name: "Add browser regression coverage" }).element();
+  const title = handledRow.querySelector<HTMLElement>(".worklist-row-body");
+  expect(Number(getComputedStyle(title!).opacity)).toBeLessThan(1);
+  const openRow = rail.getByRole("button", { name: "Theme toggle does not stick" }).element();
+  expect(Number(getComputedStyle(openRow.querySelector<HTMLElement>(".worklist-row-body")!).opacity)).toBe(1);
+});
+
+it("keeps the open item when marking it handled with d fails", async () => {
+  await page.viewport(1400, 900);
+  const server: WorklistServer = { lists: [worklistResponse(5, "Review queue")], requests: [], marks: [] };
+  const failingMarks: MockRouteOverride = (request) => {
+    if (request.method !== "POST" || request.url.pathname !== "/api/v1/worklists/5/handled") return null;
+    return jsonResponse({ title: "Internal Server Error", status: 500, detail: "mark failed" }, 500);
+  };
+  mounted = await mountBrowserApp("/worklists/5", { overrides: [failingMarks, worklistRoutes(server)] });
+  await vi.waitFor(() => expect(window.location.search).toContain("selected=pr%3A42"));
+
+  pressKey("d");
+
+  await expect.element(page.getByText("1 of 4 done")).toBeVisible();
+  await expect.element(page.getByText(/mark failed|Could not mark the item handled/)).toBeVisible();
+  expect(window.location.search).toContain("selected=pr%3A42");
+});
+
+it("does not step after a late d mark once another list is open", async () => {
+  await page.viewport(1400, 900);
+  const server: WorklistServer = {
+    lists: [worklistResponse(5, "Review queue"), worklistResponse(4, "Stale issues")],
+    requests: [],
+    marks: [],
+  };
+  mounted = await mountBrowserApp("/worklists/5", { overrides: [worklistRoutes(server)] });
+  await vi.waitFor(() => expect(window.location.search).toContain("selected=pr%3A42"));
+  let releaseMark: () => void = () => {};
+  const markHeld = new Promise<void>((resolve) => {
+    releaseMark = resolve;
+  });
+  let markSent = false;
+  const appFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const request = input instanceof Request ? input : new Request(new URL(String(input), window.location.href), init);
+    if (request.method === "POST" && new URL(request.url).pathname === "/api/v1/worklists/5/handled") {
+      markSent = true;
+      await markHeld;
+    }
+    return appFetch(input, init);
+  };
+
+  pressKey("d");
+  await vi.waitFor(() => expect(markSent).toBe(true));
+  const otherList =
+    "/worklists/4?selected=pr%3A42&provider=github&platform_host=github.com&repo_path=acme%2Fwidgets&platform_repo_id=1001";
+  navigate(otherList);
+  await expect.element(page.getByRole("region", { name: "Stale issues items" })).toBeVisible();
+  releaseMark();
+
+  await vi.waitFor(() => expect(server.marks).toHaveLength(1));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(window.location.pathname + window.location.search).toBe(otherList);
+});
+
+it("steps and marks rows in score order when the rail is sorted by score", async () => {
+  await page.viewport(1400, 900);
+  localStorage.setItem("kenn-forge:worklists:order", "score");
+  const list = worklistResponse(5, "Review queue");
+  const scores: Record<number, number | null> = { 42: 9, 84: null, 7: 10, 55: 3 };
+  list.items = list.items.map((item) => ({ ...item, score: scores[item.number] ?? null }));
+  const server: WorklistServer = { lists: [list], requests: [], marks: [] };
+  mounted = await mountBrowserApp(
+    "/worklists/5?selected=issue%3A7&provider=github&platform_host=github.com&repo_path=acme%2Fwidgets&platform_repo_id=1001",
+    { overrides: [worklistRoutes(server)] },
+  );
+  const rail = page.getByRole("region", { name: "Review queue items" });
+  await expect.element(rail.getByRole("button", { name: "Theme toggle does not stick" })).toBeVisible();
+  await expect.element(page.getByRole("radio", { name: "Score" })).toHaveAttribute("aria-checked", "true");
+
+  // The highest-scored item is last in agent order, so d only moves on in score order.
+  pressKey("d");
+  await vi.waitFor(() => expect(window.location.search).toContain("selected=pr%3A42"));
+  await expect.element(page.getByText("2 of 4 done")).toBeVisible();
+  expect(server.marks?.map((mark) => mark.items.map((item) => item.number))).toEqual([[7]]);
+
+  pressKey("j");
+  await vi.waitFor(() => expect(window.location.search).toContain("selected=pr%3A84"));
+
+  pressKey("k");
+  await vi.waitFor(() => expect(window.location.search).toContain("selected=pr%3A42"));
+});
+
+it("steps on from an open item that merges and leaves the rail", async () => {
+  await page.viewport(1400, 900);
+  const server: WorklistServer = { lists: [worklistResponse(5, "Review queue")], requests: [] };
+  mounted = await mountBrowserApp(
+    "/worklists/5?selected=pr%3A84&provider=github&platform_host=example.com&repo_path=acme%2Fwidgets&platform_repo_id=2002",
+    { overrides: [worklistRoutes(server)] },
+  );
+  const rail = page.getByRole("region", { name: "Review queue items" });
+  await expect.element(rail.getByRole("button", { name: "Mirror host stub PR" })).toBeVisible();
+
+  const merged = worklistResponse(5, "Review queue");
+  merged.items = merged.items.map((item) =>
+    item.number === 84 ? { ...item, freshness: "gone", live: { ...item.live!, state: "merged" } } : item,
+  );
+  server.lists = [merged];
+  emitBrowserEventSource("worklists_changed", { worklist_id: 5 });
+  await expect.element(rail.getByRole("button", { name: "Mirror host stub PR" })).not.toBeInTheDocument();
+  expect(window.location.search).toContain("selected=pr%3A84");
+
+  // #84 sat between #42 and #7, so j goes to #7 rather than back to the top.
+  pressKey("j");
+  await vi.waitFor(() => expect(window.location.search).toContain("selected=issue%3A7"));
+});
+
+it("keeps handled marks on items an agent keeps when it rewrites the list", async () => {
+  await page.viewport(1400, 900);
+  const server: WorklistServer = { lists: [worklistResponse(5, "Review queue")], requests: [], marks: [] };
+  mounted = await mountBrowserApp("/worklists/5", { overrides: [worklistRoutes(server)] });
+  const strip = page.getByRole("region", { name: "Worklist item context" });
+  await strip.getByRole("button", { name: "Mark handled" }).click();
+  await expect.element(strip.getByRole("button", { name: "Handled" })).toBeVisible();
+
+  const kept = server.lists[0]!.items.find((item) => item.number === 42)!;
+  const rewritten = worklistResponse(5, "Review queue, rewritten");
+  rewritten.items = rewritten.items
+    .filter((item) => item.number !== 55)
+    .map((item) => (item.number === 42 ? { ...item, handled_at: kept.handled_at } : item));
+  server.lists = [rewritten];
+  emitBrowserEventSource("worklists_changed", { worklist_id: 5 });
+
+  await expect.element(page.getByRole("heading", { name: "Review queue, rewritten" })).toBeVisible();
+  await expect.element(page.getByText("1 of 3 done")).toBeVisible();
+  await expect.element(strip.getByRole("button", { name: "Handled" })).toBeVisible();
+  const rail = page.getByRole("region", { name: "Review queue, rewritten items" });
+  await expect
+    .element(rail.getByRole("button", { name: "Add browser regression coverage" }).getByLabelText("Handled"))
+    .toBeVisible();
+});

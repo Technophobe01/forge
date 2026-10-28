@@ -53,31 +53,13 @@ func (h *Handler) SeedRefreshRepos(ctx context.Context) {
 		return
 	}
 	for _, repo := range repos {
-		if h.descriptors != nil && strings.TrimSpace(repo.PlatformRepoID) == "" {
+		if h.descriptors != nil && repo.Key.IsZero() {
 			continue
 		}
 		if strings.TrimSpace(repo.CloneURL) == "" {
 			continue
 		}
-		repoRef, err := h.repoBrowserRepoRef(ctx, repo)
-		if err != nil {
-			slog.Warn("failed to fence repo browser refresh repo",
-				"provider", repo.Platform,
-				"host", repo.PlatformHost,
-				"repo", repo.RepoPath,
-				"err", err)
-			continue
-		}
-		_, err = h.resolver.AdoptLegacyClonesIfSafe(ctx, repo, func() error {
-			return h.clones.AdoptLegacyClones(ctx, repoRef)
-		})
-		if err != nil {
-			slog.Warn("failed to adopt legacy repository clones",
-				"provider", repo.Platform,
-				"host", repo.PlatformHost,
-				"repo", repo.RepoPath,
-				"err", err)
-		}
+		repoRef := h.repoBrowserRepoRef(repo)
 		registered, err := h.clones.RegisterExistingRepoBrowserClone(ctx, repoRef)
 		if err != nil {
 			slog.Warn("failed to seed repo browser refresh repo",
@@ -97,7 +79,7 @@ func (h *Handler) SeedRefreshRepos(ctx context.Context) {
 }
 
 func (h *Handler) runRefreshPass(ctx context.Context) {
-	if h.clones == nil {
+	if h.clones == nil || h.automaticRefreshEnabled != nil && !h.automaticRefreshEnabled() {
 		return
 	}
 	slog.Debug("refreshing repo browser clones")

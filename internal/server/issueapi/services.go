@@ -8,6 +8,7 @@ import (
 	"go.kenn.io/forge/internal/providerplane"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/server/workspaceapi"
+	"go.kenn.io/forge/platform"
 )
 
 // ProviderSource supplies hub-owned issue data without spoke-local
@@ -49,7 +50,7 @@ func (s *Handler) ListService(ctx context.Context, req ListQuery) ([]IssueRespon
 	if err != nil {
 		return nil, err
 	}
-	return s.overlayLocalIssueWorkspaces(ctx, rows)
+	return s.OverlayLocalWorkspaces(ctx, rows)
 }
 
 // ListProviderService returns provider-owned rows in hub order.
@@ -60,7 +61,28 @@ func (s *Handler) ListProviderService(
 		Repo: req.Repo, State: req.State, Starred: req.Starred,
 		InvolvesMe: req.InvolvesMe, Unassigned: req.Unassigned, ReferencedByPR: req.ReferencedByPR,
 		Q: req.Text, Assignee: req.Assignee, Limit: req.Limit, Offset: req.Offset,
-	})
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	rows := output.Body
+	for i := range rows {
+		rows[i].Workspace = nil
+		rows[i].LastWorkspaceActivityAt = ""
+	}
+	return rows, nil
+}
+
+// RowsForItems returns list-issues rows for the named visible issues in any
+// state, without workspace references. Rows for repositories the list hides
+// are omitted.
+func (s *Handler) RowsForItems(
+	ctx context.Context, items []db.RepoItemNumber,
+) ([]IssueResponse, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	output, err := s.listIssuesRouteCore(ctx, &listIssuesInput{State: "all"}, items)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +128,10 @@ func (s *Handler) GetProviderService(
 	return detail, nil
 }
 
-func (s *Handler) overlayLocalIssueWorkspaces(
+// OverlayLocalWorkspaces replaces workspace references on provider rows
+// with this machine's own, since a reference from another node names a
+// workspace this machine cannot open. It returns a copy.
+func (s *Handler) OverlayLocalWorkspaces(
 	ctx context.Context, rows []IssueResponse,
 ) ([]IssueResponse, error) {
 	rows = append(make([]IssueResponse, 0, len(rows)), rows...)
@@ -148,9 +173,9 @@ func (s *Handler) overlayLocalIssueDetail(
 		return detail
 	}
 	identity := providerplane.ItemIdentity{
-		Repository: providerplane.RepositoryIdentity{
+		Repository: platform.RepositoryIdentity{
 			Provider: detail.Repo.Provider, PlatformHost: detail.Repo.PlatformHost,
-			PlatformRepoID: detail.Repo.PlatformRepoID,
+			Key: detail.Repo.Key,
 		},
 		ItemType: "issue", ItemNumber: detail.Issue.Number,
 	}.Canonical()
@@ -174,10 +199,10 @@ func issueWorkspaceOverlays(
 			continue
 		}
 		identity := providerplane.ItemIdentity{
-			Repository: providerplane.RepositoryIdentity{
-				Provider:       activity.Subject.Platform,
-				PlatformHost:   activity.Subject.PlatformHost,
-				PlatformRepoID: activity.Subject.PlatformRepoID,
+			Repository: platform.RepositoryIdentity{
+				Provider:     activity.Subject.Platform,
+				PlatformHost: activity.Subject.PlatformHost,
+				Key:          activity.Subject.RepoKey,
 			},
 			ItemType: "issue", ItemNumber: key.ItemNumber,
 		}.Canonical()
@@ -191,9 +216,9 @@ func issueWorkspaceOverlays(
 
 func issueResponseIdentity(row IssueResponse) providerplane.ItemIdentity {
 	return providerplane.ItemIdentity{
-		Repository: providerplane.RepositoryIdentity{
+		Repository: platform.RepositoryIdentity{
 			Provider: row.Repo.Provider, PlatformHost: row.Repo.PlatformHost,
-			PlatformRepoID: row.Repo.PlatformRepoID,
+			Key: row.Repo.Key,
 		},
 		ItemType: "issue", ItemNumber: row.Number,
 	}.Canonical()

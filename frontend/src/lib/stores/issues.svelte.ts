@@ -1,5 +1,7 @@
 import { Effect } from "effect";
+import { reuseUnchanged } from "../utils/reuse-unchanged.js";
 import type { AppRuntime } from "../app/runtime.js";
+import { searchEmptyReporter } from "../app/telemetry.js";
 import { TransientTransportError } from "../api/effect-errors.js";
 import type { ApiProblemError } from "../api/effect-errors.js";
 import { executeGeneratedApiRequest, type GeneratedApi } from "../api/generated-api.js";
@@ -32,6 +34,8 @@ import {
   providerMutationFailureMessage,
   type MutationCallbacks,
   type ProviderMutationFailure,
+  type ProviderMutationService,
+  type VersionedCommand,
 } from "./ordered-mutations.js";
 import { providerItemKey } from "./provider-key.js";
 import { SettingsWorkflow, settingsErrorMessage } from "./settings-workflow.js";
@@ -39,6 +43,15 @@ import { nextWorkspaceLifecycleTick } from "./workspace-create-pending.svelte.js
 import { readInvolvesMeFilter, writeInvolvesMeFilter } from "./involves-me-filter.js";
 import { readUnassignedFilter, writeUnassignedFilter } from "./unassigned-filter.js";
 import { readIssuePRReferenceFilter, writeIssuePRReferenceFilter } from "./issue-pr-reference-filter.js";
+import { createRecentDetails } from "./recent-details.js";
+import { repoIdentityKey } from "../utils/repo-label.js";
+import {
+  repositoryKeyAllows,
+  repositoryKeyFromWire,
+  repositoryKeyString,
+  sameRepositoryKey,
+  type RepositoryKey,
+} from "../api/repository-key.js";
 
 export type { IssueDetailSyncMode } from "./issues-workflow.js";
 
@@ -55,6 +68,7 @@ export interface IssueDetailRequestOptions {
   sync?: IssueDetailSyncMode;
   provider: string;
   platformHost?: string | undefined;
+  repositoryKey?: RepositoryKey | undefined;
   repoPath: string;
 }
 
@@ -64,6 +78,7 @@ type IssueDetailRequestRef = {
   number: number;
   provider: string;
   platformHost?: string | undefined;
+  repositoryKey?: RepositoryKey | undefined;
   repoPath: string;
 };
 
@@ -79,6 +94,7 @@ interface IssueCommentMutationState {
 }
 
 export interface IssuesStoreOptions {
+  getAirplaneMode?: () => boolean;
   runtime: AppRuntime;
   getGlobalRepo?: () => string | undefined;
   getGroupByRepo?: () => boolean;
@@ -133,7 +149,8 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
 
   // --- list state ---
 
-  let issues = $state<Issue[]>([]);
+  // List responses are only ever replaced, never mutated, so skip deep proxies.
+  let issues = $state.raw<Issue[]>([]);
   let hideBots = $state(false);
   let confirmedHideBots = false;
   let hideBotsMutationGeneration = 0;
@@ -154,6 +171,8 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
   // Detail envelopes are replaced immutably. Keeping the large event array raw
   // avoids proxying thousands of timeline objects that are never mutated in place.
   let issueDetail = $state.raw<IssueDetail | null>(null);
+  // Earlier requests cannot validate a later visit restored from cache.
+  let issueDetailCacheTick = $state(0);
   // Lifecycle tick captured when the request that produced the current
   // envelope STARTED (not when it landed). Workspace-create reconciliation
   // compares it against a creation confirmation's tick to tell a stale
@@ -171,6 +190,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
   type UnsavedIssueTarget = {
     provider: string;
     platformHost: string | undefined;
+    repositoryKey: RepositoryKey | undefined;
     owner: string;
     name: string;
     number: number;
@@ -178,8 +198,10 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
   };
   let unsavedLocalBody = $state<UnsavedIssueTarget | null>(null);
   let issueSyncGeneration = 0;
+  let activeIssueSelectionKey: string | null = null;
   let issuePollingGeneration = 0;
   let activeIssueDetailRef: IssueDetailRequestRef | null = null;
+  const recentDetails = createRecentDetails<{ detail: IssueDetail; envelopeTick: number; loaded: boolean }>(100);
   // Provider synchronization is eventually complete. Keep a successfully
   // deleted comment hidden locally until an ordinary sync no longer returns it.
   const hiddenDeletedCommentIDs: Record<string, number[]> = {};
@@ -190,9 +212,10 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
 
   // --- list reads ---
 
+  const visibleIssues = $derived(hideBots ? issues.filter((issue) => !isBotAuthor(issue)) : issues);
+
   function getIssues(): Issue[] {
-    if (!hideBots) return issues;
-    return issues.filter((issue) => !isBotAuthor(issue));
+    return visibleIssues;
   }
 
   function getHideBots(): boolean {
@@ -229,31 +252,33 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     return searchQuery;
   }
 
-  function issuesByRepo(): Map<string, Issue[]> {
+  const visibleIssuesByRepo = $derived.by(() => {
     const map = new Map<string, Issue[]>();
-    for (const issue of getIssues()) {
-      const key = issueIdentityKey(issueRef(issue));
+    for (const issue of visibleIssues) {
+      const key = issueRepoKey(issue);
       const existing = map.get(key);
       if (existing) existing.push(issue);
       else map.set(key, [issue]);
     }
     return map;
+  });
+  const repoOrderedIssues = $derived([...visibleIssuesByRepo.values()].flat());
+
+  function issuesByRepo(): Map<string, Issue[]> {
+    return visibleIssuesByRepo;
   }
 
   // --- detail reads ---
 
-  function issueIdentityKey(ref: Pick<ProviderRouteRef, "provider" | "platformHost" | "repoPath">): string {
-    return JSON.stringify([ref.provider, ref.platformHost ?? "", ref.repoPath]);
-  }
-
-  function issueRef(issue: Issue): ProviderRouteRef {
-    return {
+  function issueRepoKey(issue: Issue): string {
+    return repoIdentityKey({
       provider: issue.repo.provider,
       platformHost: issue.repo.platform_host,
+      repositoryKey: repositoryKeyFromWire(issue.repo),
       owner: issue.repo.owner,
       name: issue.repo.name,
       repoPath: issue.repo.repo_path,
-    };
+    });
   }
 
   function issueMatchesSelection(issue: Issue, sel: IssueSelection): boolean {
@@ -304,6 +329,10 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
   function isIssueDetailLoading(): boolean {
     return detailLoading;
   }
+
+  function isIssueDetailFromCache(): boolean {
+    return issueDetailCacheTick !== 0;
+  }
   function isIssueDetailSyncing(): boolean {
     return detailSyncing;
   }
@@ -342,6 +371,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     referencedByPR = value;
     writeIssuePRReferenceFilter(value);
   }
+  const emptySearch = searchEmptyReporter(runtime);
   function setIssueSearchQuery(q: string | undefined): void {
     searchQuery = q;
   }
@@ -400,7 +430,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     selectedIssue = null;
   }
 
-  function loadIssuesEffect(params: IssuesParams | undefined = activeListParams) {
+  function loadIssuesEffect(params: IssuesParams | undefined = activeListParams, options?: { submitted?: boolean }) {
     const globalRepo = getGlobalRepo();
     const query: IssuesParams = {
       state: filterState,
@@ -412,6 +442,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
       ...(searchQuery !== undefined && { q: searchQuery }),
       ...params,
     };
+    const reportEmpty = options?.submitted ? emptySearch.submission(query.q) : undefined;
     const read = executeGeneratedApiRequest("GET /issues", (client, signal) =>
       client.IssuesService.listIssues(query, { signal }),
     ).pipe(
@@ -425,12 +456,13 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
       Effect.andThen(
         Effect.gen(function* () {
           const workflow = yield* IssuesWorkflow;
-          return yield* workflow.list(read);
+          return yield* workflow.list(JSON.stringify(query), read);
         }),
       ),
       Effect.tap((result) =>
         Effect.sync(() => {
-          issues = result;
+          issues = reuseUnchanged(issues, result, (item) => item.ID);
+          if (result.length === 0) reportEmpty?.();
           listCapped = query.limit !== undefined && result.length === query.limit;
           loading = false;
         }),
@@ -467,7 +499,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
         const workflow = yield* IssuesWorkflow;
         yield* workflow.reconcile(read, (result) =>
           Effect.sync(() => {
-            issues = [...result];
+            issues = reuseUnchanged(issues, result, (item) => item.ID);
             listCapped = query.limit !== undefined && result.length === query.limit;
           }),
         );
@@ -475,9 +507,9 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     });
   }
 
-  function loadIssues(params?: IssuesParams): void {
+  function loadIssues(params?: IssuesParams, options?: { submitted?: boolean }): void {
     activeListParams = params;
-    runtime.runCommand(loadIssuesEffect(params), {
+    runtime.runCommand(loadIssuesEffect(params, options), {
       operation: "load issues",
       safeContext: {},
       onFailure: (failure) => {
@@ -510,6 +542,13 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
       unsavedLocalBody.name !== next.repo_name ||
       unsavedLocalBody.number !== next.issue?.Number
     ) {
+      return next;
+    }
+    if (
+      !unsavedLocalBody.repositoryKey ||
+      !sameRepositoryKey(unsavedLocalBody.repositoryKey, repositoryKeyFromWire(next.repo))
+    ) {
+      unsavedLocalBody = null;
       return next;
     }
     if (
@@ -587,7 +626,8 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
       issueDetail.repo_name === ref.name &&
       issueDetail.issue.Number === ref.number &&
       sameBodyTarget(issueDetail.repo?.provider, issueDetail.repo?.platform_host, ref.provider, ref.platformHost) &&
-      issueDetail.repo?.repo_path === ref.repoPath
+      issueDetail.repo?.repo_path === ref.repoPath &&
+      repositoryKeyAllows(ref.repositoryKey, repositoryKeyFromWire(issueDetail.repo))
     );
   }
 
@@ -600,6 +640,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     return issueDetailRequestRef(owner, name, number, {
       provider,
       platformHost: issueDetail?.repo?.platform_host ?? selectedIssue?.platformHost,
+      repositoryKey: repositoryKeyFromWire(issueDetail?.repo),
       repoPath,
     });
   }
@@ -616,6 +657,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
       number,
       provider: options.provider,
       platformHost: options.platformHost,
+      repositoryKey: options.repositoryKey,
       repoPath: options.repoPath,
     };
   }
@@ -684,6 +726,8 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     authoritative: IssueDetail,
     installEnvelope: () => boolean,
   ) {
+    if (!repositoryKeyAllows(ref.repositoryKey, repositoryKeyFromWire(authoritative.repo)))
+      return Effect.succeed(false);
     return Effect.gen(function* () {
       const mutations = yield* ProviderMutations;
       const labels = authoritative.issue.labels ?? [];
@@ -721,7 +765,14 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
           confirmed: applyIssueCommentState(ref, commentID, state),
         });
       }
-      return yield* mutations.rebaseAll(Effect.sync(installEnvelope), entries);
+      return yield* mutations.rebaseAll(
+        Effect.sync(() => {
+          const applied = installEnvelope();
+          if (applied && issueDetailEnvelopeTick >= issueDetailCacheTick) issueDetailCacheTick = 0;
+          return applied;
+        }),
+        entries,
+      );
     });
   }
 
@@ -730,6 +781,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
       if (!isIssueDetailShowingRef(ref) || issueDetail === null) return;
       const projectedBody =
         unsavedLocalBody !== null &&
+        sameRepositoryKey(unsavedLocalBody.repositoryKey, repositoryKeyFromWire(issueDetail.repo)) &&
         sameBodyTarget(unsavedLocalBody.provider, unsavedLocalBody.platformHost, ref.provider, ref.platformHost) &&
         unsavedLocalBody.owner === ref.owner &&
         unsavedLocalBody.name === ref.name &&
@@ -763,13 +815,17 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
   }
 
   function issueDetailKey(ref: IssueDetailRequestRef): string {
-    return providerItemKey({
-      provider: ref.provider,
-      platformHost: concretePlatformHost(ref),
-      owner: ref.owner,
-      name: ref.name,
-      number: ref.number,
-    });
+    return JSON.stringify([
+      providerItemKey({
+        provider: ref.provider,
+        platformHost: concretePlatformHost(ref),
+        owner: ref.owner,
+        name: ref.name,
+        number: ref.number,
+      }),
+      ref.repoPath,
+      ref.repositoryKey ? repositoryKeyString(ref.repositoryKey) : null,
+    ]);
   }
 
   function readIssueDetail(ref: IssueDetailRequestRef, operation: string) {
@@ -787,13 +843,12 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     expectedGeneration: number,
     requireVisible: boolean,
   ) {
-    const next = withPreservedLocalBody(authoritative);
     return rebaseIssueMutations(ref, authoritative, () => {
       if (expectedGeneration !== issueSyncGeneration) return false;
       if (requireVisible && !isIssueDetailShowingRef(ref)) return false;
       let applied = false;
       applyEnvelopeAt(envelopeTick, () => {
-        issueDetail = next;
+        issueDetail = withPreservedLocalBody(authoritative);
         issueDetailLoaded = authoritative.detail_loaded ?? issueDetailLoaded;
         applied = true;
       });
@@ -923,6 +978,25 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
 
   function loadIssueDetail(owner: string, name: string, number: number, options: IssueDetailRequestOptions): void {
     const ref = issueDetailRequestRef(owner, name, number, options);
+    const key = issueDetailKey(ref);
+    if (activeIssueSelectionKey !== key) {
+      rememberIssueDetail();
+      const previous = ref.repositoryKey
+        ? recentDetails.get(JSON.stringify([issueDetailKey(ref), ref.repoPath]))
+        : undefined;
+      issueDetailCacheTick = previous ? nextWorkspaceLifecycleTick() : 0;
+      if (previous) {
+        // Restoring presentation must not acknowledge mutations or workspace absence.
+        issueDetail = previous.detail;
+        issueDetailEnvelopeTick = previous.envelopeTick;
+        issueDetailLoaded = previous.loaded;
+      } else if (isIssueDetailShowingRef({ ...ref, repositoryKey: undefined })) {
+        issueDetail = null;
+        issueDetailLoaded = false;
+        unsavedLocalBody = null;
+      }
+    }
+    activeIssueSelectionKey = key;
     const syncMode = options.sync ?? true;
     const generation = ++issueSyncGeneration;
     const envelopeTick = nextWorkspaceLifecycleTick();
@@ -975,7 +1049,9 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     activeIssueDetailRef = ref;
     const pollingGeneration = ++issuePollingGeneration;
     const pollOnce = Effect.suspend(() =>
-      detailSyncing ? Effect.void : refreshIssueDetailProgram(ref, issueSyncGeneration).pipe(Effect.asVoid),
+      detailSyncing || opts.getAirplaneMode?.()
+        ? Effect.void
+        : refreshIssueDetailProgram(ref, issueSyncGeneration).pipe(Effect.asVoid),
     ).pipe(Effect.catch(() => Effect.void));
     const program = Effect.gen(function* () {
       const workflow = yield* IssuesWorkflow;
@@ -1008,9 +1084,39 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     });
   }
 
+  function rememberIssueDetail(): void {
+    if (!issueDetail || !repositoryKeyFromWire(issueDetail.repo)) return;
+    const ref = issueDetailRequestRef(issueDetail.repo_owner, issueDetail.repo_name, issueDetail.issue.Number, {
+      provider: issueDetail.repo.provider,
+      platformHost: issueDetail.repo.platform_host,
+      repositoryKey: repositoryKeyFromWire(issueDetail.repo),
+      repoPath: issueDetail.repo.repo_path,
+    });
+    recentDetails.remember(JSON.stringify([issueDetailKey(ref), ref.repoPath]), {
+      detail: issueDetail,
+      envelopeTick: issueDetailEnvelopeTick,
+      loaded: issueDetailLoaded,
+    });
+  }
+
+  function submitDetailMutation<A>(
+    mutations: ProviderMutationService,
+    ref: IssueDetailRequestRef,
+    command: VersionedCommand<A, GeneratedApi>,
+  ) {
+    return mutations
+      .submit(command)
+      .pipe(
+        Effect.ensuring(Effect.sync(() => recentDetails.delete(JSON.stringify([issueDetailKey(ref), ref.repoPath])))),
+      );
+  }
+
   function clearIssueDetail(): void {
+    rememberIssueDetail();
+    activeIssueSelectionKey = null;
     ++issueSyncGeneration;
     issueDetail = null;
+    issueDetailCacheTick = 0;
     detailLoading = false;
     detailSyncing = false;
     detailError = null;
@@ -1137,7 +1243,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
             issueDetail = { ...issueDetail, issue: { ...issueDetail.issue, labels: nextLabels } };
           }
         });
-      yield* mutations.submit({
+      yield* submitDetailMutation(mutations, ref, {
         key,
         baseline: previousLabels,
         optimistic: labels,
@@ -1208,7 +1314,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
             };
           }
         });
-      yield* mutations.submit({
+      yield* submitDetailMutation(mutations, ref, {
         key,
         baseline: previousAssignees,
         optimistic: assignees,
@@ -1259,7 +1365,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
               { signal },
             ),
       ).pipe(Effect.asVoid);
-      yield* mutations.submit({
+      yield* submitDetailMutation(mutations, ref, {
         key,
         baseline: undefined,
         optimistic: undefined,
@@ -1358,16 +1464,14 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
       ).pipe(Effect.map((response) => issueCommentState(response.events ?? [], commentID, baseline)));
       const apply = (state: IssueCommentMutationState) => applyIssueCommentState(ref, commentID, state);
       yield* Effect.sync(() => trackIssueCommentMutation(commentID, baseline));
-      yield* mutations
-        .submit({
-          key,
-          baseline,
-          optimistic,
-          apply,
-          commit,
-          refreshOnStale,
-        })
-        .pipe(Effect.ensuring(Effect.sync(() => releaseIssueCommentMutation(commentID))));
+      yield* submitDetailMutation(mutations, ref, {
+        key,
+        baseline,
+        optimistic,
+        apply,
+        commit,
+        refreshOnStale,
+      }).pipe(Effect.ensuring(Effect.sync(() => releaseIssueCommentMutation(commentID))));
       const shouldReconcile = yield* Effect.sync(() => {
         mutationSettled = true;
         return isIssueDetailShowingRef(ref);
@@ -1451,16 +1555,14 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
         detailError = null;
         trackIssueCommentMutation(commentID, baseline);
       });
-      yield* mutations
-        .submit({
-          key,
-          baseline,
-          optimistic,
-          apply,
-          commit,
-          refreshOnStale,
-        })
-        .pipe(Effect.ensuring(Effect.sync(() => releaseIssueCommentMutation(commentID))));
+      yield* submitDetailMutation(mutations, ref, {
+        key,
+        baseline,
+        optimistic,
+        apply,
+        commit,
+        refreshOnStale,
+      }).pipe(Effect.ensuring(Effect.sync(() => releaseIssueCommentMutation(commentID))));
       yield* Effect.sync(() => hideDeletedComment(ref, commentID));
       const shouldReconcile = yield* Effect.sync(() => {
         mutationSettled = true;
@@ -1524,7 +1626,15 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     ) {
       return;
     }
-    unsavedLocalBody = { provider, platformHost, owner, name, number, body };
+    unsavedLocalBody = {
+      provider,
+      platformHost,
+      repositoryKey: repositoryKeyFromWire(issueDetail.repo),
+      owner,
+      name,
+      number,
+      body,
+    };
     issueDetail = {
       ...issueDetail,
       issue: { ...issueDetail.issue, Body: body },
@@ -1545,8 +1655,12 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     readonly ref: IssueDetailRequestRef;
     readonly program: Effect.Effect<void, ProviderMutationFailure, ProviderMutations>;
   } {
-    const ref = issueDetailRequestRef(owner, name, number, routeRef);
-    const baseline = isIssueDetailShowingRef(ref) && issueDetail !== null ? issueDetail.issue.Body : body;
+    const requestedRef = issueDetailRequestRef(owner, name, number, routeRef);
+    const visibleDetail = isIssueDetailShowingRef(requestedRef) ? issueDetail : null;
+    const ref = visibleDetail
+      ? { ...requestedRef, repositoryKey: repositoryKeyFromWire(visibleDetail.repo) }
+      : requestedRef;
+    const baseline = visibleDetail?.issue.Body ?? body;
     let confirmed: { readonly detail: IssueDetail; readonly envelopeTick: number } | undefined;
     let acknowledgedUnsavedTarget: UnsavedIssueTarget | null = null;
     const program = Effect.gen(function* () {
@@ -1573,6 +1687,8 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
               if (
                 unsavedLocalBody !== null &&
                 unsavedLocalBody.body === body &&
+                sameRepositoryKey(unsavedLocalBody.repositoryKey, ref.repositoryKey) &&
+                sameRepositoryKey(unsavedLocalBody.repositoryKey, repositoryKeyFromWire(detail.repo)) &&
                 sameBodyTarget(
                   unsavedLocalBody.provider,
                   unsavedLocalBody.platformHost,
@@ -1613,7 +1729,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
           Effect.map((detail) => detail.issue.Body),
         );
       }).pipe(Effect.provideService(ProviderMutations, mutations));
-      yield* mutations.submit({
+      yield* submitDetailMutation(mutations, ref, {
         key: issueMutationKey(ref, "body"),
         baseline,
         optimistic: body,
@@ -1719,7 +1835,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
       const refreshOnStale = readIssueDetail(detailRef, "GET issue after stale star mutation").pipe(
         Effect.map((detail) => Boolean(detail.issue.Starred)),
       );
-      yield* mutations.submit({
+      yield* submitDetailMutation(mutations, detailRef, {
         key: issueMutationKey(detailRef, "star"),
         baseline: Boolean(baseline),
         optimistic: nextStarred,
@@ -1795,7 +1911,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
           Effect.map((detail) => detail.issue.State),
         );
       }).pipe(Effect.provideService(ProviderMutations, mutations));
-      yield* mutations.submit({
+      yield* submitDetailMutation(mutations, ref, {
         key: issueMutationKey(ref, "actions"),
         baseline,
         optimistic: state,
@@ -1846,15 +1962,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
   // --- navigation ---
 
   function getDisplayOrderIssues(): Issue[] {
-    if (getGroupByRepo()) {
-      const grouped = issuesByRepo();
-      const ordered: Issue[] = [];
-      for (const items of grouped.values()) {
-        ordered.push(...items);
-      }
-      return ordered;
-    }
-    return getIssues();
+    return getGroupByRepo() ? repoOrderedIssues : visibleIssues;
   }
 
   function selectNextIssue(): void {
@@ -1941,6 +2049,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     canFilterReferencedByPR,
     getIssueSearchQuery,
     setIssueSearchQuery,
+    searchTextChanged: emptySearch.textChanged,
     getIssueFilterState,
     setIssueFilterState,
     hydrateDefaults,
@@ -1955,6 +2064,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     getIssueDetail,
     getIssueDetailEnvelopeTick,
     isIssueDetailLoading,
+    isIssueDetailFromCache,
     isIssueDetailSyncing,
     getIssueDetailError,
     getIssueDetailLoaded,

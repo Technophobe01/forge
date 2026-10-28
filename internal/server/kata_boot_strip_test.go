@@ -7,13 +7,14 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 )
 
 // TestServerBootAppliesInvalidCatalogTokenNames pins boot-time catalog
 // stripping: a decoded-but-invalid Kata catalog still declares token
 // env names, and terminals created before any Kata request must strip
 // them.
-func TestServerBootAppliesInvalidCatalogTokenNames(t *testing.T) {
+func TestServerBootAppliesInvalidCatalogTokenNames(t *testing.T) { //nolint:paralleltest // t.Setenv writes KATA_HOME
 	dir := t.TempDir()
 	t.Setenv("KATA_HOME", dir)
 	require.NoError(t, os.WriteFile(
@@ -28,8 +29,8 @@ name = "prod"
 url = "https://kata2.example.com"
 `), 0o600))
 
-	srv, _, _ := setupTestServerWithConfigContentAndOptions(
-		t, validReloadConfig, &mockGH{}, ServerOptions{
+	srv, _, _, _ := setupTestServerWithConfigContentAndOptions(
+		t, validReloadConfig, &serverfake.MockGH{}, ServerOptions{
 			HostCheckAllowLoopbackAnyPort:      true,
 			WorktreeDir:                        t.TempDir(),
 			DisableWorkspaceBackgroundMonitors: true,

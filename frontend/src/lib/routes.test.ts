@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import { repositoryIdKey } from "./api/repository-key.js";
 import {
   buildFocusIssueRoute,
   buildFocusListRoute,
@@ -12,6 +13,8 @@ import {
   buildPullRequestFilesRoute,
   buildPullRequestRoute,
   buildRoutedItemRoute,
+  buildWorklistRoute,
+  parseWorklistSelection,
 } from "./routes.js";
 
 const githubWidgets = {
@@ -150,5 +153,46 @@ describe("route item builders", () => {
         anchor: "install guide",
       }),
     ).toBe("/repo/browser?provider=github&repo_path=acme%2Fwidgets&path=README.md&mode=preview#install%20guide");
+  });
+});
+
+describe("worklist routes", () => {
+  it("round-trips a selected issue and its stable repository identity through the query string", () => {
+    const route = buildWorklistRoute(3, {
+      itemType: "issue",
+      provider: "github",
+      platformHost: "github.com",
+      repositoryKey: repositoryIdKey(1001),
+      owner: "acme",
+      name: "widgets",
+      repoPath: "acme/widgets",
+      number: 7,
+      detailTab: "conversation",
+    });
+    expect(route).toBe(
+      "/worklists/3?selected=issue%3A7&provider=github&platform_host=github.com&repo_path=acme%2Fwidgets&platform_repo_id=1001",
+    );
+    expect(parseWorklistSelection(route.slice(route.indexOf("?")))).toEqual({
+      itemType: "issue",
+      provider: "github",
+      platformHost: "github.com",
+      repositoryKey: repositoryIdKey(1001),
+      owner: "acme",
+      name: "widgets",
+      repoPath: "acme/widgets",
+      number: 7,
+      detailTab: "conversation",
+    });
+  });
+
+  it("keeps the files tab only for pull requests", () => {
+    const pull = { provider: "github", owner: "acme", name: "widgets", repoPath: "acme/widgets", number: 42 };
+    expect(buildWorklistRoute(3, { ...pull, itemType: "pr", detailTab: "files" })).toBe(
+      "/worklists/3?selected=pr%3A42&provider=github&repo_path=acme%2Fwidgets&selected_tab=files",
+    );
+    expect(
+      parseWorklistSelection("?selected=issue%3A42&provider=github&repo_path=acme%2Fwidgets&selected_tab=files")
+        ?.detailTab,
+    ).toBe("conversation");
   });
 });

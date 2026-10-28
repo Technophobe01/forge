@@ -23,6 +23,7 @@ function makeStores(
   options: {
     readonly syncPolling?: Effect.Effect<never>;
     readonly providerEvents?: Effect.Effect<never>;
+    readonly worklistSummaries?: Effect.Effect<void>;
   } = {},
 ): StoreInstances {
   let terminalSettings = { ...DEFAULT_TERMINAL_SETTINGS };
@@ -34,6 +35,7 @@ function makeStores(
   let roborevSettings: Settings["roborev"] = { init_managed_clones: false };
   return {
     settings: {
+      setAirplaneMode: vi.fn(),
       setConfiguredRepos: vi.fn(),
       setRepoPresets: vi.fn(),
       setModeVisibility: vi.fn(),
@@ -43,6 +45,7 @@ function makeStores(
       }),
       setPullRequestSettings: vi.fn(),
       setDetailSettings: vi.fn(),
+      setACPSettings: vi.fn(),
       getWorkspaceSettings: () => workspaceSettings,
       setWorkspaceSettings: vi.fn((settings) => {
         workspaceSettings = settings;
@@ -74,6 +77,9 @@ function makeStores(
     },
     events: {
       streamEffect: options.providerEvents ?? Effect.never,
+    },
+    worklists: {
+      refreshSummariesEffect: () => options.worklistSummaries ?? Effect.void,
     },
   } as unknown as StoreInstances;
 }

@@ -57,15 +57,21 @@ test("switching settings categories preserves unsaved drafts", async ({ page }) 
   await expect(page.locator(".settings-page")).toBeVisible();
 
   const nav = page.getByRole("navigation", { name: "Settings" });
-  await nav.getByRole("button", { name: "Terminal" }).click();
-  const fontSize = page.getByLabel("Font size");
+  await nav
+    .getByRole("button")
+    .filter({ has: page.getByText("Workspaces", { exact: true }) })
+    .click();
+  const fontSize = page.getByLabel("Font size", { exact: true });
   await fontSize.fill("17");
 
   // Panels are hidden, not unmounted, on switch — an unsaved edit must
   // survive a round-trip through another category.
   await nav.getByRole("button", { name: "Activity" }).click();
   await expect(fontSize).toBeHidden();
-  await nav.getByRole("button", { name: "Terminal" }).click();
+  await nav
+    .getByRole("button")
+    .filter({ has: page.getByText("Workspaces", { exact: true }) })
+    .click();
   await expect(fontSize).toHaveValue("17");
 });
 
@@ -104,19 +110,20 @@ test("settings sidebar lists every panel in declaration order under group headin
     .toEqual([
       "Providers",
       "Repositories",
+      "Sync",
       "Workflow",
       "Pull requests",
       "Detail views",
       "Activity",
       "Workspace",
       "Workspaces",
-      "Terminal",
       "Kata mappings",
       "Workspace agents",
       "Quick actions",
       "Fleet federation",
       "Navigation",
       "Visible modes",
+      "Appearance",
       "System",
       "MCP companion",
     ]);
@@ -156,12 +163,16 @@ test("settings navigation stacks on phone-width viewports", async ({ page }) => 
 });
 
 test("app scroll panes use browser-native scrollbar styling", async ({ page, browserName }) => {
-  // Short viewport plus the tall Terminal panel so the settings panel
+  // Short viewport plus the tall Workspaces panel so the settings panel
   // overflows its scroll pane.
   await page.setViewportSize({ width: 1280, height: 420 });
   await page.goto("/settings");
 
-  await page.getByRole("navigation", { name: "Settings" }).getByRole("button", { name: "Terminal" }).click();
+  await page
+    .getByRole("navigation", { name: "Settings" })
+    .getByRole("button")
+    .filter({ has: page.getByText("Workspaces", { exact: true }) })
+    .click();
   const pane = page.locator(".kit-settings__scroll");
   await expect(pane).toBeVisible();
   await expect.poll(() => pane.evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(true);

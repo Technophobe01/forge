@@ -2,7 +2,6 @@ package workspacetest
 
 import (
 	"net/http"
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -15,7 +14,7 @@ import (
 // TestIssueWorkspaceConflictExposesTyped409ThroughGeneratedClient is a
 // black-box migration of TestWorkspaceCreateIssueBranchConflictReturnsTyped409
 // (still in internal/server/api_test.go). The original asserts the same
-// behavior using a package-local rawProblemDetail struct; this version
+// behavior using a package-local serverfake.RawProblemDetail struct; this version
 // decodes through generated.ErrorModel so a regression that drifts the
 // 409 response shape away from the published OpenAPI contract fails this
 // test.
@@ -28,6 +27,7 @@ import (
 // home because setupWorkspaceServerFixture already wires up a real git
 // remote, which apitest/ does not.
 func TestIssueWorkspaceConflictExposesTyped409ThroughGeneratedClient(t *testing.T) {
+	runParallelWorkspaceGitTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -80,6 +80,7 @@ func TestIssueWorkspaceConflictExposesTyped409ThroughGeneratedClient(t *testing.
 }
 
 func TestIssueWorkspaceReuseExistingBranchDoesNotReportCreated(t *testing.T) {
+	runParallelWorkspaceGitTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -106,6 +107,7 @@ func TestIssueWorkspaceReuseExistingBranchDoesNotReportCreated(t *testing.T) {
 }
 
 func TestIssueWorkspaceReuseMissingBranchReportsCreated(t *testing.T) {
+	runParallelWorkspaceGitTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -126,24 +128,12 @@ func TestIssueWorkspaceReuseMissingBranchReportsCreated(t *testing.T) {
 }
 
 func TestIssueWorkspaceCreateIgnoresBrokenCallerCwdForBranchValidation(t *testing.T) {
+	runParallelWorkspaceGitTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
 	fixture := setupWorkspaceServerFixture(t, nil)
 	seedIssue(t, fixture.database, "acme", "widget", 23, "open")
-
-	brokenCwd := t.TempDir()
-	require.NoError(os.WriteFile(
-		filepath.Join(brokenCwd, ".git"),
-		[]byte("gitdir: /definitely/not/a/git/worktree\n"),
-		0o644,
-	))
-	previousCwd, err := os.Getwd()
-	require.NoError(err)
-	require.NoError(os.Chdir(brokenCwd))
-	t.Cleanup(func() {
-		require.NoError(os.Chdir(previousCwd))
-	})
 
 	branch := "kenn-forge/issue-23-federation-test"
 	resp, err := fixture.client.HTTP.CreateIssueWorkspaceWithResponse(t.Context(), &generated.CreateIssueWorkspaceRequestOptions{PathParams: &generated.CreateIssueWorkspacePath{Provider: "gh", Owner: "acme", Name: "widget", Number: int64(23)}, Body: &generated.CreateIssueWorkspaceInputBody{GitHeadRef: &branch}})

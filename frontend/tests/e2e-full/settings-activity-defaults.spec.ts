@@ -1,4 +1,6 @@
 import { expect, request as playwrightRequest, test, type APIRequestContext } from "@playwright/test";
+import { readFile } from "node:fs/promises";
+import { load as loadToml } from "js-toml";
 import type { SettingsResponse as GeneratedSettingsResponse } from "../../src/lib/api/generated/models/index.js";
 import { startIsolatedE2EServer, type IsolatedE2EServer } from "./support/e2eServer";
 import { openSettingsPanel } from "./support/settingsPanel";
@@ -21,6 +23,83 @@ test.afterAll(async () => {
 });
 
 type SettingsResponse = GeneratedSettingsResponse;
+
+test("Activity filter defaults save to TOML and apply in a new browser session", async ({ page, browser }) => {
+  await page.goto(`${isolatedServer!.info.base_url}/settings`);
+  await openSettingsPanel(page, "Activity");
+
+  for (const control of [
+    page.getByRole("radio", { name: "30d", exact: true }),
+    page.getByRole("checkbox", { name: "Pull requests", exact: true }),
+    page.getByRole("checkbox", { name: "Reviews", exact: true }),
+    page.getByRole("button", { name: "Hide notifications", exact: true }),
+    page.getByRole("button", { name: "Hide drafts", exact: true }),
+    page.getByRole("button", { name: "Hide default-branch activity", exact: true }),
+    page.getByRole("button", { name: "Roll up commits", exact: true }),
+    page.getByRole("button", { name: "Toggle hide closed/merged", exact: true }),
+  ]) {
+    const saved = page.waitForResponse(
+      (response) => response.url().endsWith("/api/v1/settings") && response.request().method() === "PUT",
+    );
+    await control.click();
+    expect((await saved).status()).toBe(200);
+  }
+
+  const saved = loadToml(await readFile(isolatedServer!.info.config_path, "utf8")) as {
+    activity: Record<string, unknown>;
+  };
+  expect(saved.activity).toMatchObject({
+    time_range: "30d",
+    item_types: ["issue"],
+    event_types: ["comment", "commit", "force_push"],
+    hide_notifications: true,
+    hide_drafts: true,
+    hide_default_branch: true,
+    roll_up_commits: true,
+    hide_closed: true,
+  });
+
+  const context = await browser.newContext();
+  try {
+    const freshPage = await context.newPage();
+    await freshPage.goto(isolatedServer!.info.base_url);
+    await expect(freshPage.locator(".activity-filters__trigger")).toContainText("30d");
+    await freshPage.locator(".activity-filters__trigger").click();
+    for (const [name, pressed] of [
+      ["Reviews", false],
+      ["Notifications", false],
+      ["Hide closed/merged", true],
+      ["Hide drafts", true],
+      ["Hide default-branch activity", true],
+      ["Roll up commits", true],
+    ] as const) {
+      await expect(freshPage.getByRole("button", { name, exact: true })).toHaveAttribute(
+        "aria-pressed",
+        String(pressed),
+      );
+    }
+  } finally {
+    await context.close();
+    // Keep the shared server's defaults independent for the remaining tests.
+    const current: SettingsResponse = await (await api!.get("/api/v1/settings")).json();
+    const reset = await api!.put("/api/v1/settings", {
+      data: {
+        activity: {
+          ...current.activity,
+          time_range: "7d",
+          item_types: ["pr", "issue"],
+          event_types: ["comment", "review", "commit", "force_push"],
+          hide_notifications: false,
+          hide_drafts: false,
+          hide_default_branch: false,
+          roll_up_commits: false,
+          hide_closed: false,
+        },
+      },
+    });
+    expect(reset.ok()).toBe(true);
+  }
+});
 
 test("activity default view mode and time range persist through the segmented controls", async ({ page }) => {
   await page.goto(`${isolatedServer!.info.base_url}/settings`);
@@ -196,4 +275,43 @@ test("Activity search survives returning after reloading Settings", async ({ pag
   await page.reload();
   await page.getByRole("button", { name: "Back to app" }).click();
   await expect(search).toHaveValue("caching layer");
+});
+
+test("Activity defaults survive changing several controls and returning from Activity", async ({ page }) => {
+  await page.goto(`${isolatedServer!.info.base_url}/settings`);
+  await openSettingsPanel(page, "Activity");
+  let releaseSave = () => {};
+  const saveGate = new Promise<void>((resolve) => {
+    releaseSave = resolve;
+  });
+  let completedSaves = 0;
+  await page.route("**/api/v1/settings", async (route) => {
+    if (route.request().method() !== "PUT") return route.fallback();
+    await saveGate;
+    const response = await route.fetch();
+    await route.fulfill({ response });
+    completedSaves += 1;
+  });
+  try {
+    await page.getByRole("radio", { name: "90d", exact: true }).click();
+    await page.getByRole("checkbox", { name: "Force pushes", exact: true }).uncheck();
+    await page.getByRole("checkbox", { name: "Issues", exact: true }).uncheck();
+    await page.getByRole("button", { name: "Back to app" }).click();
+    await page.getByTitle("Settings", { exact: true }).click();
+    await expect(page.getByText("Loading settings...", { exact: true })).toBeVisible();
+  } finally {
+    releaseSave();
+  }
+  await expect.poll(() => completedSaves).toBe(3);
+  await openSettingsPanel(page, "Activity");
+  await expect(page.getByRole("radio", { name: "90d", exact: true })).toBeChecked();
+  await expect(page.getByRole("checkbox", { name: "Force pushes", exact: true })).not.toBeChecked();
+  await expect(page.getByRole("checkbox", { name: "Issues", exact: true })).not.toBeChecked();
+  const saved: SettingsResponse = await (await api!.get("/api/v1/settings")).json();
+  expect(saved.activity).toMatchObject({
+    time_range: "90d",
+    item_types: ["pr"],
+    event_types: ["comment", "review", "commit"],
+  });
+  await page.unrouteAll({ behavior: "wait" });
 });

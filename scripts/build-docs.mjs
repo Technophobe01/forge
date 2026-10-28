@@ -13,7 +13,10 @@ const publishedFiles = new Set([
   "archive.md",
   "commands.md",
   "configuration.md",
+  "devboxes.md",
+  "external-pr-context.md",
   "federated-fleet.md",
+  "gh-shim.md",
   "index.md",
   "integrations.md",
   "kenn-forge-mcp.md",
@@ -28,6 +31,7 @@ const publishedFiles = new Set([
   path.join("workflows", "issue-triager.md"),
   path.join("workflows", "repositories.md"),
   path.join("workflows", "workspaces.md"),
+  path.join("workflows", "worklists.md"),
   "workflows.md",
 ]);
 const publishedDirectoryEntries = new Set(["overrides", "stylesheets", "workflows"]);
@@ -51,8 +55,12 @@ export async function stageDocsSource(sourceDir, destinationDir, faviconSource, 
   });
 }
 
+export function publishedDocsFiles() {
+  return [...publishedFiles].sort();
+}
+
 export function publishedMarkdownPages() {
-  return [...publishedFiles].filter((file) => file.endsWith(".md")).sort();
+  return publishedDocsFiles().filter((file) => file.endsWith(".md"));
 }
 
 function twinPathFor(siteRoot, page) {

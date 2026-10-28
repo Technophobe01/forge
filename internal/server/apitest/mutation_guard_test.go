@@ -8,15 +8,18 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 )
 
 func TestMutationGuardRejectsCrossOriginRequestWithJSONError(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
 	srv, _ := setupTestServer(t)
 
-	req := httptest.NewRequest(
+	req := httptest.NewRequestWithContext(t.Context(),
 		http.MethodPost,
 		"/api/v1/sync",
 		nil,

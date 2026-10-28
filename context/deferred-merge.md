@@ -3,6 +3,9 @@
 Use this document for changes to deferred merge queueing, cancellation,
 supersession, completion events, or pending-state presentation.
 
+- Stack position alone does not warrant a merge warning. With mid-stack merges
+  allowed, gh-stack users may queue merges at any position; show neutral stack
+  context rather than cautioning about merge order.
 - Queued deferred merges live only in the server process (`deferredMergeInFlight`
   in `internal/server/pullapi/deferred_merge.go`); a restart drops them. Detail responses
   expose the state as `deferred_merge_pending`.
@@ -10,10 +13,19 @@ supersession, completion events, or pending-state presentation.
   terminal `deferred_merge_completed` (success or failure). Clients refresh
   detail the moment they see the event, and that first read must not report a
   queued merge.
-- A successful immediate merge supersedes the queued worker silently (per-key
-  handle): pending clears with the merge response and the worker emits no event.
+- A successful immediate merge or merge queue enqueue supersedes the queued
+  worker silently (per-key handle): pending clears with the merge response and the worker emits no event.
   An immediate provider response with `merged: false` leaves the queued merge and
   all merge-completion side effects untouched.
+- Immediate and deferred merges and enqueues hold a per-pull-request merge
+  lock through the provider call. The deferred worker checks supersession
+  under that lock, because an enqueue leaves the pull request open where
+  target checks cannot see it (`internal/server/pullapi/routes.go::Handler.mergePRWithBodyAdmitted`).
+- A deferred worker whose merge went to the target branch's merge queue
+  completes with status `queued`: clear pending, publish no merged status, and
+  leave the outcome to the pull request's queue state; its workspace deletion is
+  kept like an immediate enqueue's
+  (`internal/server/pullapi/deferred_merge.go::Handler.completeDeferredMerge`).
 - A deferred worker response with `merged: false` is a terminal failure: clear pending and publish the provider message,
   but never publish merged status or run merge-completion side effects
   (`internal/server/pullapi/deferred_merge.go::Handler.completeDeferredMerge`).
@@ -44,6 +56,6 @@ supersession, completion events, or pending-state presentation.
 - Successful completion can carry `workspace_cleanup_pending`; cleanup completion
   is reported independently by workspace lifecycle events, so the merge event
   never infers deletion (`internal/server/pullapi/deferred_merge.go::DeferredMergeCompletedPayload`).
-- Frontend callbacks distinguish queue acknowledgement from provider merge
-  completion. A queued outcome closes the modal and refreshes pending state; it
-  never publishes workspace deletion (`frontend/src/lib/stores/detail.svelte.ts::MergePullOutcome`).
+- Queue acknowledgement refreshes deferred pending state; it must never imply
+  provider merge completion or workspace deletion
+  (`frontend/src/lib/stores/detail.svelte.ts::MergePullOutcome`).

@@ -36,6 +36,7 @@ export type WorkspaceListItem = Pick<
     readonly commits_behind?: number | null;
     readonly commits_vs_pr_head?: boolean;
     readonly error_message?: GeneratedWorkspace["error_message"] | null;
+    readonly item_author?: string | null;
     readonly item_last_activity_at?: string | null;
     readonly mr_additions?: number | null;
     readonly mr_deletions?: number | null;
@@ -44,7 +45,7 @@ export type WorkspaceListItem = Pick<
     readonly mr_title?: string | null;
     readonly repo?: Pick<
       GeneratedRepo,
-      "name" | "owner" | "platform_host" | "platform_repo_id" | "provider" | "repo_path"
+      "bitbucket_repository_uuid" | "name" | "owner" | "platform_host" | "platform_repo_id" | "provider" | "repo_path"
     >;
     readonly tmux_pane_title?: string | null;
     readonly fleet_host_key?: string;
@@ -56,7 +57,8 @@ const Repo = Schema.Struct({
   name: Schema.String,
   owner: Schema.String,
   platform_host: Schema.String,
-  platform_repo_id: Schema.optionalKey(Schema.String),
+  platform_repo_id: Schema.optionalKey(Schema.Number),
+  bitbucket_repository_uuid: Schema.optionalKey(Schema.String),
   provider: Schema.String,
   repo_path: Schema.String,
 });
@@ -86,6 +88,7 @@ const Workspace = Schema.Struct({
   git_head_ref: Schema.String,
   id: Schema.String,
   item_key: Schema.optionalKey(Schema.String),
+  item_author: Schema.optionalKey(Schema.NullOr(Schema.String)),
   item_last_activity_at: Schema.optionalKey(Schema.NullOr(Schema.String)),
   item_number: Schema.Number,
   item_type: Schema.String,

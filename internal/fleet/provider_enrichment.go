@@ -62,13 +62,22 @@ func EnrichProviderState(
 		if err != nil {
 			return NeutralSnapshot{}, err
 		}
-		if repository == nil || workspace.ItemNumber <= 0 {
+		if repository == nil {
 			continue
 		}
-		switch strings.ToLower(strings.TrimSpace(workspace.ItemType)) {
+		itemType := strings.ToLower(strings.TrimSpace(workspace.ItemType))
+		itemNumber := workspace.ItemNumber
+		if itemType == db.WorkspaceItemTypeAdHoc && workspace.AssociatedPRNumber != nil {
+			// An ad-hoc workspace's linked PR is its item for display.
+			itemType, itemNumber = db.WorkspaceItemTypePullRequest, *workspace.AssociatedPRNumber
+		}
+		if itemNumber <= 0 {
+			continue
+		}
+		switch itemType {
 		case "pr", "pull_request", "merge_request":
 			pull, err := database.GetVisibleMergeRequestByRepoIDAndNumber(
-				ctx, repository.Repository.ID, workspace.ItemNumber,
+				ctx, repository.Repository.ID, itemNumber,
 			)
 			if err != nil {
 				return NeutralSnapshot{}, err
@@ -78,7 +87,7 @@ func EnrichProviderState(
 			}
 		case "issue":
 			issue, err := database.GetVisibleIssueByRepoIDAndNumber(
-				ctx, repository.Repository.ID, workspace.ItemNumber,
+				ctx, repository.Repository.ID, itemNumber,
 			)
 			if err != nil {
 				return NeutralSnapshot{}, err
@@ -104,18 +113,16 @@ func providerRepository(
 ) (*db.RepositoryCatalogEntry, error) {
 	if database == nil || strings.TrimSpace(identity.Provider) == "" ||
 		strings.TrimSpace(identity.PlatformHost) == "" ||
-		strings.TrimSpace(identity.PlatformRepoID) == "" {
+		identity.Key.IsZero() {
 		return nil, nil
 	}
 	key := strings.ToLower(strings.TrimSpace(identity.Provider)) + "\x00" +
 		strings.ToLower(strings.TrimSpace(identity.PlatformHost)) + "\x00" +
-		strings.TrimSpace(identity.PlatformRepoID)
+		identity.Key.String()
 	if repository, ok := cache[key]; ok {
 		return repository, nil
 	}
-	repository, err := database.GetRepositoryByProviderID(
-		ctx, identity.Provider, identity.PlatformHost, identity.PlatformRepoID,
-	)
+	repository, err := database.GetRepositoryByProviderID(ctx, identity.ProviderIdentity())
 	if err != nil {
 		return nil, err
 	}
@@ -158,6 +165,7 @@ func enrichWorktreeFromPull(worktree *RawWorktree, pull *db.MergeRequest) {
 }
 
 func clearWorkspaceProviderState(workspace *RawWorkspace) {
+	workspace.ItemAuthor = nil
 	workspace.ItemLastActivityAt = nil
 	workspace.MRTitle = nil
 	workspace.MRState = nil
@@ -169,6 +177,7 @@ func clearWorkspaceProviderState(workspace *RawWorkspace) {
 }
 
 func enrichWorkspaceFromPull(workspace *RawWorkspace, pull *db.MergeRequest) {
+	workspace.ItemAuthor = pointerIfNotEmpty(pull.Author)
 	workspace.ItemLastActivityAt = pointerTime(pull.LastActivityAt)
 	workspace.MRTitle = pointerIfNotEmpty(pull.Title)
 	workspace.MRState = pointerIfNotEmpty(string(pull.State))
@@ -180,6 +189,7 @@ func enrichWorkspaceFromPull(workspace *RawWorkspace, pull *db.MergeRequest) {
 }
 
 func enrichWorkspaceFromIssue(workspace *RawWorkspace, issue *db.Issue) {
+	workspace.ItemAuthor = pointerIfNotEmpty(issue.Author)
 	workspace.ItemLastActivityAt = pointerTime(issue.LastActivityAt)
 	workspace.MRTitle = pointerIfNotEmpty(issue.Title)
 	workspace.MRState = pointerIfNotEmpty(issue.State)

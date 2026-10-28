@@ -12,12 +12,13 @@ import (
 	"time"
 
 	"go.kenn.io/forge/internal/apiclient/generated"
+	"go.kenn.io/forge/internal/daemonclient"
+	"go.kenn.io/forge/internal/server/spokeapi"
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/federation"
 	"go.kenn.io/forge/internal/fleetsetup"
-	"go.kenn.io/forge/internal/server"
 	"golang.org/x/term"
 )
 
@@ -65,8 +66,8 @@ type fleetCommandRunner interface {
 		context.Context, fleetEnrollmentTokenOptions,
 	) (federation.EnrollmentToken, error)
 	Join(context.Context, fleetJoinOptions) (federation.LocalEnrollment, error)
-	PrepareSpoke(context.Context, fleetPrepareOptions) (server.SpokePreparationReport, error)
-	AbortPreparation(context.Context, fleetAbortPreparationOptions) (server.SpokePreparationAbortReport, error)
+	PrepareSpoke(context.Context, fleetPrepareOptions) (spokeapi.SpokePreparationReport, error)
+	AbortPreparation(context.Context, fleetAbortPreparationOptions) (spokeapi.SpokePreparationAbortReport, error)
 	Revoke(context.Context, fleetRevokeOptions) error
 }
 
@@ -110,6 +111,7 @@ func newFleetCommand(options fleetCLIOptions) *cobra.Command {
 		newFleetPrepareSpokeCommand(options),
 		newFleetAbortPreparationCommand(options),
 		newFleetRevokeCommand(options),
+		newFleetLeaveCommand(options),
 		newFleetMigrateProtocolCommand(options),
 	)
 	return cmd
@@ -251,16 +253,16 @@ func (daemonFleetCommandRunner) Join(ctx context.Context, options fleetJoinOptio
 	return result, err
 }
 
-func (daemonFleetCommandRunner) PrepareSpoke(ctx context.Context, options fleetPrepareOptions) (server.SpokePreparationReport, error) {
-	var result server.SpokePreparationReport
+func (daemonFleetCommandRunner) PrepareSpoke(ctx context.Context, options fleetPrepareOptions) (spokeapi.SpokePreparationReport, error) {
+	var result spokeapi.SpokePreparationReport
 	err := localFleetJSON(ctx, options.ConfigPath, options.Timeout, func(baseURL string) (*http.Request, error) {
 		return generated.NewPrepareFederationSpokeRequest(ctx, baseURL)
 	}, &result)
 	return result, err
 }
 
-func (daemonFleetCommandRunner) AbortPreparation(ctx context.Context, options fleetAbortPreparationOptions) (server.SpokePreparationAbortReport, error) {
-	var result server.SpokePreparationAbortReport
+func (daemonFleetCommandRunner) AbortPreparation(ctx context.Context, options fleetAbortPreparationOptions) (spokeapi.SpokePreparationAbortReport, error) {
+	var result spokeapi.SpokePreparationAbortReport
 	err := localFleetJSON(ctx, options.ConfigPath, options.Timeout, func(baseURL string) (*http.Request, error) {
 		return generated.NewAbortFederationSpokePreparationRequest(ctx, baseURL, &generated.AbortFederationSpokePreparationRequestOptions{Body: &generated.AbortFederationSpokePreparationBody{Force: &options.Force}})
 	}, &result)
@@ -277,7 +279,7 @@ func localFleetJSON(
 	ctx context.Context, configPath string, timeout time.Duration,
 	buildRequest func(string) (*http.Request, error), result any,
 ) error {
-	daemon, err := discoverDaemonHTTP(configPath, timeout)
+	daemon, err := daemonclient.Discover(configPath, timeout)
 	if err != nil {
 		return err
 	}

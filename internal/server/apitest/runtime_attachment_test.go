@@ -12,6 +12,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/server/workspaceapi"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/workspace/localruntime"
 )
 
@@ -21,6 +22,7 @@ import (
 // about, but it is cleaner to drive it with controlled channels than to depend
 // on backend-specific PTY behavior in an e2e helper.
 func TestBridgeRuntimeAttachmentOutputClosedEmitsExitFrameBeforeDone(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	closedOutput := make(chan []byte)
 	close(closedOutput)
@@ -55,10 +57,17 @@ func TestBridgeRuntimeAttachmentOutputClosedEmitsExitFrameBeforeDone(t *testing.
 	))
 	t.Cleanup(srv.Close)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	conn, wsHTTPResp, err := websocket.Dial(ctx, wsURL, nil)
+	if wsHTTPResp != nil && wsHTTPResp.Body != nil {
+		t.Cleanup(func() {
+			if wsHTTPResp != nil && wsHTTPResp.Body != nil {
+				_ = wsHTTPResp.Body.Close()
+			}
+		})
+	}
 	require.NoError(err)
 	defer conn.Close(websocket.StatusNormalClosure, "done")
 
@@ -98,6 +107,7 @@ func TestBridgeRuntimeAttachmentOutputClosedEmitsExitFrameBeforeDone(t *testing.
 // TCP send buffer faster than the bridge can drain it), so this is
 // a focused unit test on the bridge's branching logic.
 func TestBridgeRuntimeAttachmentSubscriberDropDoesNotEmitExitFrame(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	require := require.New(t)
 	closedOutput := make(chan []byte)
 	close(closedOutput)
@@ -129,11 +139,18 @@ func TestBridgeRuntimeAttachmentSubscriberDropDoesNotEmitExitFrame(t *testing.T)
 	t.Cleanup(srv.Close)
 
 	ctx, cancel := context.WithTimeout(
-		context.Background(), 4*time.Second,
+		t.Context(), 4*time.Second,
 	)
 	defer cancel()
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	conn, wsHTTPResp, err := websocket.Dial(ctx, wsURL, nil)
+	if wsHTTPResp != nil && wsHTTPResp.Body != nil {
+		t.Cleanup(func() {
+			if wsHTTPResp != nil && wsHTTPResp.Body != nil {
+				_ = wsHTTPResp.Body.Close()
+			}
+		})
+	}
 	require.NoError(err)
 	defer conn.Close(websocket.StatusNormalClosure, "done")
 

@@ -11,8 +11,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
 	"go.kenn.io/forge/internal/config"
+	"go.kenn.io/forge/internal/server/repoapi"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 )
 
 // recordingToolingRunner simulates probe subprocesses. Each call is
@@ -37,12 +38,12 @@ func (r *recordingToolingRunner) run(
 
 func decodeToolingStatus(
 	t *testing.T, ts *httptest.Server,
-) toolingStatusBody {
+) repoapi.ToolingStatusBody {
 	t.Helper()
-	resp := httpDo(t, ts, http.MethodGet, "/api/v1/tooling-status", nil)
+	resp := serverfake.HttpDo(t, ts, http.MethodGet, "/api/v1/tooling-status", nil)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
-	var body toolingStatusBody
+	var body repoapi.ToolingStatusBody
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
 	return body
 }
@@ -51,9 +52,10 @@ func decodeToolingStatus(
 // every CLI present and authenticated: versions, hosts, and users are
 // reported in the shape the UI's ToolingStatus contract expects.
 func TestToolingStatusHappyPath(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 
-	srv, _ := setupTestServer(t)
+	srv, _, _ := setupTestServer(t)
 	runner := &recordingToolingRunner{
 		outputs: map[string]string{
 			"git --version": "git version 2.44.0 (Apple Git-170)",
@@ -83,9 +85,10 @@ func TestToolingStatusHappyPath(t *testing.T) {
 // installed, so gh reports unavailable without auth probes, while git
 // and glab report independently.
 func TestToolingStatusMissingGh(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 
-	srv, _ := setupTestServer(t)
+	srv, _, _ := setupTestServer(t)
 	runner := &recordingToolingRunner{
 		outputs: map[string]string{
 			"git --version": "git version 2.44.0",
@@ -118,9 +121,10 @@ func TestToolingStatusMissingGh(t *testing.T) {
 // TestToolingStatusCachesProbes verifies rapid repeat requests serve
 // the cached status instead of re-spawning probe subprocesses.
 func TestToolingStatusCachesProbes(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 
-	srv, _ := setupTestServer(t)
+	srv, _, _ := setupTestServer(t)
 	runner := &recordingToolingRunner{}
 	srv.toolingRun = runner.run
 	ts := httptest.NewServer(srv)
@@ -139,10 +143,11 @@ func TestToolingStatusCachesProbes(t *testing.T) {
 // configured self-hosted platform hosts are probed instead of the
 // public defaults, and the response reports the probed host.
 func TestToolingStatusProbesConfiguredHosts(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
-	srv, _ := setupTestServer(t)
+	srv, _, _ := setupTestServer(t)
 	srv.cfgMu.Lock()
 	srv.cfg = &config.Config{
 		Platforms: []config.PlatformConfig{

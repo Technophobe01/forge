@@ -1,11 +1,16 @@
 <script lang="ts">
-  import { copyToClipboard, DiffStats, formatRelativeTime, formatTimestamp, Modal, SearchInput, Spinner, StatusDot, Toggle, type StatusDotStatus } from "@kenn-io/kit-ui";
+  import { workspaceAuthorOptions, workspaceMatchesAuthor } from "../terminal/workspace-author-filter.js";
+  import QuerySearchInput from "../shared/QuerySearchInput.svelte";
+  import MobileNavMenu from "./MobileNavMenu.svelte";
+  import { copyToClipboard, DiffStats, formatRelativeTime, formatTimestamp, Modal, Spinner, StatusDot, Toggle, Typeahead, type StatusDotStatus } from "@kenn-io/kit-ui";
+  import { buildCanonicalProviderItemURL } from "../../utils/item-reference.js";
   import MoreHorizontalIcon from "@lucide/svelte/icons/ellipsis";
   import PlusIcon from "@lucide/svelte/icons/plus";
   import { Effect, Schedule, Stream } from "effect";
   import { onMount, untrack } from "svelte";
   import { apiErrorMessage } from "../../api/runtime.js";
   import { configuredAPIPath } from "../../api/runtime-base.js";
+  import { getStreamEventsUrl } from "../../api/generated/system/system.js";
   import { ApiProblemError } from "../../api/effect-errors.js";
   import { ProblemCodes } from "../../api/problems.js";
   import {
@@ -15,6 +20,7 @@
   import { loadFleetSnapshot } from "../../api/fleet-snapshot.js";
   import type { HostSummary as GeneratedHostSummary } from "../../api/generated/models/index.js";
   import { getAppRuntime } from "../../app/runtime-context.js";
+  import { getStores } from "../../context.js";
   import { eventSourceStream } from "../../browser/event-source.js";
   import { openNewWorkspaceDialog } from "../../stores/new-workspace.svelte.js";
   import { showFlash } from "../../stores/flash.svelte.js";
@@ -24,7 +30,9 @@
   import {
     WorkspaceListWorkflow,
     makeWorkspaceRefreshHub,
+    removeWorkspaceListEntry,
     workspaceListLifecycle,
+    type WorkspaceListSnapshot,
   } from "../terminal/workspace-list-workflow.js";
   import {
     decodeWorkspaceList,
@@ -51,6 +59,8 @@
     sortMobileWorkspaces,
     workspaceMatchesMobileSearch,
   } from "./mobile-workspace-list.js";
+  import { workspaceItemAccent, workspaceItemState } from "../terminal/workspace-item-state.js";
+  import { repositoryKeyFromWire } from "../../api/repository-key.js";
 
   type HostSummary = GeneratedHostSummary;
 
@@ -61,6 +71,7 @@
 
   let { onOpen, onOpenItem }: Props = $props();
   const appRuntime = getAppRuntime();
+  const { detail } = getStores();
   const refreshOwner = $props.id();
   const loadTimeout = "10 seconds";
 
@@ -70,6 +81,7 @@
   let fleetError = $state<string | null>(null);
   let listStatus = $state<"loading" | "retrying" | "loaded">("loading");
   let searchQuery = $state("");
+  let author = $state("");
   let sortMode = $state<WorkspaceListSort>(loadWorkspaceListSort());
   let displayOptions = $state<WorkspaceListDisplayOptions>(loadWorkspaceListDisplayOptions());
   let viewOpen = $state(false);
@@ -78,14 +90,16 @@
   let deleteForce = $state(false);
   let actionBusy = $state<string | null>(null);
 
+  const authorOptions = $derived(workspaceAuthorOptions(workspaces));
   const filtered = $derived(
-    workspaces.filter((workspace) => workspaceMatchesMobileSearch(workspace, searchQuery)),
+    workspaces.filter((workspace) => workspaceMatchesAuthor(workspace, author) && workspaceMatchesMobileSearch(workspace, searchQuery)),
   );
   const groups = $derived(groupMobileWorkspaces(filtered, displayOptions.showOrgNames));
   const flat = $derived(
     sortMode === "repo" ? [] : sortMobileWorkspaces(filtered, sortMode),
   );
   const viewBadgeCount = $derived(
+    Number(Boolean(author)) + Number(Boolean(searchQuery.trim())) +
     Number(sortMode !== defaultWorkspaceListSort) +
       Number(displayOptions.showOrgNames !== defaultWorkspaceListDisplayOptions.showOrgNames) +
       Number(displayOptions.showDiffStats !== defaultWorkspaceListDisplayOptions.showDiffStats),
@@ -130,24 +144,35 @@
 
   function loadWorkspaces() {
     return Effect.gen(function* () {
+      const workflow = yield* WorkspaceListWorkflow;
       const payload = yield* loadFleetSnapshot().pipe(Effect.timeout(loadTimeout));
       const decoded = yield* decodeWorkspaceList({ workspaces: payload.workspaces });
       const nextHosts = payload.hosts ?? [];
-      workspaces = retainDegradedHostWorkspaces(
+      const nextWorkspaces = retainDegradedHostWorkspaces(
         workspaces,
         decoded.filter((workspace) => workspace.visible !== false),
         nextHosts,
         payload.aggregateIncomplete ?? false,
       );
-      fleetHosts = nextHosts;
-      peerErrors = Object.fromEntries(
-        fleetHosts
-          .filter((host) => host.kind !== "self" && host.error)
-          .map((host) => [host.configKey, host.error ?? "Host unavailable"]),
-      );
-      fleetError = null;
-      listStatus = "loaded";
+      workflow.snapshot = {
+        workspaces: nextWorkspaces,
+        hosts: nextHosts,
+        aggregateComplete: !(payload.aggregateIncomplete ?? false),
+      };
+      applySnapshot(workflow.snapshot);
     });
+  }
+
+  function applySnapshot(snapshot: WorkspaceListSnapshot): void {
+    workspaces = snapshot.workspaces;
+    fleetHosts = snapshot.hosts;
+    peerErrors = Object.fromEntries(
+      fleetHosts
+        .filter((host) => host.kind !== "self" && host.error)
+        .map((host) => [host.configKey, host.error ?? "Host unavailable"]),
+    );
+    fleetError = null;
+    listStatus = "loaded";
   }
 
   const refreshWorkspaces = makeWorkspaceRefreshHub(
@@ -174,6 +199,7 @@
   }
 
   function status(workspace: WorkspaceListItem): StatusDotStatus {
+    if (workspaceMerging(workspace)) return "working";
     if (workspace.agent_state === "working" || workspace.tmux_working || workspace.status === "creating") {
       return "working";
     }
@@ -184,6 +210,7 @@
   }
 
   function statusLabel(workspace: WorkspaceListItem): string {
+    if (workspaceMerging(workspace)) return "Merging";
     if (workspace.agent_state === "approval") return "Agent waiting for approval";
     if (workspace.agent_state === "input") return "Agent waiting for input";
     if (workspace.agent_state === "working" || workspace.tmux_working) return "Workspace active";
@@ -191,6 +218,19 @@
     if (workspace.status === "creating") return "Creating workspace";
     if (workspace.status === "error") return "Workspace error";
     return `Workspace ${workspace.status}`;
+  }
+
+  function workspaceMerging(workspace: WorkspaceListItem): boolean {
+    if (!workspace.repo) return false;
+    const number = workspace.item_type === "pull_request" ? workspace.item_number : (workspace.associated_pr_number ?? 0);
+    return number > 0 && detail.isPullMerging({
+      provider: workspace.repo.provider,
+      platformHost: workspace.repo.platform_host,
+      repositoryKey: repositoryKeyFromWire(workspace.repo),
+      owner: workspace.repo.owner,
+      name: workspace.repo.name,
+      repoPath: workspace.repo.repo_path,
+    }, number);
   }
 
   function agentStatePresentation(workspace: WorkspaceListItem): {
@@ -219,16 +259,24 @@
     return number === null ? null : `#${number}`;
   }
 
+  function itemAccent(workspace: WorkspaceListItem): string {
+    return workspaceItemAccent[workspaceItemState(workspace, mobileWorkspaceLinkedItem(workspace)?.itemType ?? "pr")];
+  }
+
   function providerItemURL(workspace: WorkspaceListItem): string | null {
     const linked = mobileWorkspaceLinkedItem(workspace);
+    if (linked === null) return null;
     const provider = workspace.repo?.provider.toLowerCase();
-    const repoPath = workspace.repo?.repo_path ?? `${workspace.repo_owner}/${workspace.repo_name}`;
-    if (linked === null || !provider || !workspace.platform_host || !repoPath) return null;
-    const number = linked.number;
-    const encodedPath = repoPath.split("/").map(encodeURIComponent).join("/");
-    const kind = linked.itemType === "issue" ? "issues" : provider === "github" ? "pull" : provider === "gitlab" ? "merge_requests" : "pulls";
-    const separator = provider === "gitlab" ? "/-/" : "/";
-    return `https://${workspace.platform_host}/${encodedPath}${separator}${kind}/${number}`;
+    if (!provider) return null;
+    return buildCanonicalProviderItemURL({
+      provider,
+      platformHost: workspace.platform_host,
+      owner: workspace.repo_owner,
+      name: workspace.repo_name,
+      repoPath: workspace.repo?.repo_path ?? `${workspace.repo_owner}/${workspace.repo_name}`,
+      number: linked.number,
+      itemType: linked.itemType,
+    }) ?? null;
   }
 
   function copyText(value: string, message: string): void {
@@ -259,9 +307,9 @@
       ? executeOpaqueGeneratedApiRequest<unknown>(`${action} mobile Fleet workspace`, (client, signal) => {
           const params = { hostKey, id: workspace.id };
           switch (action) {
-            case "push": return client.FleetService.pushFleetWorkspaceBranch(params, { signal });
-            case "pull": return client.FleetService.pullFleetWorkspaceBranch(params, { signal });
-            case "refresh": return client.FleetService.refreshFleetWorkspace(params, { signal });
+            case "push": return (hostKey.startsWith("devbox:") ? client.DevboxesService.pushDevboxWorkspace({ connectionId: hostKey.slice(7), id: workspace.id }, { signal }) : client.FleetService.pushFleetWorkspaceBranch(params, { signal }));
+            case "pull": return (hostKey.startsWith("devbox:") ? client.DevboxesService.pullDevboxWorkspace({ connectionId: hostKey.slice(7), id: workspace.id }, { signal }) : client.FleetService.pullFleetWorkspaceBranch(params, { signal }));
+            case "refresh": return (hostKey.startsWith("devbox:") ? client.DevboxesService.refreshDevboxWorkspace({ connectionId: hostKey.slice(7), id: workspace.id }, { signal }) : client.FleetService.refreshFleetWorkspace(params, { signal }));
             case "reveal": return client.FleetService.revealFleetWorkspace(params, { signal });
           }
         }).pipe(Effect.asVoid)
@@ -299,12 +347,15 @@
     actionBusy = `${workspace.fleet_host_key ?? "local"}:${workspace.id}:delete`;
     const hostKey = workspace.fleet_host_key;
     const command = hostKey
-      ? executeOpaqueGeneratedApiRequest("delete mobile Fleet workspace", (client, signal) =>
-          client.FleetService.deleteFleetWorkspace(
+      ? executeOpaqueGeneratedApiRequest<unknown>("delete mobile Fleet workspace", (client, signal) =>
+          (hostKey.startsWith("devbox:") ? client.DevboxesService.deleteDevboxWorkspace({ connectionId: hostKey.slice(7),  id: workspace.id },
+            force ? { force: true } : undefined,
+            { signal },
+          ) : client.FleetService.deleteFleetWorkspace(
             { hostKey, id: workspace.id },
             force ? { force: true } : undefined,
             { signal },
-          ),
+          )),
         ).pipe(Effect.asVoid)
       : executeGeneratedApiRequest("delete mobile workspace", (client, signal) =>
           client.WorkspacesService.deleteWorkspace(
@@ -315,6 +366,7 @@
         ).pipe(Effect.asVoid);
     appRuntime.runCommand(
       command.pipe(
+        Effect.tap(() => removeWorkspaceListEntry(workspace.id, hostKey)),
         Effect.tap(() =>
           Effect.sync(() => {
             notifyWorkspaceDeleted(workspace.id, hostKey, {
@@ -415,7 +467,7 @@
   });
 
   onMount(() => {
-    const events = eventSourceStream(configuredAPIPath("/events"), "workspace_status").pipe(
+    const events = eventSourceStream(configuredAPIPath(getStreamEventsUrl()), "workspace_status").pipe(
       Stream.retry(Schedule.exponential("1 second").pipe(Schedule.jittered)),
       Stream.catch(() => Stream.empty),
     );
@@ -423,6 +475,7 @@
       Effect.scoped(
         Effect.gen(function* () {
           const workflow = yield* WorkspaceListWorkflow;
+          if (workflow.snapshot) applySnapshot(workflow.snapshot);
           yield* workflow.claim(refreshOwner, refreshWorkspaces.request);
           yield* workspaceListLifecycle({ refreshWorkspaces, refreshFleet, workspaceEvents: events });
         }),
@@ -445,10 +498,10 @@
       <button
         class="mobile-workspace-list__view"
         type="button"
-        aria-label="View workspace options"
+        aria-label="Workspace filters"
         onclick={() => (viewOpen = true)}
       >
-        View
+        Filters
         {#if viewBadgeCount > 0}<span>{viewBadgeCount}</span>{/if}
       </button>
       <button
@@ -460,8 +513,9 @@
         <PlusIcon size="18" strokeWidth="2" aria-hidden="true" />
         New
       </button>
+      <MobileNavMenu />
     </div>
-    <SearchInput
+    <QuerySearchInput
       value={searchQuery}
       block
       placeholder="Filter workspaces"
@@ -489,8 +543,7 @@
       </div>
     {:else if filtered.length === 0}
       <div class="mobile-workspace-list__state">
-        <strong>{searchQuery.trim() ? "No matching workspaces" : "No workspaces yet"}</strong>
-        <span>{searchQuery.trim() ? "Try a repository, branch, title, or item number." : "Create one to start a terminal session."}</span>
+        <strong>{searchQuery.trim() || author ? "No matching workspaces" : "No workspaces yet"}</strong>
       </div>
     {:else if sortMode === "repo"}
       {#each groups as group (group.key)}
@@ -511,19 +564,23 @@
 
 {#snippet workspaceRow(workspace: WorkspaceListItem, showRepository: boolean)}
   {@const label = itemLabel(workspace)}
+  {@const merging = workspaceMerging(workspace)}
   {@const agentState = agentStatePresentation(workspace)}
   {@const sortTimestamp = workspaceListSortTimestamp(workspace, sortMode)}
   <article class="mobile-workspace-row">
     <button
       class="mobile-workspace-row__main"
       type="button"
-      aria-label={`Open workspace ${mobileWorkspaceDisplayName(workspace)}${agentState ? `, agent ${agentState.announcement}` : ""}`}
+      aria-label={`Open workspace ${mobileWorkspaceDisplayName(workspace)}${merging ? ", merging" : ""}${agentState ? `, agent ${agentState.announcement}` : ""}`}
       disabled={!workspaceOperationAvailable(workspace, "workspaceRead") || !workspaceOperationAvailable(workspace, "terminalAttach")}
       onclick={() => openWorkspace(workspace)}
     >
       <span class="mobile-workspace-row__title">
         <StatusDot status={status(workspace)} label={statusLabel(workspace)} size={7} animated />
         <strong>{mobileWorkspaceDisplayName(workspace)}</strong>
+        {#if merging}
+          <span class="mobile-workspace-row__merge-state" aria-hidden="true">Merging</span>
+        {/if}
         {#if agentState}
           <span
             class={["mobile-workspace-row__agent-state", `mobile-workspace-row__agent-state--${agentState.tone}`]}
@@ -547,6 +604,7 @@
         {#if label}
           <button
             class="mobile-workspace-row__item"
+            style:--item-accent={itemAccent(workspace)}
             type="button"
             aria-label={`Open linked item ${label}`}
             onclick={() => openWorkspaceItem(workspace)}
@@ -577,14 +635,27 @@
 
 {#if viewOpen}
   <Modal
-    title="View workspaces"
-    ariaLabel="View workspace options"
-    closeLabel="Close View options"
+    title="Workspace filters"
+    ariaLabel="Workspace filters"
+    closeLabel="Close filters"
     width="min(100%, 38rem)"
     maxWidth="100%"
     onclose={() => (viewOpen = false)}
   >
     <div class="mobile-sheet-content">
+      <fieldset>
+        <legend>Author</legend>
+        <Typeahead
+          options={authorOptions}
+          value={author}
+          fallbackLabel={author || "Anyone"}
+          placeholder="Filter authors"
+          title="Filter by PR or issue author"
+          allowClear
+          clearLabel="Anyone"
+          onselect={(value) => { author = value; }}
+        />
+      </fieldset>
       <fieldset>
         <legend>Sort and group</legend>
         {#each workspaceListSortOptions as option (option.value)}
@@ -602,6 +673,15 @@
           <span><strong>Show PR diff stats</strong><small>Show additions and deletions on linked pull requests.</small></span>
         </Toggle>
       </div>
+      {#if viewBadgeCount > 0}
+        <button type="button" onclick={() => {
+          author = "";
+          searchQuery = "";
+          setSort(defaultWorkspaceListSort);
+          displayOptions = { ...defaultWorkspaceListDisplayOptions };
+          saveWorkspaceListDisplayOptions(displayOptions);
+        }}>Reset filters</button>
+      {/if}
     </div>
   </Modal>
 {/if}
@@ -622,7 +702,9 @@
         {#if canPush(actionsWorkspace)}<button type="button" disabled={actionBusy !== null || workspaceActionsDisabled(actionsWorkspace)} onclick={() => runSheetAction("push")}>Push branch</button>{/if}
         {#if canPull(actionsWorkspace)}<button type="button" disabled={actionBusy !== null || workspaceActionsDisabled(actionsWorkspace)} onclick={() => runSheetAction("pull")}>Pull remote changes</button>{/if}
         <button type="button" disabled={actionBusy !== null || workspaceActionsDisabled(actionsWorkspace)} onclick={() => runSheetAction("refresh")}>Refresh workspace</button>
-        <button type="button" disabled={actionBusy !== null || workspaceActionsDisabled(actionsWorkspace)} onclick={() => runSheetAction("reveal")}>Reveal worktree</button>
+        {#if !actionsWorkspace.fleet_host_key?.startsWith("devbox:")}
+          <button type="button" disabled={actionBusy !== null || workspaceActionsDisabled(actionsWorkspace)} onclick={() => runSheetAction("reveal")}>Reveal worktree</button>
+        {/if}
         <button type="button" onclick={() => copySheetValue("branch")}>Copy branch name</button>
         <button type="button" onclick={() => copySheetValue("path")}>Copy worktree path</button>
         {#if itemURL}
@@ -667,7 +749,7 @@
   .mobile-workspace-list__scroll { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding-bottom: max(1rem, env(safe-area-inset-bottom)); }
   .mobile-workspace-list__state { min-height: 12rem; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.5rem; padding: 2rem; color: var(--text-muted); text-align: center; font-size: var(--font-size-md); }
   .mobile-workspace-list__state strong { color: var(--text-primary); }
-  .mobile-workspace-group h2 { min-height: 2.5rem; display: flex; align-items: center; justify-content: space-between; margin: 0; padding: 0.5rem 0.875rem; color: var(--text-muted); border-bottom: thin solid var(--border-muted); background: var(--bg-inset); font-size: var(--font-size-sm); font-weight: 700; letter-spacing: 0.055em; text-transform: uppercase; }
+  .mobile-workspace-group h2 { min-height: 2.5rem; display: flex; align-items: center; justify-content: space-between; margin: 0; padding: 0.5rem 0.875rem; color: var(--text-muted); border-bottom: thin solid var(--border-muted); background: var(--bg-inset); font-size: var(--font-size-sm); font-weight: 700; letter-spacing: var(--letter-spacing-label, 0.055em); text-transform: var(--label-transform, uppercase); }
   .mobile-workspace-group h2 span { font-family: var(--font-mono); font-weight: 500; }
   .mobile-workspace-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: stretch; border-bottom: thin solid var(--border-default); background: var(--bg-surface); }
   .mobile-workspace-row:focus-within { box-shadow: inset 0 0 0 1px var(--accent-blue); }
@@ -675,7 +757,8 @@
   .mobile-workspace-row__main { min-width: 0; min-height: 5.5rem; display: flex; flex-direction: column; justify-content: center; gap: 0.5rem; padding: 0.75rem 0.25rem 0.75rem 0.875rem; text-align: left; }
   .mobile-workspace-row__title { min-width: 0; display: flex; align-items: center; gap: 0.5rem; }
   .mobile-workspace-row__title strong { min-width: 0; flex: 1; overflow: hidden; color: var(--text-primary); font-size: var(--font-size-md); font-weight: 650; line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
-  .mobile-workspace-row__agent-state { flex-shrink: 0; padding: 0.1875rem 0.375rem; border: thin solid currentColor; border-radius: 999px; background: var(--bg-inset); font-size: var(--font-size-xs); font-weight: 700; line-height: 1; }
+  .mobile-workspace-row__agent-state, .mobile-workspace-row__merge-state { flex-shrink: 0; padding: 0.1875rem 0.375rem; border: thin solid currentColor; border-radius: 999px; background: var(--bg-inset); font-size: var(--font-size-xs); font-weight: 700; line-height: 1; }
+  .mobile-workspace-row__merge-state { color: var(--accent-blue); }
   .mobile-workspace-row__agent-state--working, .mobile-workspace-row__agent-state--done { color: var(--accent-green); }
   .mobile-workspace-row__agent-state--approval { color: var(--accent-amber); }
   .mobile-workspace-row__agent-state--input { color: var(--accent-purple); }
@@ -686,7 +769,7 @@
   .mobile-workspace-row__meta em { color: var(--accent-blue); font-style: normal; font-weight: 650; }
   .mobile-workspace-row__item-stack { align-self: center; display: flex; flex-direction: column; align-items: center; gap: 0.125rem; margin: 0.25rem; }
   .mobile-workspace-row__item, .mobile-workspace-row__more { align-self: center; min-width: 2.75rem; min-height: 2.75rem; margin: 0.25rem; border-radius: var(--radius-md) !important; }
-  .mobile-workspace-row__item { height: 2rem; min-width: auto; min-height: 2rem; margin: 0; padding: 0 0.625rem !important; color: var(--text-on-accent) !important; background: var(--accent-green) !important; font-family: var(--font-mono) !important; font-weight: 700 !important; }
+  .mobile-workspace-row__item { height: 2rem; min-width: auto; min-height: 2rem; margin: 0; padding: 0 0.625rem !important; color: color-mix(in srgb, var(--item-accent) 25%, var(--bubble-ink)) !important; background: color-mix(in srgb, var(--item-accent) 70%, #ffffff) !important; font-family: var(--font-mono) !important; font-weight: 700 !important; }
   .mobile-workspace-row__sort-time { color: var(--text-muted); font-size: var(--font-size-sm); line-height: 1.35; white-space: nowrap; }
   .mobile-workspace-row__item:disabled { cursor: not-allowed; opacity: var(--opacity-disabled); }
   .mobile-workspace-row__more { display: inline-flex; align-items: center; justify-content: center; color: var(--text-muted) !important; }
@@ -695,7 +778,7 @@
   :global(.kit-modal-panel:has(.mobile-sheet-content)) { max-height: min(82vh, 44rem); border-bottom: 0; border-radius: var(--radius-lg) var(--radius-lg) 0 0; }
   :global(.kit-modal-body:has(> .mobile-sheet-content)) { padding: 0 0 max(1rem, env(safe-area-inset-bottom)); }
   .mobile-sheet-content fieldset { margin: 0; padding: 0.875rem; border: 0; }
-  .mobile-sheet-content legend { padding: 0; color: var(--text-muted); font-size: var(--font-size-sm); font-weight: 700; letter-spacing: 0.055em; text-transform: uppercase; }
+  .mobile-sheet-content legend { padding: 0; color: var(--text-muted); font-size: var(--font-size-sm); font-weight: 700; letter-spacing: var(--letter-spacing-label, 0.055em); text-transform: var(--label-transform, uppercase); }
   .mobile-sheet-content fieldset label { min-height: 3.75rem; display: flex; align-items: center; gap: 0.75rem; border-bottom: thin solid var(--border-muted); }
   .mobile-sheet-content fieldset input { width: 1.25rem; height: 1.25rem; accent-color: var(--accent-blue); }
   .mobile-sheet-content label span, .mobile-sheet__switches :global(.kit-toggle__label > span) { min-width: 0; display: flex; flex: 1; flex-direction: column; gap: 0.125rem; text-align: left; }

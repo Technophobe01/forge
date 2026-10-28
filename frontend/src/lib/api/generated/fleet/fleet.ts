@@ -8,6 +8,9 @@ import type {
   ActivateFederationEnrollmentPathParameters,
   BeginFederationEnrollmentHeaders,
   BeginFederationSpokePreparationPathParameters,
+  BrowserLoginOutputBody,
+  BrowserLoginRequestBody,
+  BrowserLoginTicketBody,
   CloneFleetProjectBody,
   CloneFleetProjectDefaultOne,
   CloneFleetProjectPathParameters,
@@ -15,6 +18,7 @@ import type {
   CompleteFleetFilesystemPathParams,
   CompleteFleetFilesystemPathPathParameters,
   CreateEnrollmentTokenInputBody,
+  CreateFleetBrowserLoginPathParameters,
   CreateFleetIssueWorkspaceBody,
   CreateFleetIssueWorkspaceDefaultOne,
   CreateFleetIssueWorkspaceOnPlatformHostBody,
@@ -46,6 +50,7 @@ import type {
   EnrollmentToken,
   EnsureFleetProjectWorktreeRuntimeShellDefaultOne,
   EnsureFleetProjectWorktreeRuntimeShellPathParameters,
+  FederationClearWorklistMarksPathParameters,
   FederationDiffDescriptorRequest,
   FederationIdentityOutputBody,
   FederationSetWorkflowStateRequest,
@@ -54,6 +59,9 @@ import type {
   FederationWorkflowMutation,
   FederationWorkflowPage,
   FederationWorkflowQuery,
+  FederationWorklistPut,
+  FederationWorkspaceProviderStateRequest,
+  FederationWorkspaceProviderStateResponse,
   GetFleetHostRuntimeSessionAttachSpecDefaultOne,
   GetFleetHostRuntimeSessionAttachSpecPathParameters,
   GetFleetProjectDefaultOne,
@@ -76,11 +84,15 @@ import type {
   GetFleetWorkspaceFilesPathParameters,
   GetFleetWorkspacePathParameters,
   GetFleetWorkspaceRuntimeDefaultOne,
+  GetFleetWorkspaceRuntimeParams,
   GetFleetWorkspaceRuntimePathParameters,
   GetFleetWorkspaceRuntimeSessionAttachSpecDefaultOne,
   GetFleetWorkspaceRuntimeSessionAttachSpecPathParameters,
+  GetFleetWorkspaceViewStatePathParameters,
   GetSnapshotAggregateParams,
   GetSnapshotParams,
+  GitHubRepositoryIDRequest,
+  GitHubRepositoryIDResponse,
   InspectFleetProjectWorktreeDefaultOne,
   InspectFleetProjectWorktreePathParameters,
   JoinRequest,
@@ -98,6 +110,7 @@ import type {
   ListFleetProjectBranchesPathParameters,
   ListFleetProjectWorktreesDefaultOne,
   ListFleetProjectWorktreesPathParameters,
+  ListFleetWorkspaceTargetsPathParameters,
   ListFleetWorkspacesDefaultOne,
   ListFleetWorkspacesPathParameters,
   LocalEnrollment,
@@ -130,7 +143,7 @@ import type {
   RenameFleetWorkspaceRuntimeSessionDefaultOne,
   RenameFleetWorkspaceRuntimeSessionPathParameters,
   RepositoryDescriptor,
-  RepositoryRoute,
+  RepositoryDescriptorRequest,
   RetryFleetWorkspaceDefaultOne,
   RetryFleetWorkspacePathParameters,
   RevealFleetWorkspaceDefaultOne,
@@ -158,14 +171,22 @@ import type {
   StoreFleetTerminalPasteImagePathParameters,
   StreamFederationProviderEventsHeaders,
   StreamFederationProviderEventsParams,
+  UpdateFleetWorkspaceTargetBody,
+  UpdateFleetWorkspaceTargetPathParameters,
+  UpdateFleetWorkspaceViewStateBody,
+  UpdateFleetWorkspaceViewStatePathParameters,
   ValidateFleetFilesystemRepoDefaultOne,
   ValidateFleetFilesystemRepoParams,
   ValidateFleetFilesystemRepoPathParameters,
   WatchFleetWorkspaceDiffDefaultOne,
   WatchFleetWorkspaceDiffParams,
   WatchFleetWorkspaceDiffPathParameters,
+  WorklistMarksCleared,
+  WorklistPutResult,
   WorkspaceLaunchRequest,
   WorkspaceLaunchSpec,
+  WorkspaceTargetsResponse,
+  WorkspaceViewState,
 } from "../models";
 
 import { orvalFetch } from "../../runtime.ts";
@@ -187,6 +208,22 @@ type NonReadonly<T> = [T] extends [UnionToIntersection<T>]
     }
   : DistributeReadOnlyOverUnions<T>;
 
+export const getIssueFederationBrowserLoginTicketUrl = () => {
+  return `/federation/browser-login-tickets`;
+};
+
+/**
+ * @summary Issue a one-time browser login ticket for a fleet peer
+ */
+export const issueFederationBrowserLoginTicket = async (
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<BrowserLoginTicketBody> => {
+  return orvalFetch<BrowserLoginTicketBody>(getIssueFederationBrowserLoginTicketUrl(), {
+    ...options,
+    method: "POST",
+  });
+};
+
 export const getBeginFederationEnrollmentUrl = () => {
   return `/federation/enrollments`;
 };
@@ -202,8 +239,16 @@ export const beginFederationEnrollment = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<JoinResponse>(getBeginFederationEnrollmentUrl(), {
     ...options,
@@ -245,8 +290,16 @@ export const activateFederationEnrollment = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<Enrollment>(getActivateFederationEnrollmentUrl({ enrollmentId }), {
     ...options,
@@ -292,8 +345,16 @@ export const sealFederationSpokePreparation = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<SpokePreparationSeal>(getSealFederationSpokePreparationUrl({ enrollmentId }), {
     ...options,
@@ -328,8 +389,16 @@ export const streamFederationProviderEvents = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<ProblemError>(getStreamFederationProviderEventsUrl(params), {
     ...options,
@@ -368,8 +437,16 @@ export const federationImportReviewDraft = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<ProviderStateImportResult>(getFederationImportReviewDraftUrl(), {
     ...options,
@@ -393,8 +470,16 @@ export const federationImportWorkflowState = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<ProviderStateImportResult>(getFederationImportWorkflowStateUrl(), {
     ...options,
@@ -418,8 +503,16 @@ export const federationFilterUnassignedActivitySubjects = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<FederationUnassignedActivitySubjectsResponse>(getFederationFilterUnassignedActivitySubjectsUrl(), {
     ...options,
@@ -443,14 +536,55 @@ export const federationGetDiffDescriptor = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<DiffDescriptor>(getFederationGetDiffDescriptorUrl(), {
     ...options,
     method: "POST",
     headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
     body: JSON.stringify(federationDiffDescriptorRequest),
+  });
+};
+
+export const getFederationResolveGithubRepositoryIdUrl = () => {
+  return `/federation/provider/github-repository-id`;
+};
+
+/**
+ * @summary Resolve a stored GitHub node ID to its integer repository ID for a Forge spoke
+ */
+export const federationResolveGithubRepositoryId = async (
+  gitHubRepositoryIDRequest: NonReadonly<GitHubRepositoryIDRequest>,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<GitHubRepositoryIDResponse> => {
+  const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+  return orvalFetch<GitHubRepositoryIDResponse>(getFederationResolveGithubRepositoryIdUrl(), {
+    ...options,
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
+    body: JSON.stringify(gitHubRepositoryIDRequest),
   });
 };
 
@@ -462,20 +596,28 @@ export const getFederationGetRepositoryDescriptorUrl = () => {
  * @summary Resolve a repository descriptor for a Forge spoke
  */
 export const federationGetRepositoryDescriptor = async (
-  repositoryRoute: NonReadonly<RepositoryRoute>,
+  repositoryDescriptorRequest: NonReadonly<RepositoryDescriptorRequest>,
   options?: Parameters<typeof orvalFetch>[1],
 ): Promise<RepositoryDescriptor> => {
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<RepositoryDescriptor>(getFederationGetRepositoryDescriptorUrl(), {
     ...options,
     method: "POST",
     headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
-    body: JSON.stringify(repositoryRoute),
+    body: JSON.stringify(repositoryDescriptorRequest),
   });
 };
 
@@ -509,8 +651,16 @@ export const federationUpdateProviderSettings = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<ProviderSettingsResponse>(getFederationUpdateProviderSettingsUrl(), {
     ...options,
@@ -534,8 +684,16 @@ export const federationSetWorkflowState = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<FederationWorkflowMutation>(getFederationSetWorkflowStateUrl(), {
     ...options,
@@ -559,14 +717,72 @@ export const federationListWorkflowStates = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<FederationWorkflowPage>(getFederationListWorkflowStatesUrl(), {
     ...options,
     method: "POST",
     headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
     body: JSON.stringify(federationWorkflowQuery),
+  });
+};
+
+export const getFederationPutWorklistUrl = () => {
+  return `/federation/provider/worklist`;
+};
+
+/**
+ * @summary Put hub worklist for a Forge spoke
+ */
+export const federationPutWorklist = async (
+  federationWorklistPut: NonReadonly<FederationWorklistPut>,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<WorklistPutResult> => {
+  const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+  return orvalFetch<WorklistPutResult>(getFederationPutWorklistUrl(), {
+    ...options,
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
+    body: JSON.stringify(federationWorklistPut),
+  });
+};
+
+export const getFederationClearWorklistMarksUrl = ({ id }: FederationClearWorklistMarksPathParameters) => {
+  return `/federation/provider/worklist/${encodeURIComponent(String(id))}/clear-marks`;
+};
+
+/**
+ * @summary Clear hub worklist handled marks for a Forge spoke
+ */
+export const federationClearWorklistMarks = async (
+  { id }: FederationClearWorklistMarksPathParameters,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<WorklistMarksCleared> => {
+  return orvalFetch<WorklistMarksCleared>(getFederationClearWorklistMarksUrl({ id }), {
+    ...options,
+    method: "POST",
   });
 };
 
@@ -584,8 +800,16 @@ export const federationAutoAssignWorkspaceItem = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<void>(getFederationAutoAssignWorkspaceItemUrl(), {
     ...options,
@@ -609,8 +833,16 @@ export const federationResolveWorkspaceLaunchSpec = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<WorkspaceLaunchSpec>(getFederationResolveWorkspaceLaunchSpecUrl(), {
     ...options,
@@ -634,14 +866,55 @@ export const federationRefreshWorkspaceLaunchSpec = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<WorkspaceLaunchSpec>(getFederationRefreshWorkspaceLaunchSpecUrl(), {
     ...options,
     method: "POST",
     headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
     body: JSON.stringify(workspaceLaunchRequest),
+  });
+};
+
+export const getFederationQueryWorkspaceProviderStateUrl = () => {
+  return `/federation/provider/workspace-state/query`;
+};
+
+/**
+ * @summary Read hub provider state for a spoke's workspaces
+ */
+export const federationQueryWorkspaceProviderState = async (
+  federationWorkspaceProviderStateRequest: NonReadonly<FederationWorkspaceProviderStateRequest>,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<FederationWorkspaceProviderStateResponse> => {
+  const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+  return orvalFetch<FederationWorkspaceProviderStateResponse>(getFederationQueryWorkspaceProviderStateUrl(), {
+    ...options,
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
+    body: JSON.stringify(federationWorkspaceProviderStateRequest),
   });
 };
 
@@ -659,8 +932,16 @@ export const createFleetEnrollmentToken = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<EnrollmentToken>(getCreateFleetEnrollmentTokenUrl(), {
     ...options,
@@ -775,8 +1056,16 @@ export const createFleetIssueWorkspaceOnPlatformHost = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<CreateFleetIssueWorkspaceOnPlatformHostDefaultOne>(
     getCreateFleetIssueWorkspaceOnPlatformHostUrl({ hostKey, platformHost, provider, owner, name, number }),
@@ -810,8 +1099,16 @@ export const createFleetRepoWorkspaceOnPlatformHost = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<CreateFleetRepoWorkspaceOnPlatformHostDefaultOne>(
     getCreateFleetRepoWorkspaceOnPlatformHostUrl({ hostKey, platformHost, provider, owner, name }),
@@ -845,8 +1142,16 @@ export const createFleetIssueWorkspace = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<CreateFleetIssueWorkspaceDefaultOne>(
     getCreateFleetIssueWorkspaceUrl({ hostKey, provider, owner, name, number }),
@@ -874,8 +1179,16 @@ export const registerFleetProject = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<RegisterFleetProjectDefaultOne>(getRegisterFleetProjectUrl({ hostKey }), {
     ...options,
@@ -900,8 +1213,16 @@ export const cloneFleetProject = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<CloneFleetProjectDefaultOne>(getCloneFleetProjectUrl({ hostKey }), {
     ...options,
@@ -994,8 +1315,16 @@ export const createFleetProjectWorktree = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<CreateFleetProjectWorktreeDefaultOne>(getCreateFleetProjectWorktreeUrl({ hostKey, projectId }), {
     ...options,
@@ -1023,8 +1352,16 @@ export const createFleetProjectWorktreeFromMergeRequest = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<CreateFleetProjectWorktreeFromMergeRequestDefaultOne>(
     getCreateFleetProjectWorktreeFromMergeRequestUrl({ hostKey, projectId }),
@@ -1056,8 +1393,16 @@ export const removeFleetProjectWorktree = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<RemoveFleetProjectWorktreeDefaultOne>(
     getRemoveFleetProjectWorktreeUrl({ hostKey, projectId, worktreeId }),
@@ -1113,8 +1458,16 @@ export const setFleetProjectWorktreeLinks = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<SetFleetProjectWorktreeLinksDefaultOne>(
     getSetFleetProjectWorktreeLinksUrl({ hostKey, projectId, worktreeId }),
@@ -1194,8 +1547,16 @@ export const launchFleetProjectWorktreeRuntimeSession = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<LaunchFleetProjectWorktreeRuntimeSessionDefaultOne>(
     getLaunchFleetProjectWorktreeRuntimeSessionUrl({ hostKey, projectId, worktreeId }),
@@ -1301,8 +1662,16 @@ export const setFleetProjectWorktreeSessionBackend = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<SetFleetProjectWorktreeSessionBackendDefaultOne>(
     getSetFleetProjectWorktreeSessionBackendUrl({ hostKey, projectId, worktreeId }),
@@ -1335,8 +1704,16 @@ export const createFleetRepoWorkspace = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<CreateFleetRepoWorkspaceDefaultOne>(
     getCreateFleetRepoWorkspaceUrl({ hostKey, provider, owner, name }),
@@ -1364,8 +1741,16 @@ export const launchFleetHostRuntimeSession = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<LaunchFleetHostRuntimeSessionDefaultOne>(getLaunchFleetHostRuntimeSessionUrl({ hostKey }), {
     ...options,
@@ -1433,8 +1818,16 @@ export const storeFleetTerminalPasteImage = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<StoreFleetTerminalPasteImageDefaultOne>(getStoreFleetTerminalPasteImageUrl({ hostKey }), {
     ...options,
@@ -1476,8 +1869,16 @@ export const createFleetWorkspace = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<CreateFleetWorkspaceDefaultOne>(getCreateFleetWorkspaceUrl({ hostKey }), {
     ...options,
@@ -1774,8 +2175,23 @@ export const revealFleetWorkspace = async (
   });
 };
 
-export const getGetFleetWorkspaceRuntimeUrl = ({ hostKey, id }: GetFleetWorkspaceRuntimePathParameters) => {
-  return `/fleet/hosts/${encodeURIComponent(String(hostKey))}/workspaces/${encodeURIComponent(String(id))}/runtime`;
+export const getGetFleetWorkspaceRuntimeUrl = (
+  { hostKey, id }: GetFleetWorkspaceRuntimePathParameters,
+  params?: GetFleetWorkspaceRuntimeParams,
+) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? "null" : String(value));
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0
+    ? `/fleet/hosts/${encodeURIComponent(String(hostKey))}/workspaces/${encodeURIComponent(String(id))}/runtime?${stringifiedParams}`
+    : `/fleet/hosts/${encodeURIComponent(String(hostKey))}/workspaces/${encodeURIComponent(String(id))}/runtime`;
 };
 
 /**
@@ -1783,9 +2199,10 @@ export const getGetFleetWorkspaceRuntimeUrl = ({ hostKey, id }: GetFleetWorkspac
  */
 export const getFleetWorkspaceRuntime = async (
   { hostKey, id }: GetFleetWorkspaceRuntimePathParameters,
+  params?: GetFleetWorkspaceRuntimeParams,
   options?: Parameters<typeof orvalFetch>[1],
 ): Promise<GetFleetWorkspaceRuntimeDefaultOne> => {
-  return orvalFetch<GetFleetWorkspaceRuntimeDefaultOne>(getGetFleetWorkspaceRuntimeUrl({ hostKey, id }), {
+  return orvalFetch<GetFleetWorkspaceRuntimeDefaultOne>(getGetFleetWorkspaceRuntimeUrl({ hostKey, id }, params), {
     ...options,
     method: "GET",
   });
@@ -1809,8 +2226,16 @@ export const launchFleetWorkspaceRuntimeSession = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<LaunchFleetWorkspaceRuntimeSessionDefaultOne>(
     getLaunchFleetWorkspaceRuntimeSessionUrl({ hostKey, id }),
@@ -1866,8 +2291,16 @@ export const renameFleetWorkspaceRuntimeSession = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<RenameFleetWorkspaceRuntimeSessionDefaultOne>(
     getRenameFleetWorkspaceRuntimeSessionUrl({ hostKey, id, sessionKey }),
@@ -1904,6 +2337,142 @@ export const getFleetWorkspaceRuntimeSessionAttachSpec = async (
   );
 };
 
+export const getListFleetWorkspaceTargetsUrl = ({ hostKey, id }: ListFleetWorkspaceTargetsPathParameters) => {
+  return `/fleet/hosts/${encodeURIComponent(String(hostKey))}/workspaces/${encodeURIComponent(String(id))}/targets`;
+};
+
+/**
+ * @summary List workspace targets on fleet host
+ */
+export const listFleetWorkspaceTargets = async (
+  { hostKey, id }: ListFleetWorkspaceTargetsPathParameters,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<WorkspaceTargetsResponse> => {
+  return orvalFetch<WorkspaceTargetsResponse>(getListFleetWorkspaceTargetsUrl({ hostKey, id }), {
+    ...options,
+    method: "GET",
+  });
+};
+
+export const getUpdateFleetWorkspaceTargetUrl = ({ hostKey, id }: UpdateFleetWorkspaceTargetPathParameters) => {
+  return `/fleet/hosts/${encodeURIComponent(String(hostKey))}/workspaces/${encodeURIComponent(String(id))}/targets`;
+};
+
+/**
+ * @summary Track or hide a workspace target on fleet host
+ */
+export const updateFleetWorkspaceTarget = async (
+  { hostKey, id }: UpdateFleetWorkspaceTargetPathParameters,
+  updateFleetWorkspaceTargetBody: UpdateFleetWorkspaceTargetBody,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<void> => {
+  const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+  return orvalFetch<void>(getUpdateFleetWorkspaceTargetUrl({ hostKey, id }), {
+    ...options,
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
+    body: JSON.stringify(updateFleetWorkspaceTargetBody),
+  });
+};
+
+export const getGetFleetWorkspaceViewStateUrl = ({ hostKey, id }: GetFleetWorkspaceViewStatePathParameters) => {
+  return `/fleet/hosts/${encodeURIComponent(String(hostKey))}/workspaces/${encodeURIComponent(String(id))}/view-state`;
+};
+
+/**
+ * @summary Get workspace view state on fleet host
+ */
+export const getFleetWorkspaceViewState = async (
+  { hostKey, id }: GetFleetWorkspaceViewStatePathParameters,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<WorkspaceViewState> => {
+  return orvalFetch<WorkspaceViewState>(getGetFleetWorkspaceViewStateUrl({ hostKey, id }), {
+    ...options,
+    method: "GET",
+  });
+};
+
+export const getUpdateFleetWorkspaceViewStateUrl = ({ hostKey, id }: UpdateFleetWorkspaceViewStatePathParameters) => {
+  return `/fleet/hosts/${encodeURIComponent(String(hostKey))}/workspaces/${encodeURIComponent(String(id))}/view-state`;
+};
+
+/**
+ * @summary Update workspace view state on fleet host
+ */
+export const updateFleetWorkspaceViewState = async (
+  { hostKey, id }: UpdateFleetWorkspaceViewStatePathParameters,
+  updateFleetWorkspaceViewStateBody: UpdateFleetWorkspaceViewStateBody,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<WorkspaceViewState> => {
+  const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+  return orvalFetch<WorkspaceViewState>(getUpdateFleetWorkspaceViewStateUrl({ hostKey, id }), {
+    ...options,
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
+    body: JSON.stringify(updateFleetWorkspaceViewStateBody),
+  });
+};
+
+export const getCreateFleetBrowserLoginUrl = ({ nodeId }: CreateFleetBrowserLoginPathParameters) => {
+  return `/fleet/hosts/${encodeURIComponent(String(nodeId))}/browser-login`;
+};
+
+/**
+ * @summary Create a one-time link that signs this browser into another Forge
+ */
+export const createFleetBrowserLogin = async (
+  { nodeId }: CreateFleetBrowserLoginPathParameters,
+  browserLoginRequestBody?: NonReadonly<BrowserLoginRequestBody>,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<BrowserLoginOutputBody> => {
+  const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+  return orvalFetch<BrowserLoginOutputBody>(getCreateFleetBrowserLoginUrl({ nodeId }), {
+    ...options,
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
+    body: JSON.stringify(browserLoginRequestBody),
+  });
+};
+
 export const getJoinFederationUrl = () => {
   return `/fleet/join`;
 };
@@ -1918,8 +2487,16 @@ export const joinFederation = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<LocalEnrollment>(getJoinFederationUrl(), {
     ...options,
@@ -1959,8 +2536,16 @@ export const abortFederationSpokePreparation = async (
   const getHeaders = (h?: NonNullable<RequestInit["headers"]>): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<SpokePreparationAbortReport>(getAbortFederationSpokePreparationUrl(), {
     ...options,

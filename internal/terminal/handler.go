@@ -3,6 +3,7 @@ package terminal
 import (
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 
 	"go.kenn.io/forge/internal/config"
+	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/procutil"
 	"go.kenn.io/forge/internal/ptyowner"
 	"go.kenn.io/forge/internal/ptysize"
@@ -29,6 +31,8 @@ import (
 type Handler struct {
 	Workspaces  *workspace.Manager
 	TmuxCommand []string
+	// Typed reports input typed into a pty-owner workspace terminal.
+	Typed func(workspaceID string)
 
 	mu     sync.Mutex
 	active map[string]int
@@ -144,7 +148,11 @@ func (h *Handler) ServeHTTP(
 		// Setup is complete; end the span before the long-lived bridge
 		// loop so terminal.attach stays bounded to the attach phase.
 		endAttachSpan()
-		exited := bridgePtyOwnerAttachment(ctx, conn, attachment)
+		exited := bridgePtyOwnerAttachment(ctx, conn, attachment, func() {
+			if h.Typed != nil {
+				h.Typed(ws.ID)
+			}
+		})
 		if exited {
 			conn.Close(websocket.StatusNormalClosure, "session ended")
 		} else {
@@ -335,6 +343,7 @@ func bridgePtyOwnerAttachment(
 	ctx context.Context,
 	conn *websocket.Conn,
 	attachment *ptyowner.Attachment,
+	onInput func(),
 ) bool {
 	defer attachment.Close()
 
@@ -351,6 +360,9 @@ func bridgePtyOwnerAttachment(
 			}
 			switch typ {
 			case websocket.MessageBinary:
+				if !localruntime.TerminalRepliesOnly(data) {
+					onInput()
+				}
 				if err := attachment.Write(data); err != nil {
 					return
 				}
@@ -439,6 +451,16 @@ func writeTerminalExit(conn *websocket.Conn, exitCode int) {
 	writeCancel()
 }
 
+// StopUnattachedTerminal claims the workspace slot so an attach cannot restart it mid-pass.
+func (h *Handler) StopUnattachedTerminal(ctx context.Context, ws *db.Workspace) error {
+	release, err := h.claimTerminalSlot(ws.ID)
+	if err != nil {
+		return nil
+	}
+	defer release()
+	return h.Workspaces.StopPtyOwnerTerminal(ctx, ws)
+}
+
 func (h *Handler) claimTerminalSlot(
 	id string,
 ) (func(), error) {
@@ -448,7 +470,7 @@ func (h *Handler) claimTerminalSlot(
 		h.active = make(map[string]int)
 	}
 	if h.active[id] > 0 {
-		return nil, fmt.Errorf("workspace terminal already active")
+		return nil, errors.New("workspace terminal already active")
 	}
 	h.active[id]++
 	active := h.active[id]

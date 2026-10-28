@@ -1,16 +1,19 @@
 <script lang="ts">
-  import { SearchInput } from "@kenn-io/kit-ui";
+  import { Button, SearchInput } from "@kenn-io/kit-ui";
   import CheckIcon from "@lucide/svelte/icons/check";
   import EraserIcon from "@lucide/svelte/icons/eraser";
   import XIcon from "@lucide/svelte/icons/x";
 
   interface Props {
     title: string;
+    labelForUser?: ((identity: string) => string) | undefined;
+    allowFreeEntry?: boolean;
     candidates: string[];
     selected: string[];
     loading?: boolean;
     pendingUser?: string | null;
     error?: string | null;
+    onretry?: (() => void) | undefined;
     autofocusFilter?: boolean;
     avatarUrlForUser?: ((username: string) => string) | undefined;
     /// The query the current candidates were fetched for. When set,
@@ -28,11 +31,14 @@
 
   const {
     title,
+    labelForUser = (identity) => identity,
+    allowFreeEntry = true,
     candidates,
     selected,
     loading = false,
     pendingUser = null,
     error = null,
+    onretry = undefined,
     autofocusFilter = false,
     avatarUrlForUser = undefined,
     candidatesQuery = undefined,
@@ -59,13 +65,14 @@
     }
     const needle = query.trim().toLowerCase();
     if (needle === "") return users;
-    return users.filter((name) => name.toLowerCase().includes(needle));
+    return users.filter((name) => labelForUser(name).toLowerCase().includes(needle));
   });
   // The candidate source is synced history, so it cannot know every
   // valid provider username. Typing a name that matches no listed user
   // offers an exact-username entry; the provider rejects names that do
   // not exist.
   const freeEntryUser = $derived.by(() => {
+    if (!allowFreeEntry) return null;
     const trimmed = query.trim();
     if (trimmed === "") return null;
     if (loading) return null;
@@ -134,7 +141,12 @@
   </div>
 
   {#if error}
-    <div class="user-picker__error" role="alert">{error}</div>
+    <div class="user-picker__error" role="alert">
+      {error}
+      {#if onretry}
+        <Button size="sm" tone="neutral" surface="outline" disabled={loading} onclick={onretry}>Retry</Button>
+      {/if}
+    </div>
   {/if}
 
   <div class="user-picker__list" role="menu" aria-label="Users">
@@ -160,9 +172,9 @@
             onerror={() => markAvatarFailed(username)}
           />
         {:else}
-          <span class="user-picker__avatar" aria-hidden="true">{username.slice(0, 1).toUpperCase()}</span>
+          <span class="user-picker__avatar" aria-hidden="true">{labelForUser(username).slice(0, 1).toUpperCase()}</span>
         {/if}
-        <span class="user-picker__name">{username}</span>
+        <span class="user-picker__name">{labelForUser(username)}</span>
         <span class="user-picker__status">
           {#if pendingUser === username}
             <span class="user-picker__pending">Saving…</span>

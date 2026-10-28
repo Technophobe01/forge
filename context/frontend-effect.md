@@ -11,6 +11,7 @@ Read the installed package that the frontend actually compiles against before
 assuming an API from a newer Effect release:
 
 - `frontend/node_modules/effect/README.md` for the installed package overview.
+- `frontend/node_modules/effect/AGENTS.md` for the installed library guidance.
 - `frontend/node_modules/effect/src/Effect.ts` for core constructors,
   composition, runtime, interruption, and scope APIs.
 - `frontend/node_modules/effect/src/Stream.ts`, `Schema.ts`, `Layer.ts`, and
@@ -22,8 +23,7 @@ assuming an API from a newer Effect release:
 - `frontend/node_modules/@effect/language-service/schema.json` for supported
   `tsconfig.json` plugin options.
 
-The pinned Effect package does not currently contain an `AGENTS.md`; do not
-invent or link that path. The language-service README says TypeScript 7 should
+The language-service README says TypeScript 7 should
 use `@effect/tsgo`, but kenn-forge uses TypeScript 5.9, so the installed language
 service is the supported tool here.
 
@@ -39,9 +39,15 @@ service is the supported tool here.
 - Application ownership lasts for the browser runtime unless explicitly persisted.
   Reload may discard presentation and deferred launch intent, but persisted server
   authority must remain discoverable afterward.
+- Settings page reads must follow previously accepted saves but remain page-owned;
+  leaving Settings cancels reads without cancelling saves or blocking later writes
+  (`frontend/src/lib/stores/settings-workflow.ts::SettingsWorkflowLive`).
 - Use scoped acquisition and finalizers for listeners, streams, readers,
   abort controllers, timers, presenters, and workflow owners. Teardown must be
   explicit at the same lifetime boundary that acquired the resource.
+- Shared diff workers start on first diff demand and live until app disposal;
+  mounting the app or disposing one diff must not create or terminate the pool
+  (`frontend/src/lib/components/diff/pierre-worker-pool.ts::PierreDiffWorkerPoolLive`).
 - Publish an owner registry entry and install its finalizer in one
   uninterruptible acquisition handoff. After an ordered queue admits a
   non-idempotent command, pending-state publication and executor release are
@@ -55,6 +61,9 @@ service is the supported tool here.
 - Workflow caches and progress belong to provider, host, and permanent repository ID;
   renames retain successful reads and dispatches, while a replacement route occupant gets separate state
   (`frontend/src/lib/stores/workflow-actions.svelte.ts::workflowRepositoryKey`).
+- Relay workflow events refresh only the mounted Actions page's selected repository and
+  workflow; do not add hidden-page fetches or a second batching timer.
+  (`frontend/src/lib/components/actions/ActionsPage.svelte::loadSelectedCatalog`).
 - Reads are latest-wins per repository through generation counters; a stale catalog
   or run response never replaces newer data
   (`frontend/src/lib/stores/workflow-actions.svelte.ts::selectWorkflow`).
@@ -71,6 +80,14 @@ service is the supported tool here.
   of bespoke Promise generations, overlapping timers, or boolean race guards.
   Preserve latest-wins, single-flight, ordered, or lossless semantics explicitly;
   these are different contracts.
+- Repeated reads of the same PR or issue list query share the pending request;
+  only a changed query replaces it, so polling cannot starve a slow response
+  (`frontend/src/lib/effect/latest-shared-read.ts::makeLatestSharedRead`).
+- Fleet snapshot consumers share pending reads within the app runtime; completed results do not suppress later refreshes,
+  and releasing one consumer does not cancel another (`frontend/src/lib/api/fleet-snapshot.ts::FleetSnapshotReadsLive`).
+- Navigation retains successful previews for explicit commit/range scopes;
+  head and workspace previews still follow their mutable refresh generations
+  (`frontend/src/lib/stores/diff-preview-workflow.ts::FilePreviewWorkflowLive`).
 - Timer polls use the shared visibility-aware helper: hidden documents stop
   polling and refresh at once when shown; event-driven refreshes ignore
   visibility (`frontend/src/lib/effect/poll-while-visible.ts::pollWhileVisible`).
@@ -88,9 +105,16 @@ service is the supported tool here.
   Orval model from `frontend/src/lib/api/generated/models/`, directly or through
   `frontend/src/lib/api/types.ts`; do not duplicate those shapes or add runtime
   guards around already-generated contracts.
+- Build API paths, including raw `orvalRequest`, EventSource, and Roborev
+  calls, with the generated Orval `get*Url` helpers instead of string routes
+  (`frontend/src/lib/api/generated/system/system.ts::getStreamEventsUrl`). Only
+  endpoints outside OpenAPI, such as `/ws/v1` terminals, are hand-built.
 - A non-idempotent transport failure may be uncertain. Retain a fence and read
   fresh authority before retrying. Definite rejection, uncertain outcome, and
   acknowledged success followed by refresh failure require different UI state.
+- New settings fields must participate in save-recovery comparisons; reading
+  unchanged settings cannot confirm that a requested change took effect
+  (`frontend/src/lib/stores/settings-workflow.ts::settingsMatchRequest`).
 - Presentation callbacks must not change command acknowledgement. Publish
   identity-scoped authoritative outcomes before component-liveness checks, and
   gate only local presentation on the current view.

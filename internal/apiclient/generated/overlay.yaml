@@ -3,6 +3,12 @@ info:
   title: Preserve arbitrary JSON object values in Go
   version: 1.0.0
 actions:
+  - target: $.components.schemas.HookEvent.properties.background_tasks
+    update:
+      x-go-type: any
+  - target: $.components.schemas.HookEvent.properties.session_crons
+    update:
+      x-go-type: any
   - target: $.components.schemas.ProblemError.properties.details
     update:
       additionalProperties: true
@@ -10,6 +16,12 @@ actions:
     update:
       additionalProperties: true
   - target: $.components.schemas.WorkflowDispatchBody.properties.inputs
+    update:
+      additionalProperties: true
+  - target: $.components.schemas.WorkspaceChatCommand.properties.content
+    update:
+      additionalProperties: true
+  - target: $.components.schemas.ACPElicitationSchema.properties.properties
     update:
       additionalProperties: true
   - target: $.components.schemas.ErrorDetail.properties.value
@@ -20,3 +32,12 @@ actions:
     update:
       x-go-type: any
       x-go-type-skip-optional-pointer: true
+  - target: $.components.schemas.WorklistItemResponse.properties.issue
+    update:
+      nullable: true
+  - target: $.components.schemas.WorklistItemResponse.properties.live
+    update:
+      nullable: true
+  - target: $.components.schemas.WorklistItemResponse.properties.pull
+    update:
+      nullable: true

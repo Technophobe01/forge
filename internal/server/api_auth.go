@@ -1,7 +1,6 @@
 package server
 
 import (
-	"crypto/subtle"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -11,7 +10,9 @@ import (
 	"go.kenn.io/forge/internal/federation"
 	"go.kenn.io/forge/internal/federationauth"
 	"go.kenn.io/forge/internal/providerplane"
+	"go.kenn.io/forge/internal/server/authapi"
 	"go.kenn.io/forge/internal/server/httpapi"
+	"go.kenn.io/forge/internal/server/routepolicy"
 )
 
 // API auth gates /api and /ws routes behind the daemon's bearer token
@@ -24,67 +25,65 @@ import (
 // probes (/healthz, /livez) stay open so supervisors can poll before
 // they have read the token file.
 
-const authCookieName = "forge_auth"
-
-// authBootstrapParam is the query parameter that converts a token
-// into a session cookie; it is stripped from the URL by redirect so
-// the token does not linger in the location bar or history beyond
-// the first load.
-const authBootstrapParam = "auth_token"
-
-func tokenEqual(a, b string) bool {
-	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
-}
-
-func hasValidBearer(r *http.Request, expected string) bool {
-	if expected == "" {
-		return false
-	}
-	token, ok := requestBearer(r)
-	return ok && tokenEqual(strings.TrimSpace(token), expected)
-}
-
-func requestBearer(r *http.Request) (string, bool) {
-	header := r.Header.Get("Authorization")
-	token, ok := strings.CutPrefix(header, "Bearer ")
-	if !ok {
-		return "", false
-	}
-	token = strings.TrimSpace(token)
-	return token, token != ""
-}
-
-// handleAuthBootstrap converts a valid ?auth_token= query into the
-// session cookie and redirects to the same URL without the parameter.
+// handleLoginTicketBootstrap converts a valid ?login_ticket= on a page load
+// into a browser session cookie and redirects to the same URL without the
+// parameter. The ticket is consumed even when the request is then rejected.
 // Returns true when it wrote a response (redirect or rejection).
-func (s *Server) handleAuthBootstrap(
+func (s *Server) handleLoginTicketBootstrap(
 	w http.ResponseWriter, r *http.Request,
 ) bool {
-	token := r.URL.Query().Get(authBootstrapParam)
-	if token == "" {
+	query := r.URL.Query()
+	if !query.Has(authapi.LoginTicketParam) || r.Method != http.MethodGet ||
+		s.authapi.IsGatedAPIRequest(r) {
 		return false
 	}
-	if !tokenEqual(token, s.daemonRequests.token) {
-		http.Error(w, "invalid auth token", http.StatusForbidden)
+	grant, ok := s.browserLoginTickets.Consume(query.Get(authapi.LoginTicketParam))
+	if !ok || !s.browserLoginPeerActive(grant.NodeID) {
+		http.Error(w, "invalid or expired login ticket", http.StatusForbidden)
+		return true
+	}
+	session, sessionGrant, err := s.browserSessions.Issue(grant.NodeID)
+	if err != nil {
+		http.Error(w, "browser session unavailable", http.StatusInternalServerError)
 		return true
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name:     authCookieName,
-		Value:    token,
+		Name:     authapi.BrowserSessionCookieName,
+		Value:    session,
 		Path:     "/",
+		Expires:  sessionGrant.ExpiresAt,
 		HttpOnly: true,
+		Secure:   s.authapi.RequestArrivedOverHTTPS(r),
 		SameSite: http.SameSiteLaxMode,
 	})
-	redirect := *r.URL
-	query := redirect.Query()
-	query.Del(authBootstrapParam)
-	redirect.RawQuery = query.Encode()
-	target := redirect.String()
-	if target == "" {
-		target = "/"
+	query.Del(authapi.LoginTicketParam)
+	// Collapse leading slashes so the relative Location can never become a
+	// scheme-relative redirect to another origin.
+	target := "/" + strings.TrimLeft(r.URL.EscapedPath(), "/")
+	if encoded := query.Encode(); encoded != "" {
+		target += "?" + encoded
 	}
 	http.Redirect(w, r, target, http.StatusSeeOther)
 	return true
+}
+
+// browserLoginPeerActive reports whether the fleet peer that issued a login
+// ticket or session still holds an active enrollment. Revocation, disabled
+// federation, and an expired activation lease all end its browser sessions.
+func (s *Server) browserLoginPeerActive(nodeID string) bool {
+	state, ok := s.federationPrincipalEnrollmentState(
+		federationauth.Principal{NodeID: nodeID},
+	)
+	return ok && state == federation.EnrollmentActive
+}
+
+func (s *Server) hasValidBrowserSession(r *http.Request) bool {
+	cookie, err := r.Cookie(authapi.BrowserSessionCookieName)
+	if err != nil {
+		return false
+	}
+	grant, ok := s.browserSessions.Lookup(cookie.Value)
+	return ok && s.browserLoginPeerActive(grant.NodeID)
 }
 
 // authorizeAPIRequest reports whether the request carries a valid
@@ -92,28 +91,38 @@ func (s *Server) handleAuthBootstrap(
 func (s *Server) authorizeAPIRequest(
 	w http.ResponseWriter, r *http.Request,
 ) bool {
-	if s.isPreEnrollmentRequest(r) {
+	if s.options.ExecutionWorker {
+		if authapi.HasValidBearer(r, s.daemonRequests.Token) {
+			return true
+		}
+		w.Header().Set("WWW-Authenticate", `Bearer realm="kenn-forge-worker"`)
+		routepolicy.WriteProblemResponse(w, httpapi.NewProblem(http.StatusUnauthorized, httpapi.CodeUnauthorized, "missing or invalid worker bearer", nil))
+		return false
+	}
+	if s.authapi.IsPreEnrollmentRequest(r) {
 		return true
 	}
-	if hasValidBearer(r, s.daemonRequests.token) {
+	if authapi.HasValidBearer(r, s.daemonRequests.Token) {
 		return true
 	}
-	if cookie, err := r.Cookie(authCookieName); err == nil {
-		if tokenEqual(cookie.Value, s.daemonRequests.token) {
+	if cookie, err := r.Cookie(authapi.AuthCookieName); err == nil {
+		if authapi.TokenEqual(cookie.Value, s.daemonRequests.Token) {
 			return true
 		}
 	}
 	// Federation requests sent through Tailscale Serve also carry its user
 	// identity header. Authenticate the narrower bearer first so handlers retain
 	// the spoke principal and federation scope checks still apply.
-	if token, ok := requestBearer(r); ok && s.federationAuth != nil {
+	if token, ok := authapi.RequestBearer(r); ok && s.federationAuth != nil {
 		if principal, authenticated := s.federationAuth.Authenticate(token); authenticated {
 			return s.authorizeFederationRequest(w, r, principal)
 		}
 	}
-	if s.daemonRequests.acceptsTailscaleServeUser(r) {
-		if !tailscaleWebSocketOriginAllowed(r) {
-			writeProblemResponse(w, httpapi.NewProblem(
+	// Tailscale Serve identity and peer-issued browser sessions are network
+	// browser credentials, so both reject cross-origin WebSocket upgrades.
+	if s.daemonRequests.AcceptsTailscaleServeUser(r) || s.hasValidBrowserSession(r) {
+		if !authapi.BrowserWebSocketOriginAllowed(r) {
+			routepolicy.WriteProblemResponse(w, httpapi.NewProblem(
 				http.StatusForbidden,
 				httpapi.CodeForbidden,
 				"cross-origin WebSocket access is not allowed",
@@ -124,47 +133,13 @@ func (s *Server) authorizeAPIRequest(
 		return true
 	}
 	w.Header().Set("WWW-Authenticate", `Bearer realm="kenn-forge"`)
-	writeProblemResponse(w, httpapi.NewProblem(
+	routepolicy.WriteProblemResponse(w, httpapi.NewProblem(
 		http.StatusUnauthorized,
 		httpapi.CodeUnauthorized,
 		"missing or invalid API auth token",
 		nil,
 	))
 	return false
-}
-
-func tailscaleWebSocketOriginAllowed(r *http.Request) bool {
-	if !strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket") {
-		return true
-	}
-	origins := r.Header.Values("Origin")
-	if len(origins) == 0 {
-		return true
-	}
-	if len(origins) != 1 {
-		return false
-	}
-	origin, err := url.Parse(strings.TrimSpace(origins[0]))
-	if err != nil || origin.Scheme != "https" ||
-		origin.User != nil || origin.Host == "" || origin.Path != "" ||
-		origin.RawQuery != "" || origin.Fragment != "" {
-		return false
-	}
-	originHost, err := config.ParseHostKey(origin.Host)
-	if err != nil {
-		return false
-	}
-	requestHost, err := config.ParseHostKey(r.Host)
-	if err != nil {
-		return false
-	}
-	if originHost.Port == "" {
-		originHost.Port = "443"
-	}
-	if requestHost.Port == "" {
-		requestHost.Port = "443"
-	}
-	return originHost.Equal(requestHost)
 }
 
 func (s *Server) federationPrincipalEnrollmentState(
@@ -236,39 +211,19 @@ func (s *Server) federationPrincipalEnrollmentState(
 	return "", false
 }
 
-func pendingProviderRouteAllowed(method, path string) bool {
-	if method != http.MethodPost {
-		return false
-	}
-	switch path {
-	case "/api/v1/federation/provider/repository-descriptor",
-		"/api/v1/federation/provider/workspace-launch-spec",
-		"/api/v1/federation/provider-state/review-drafts/import",
-		"/api/v1/federation/provider-state/workflow-states/import":
-		return true
-	default:
-		return false
-	}
-}
-
-func (s *Server) isPreEnrollmentRequest(r *http.Request) bool {
-	return r.Method == http.MethodPost &&
-		s.canonicalAPIPath(r) == "/api/v1/federation/enrollments"
-}
-
 func (s *Server) authorizeFederationRequest(
 	w http.ResponseWriter, r *http.Request, principal federationauth.Principal,
 ) bool {
 	if claimed := r.Header.Get(federationauth.NodeIDHeader); claimed != "" &&
 		claimed != principal.NodeID {
-		writeFederationAuthProblem(
+		authapi.WriteFederationAuthProblem(
 			w,
 			"federation credential subject does not match the supplied node ID",
 			map[string]any{"reason": "federationSubjectMismatch"},
 		)
 		return false
 	}
-	canonicalPath := s.canonicalAPIPath(r)
+	canonicalPath := s.authapi.CanonicalAPIPath(r)
 	enrollmentState, enrolled := s.federationPrincipalEnrollmentState(principal)
 	if !enrolled && s.allowsActivationLeaseHandshake(r, canonicalPath, principal) {
 		enrollmentState = federation.EnrollmentActive
@@ -279,7 +234,7 @@ func (s *Server) authorizeFederationRequest(
 		enrolled = true
 	}
 	if !enrolled {
-		writeFederationAuthProblem(
+		authapi.WriteFederationAuthProblem(
 			w,
 			"federation credential is not attached to an authorized enrollment",
 			map[string]any{"reason": "federationEnrollmentInactive"},
@@ -288,14 +243,14 @@ func (s *Server) authorizeFederationRequest(
 	}
 	required, listed := s.federationAuth.RequiredScope(r.Method, canonicalPath)
 	providerRule, providerOwned := providerRouteRuleForRequest(r.Method, canonicalPath)
-	providerOwned = providerOwned && providerRule.Owner != NodeLocal
+	providerOwned = providerOwned && providerRule.Owner != routepolicy.NodeLocal
 	if !listed && providerOwned {
 		required = providerRule.PeerScope
 		listed = true
 	}
 	if enrollmentState == federation.EnrollmentPending && providerOwned &&
-		!pendingProviderRouteAllowed(r.Method, canonicalPath) {
-		writeFederationAuthProblem(
+		!authapi.PendingProviderRouteAllowed(r.Method, canonicalPath) {
+		authapi.WriteFederationAuthProblem(
 			w,
 			"pending federation credentials cannot access this provider route",
 			map[string]any{"reason": "federationEnrollmentPending"},
@@ -303,7 +258,7 @@ func (s *Server) authorizeFederationRequest(
 		return false
 	}
 	if !listed {
-		writeFederationAuthProblem(
+		authapi.WriteFederationAuthProblem(
 			w,
 			"federation credentials cannot access this route",
 			map[string]any{"reason": "federationRouteNotAllowed"},
@@ -311,7 +266,7 @@ func (s *Server) authorizeFederationRequest(
 		return false
 	}
 	if !principal.Has(required) {
-		writeFederationAuthProblem(
+		authapi.WriteFederationAuthProblem(
 			w,
 			"federation credential does not grant the required scope",
 			map[string]any{
@@ -322,7 +277,7 @@ func (s *Server) authorizeFederationRequest(
 	}
 	if providerOwned && r.Header.Get(providerplane.ProtocolVersionHeader) !=
 		strconv.Itoa(federation.ProtocolVersion) {
-		writeProblemResponse(w, httpapi.NewProblem(
+		routepolicy.WriteProblemResponse(w, httpapi.NewProblem(
 			http.StatusConflict,
 			httpapi.CodeConflict,
 			"federation protocol version does not match",
@@ -375,49 +330,4 @@ func (s *Server) allowsSpokeEnrollmentRevocation(
 	s.cfgMu.Unlock()
 	return fleetEnabled && canonicalPath ==
 		"/api/v1/fleet/enrollments/"+url.PathEscape(local.EnrollmentID)
-}
-
-func writeFederationAuthProblem(
-	w http.ResponseWriter, detail string, details map[string]any,
-) {
-	writeProblemResponse(w, httpapi.NewProblem(
-		http.StatusForbidden, httpapi.CodeForbidden, detail, details,
-	))
-}
-
-func (s *Server) canonicalAPIPath(r *http.Request) string {
-	path := r.URL.EscapedPath()
-	if s.basePath == "/" {
-		return path
-	}
-	prefix := strings.TrimSuffix(s.basePath, "/")
-	return strings.TrimPrefix(path, prefix)
-}
-
-// isGatedAPIRequest reports whether the path is a route subject to
-// auth: the REST API under /api/ and the terminal WebSocket routes
-// under /ws/, which open interactive shells and must not be reachable
-// without a credential. Health probes are exempt so supervisors can
-// poll liveness before reading the token file. Browsers carry the
-// session cookie on the WebSocket upgrade, so the same cookie/bearer
-// check applies uniformly.
-func (s *Server) isGatedAPIRequest(r *http.Request) bool {
-	path := r.URL.Path
-	if s.basePath != "/" {
-		prefix := strings.TrimSuffix(s.basePath, "/")
-		path = strings.TrimPrefix(path, prefix)
-	}
-	return strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/ws/")
-}
-
-// redactedQuery renders a URL's query for logging with credential
-// parameters masked, so the auth bootstrap token never lands in
-// debug logs.
-func redactedQuery(u *url.URL) string {
-	query := u.Query()
-	if _, ok := query[authBootstrapParam]; !ok {
-		return u.RawQuery
-	}
-	query.Set(authBootstrapParam, "REDACTED")
-	return query.Encode()
 }

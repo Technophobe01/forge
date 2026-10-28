@@ -401,7 +401,7 @@ func TestKataDaemonsEndpointReportsUnreachableAsDown(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(err)
 	addr := listener.Addr().String()
 	require.NoError(listener.Close())
@@ -725,7 +725,7 @@ url = "`+upstream.URL+`"
 			defer done.Done()
 			launched.Done()
 			<-start
-			req := httptest.NewRequest(http.MethodGet, "/api/v1/kata/daemons", nil)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/kata/daemons", nil)
 			rr := httptest.NewRecorder()
 			srv.ServeHTTP(rr, req)
 			statuses <- rr.Code
@@ -735,9 +735,9 @@ url = "`+upstream.URL+`"
 	close(start)
 
 	<-entered
-	deadline := time.Now().Add(250 * time.Millisecond)
-	for time.Now().Before(deadline) && probes.Load() == 1 {
-		time.Sleep(time.Millisecond)
+	select {
+	case <-entered:
+	case <-time.After(250 * time.Millisecond): //nolint:kennlint // shows the event does not happen; concurrent HTTP callers must share the blocked health probe
 	}
 	got := probes.Load()
 	close(release)

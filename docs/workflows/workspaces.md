@@ -10,6 +10,10 @@ Kata issue, or the **New workspace** button.
   <figcaption>A workspace keeps its branch, linked item, files, diff, and running sessions together.</figcaption>
 </figure>
 
+For remote compute, connect a [devbox](../devboxes.md) and select it as your
+workspace machine. Agents, worktrees and tools then run in your account on that
+host while you supervise them from your usual Forge.
+
 ## Create the right workspace
 
 From a pull request, Kenn Forge checks out the pull request branch. From an
@@ -48,7 +52,8 @@ the complete ownership model and setup workflow.
 
 ## Use the workspace view
 
-The workspace sidebar can search, sort, and group workspaces. Rows show the
+The workspace sidebar can search, sort, and group workspaces. Prefix a search
+word with `!` or `NOT` to hide matching workspaces. Rows show the
 repository, branch, linked item, changed-line counts, and current agent state
 when lifecycle hooks report one.
 
@@ -90,6 +95,10 @@ Use `--agent NAME` to install one agent's hook. The sidebar can then show when
 an agent is working, waiting for approval, waiting for input, or done. Without
 fresh hook reports, Forge falls back to tmux activity.
 
+On Windows, ending a conversation with `/clear` or exit clears its badge even
+if another program, such as a virus scanner, has the activity file open. If
+Forge can't clear it, the SessionEnd hook fails and names the file.
+
 ## Attach outside the browser
 
 Workspace and session controls expose tmux attach commands. This is useful for
@@ -101,6 +110,12 @@ browser and terminal attach to the same durable session.
 Delete removes the kenn-forge-managed worktree and its workspace record. A
 dirty worktree blocks normal deletion so uncommitted work is not discarded.
 Review the files first. Force deletion is available only after that warning.
+
+To delete several workspaces, Shift- or Cmd/Ctrl-click them in the list,
+right-click, and choose **Delete N workspaces...**. The dialog closes when you
+confirm, and each row shows **Deleting workspace** until its delete finishes.
+Bulk deletion never forces, so workspaces with uncommitted changes stay.
+When it finishes, Forge names each workspace it could not delete and why.
 
 If issue workspace creation finds the expected directory already present,
 Forge can recover it after verifying that it belongs to the managed

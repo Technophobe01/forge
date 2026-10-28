@@ -20,6 +20,7 @@ import (
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	serverfake "go.kenn.io/forge/internal/testutil/serverfake"
 	"go.kenn.io/forge/internal/testutil/servertest"
 	"go.kenn.io/forge/platform"
 )
@@ -29,6 +30,7 @@ import (
 // repository regardless: the tracked ghost is repository-scoped noise, not a
 // reason to fail the pass.
 func TestArchiveWorkerSkipsUnresolvableTrackedRepoE2E(t *testing.T) {
+	serverfake.RunParallelServerTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -49,7 +51,7 @@ func TestArchiveWorkerSkipsUnresolvableTrackedRepoE2E(t *testing.T) {
 			_, _ = w.Write([]byte(`{"data":{"repository":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}`))
 		case "/api/v3/repos/acme/widget/pulls":
 			_, _ = w.Write([]byte(`[]`))
-		case "/api/v3/repos/acme/widget":
+		case "/api/v3/repos/acme/widget", "/api/v3/repositories/1":
 			_, _ = w.Write([]byte(`{"id":1,"node_id":"R_widget","name":"widget","full_name":"acme/widget","owner":{"login":"acme"}}`))
 		default:
 			// The ghost repository resolves nowhere, matching a renamed or
@@ -72,7 +74,7 @@ func TestArchiveWorkerSkipsUnresolvableTrackedRepoE2E(t *testing.T) {
 	healthy := platform.RepoRef{
 		Platform: platform.KindGitHub, Host: "github.com",
 		Owner: "acme", Name: "widget", RepoPath: "acme/widget",
-		PlatformExternalID: "R_widget",
+		Key: platform.RepositoryIDKey(1),
 	}
 	ghost := platform.RepoRef{
 		Platform: platform.KindGitHub, Host: "github.com",
@@ -84,8 +86,8 @@ func TestArchiveWorkerSkipsUnresolvableTrackedRepoE2E(t *testing.T) {
 			{
 				Platform: healthy.Platform, PlatformHost: healthy.Host,
 				Owner: healthy.Owner, Name: healthy.Name,
-				RepoPath:           healthy.RepoPath,
-				PlatformExternalID: healthy.PlatformExternalID,
+				RepoPath: healthy.RepoPath,
+				Key:      healthy.Key,
 			},
 			{
 				Platform: ghost.Platform, PlatformHost: ghost.Host,

@@ -15,6 +15,8 @@ import (
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/server/workspaceapi"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	"go.kenn.io/forge/platform"
 )
 
 func TestHandlerRegistersOnlyIssueRoutes(t *testing.T) {
@@ -49,6 +51,8 @@ func TestHandlerRegistersOnlyIssueRoutes(t *testing.T) {
 	addPair("delete-issue-comment", http.MethodDelete, "/comments/{comment_id}", http.StatusNoContent)
 	addPair("set-issue-labels", http.MethodPut, "/labels", http.StatusOK)
 	addPair("set-issue-assignees", http.MethodPut, "/assignees", http.StatusOK)
+	addPair("update-issue-labels", http.MethodPatch, "/labels", http.StatusOK)
+	addPair("update-issue-assignees", http.MethodPatch, "/assignees", http.StatusOK)
 	addPair("set-issue-github-state", http.MethodPost, "/github-state", http.StatusOK)
 
 	gotByID := make(map[string]*huma.Operation)
@@ -87,8 +91,8 @@ func TestIssueDetailTreatsWorkspaceSnapshotFailureAsBestEffort(t *testing.T) {
 	database := dbtest.Open(t)
 	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
 	identity := db.GitHubRepoIdentity("github.com", "acme", "widget")
-	identity.PlatformRepoID = "repo-acme-widget"
-	repoID, err := database.UpsertRepo(t.Context(), identity)
+	identity.Key = platform.RepositoryIDKey(1001)
+	repoID, err := reposeed.Seed(t.Context(), database, identity)
 	require.NoError(err)
 	_, err = database.UpsertIssue(t.Context(), &db.Issue{
 		RepoID: repoID, PlatformID: 43, Number: 43, Title: "Available issue",
@@ -158,10 +162,10 @@ func TestProviderFetchOverlaysLocalIssueWorkspaceWithoutReordering(t *testing.T)
 	handler := New(Deps{
 		ProviderSource: stubIssueProviderSource{rows: []IssueResponse{
 			{RepoID: 91, Number: 2, Repo: httpapi.RepoRefResponse{
-				Provider: "github", PlatformHost: "github.com", PlatformRepoID: "repo-widget",
+				Provider: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(1001),
 			}},
 			{RepoID: 91, Number: 1, Repo: httpapi.RepoRefResponse{
-				Provider: "github", PlatformHost: "github.com", PlatformRepoID: "repo-widget",
+				Provider: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(1001),
 			}},
 		}},
 		WorkspaceSubjects: func(context.Context) (workspaceapi.WorkspaceSubjectSnapshot, error) {
@@ -171,7 +175,7 @@ func TestProviderFetchOverlaysLocalIssueWorkspaceWithoutReordering(t *testing.T)
 					key: {
 						Subject: db.WorkspaceSubjectMetadata{
 							Key: key, Platform: "github", PlatformHost: "github.com",
-							PlatformRepoID: "repo-widget",
+							RepoKey: platform.RepositoryIDKey(1001),
 						},
 						Workspace: ref,
 					},
@@ -200,7 +204,7 @@ func TestProviderFetchReplacesHubIssueDetailWorkspaceWithLocalWorkspace(t *testi
 		ProviderSource: stubIssueProviderSource{detail: IssueDetailResponse{
 			Issue: &db.Issue{RepoID: 91, Number: 42},
 			Repo: httpapi.RepoRefResponse{
-				Provider: "github", PlatformHost: "github.com", PlatformRepoID: "repo-widget",
+				Provider: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(1001),
 			},
 			Workspace: &workspaceapi.WorkspaceRef{ID: "ws-hub", Status: "ready"},
 		}},
@@ -211,7 +215,7 @@ func TestProviderFetchReplacesHubIssueDetailWorkspaceWithLocalWorkspace(t *testi
 					key: {
 						Subject: db.WorkspaceSubjectMetadata{
 							Key: key, Platform: "github", PlatformHost: "github.com",
-							PlatformRepoID: "repo-widget",
+							RepoKey: platform.RepositoryIDKey(1001),
 						},
 						Workspace: local,
 					},
@@ -235,8 +239,8 @@ func TestListIssuesWorkspaceActivityRecencyIsOptIn(t *testing.T) {
 	database := dbtest.Open(t)
 	base := time.Date(2026, 8, 15, 10, 0, 0, 0, time.UTC)
 	identity := db.GitHubRepoIdentity("github.com", "acme", "widget")
-	identity.PlatformRepoID = "repo-acme-widget"
-	repoID, err := database.UpsertRepo(t.Context(), identity)
+	identity.Key = platform.RepositoryIDKey(1001)
+	repoID, err := reposeed.Seed(t.Context(), database, identity)
 	require.NoError(err)
 	for number, activityAt := range map[int]time.Time{1: base, 2: base.Add(time.Hour)} {
 		_, err = database.UpsertIssue(t.Context(), &db.Issue{
@@ -258,7 +262,7 @@ func TestListIssuesWorkspaceActivityRecencyIsOptIn(t *testing.T) {
 					key: {
 						Subject: db.WorkspaceSubjectMetadata{
 							Key: key, Platform: "github", PlatformHost: "github.com",
-							PlatformRepoID: identity.PlatformRepoID,
+							RepoKey: identity.Key,
 						},
 						Workspace: ref, ActivityAt: &workspaceAt,
 					},

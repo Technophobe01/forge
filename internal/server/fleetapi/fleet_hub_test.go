@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,7 +42,7 @@ func TestBuildFleetSnapshotMergesMemberAndDegrades(t *testing.T) {
 		config.FleetMember{NodeID: "cccccccccccccccccccccccccccccccc", Name: "epyc", BaseURL: "https://127.0.0.1:1"},
 	)
 
-	snap, err := srv.buildFleetSnapshot(context.Background(), true)
+	snap, err := srv.buildFleetSnapshot(t.Context(), true)
 	require.NoError(err)
 	var reachable, down int
 	for _, h := range snap.Hosts {
@@ -62,6 +63,43 @@ func TestBuildFleetSnapshotMergesMemberAndDegrades(t *testing.T) {
 	}
 	assert.GreaterOrEqual(reachable, 2, "want self+mbp reachable, hosts=%+v", snap.Hosts)
 	assert.Equal(1, down, "want 1 unreachable (epyc)")
+}
+
+func TestBuildFleetSnapshotFetchesMembersAndExecutionTargetsTogether(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	targetStarted := make(chan struct{})
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-targetStarted:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"protocolVersion":` + strconv.Itoa(federation.ProtocolVersion) + `,"nodeID":"` + testMemberNodeID + `","host":{"hostname":"member","platform":"linux"}}`))
+	}))
+	t.Cleanup(peer.Close)
+	server := New(Deps{
+		DB: dbtest.Open(t),
+		ExecutionTargets: func(context.Context, time.Duration) []fleet.PeerResult {
+			close(targetStarted)
+			return []fleet.PeerResult{{
+				NodeID: "devbox:compute-a", Name: "Compute A", Role: fleet.RoleDevbox, Reachable: true,
+				Raw: &fleet.RawSnapshot{NodeID: "devbox:compute-a", Host: fleet.RawHost{Hostname: "worker", Platform: "linux"}},
+			}}
+		},
+	})
+	configureTestMembers(t, server, testTLSClient(t, peer), config.FleetMember{
+		NodeID: testMemberNodeID, Name: "member", BaseURL: peer.URL,
+	})
+
+	snapshot, err := server.buildFleetSnapshot(t.Context(), true)
+	require.NoError(err)
+	require.Len(snapshot.Hosts, 3)
+	for _, host := range snapshot.Hosts {
+		assert.True(host.Reachable, "host %s must not time out waiting for the other batch to start", host.ConfigKey)
+	}
 }
 
 func TestBuildFleetSnapshotExplainsInactivePeerFederation(t *testing.T) {
@@ -118,7 +156,7 @@ func TestBuildFleetSnapshotSkipsMembersWhenFederationDisabled(t *testing.T) {
 		Members: []config.FleetMember{{NodeID: testMemberNodeID, Name: "mbp", BaseURL: peer.URL}},
 	}})
 
-	snap, err := srv.buildFleetSnapshot(context.Background(), true)
+	snap, err := srv.buildFleetSnapshot(t.Context(), true)
 	require.NoError(t, err)
 	require.Len(t, snap.Hosts, 1, "disabled federation must return local host only")
 	assert.Equal(t, 0, peerRequests, "disabled federation must not fetch members")
@@ -126,7 +164,7 @@ func TestBuildFleetSnapshotSkipsMembersWhenFederationDisabled(t *testing.T) {
 
 func TestBuildFleetSnapshotLocalOnly(t *testing.T) {
 	srv := &Handler{db: dbtest.Open(t), config: ConfigSnapshot{}}
-	snap, err := srv.buildFleetSnapshot(context.Background(), false)
+	snap, err := srv.buildFleetSnapshot(t.Context(), false)
 	require.NoError(t, err)
 	require.Len(t, snap.Hosts, 1, "local-only build must yield exactly one self host")
 	assert.True(t, snap.Hosts[0].Reachable, "self host must be reachable")
@@ -139,7 +177,7 @@ func TestBuildFleetSnapshotDefaultsToFleetNamespace(t *testing.T) {
 	assert := assert.New(t)
 	srv := New(Deps{DB: dbtest.Open(t), NodeID: testHubNodeID})
 
-	snap, err := srv.buildFleetSnapshot(context.Background(), false)
+	snap, err := srv.buildFleetSnapshot(t.Context(), false)
 	require.NoError(err)
 	require.Len(snap.Hosts, 1)
 	assert.Equal(testHubNodeID, snap.Hosts[0].ConfigKey)
@@ -265,6 +303,133 @@ func TestSpokeProjectionConsumesHubAggregateAndRefreshesSelf(t *testing.T) {
 	require.FailNow("hub host missing from spoke projection")
 }
 
+// newProviderStateSpoke builds an active spoke whose hub serves hubHandler and
+// whose provider-state lookup is pull. The spoke owns one workspace, ws-merged.
+func newProviderStateSpoke(
+	t *testing.T,
+	hubHandler http.HandlerFunc,
+	peerTimeout string,
+	pull func(context.Context, []fleet.RawWorkspace) ([]fleet.RawWorkspace, error),
+) *Handler {
+	t.Helper()
+	hub := httptest.NewTLSServer(hubHandler)
+	t.Cleanup(hub.Close)
+	credentials, err := federationauth.Open(filepath.Join(
+		t.TempDir(), "federation-credentials.json",
+	))
+	require.NoError(t, err)
+	require.NoError(t, credentials.StoreOutbound(
+		testHubNodeID, "spoke-calls-hub-token-000000000000000", federationauth.SpokeToHubScopes(),
+	))
+	return New(Deps{
+		DB: dbtest.Open(t), NodeID: testMemberNodeID,
+		FederationActive: true,
+		Credentials:      credentials, FederationHTTPClient: testTLSClient(t, hub),
+		Config: ConfigSnapshot{Fleet: config.Fleet{
+			Enabled: true, Role: config.FleetRoleSpoke, PeerTimeout: peerTimeout,
+			BaseURL: "https://spoke.example",
+			Hub: &config.FleetHub{
+				NodeID: testHubNodeID, Name: "hub", BaseURL: hub.URL,
+			},
+		}},
+		WorkspaceSnapshot: func(context.Context) (workspaceapi.FleetSnapshot, error) {
+			return workspaceapi.FleetSnapshot{Workspaces: []fleet.RawWorkspace{{
+				ID: "ws-merged", Status: "ready", ItemType: "pull_request", ItemNumber: 7,
+			}}}, nil
+		},
+		WorkspaceProviderState: pull,
+	})
+}
+
+func serveHubAggregate(t *testing.T, aggregate fleet.NeutralSnapshot) http.HandlerFunc {
+	return func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		assert.NoError(t, json.NewEncoder(writer).Encode(aggregate))
+	}
+}
+
+func hubOnlyAggregate(workspaces ...fleet.RawWorkspace) fleet.NeutralSnapshot {
+	return fleet.NeutralSnapshot{
+		ProtocolVersion: federation.ProtocolVersion,
+		Hosts: []fleet.NeutralHost{{
+			NodeID: fleet.NodeID(testHubNodeID), FederationRole: fleet.RoleHub,
+			Name: "hub", BaseURL: "https://hub.example", Reachable: true,
+		}},
+		Workspaces: workspaces,
+	}
+}
+
+func pullMerged(_ context.Context, workspaces []fleet.RawWorkspace) ([]fleet.RawWorkspace, error) {
+	out := append([]fleet.RawWorkspace(nil), workspaces...)
+	for index := range out {
+		out[index].MRState = new("merged")
+		out[index].MRTitle = new("Merged change")
+	}
+	return out, nil
+}
+
+func snapshotWorkspaceState(t *testing.T, snapshot fleet.Snapshot) string {
+	t.Helper()
+	require.Len(t, snapshot.Workspaces, 1)
+	require.Equal(t, "ws-merged", snapshot.Workspaces[0].ID)
+	require.NotNil(t, snapshot.Workspaces[0].MRState)
+	return *snapshot.Workspaces[0].MRState
+}
+
+func TestSpokeShowsPulledProviderStateWhenHubCannotReachIt(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	// An outbound-disabled spoke is absent from the hub aggregate, so the
+	// aggregate carries no provider state for the spoke's workspaces.
+	server := newProviderStateSpoke(t, serveHubAggregate(t, hubOnlyAggregate()), "", pullMerged)
+
+	snapshot, err := server.buildFleetSnapshot(t.Context(), true)
+	require.NoError(err)
+	assert.Equal("merged", snapshotWorkspaceState(t, snapshot))
+	require.NotNil(snapshot.Workspaces[0].MRTitle)
+	assert.Equal("Merged change", *snapshot.Workspaces[0].MRTitle)
+
+	raw, err := server.buildLocalRaw(t.Context())
+	require.NoError(err)
+	require.Len(raw.Workspaces, 1)
+	assert.Nil(raw.Workspaces[0].MRState, "raw snapshots carry only producer-local facts")
+}
+
+func TestSpokeFallsBackToAggregateProviderStateWhenPullFails(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	aggregate := hubOnlyAggregate(fleet.RawWorkspace{
+		HostKey: testMemberNodeID, ID: "ws-merged", Status: "ready",
+		MRState: new("merged"),
+	})
+	stalledPull := func(ctx context.Context, _ []fleet.RawWorkspace) ([]fleet.RawWorkspace, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	server := newProviderStateSpoke(t, serveHubAggregate(t, aggregate), "50ms", stalledPull)
+
+	started := time.Now()
+	snapshot, err := server.buildFleetSnapshot(t.Context(), true)
+	require.NoError(err)
+	assert.Less(time.Since(started), 2*time.Second, "a stalled pull must stay within the snapshot budget")
+	assert.False(snapshot.AggregateIncomplete)
+	assert.Equal("merged", snapshotWorkspaceState(t, snapshot))
+}
+
+func TestSpokePullsProviderStateWhenAggregateFails(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	failingHub := func(writer http.ResponseWriter, _ *http.Request) {
+		http.Error(writer, "aggregate unavailable", http.StatusBadGateway)
+	}
+	server := newProviderStateSpoke(t, failingHub, "", pullMerged)
+
+	snapshot, err := server.buildFleetSnapshot(t.Context(), true)
+	require.NoError(err)
+	assert.True(snapshot.AggregateIncomplete)
+	assert.Equal("merged", snapshotWorkspaceState(t, snapshot))
+}
+
 func TestSpokeAggregateAllowsHubMemberFanoutToReachItsOwnDeadline(t *testing.T) {
 	require := require.New(t)
 	aggregate := fleet.NeutralSnapshot{
@@ -276,7 +441,7 @@ func TestSpokeAggregateAllowsHubMemberFanoutToReachItsOwnDeadline(t *testing.T) 
 	hub := httptest.NewTLSServer(http.HandlerFunc(func(
 		writer http.ResponseWriter, _ *http.Request,
 	) {
-		time.Sleep(40 * time.Millisecond)
+		time.Sleep(40 * time.Millisecond) //nolint:kennlint // delays the HTTP aggregate beyond the 30ms peer budget to exercise the longer fanout deadline
 		assert.NoError(t, json.NewEncoder(writer).Encode(aggregate))
 	}))
 	defer hub.Close()
@@ -401,4 +566,55 @@ func TestInactiveSpokeSnapshotMarksAggregateIncomplete(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.True(t, snapshot.AggregateIncomplete)
+}
+
+func TestOutboundDisabledSpokeIsNotContactedOrReportedOffline(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	var calls atomic.Int32
+	peer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"protocolVersion":` + strconv.Itoa(federation.ProtocolVersion) + `,"nodeID":"` + testMemberNodeID + `","host":{"hostname":"spoke"}}`))
+	}))
+	t.Cleanup(peer.Close)
+	srv := New(Deps{DB: dbtest.Open(t)})
+	configureTestMembers(t, srv, testTLSClient(t, peer), config.FleetMember{
+		NodeID: testMemberNodeID, BaseURL: peer.URL, OutboundDisabled: true,
+	})
+
+	snapshot, err := srv.buildFleetSnapshot(t.Context(), true)
+	require.NoError(err)
+	require.Len(snapshot.Hosts, 1)
+	assert.Equal(testHubNodeID, snapshot.Hosts[0].NodeID)
+	_, reachable := srv.resolveFleetHostTarget(testMemberNodeID)
+	assert.False(reachable)
+
+	// The spoke's own view still adds its local authority to the hub directory.
+	local := fleet.RawSnapshot{NodeID: fleet.NodeID(testMemberNodeID)}
+	hub, err := srv.buildLocalRaw(t.Context())
+	require.NoError(err)
+	aggregate, err := srv.buildHubAggregate(t.Context(), hub, true, time.Second)
+	require.NoError(err)
+	view := fleet.ProjectForObserver(aggregate, local, fleet.Observer{NodeID: local.NodeID, Role: fleet.RoleSpoke})
+	require.Len(view.Hosts, 2)
+	assert.True(view.Hosts[1].Reachable)
+	assert.Equal(testMemberNodeID, view.Hosts[1].NodeID)
+
+	// Re-enabling access takes effect without enrollment or a restart.
+	cfg := srv.configSnapshot()
+	cfg.Fleet.Members[0].OutboundDisabled = false
+	srv.ApplyConfig(cfg)
+	snapshot, err = srv.buildFleetSnapshot(t.Context(), true)
+	require.NoError(err)
+	assert.Len(snapshot.Hosts, 2)
+	assert.Equal(int32(1), calls.Load())
+
+	cfg.Fleet.Members[0].OutboundDisabled = true
+	srv.ApplyConfig(cfg)
+	enrollment, ok := srv.enrollments.EnrollmentForSpoke(testMemberNodeID)
+	require.True(ok)
+	_, err = srv.revokeEnrollment(t.Context(), &revokeEnrollmentInput{EnrollmentID: enrollment.ID})
+	require.NoError(err)
+	assert.Equal(int32(1), calls.Load(), "revocation must not contact an outbound-disabled spoke")
 }

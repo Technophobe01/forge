@@ -9,7 +9,10 @@
   import PencilIcon from "@lucide/svelte/icons/pencil";
   import Trash2Icon from "@lucide/svelte/icons/trash-2";
   import XIcon from "@lucide/svelte/icons/x";
-  import { onDestroy, untrack } from "svelte";
+  import { onDestroy, tick, untrack } from "svelte";
+  import { Effect } from "effect";
+  import { nextAnimationFrame } from "../../browser/animation-frame.js";
+  import { getCommentNavigation } from "../../stores/router.svelte.js";
   import { slide } from "svelte/transition";
   import type { IssueEvent, PREvent } from "../../api/types.js";
   import type {
@@ -27,6 +30,7 @@
     Button,
     Card,
     CommentCard,
+    HarnessIcon,
     IconButton,
     Modal,
     Timeline,
@@ -46,6 +50,7 @@
     buildItemReferenceLink,
     type ItemReferenceDataAttributes,
   } from "../../utils/item-reference.js";
+  import { commitAttribution } from "./commit-attribution.js";
   import CommentEditor from "./CommentEditor.svelte";
   import DiffReviewThreadSnippet from "../diff/DiffReviewThreadSnippet.svelte";
   import ReviewSuggestionBlock from "./ReviewSuggestionBlock.svelte";
@@ -54,12 +59,15 @@
     reviewThreadLineLabel,
     type ReviewThread,
   } from "../diff/review-thread-context.js";
+  import type { RepositoryKey } from "../../api/repository-key.js";
 
   interface Props {
+    visible?: boolean;
     events: Array<PREvent | IssueEvent>;
     orderingEvents?: Array<PREvent | IssueEvent> | undefined;
     provider?: string | undefined;
     platformHost?: string | undefined;
+    repositoryKey?: RepositoryKey | undefined;
     repoOwner?: string;
     repoName?: string;
     repoPath?: string | undefined;
@@ -105,10 +113,12 @@
   }
 
   const {
+    visible = true,
     events,
     orderingEvents = events,
     provider,
     platformHost,
+    repositoryKey,
     repoOwner,
     repoName,
     repoPath,
@@ -738,12 +748,25 @@
       });
     }
 
-    return timelineOrder === "chronological"
-      ? collapseObsoleteCommitEntries(entries, "")
-      : entries;
+    return collapseObsoleteCommitEntries(entries, "");
   }
 
-  const displayEvents = $derived(collapseLifecycleTransitions(events));
+  const commentNavigation = $derived(getCommentNavigation({ provider, platformHost, repoPath, number, itemType }));
+  const targetComment = $derived(orderingEvents.find((event) => {
+    const prefix = event.EventType === "issue_comment" ? "issuecomment-"
+      : event.EventType === "review_comment" ? "discussion_r"
+      : event.EventType === "review" ? "pullrequestreview-" : null;
+    return prefix !== null && event.PlatformID != null &&
+      `${prefix}${event.PlatformID}` === commentNavigation?.commentAnchor;
+  }));
+  // Reveal filtered targets in their original position in the discussion.
+  const displayEvents = $derived.by(() => {
+    if (!targetComment || events.some((event) => event.ID === targetComment.ID)) {
+      return collapseLifecycleTransitions(events);
+    }
+    const visibleIDs = new Set([targetComment.ID, ...events.map((event) => event.ID)]);
+    return collapseLifecycleTransitions(orderingEvents.filter((event) => visibleIDs.has(event.ID)));
+  });
   const displayOrderingEvents = $derived(collapseLifecycleTransitions(orderingEvents));
   const timelineEntries = $derived(buildTimelineEntries(displayEvents, displayOrderingEvents));
   const compactTimelineEntries = $derived(buildCompactTimelineEntries(displayEvents, displayOrderingEvents));
@@ -753,8 +776,12 @@
   const progressiveMount = createProgressiveMountController({ batchSize: 25 });
   let mountedEntryCount = $state(0);
   let fullTimelineRequested = $state(false);
-  const mountedTimelineEntries = $derived(renderedTimelineEntries.slice(0, mountedEntryCount));
-  const unmountedEntryCount = $derived(renderedTimelineEntries.length - mountedEntryCount);
+  const targetEntryIndex = $derived(renderedTimelineEntries.findIndex((entry) =>
+    entry.event.ID === targetComment?.ID || entry.replies.some((reply) => reply.ID === targetComment?.ID),
+  ));
+  const visibleEntryCount = $derived(Math.max(mountedEntryCount, targetEntryIndex + 1));
+  const mountedTimelineEntries = $derived(renderedTimelineEntries.slice(0, visibleEntryCount));
+  const unmountedEntryCount = $derived(renderedTimelineEntries.length - visibleEntryCount);
   const timelineMountKey = $derived(
     `${itemIdentity}\u0000${activityViewMode}\u0000${timelineOrder}\u0000${filtered}\u0000${filterScope}\u0000${initialEntryLimit}`,
   );
@@ -776,6 +803,49 @@
     });
   });
 
+  let timelineElement: HTMLDivElement | undefined = $state();
+  let missingCommentElement: HTMLParagraphElement | undefined = $state();
+  let completedCommentID: number | undefined;
+  let completedCommentNavigation: ReturnType<typeof getCommentNavigation> = null;
+  $effect(() => {
+    const navigation = commentNavigation;
+    const target = targetComment;
+    const entry = renderedTimelineEntries[targetEntryIndex];
+    const element = timelineElement;
+    const missing = missingCommentElement;
+    if (!visible || !navigation || (!element && !missing) ||
+        (navigation === completedCommentNavigation && target?.ID === completedCommentID)) return;
+    const execution = untrack(() => runtime.runCommand(
+      Effect.sync(() => {
+        if (!target || !entry) return;
+        // Reveal once for this navigation; subsequent toggles and refreshes
+        // keep the user's normal expansion state.
+        expandedCompactRows = [...new Set([...expandedCompactRows, entry.key])];
+        expandedProviderHiddenComments = [...new Set([
+          ...expandedProviderHiddenComments, target.ID, entry.event.ID,
+        ])];
+        if (entry.replies.some((reply) => reply.ID === target.ID)) {
+          collapsedThreads = collapsedThreads.filter((id) => id !== entryThreadID(entry));
+        }
+      }).pipe(
+        Effect.andThen(Effect.promise(() => tick())),
+        Effect.andThen(nextAnimationFrame),
+        Effect.andThen(Effect.sync(() => {
+          const comment = target
+            ? element?.querySelector<HTMLElement>(`[data-comment-id="${target.ID}"]`)
+            : missing;
+          if (!comment) return;
+          comment.focus({ preventScroll: true });
+          comment.scrollIntoView({ block: "start" });
+          completedCommentNavigation = navigation;
+          completedCommentID = target?.ID;
+        })),
+      ),
+      { operation: "navigate to comment", safeContext: {}, onFailure: () => {} },
+    ));
+    return () => execution.interrupt();
+  });
+
   function loadFullTimeline(): void {
     fullTimelineRequested = true;
     progressiveMount.start(mountedEntryCount, renderedTimelineEntries.length, (count) => {
@@ -793,9 +863,7 @@
       reviewThread: reviewThreadFor(event) ?? undefined,
       replies: [],
     }));
-    return timelineOrder === "chronological"
-      ? collapseObsoleteCommitEntries(entries, "compact-")
-      : entries;
+    return collapseObsoleteCommitEntries(entries, "compact-");
   }
 
   function isCompactEvent(eventType: string): boolean {
@@ -827,7 +895,7 @@
   }
 
   function commitDetailsBody(body: string): string {
-    return body.trim();
+    return commitAttribution(body).message;
   }
 
   function systemEventLabel(eventType: string): string {
@@ -1077,6 +1145,7 @@
     detailStore?.loadDetail(repoOwner, repoName, number, {
       provider,
       platformHost,
+      repositoryKey,
       repoPath,
       sync: false,
     });
@@ -1821,8 +1890,17 @@
 	{/if}
 {/snippet}
 
+{#snippet commitAgentIcons(body: string)}
+  {#each commitAttribution(body).agents as agent (agent.harness)}
+    <span class="commit-agent" title={agent.name}>
+      <HarnessIcon harness={agent.harness} label={agent.name} size={12} />
+    </span>
+  {/each}
+{/snippet}
+
 {#snippet eventAuthorByline(event: PREvent | IssueEvent, compact = false)}
   <span class={["event-author", compact && "compact-event-author", isLifecycleTransitionEvent(event.EventType) && event.Author && "event-author--lifecycle"]}>
+    {#if event.EventType === "commit"}{@render commitAgentIcons(event.Body)}{/if}
     {#if isLifecycleTransitionEvent(event.EventType) && event.Author}
       <span class="event-author-prefix">by</span> {event.Author}
     {:else}
@@ -1877,7 +1955,11 @@
 	{/if}
 {/snippet}
 
-{#if events.length === 0}
+{#if commentNavigation && !targetComment}
+  <p role="status" tabindex="-1" bind:this={missingCommentElement}>Comment not found in this discussion.</p>
+{/if}
+
+{#if displayEvents.length === 0}
   <p class="empty">{filtered ? "No activity matches the current filters" : "No activity yet"}</p>
 {:else}
   {#if onApplySuggestion !== undefined && eligibleBatchedSuggestions.length > 0}
@@ -1896,7 +1978,7 @@
       </div>
     </Card>
   {/if}
-  <div class="event-timeline">
+  <div class="event-timeline" bind:this={timelineElement}>
     <Timeline ariaLabel="Item activity">
       {#each mountedTimelineEntries as entry (entry.key)}
       {@const event = entry.event}
@@ -1930,7 +2012,7 @@
                 {#each entry.obsoleteCommits as commit (commit.ID)}
                   <div class="obsolete-commit-row">
                     {#if eventAttribution(commit)}
-                      <span class="event-author">{eventAttribution(commit)}</span>
+                      <span class="event-author">{@render commitAgentIcons(commit.Body)} {eventAttribution(commit)}</span>
                     {/if}
                     <span class="commit-sha">{shortCommit(commit.Summary)}</span>
                     <span class="commit-title">{commitTitle(commit.Body)}</span>
@@ -1946,6 +2028,7 @@
         tone={eventTimelineTone(event.EventType)}
         class={activityViewMode === "compact" || isCompactEvent(event.EventType) ? "event--compact" : ""}
       >
+        <div data-comment-id={event.ID} tabindex="-1" class:comment-target={event.ID === targetComment?.ID}>
         {#if activityViewMode === "compact"}
           {@const compactContext = compactEventContext(event, entry.reviewThread)}
           {@const compactSummary = compactEventSummary(event, entry.reviewThread)}
@@ -2045,6 +2128,7 @@
           {#if isLifecycleTransitionEvent(event.EventType)}
             <CommentCard
               class="event-card--compact event--lifecycle"
+              layout="inline"
               typeLabel={systemEventLabel(event.EventType)}
               tone={eventTimelineTone(event.EventType)}
               author={event.Author ? `by ${event.Author}` : undefined}
@@ -2064,7 +2148,7 @@
                   {systemEventLabel(event.EventType)}
                 </span>
                 {#if eventAttribution(event)}
-                  <span class="event-author">{eventAttribution(event)}</span>
+                  <span class="event-author">{@render commitAgentIcons(event.Body)} {eventAttribution(event)}</span>
                 {/if}
                 <span class="commit-sha">{shortCommit(event.Summary)}</span>
                 {#if !showCommitDetails}
@@ -2082,6 +2166,7 @@
             {@const sourceLink = crossReferenceLink(metadata, sourceUrl)}
             <CommentCard
               class="event-card--compact"
+              layout="inline"
               typeLabel="Referenced"
               tone={eventTimelineTone(event.EventType)}
               author={event.Author || undefined}
@@ -2104,6 +2189,7 @@
           {:else}
             <CommentCard
               class="event-card--compact"
+              layout="inline"
               typeLabel={event.EventType === "comment_deleted" || event.EventType === "assigned" || event.EventType === "unassigned"
                 ? undefined
                 : systemEventLabel(event.EventType)}
@@ -2175,6 +2261,9 @@
                     {@const replyHiddenState = providerHiddenState(reply)}
                     <li
                       class="thread-reply"
+                      data-comment-id={reply.ID}
+                      tabindex="-1"
+                      class:comment-target={reply.ID === targetComment?.ID}
                       class:thread-reply--first={index === 0}
                       class:thread-reply--last={index === entry.replies.length - 1}
                     >
@@ -2209,6 +2298,7 @@
             {/if}
           </CommentCard>
         {/if}
+        </div>
       </TimelineItem>
       {/if}
       {/each}
@@ -2253,6 +2343,12 @@
 {/if}
 
 <style>
+  .comment-target {
+    scroll-margin-block-start: 1rem;
+    outline: 2px solid var(--focus-ring, var(--accent-blue));
+    outline-offset: 2px;
+  }
+
   .empty {
     font-size: var(--font-size-root);
     color: var(--text-muted);
@@ -2280,8 +2376,18 @@
     gap: var(--focus-detail-space-sm, 0.62rem);
   }
 
-  :global(.event-card--compact) {
-    --kit-card-padding-block: var(--focus-detail-space-xs, 7px);
+
+  /* System events (commits, base changes, lifecycle, references) are one
+     quiet line beside their rail dot; only conversation gets a card. */
+  .event-timeline :global(.kit-card.event-card--compact) {
+    --kit-card-bg: transparent;
+    --kit-card-border: transparent;
+    padding-block: var(--space-3);
+  }
+
+  /* Consecutive one-line events pack tighter than conversation cards. */
+  .event-timeline :global(.kit-timeline-item.event--compact) {
+    --kit-timeline-gap: var(--space-2);
   }
 
   .event-header {
@@ -2431,9 +2537,9 @@
 
   .event-type {
     font-size: var(--font-size-xs);
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    font-weight: var(--font-weight-semibold);
+    text-transform: var(--label-transform, uppercase);
+    letter-spacing: var(--letter-spacing-label, 0.04em);
   }
 
   .event-author {
@@ -2511,9 +2617,24 @@
     color: var(--text-primary);
   }
 
-  .commit-body-details {
-    margin-top: var(--focus-detail-space-xs, 7px);
+  .commit-agent {
+    display: inline-flex;
+    vertical-align: middle;
+    margin-right: var(--space-1);
+  }
+
+  .event-body.commit-body-details {
+    margin-top: var(--space-2);
     padding-right: var(--focus-detail-space-sm, 10px);
+    padding-bottom: 0;
+  }
+
+  .commit-body-details > :global(:first-child) {
+    margin-top: 0;
+  }
+
+  .commit-body-details > :global(:last-child) {
+    margin-bottom: 0;
   }
 
   .obsolete-group-row {
@@ -2751,7 +2872,7 @@
   .event-body {
     font-size: var(--font-size-sm);
     color: var(--text-primary);
-    padding: 0 calc(var(--focus-detail-hit-target, 26px) + var(--focus-detail-space-sm, 8px)) var(--focus-detail-space-sm, 8px) var(--focus-detail-space-sm, 10px);
+    padding: 0 calc(var(--focus-detail-hit-target, 26px) + var(--focus-detail-space-sm, 8px)) var(--focus-detail-space-sm, 8px) 0;
     white-space: pre-wrap;
     word-break: break-word;
     line-height: 1.6;

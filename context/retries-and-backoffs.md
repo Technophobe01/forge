@@ -22,6 +22,10 @@ attempt at `DEBUG`.
 
 Production schedule: 500ms → ~4s, jitter ±30%, 3 attempts.
 
+Frontend idempotent reads use `retryIdempotentRead`
+(`frontend/src/lib/api/retry-policy.ts`). Never add custom retry loops or Retry
+buttons; a read that still fails shows its error.
+
 **Transient retry sites:**
 
 - [`internal/retry/retry.go`](../internal/retry/retry.go) — shared helper and
@@ -52,8 +56,12 @@ active clones and retry only existing idempotent operations
 
 ## Rate-limit gates
 
-These paths are **not** transient retry. They represent provider quota state and
-wait until the reset window.
+These gates wait for provider quota resets or an observed-throttling cooldown.
+They do not retry mutations automatically.
+
+- Unknown-quota exhaustion shares a 1/2/4/5-minute capped cooldown across sync and
+  action availability; successful observations reset it. Keep this local policy
+  separate from provider reset data (`internal/ratelimit/rate.go::RetryAt`).
 
 - [`internal/ratelimit/rate.go`](../internal/ratelimit/rate.go) —
   `RateTracker.ShouldBackoff()` returns `(bool, time.Duration)` for exhausted
@@ -62,6 +70,14 @@ wait until the reset window.
   `GraphQLFetcher.ShouldBackoff()` passthrough for GraphQL quota gating.
 - [`internal/github/sync.go`](../internal/github/sync.go) — worker and GraphQL
   call sites that gate work on `ShouldBackoff()` before proceeding.
+
+Archive budget refusals are scheduling waits: retain pending work without new
+failure attempts, and preserve prior failures until successful collection
+(`internal/db/queries_dataset_progress.go::DB.FailArchiveItemSync`).
+
+Budget-wait status includes pending items with future retry times; failed
+items waiting for their own retry do not establish a budget wait
+(`internal/db/queries_archive.go::deriveArchiveProgress`).
 
 Do not wrap these paths in `backoff.Retry`, `RetryAfterError`, or any new retry
 abstraction unless a separate design explicitly changes rate-limit policy.
@@ -75,6 +91,8 @@ migrate ticker-driven sync or refresh loops into `backoff/v5`
 The archive worker uses the backoff schedule type only as an idle delay calculator,
 not as a retry wrapper: idle passes double up to a five-minute cap and any wake or
 worked pass resets it (`internal/github/sync.go::runArchiveLoop`).
+Count provider work even if a later quota refusal stops the pass
+(`internal/archive/scheduler.go::Service.finishWork`).
 
 - Manual workflow dispatch is never retried. Track only the run ID returned by
   dispatch, using direct reads until completion or thirty minutes; never infer
@@ -193,7 +211,7 @@ and newer completed tokens survive stale responses.
 Roborev discovery retains definitive results until managed-clone initialization
 confirms a registration. Invalidation clears all inventory state and fences out
 older refreshes by generation; transient failures still retry after cooldown and
-each waiter can cancel independently (`internal/server/roborev_repositories.go::roborevRepositoryProbe`).
+each waiter can cancel independently (`internal/server/roborevapi/roborev_repositories.go::RoborevRepositoryProbe`).
 
 ## Tests
 

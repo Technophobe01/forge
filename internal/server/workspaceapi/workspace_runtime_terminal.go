@@ -65,6 +65,25 @@ func (s *Handler) handleWorkspaceRuntimeSessionTerminal(
 		return
 	}
 
+	// Sockets only attach; stopped runtimes resume from a page view.
+	restoreErr := s.restoreWorkspaceACP(ctx, summary.ID, summary.WorktreePath)
+	if agent, err := s.runtime.ACP(summary.ID, r.PathValue("session_key")); err == nil {
+		endAttachSpan()
+		serveACP(w, r, agent)
+		return
+	}
+	if restoreErr != nil && r.URL.Query().Get("protocol") == "acp" {
+		conn, err := terminalwebsocket.Accept(w, r)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "chat recovery failed")
+		data, err := json.Marshal(acpCommandError{Message: restoreErr.Error(), Command: "connect"})
+		if err == nil {
+			_ = conn.Write(ctx, websocket.MessageText, data)
+		}
+		return
+	}
 	attachment, err := s.runtime.AttachSessionWithOptions(
 		summary.ID, r.PathValue("session_key"),
 		localruntime.AttachSessionOptions{

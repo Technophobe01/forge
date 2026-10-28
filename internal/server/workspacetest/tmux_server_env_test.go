@@ -26,7 +26,7 @@ import (
 // processes. The test uses a test-scoped socket rather than the shared
 // package server so the spawn happens inside this test with the token
 // variables present in the daemon (test process) environment.
-func TestWorkspaceTmuxServerEnvironmentExcludesTokensE2E(t *testing.T) {
+func TestWorkspaceTmuxServerEnvironmentExcludesTokensE2E(t *testing.T) { //nolint:paralleltest // t.Setenv writes GITHUB_TOKEN, WORKSPACETEST_CUSTOM_TOKEN, KATA_AUTH_TOKEN, KENN_FORGE_FORGEJO_TOKEN, WORKSPACETEST_UNDECLARED_SECRET, XDG_WORKSPACETEST_TOKEN, WKSP_BENIGN_PROXY
 	if len(workspaceTestTmuxCommand) == 0 {
 		t.Skip("tmux is required")
 	}
@@ -52,7 +52,7 @@ func TestWorkspaceTmuxServerEnvironmentExcludesTokensE2E(t *testing.T) {
 	socket := filepath.Join(sockDir, "tmux.sock")
 	tmuxCommand := []string{tmuxPath, "-f", "/dev/null", "-S", socket}
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
 		defer cancel()
 		_ = procutil.Run(ctx, procutil.CommandContext(
 			ctx, tmuxPath, "-f", "/dev/null", "-S", socket, "kill-server",
@@ -131,12 +131,14 @@ func TestWorkspaceTmuxServerEnvironmentExcludesTokensE2E(t *testing.T) {
 	// The base terminal pane receives the credential-sanitized full
 	// daemon environment through the env-file handoff: benign daemon
 	// variables stay usable while tokens never appear.
-	probe := "printf 'PROBE:%s:%s:%s:%s:%s:%s:%s\\n' \"$WKSP_BENIGN_PROXY\" " +
-		"\"${GITHUB_TOKEN:-unset}\" \"${KATA_AUTH_TOKEN:-unset}\" " +
-		"\"${KENN_FORGE_FORGEJO_TOKEN:-unset}\" " +
-		"\"${WORKSPACETEST_CUSTOM_TOKEN:-unset}\" " +
-		"\"${XDG_WORKSPACETEST_TOKEN:-unset}\" " +
-		"\"${TMUX:+tmux-set}\"\r"
+	// The base terminal uses the user's login shell, which may be fish. Keep
+	// POSIX parameter expansion inside an explicit sh child of that pane.
+	probe := `/bin/sh -c 'printf "PROBE:%s:%s:%s:%s:%s:%s:%s\n" "$WKSP_BENIGN_PROXY" ` +
+		`"${GITHUB_TOKEN:-unset}" "${KATA_AUTH_TOKEN:-unset}" ` +
+		`"${KENN_FORGE_FORGEJO_TOKEN:-unset}" ` +
+		`"${WORKSPACETEST_CUSTOM_TOKEN:-unset}" ` +
+		`"${XDG_WORKSPACETEST_TOKEN:-unset}" ` +
+		`"${TMUX:+tmux-set}"'` + "\r"
 	require.NoError(conn.Write(ctx, websocket.MessageBinary, []byte(probe)))
 	readCtx, cancelRead := context.WithTimeout(ctx, 15*time.Second)
 	defer cancelRead()

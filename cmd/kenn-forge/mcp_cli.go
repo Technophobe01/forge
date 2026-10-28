@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"go.kenn.io/forge/internal/apiclient/generated"
+	"go.kenn.io/forge/internal/daemonclient"
 
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/spf13/cobra"
@@ -110,7 +111,7 @@ func loadMCPQuickstart(
 	}
 	if _, err := os.Stat(runtimelock.LockPath(cfg.DataDir)); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return stoppedMCPQuickstart(cfg.MCP.Enabled, configPath), nil
+			return stoppedMCPQuickstart(cfg.MCPEnabled(), configPath), nil
 		}
 		return mcpQuickstartInfo{}, fmt.Errorf("mcp quickstart: inspect daemon lock: %w", err)
 	}
@@ -119,7 +120,7 @@ func loadMCPQuickstart(
 		return mcpQuickstartInfo{}, fmt.Errorf("mcp quickstart: read daemon status: %w", err)
 	}
 	if !status.Running {
-		return stoppedMCPQuickstart(cfg.MCP.Enabled, configPath), nil
+		return stoppedMCPQuickstart(cfg.MCPEnabled(), configPath), nil
 	}
 	if status.Metadata == nil {
 		return mcpQuickstartInfo{}, fmt.Errorf(
@@ -128,7 +129,7 @@ func loadMCPQuickstart(
 		)
 	}
 
-	daemon, err := discoverDaemonHTTP(configPath, timeout)
+	daemon, err := daemonclient.Discover(configPath, timeout)
 	if err != nil {
 		return mcpQuickstartInfo{}, fmt.Errorf("mcp quickstart: discover daemon: %w", err)
 	}
@@ -154,10 +155,10 @@ func loadMCPQuickstart(
 		return mcpQuickstartInfo{}, fmt.Errorf("mcp quickstart: decode settings: %w", err)
 	}
 	if err := json.UnmarshalDecode(decoder, &struct{}{}); !errors.Is(err, io.EOF) {
-		return mcpQuickstartInfo{}, fmt.Errorf("mcp quickstart: decode settings: trailing JSON data")
+		return mcpQuickstartInfo{}, errors.New("mcp quickstart: decode settings: trailing JSON data")
 	}
 	if settings.MCP == nil {
-		return mcpQuickstartInfo{}, fmt.Errorf("mcp quickstart: daemon did not publish MCP settings")
+		return mcpQuickstartInfo{}, errors.New("mcp quickstart: daemon did not publish MCP settings")
 	}
 	info := daemonMCPQuickstart(*settings.MCP, daemon.TokenPath)
 	info.pid = status.Metadata.PID

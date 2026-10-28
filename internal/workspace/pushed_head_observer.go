@@ -90,12 +90,12 @@ type PushedHeadObserver struct {
 }
 
 func NewPushedHeadObserver(
-	database *db.DB, monitorOptions ...PRMonitorOptions,
+	database *db.DB, manager *Manager, monitorOptions ...PRMonitorOptions,
 ) *PushedHeadObserver {
 	return &PushedHeadObserver{
 		db:       database,
 		monitor:  NewPRMonitor(database, monitorOptions...),
-		git:      newGitdirRemoteHeadReader(),
+		git:      newGitdirRemoteHeadReader(manager.repositoryWorktrees),
 		now:      time.Now,
 		observed: make(map[remoteHeadKey]remoteHeadObservation),
 		failures: make(map[string]int),
@@ -231,7 +231,7 @@ func (o *PushedHeadObserver) resolveWorkspacePR(
 		return nil, nil, nil, false, nil
 	}
 
-	prNumber := 0
+	var prNumber int
 	var assoc *WorkspacePRAssociation
 	switch ws.ItemType {
 	case db.WorkspaceItemTypePullRequest:
@@ -295,10 +295,10 @@ func (o *PushedHeadObserver) workspaceRepository(
 	if ws.RepoID != 0 {
 		repo, err := o.db.GetActiveRepoByID(ctx, ws.RepoID)
 		if err != nil || repo == nil {
-			return repo, err
+			return nil, err
 		}
 		if launchSpec != nil {
-			if repo.PlatformRepoID != launchSpec.Repository.PlatformRepoID {
+			if repo.Key != launchSpec.Repository.Key {
 				return nil, errors.New("workspace launch repository identity changed")
 			}
 			repo.Platform = launchSpec.Repository.Provider
@@ -309,25 +309,19 @@ func (o *PushedHeadObserver) workspaceRepository(
 			repo.CloneURL = launchSpec.Repository.CloneURL
 			repo.DefaultBranch = launchSpec.Repository.DefaultBranch
 		}
-		return repo, nil
+		return repo.Row(), nil
 	}
 	if launchSpec != nil {
 		return &db.Repo{
-			Platform:       launchSpec.Repository.Provider,
-			PlatformHost:   launchSpec.Repository.PlatformHost,
-			PlatformRepoID: launchSpec.Repository.PlatformRepoID,
-			Owner:          launchSpec.Repository.Owner,
-			Name:           launchSpec.Repository.Name,
-			RepoPath:       launchSpec.Repository.Owner + "/" + launchSpec.Repository.Name,
-			CloneURL:       launchSpec.Repository.CloneURL,
-			DefaultBranch:  launchSpec.Repository.DefaultBranch,
+			Platform:      launchSpec.Repository.Provider,
+			PlatformHost:  launchSpec.Repository.PlatformHost,
+			Key:           launchSpec.Repository.Key,
+			Owner:         launchSpec.Repository.Owner,
+			Name:          launchSpec.Repository.Name,
+			RepoPath:      launchSpec.Repository.Owner + "/" + launchSpec.Repository.Name,
+			CloneURL:      launchSpec.Repository.CloneURL,
+			DefaultBranch: launchSpec.Repository.DefaultBranch,
 		}, nil
-	}
-	collision, err := o.db.WorkspaceRepoRouteHasHistoricalOccupants(
-		ctx, workspaceProvider(ws), ws.PlatformHost, ws.RepoOwner, ws.RepoName,
-	)
-	if err != nil || collision {
-		return nil, err
 	}
 	repo, err := o.db.GetRepoByIdentity(ctx, db.RepoIdentity{
 		Platform:     workspaceProvider(ws),
@@ -338,7 +332,10 @@ func (o *PushedHeadObserver) workspaceRepository(
 	if err != nil {
 		return nil, fmt.Errorf("get repo: %w", err)
 	}
-	return repo, nil
+	if repo == nil {
+		return nil, nil
+	}
+	return repo.Row(), nil
 }
 
 type trackingLookup struct {

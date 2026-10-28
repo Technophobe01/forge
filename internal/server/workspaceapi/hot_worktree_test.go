@@ -2,6 +2,8 @@ package workspaceapi
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,12 +17,15 @@ import (
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/gitclone"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/gitsafe"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	"go.kenn.io/forge/internal/testutil/workspacetest"
 	"go.kenn.io/forge/internal/workspace"
-	gitcmd "go.kenn.io/kit/git/cmd"
 )
 
 func TestHotWorktreeLifecycleWarmsClaimsRefillsAndStops(t *testing.T) {
-	for _, previousWorkspace := range []string{"existing", "deleted"} {
+	t.Parallel()
+	for _, previousWorkspace := range []string{"existing", "deleted", "pre-library spare"} {
 		t.Run(previousWorkspace, func(t *testing.T) {
 			require := require.New(t)
 			root := t.TempDir()
@@ -44,15 +49,14 @@ func TestHotWorktreeLifecycleWarmsClaimsRefillsAndStops(t *testing.T) {
 
 			database := dbtest.Open(t)
 			identity := db.GitHubRepoIdentity(serverURL.Host, "acme", "widget")
-			identity.PlatformRepoID = "repo-acme-widget"
-			repoID, err := database.UpsertRepo(t.Context(), identity)
+			repoID, err := reposeed.Seed(t.Context(), database, identity)
 			require.NoError(err)
-			require.NoError(database.UpdateRepoProviderMetadata(t.Context(), repoID, db.RepoProviderMetadata{
+			require.NoError(database.UpdateRepoProviderObservation(t.Context(), repoID, db.RepoProviderMetadata{
 				CloneURL: server.URL + "/acme/widget.git", DefaultBranch: "main",
-			}))
+			}, nil, nil))
 
 			clones := gitclone.New(filepath.Join(root, "clones"), nil)
-			manager := workspace.NewManager(database, filepath.Join(root, "worktrees"))
+			manager := workspacetest.NewManager(t, database, filepath.Join(root, "worktrees"))
 			manager.SetClones(clones)
 			manager.SetTmuxCommand([]string{os.Args[0], "-test.run=^$", "--"})
 			first, err := manager.CreateAdHoc(
@@ -61,16 +65,40 @@ func TestHotWorktreeLifecycleWarmsClaimsRefillsAndStops(t *testing.T) {
 			)
 			require.NoError(err)
 			require.NoError(manager.Setup(t.Context(), first))
-			commonDir, stderr, err := gitcmd.New().Run(t.Context(), first.WorktreePath, nil, "rev-parse", "--git-common-dir")
+			commonDir, stderr, err := gitsafe.Runner().Run(t.Context(), first.WorktreePath, nil, "rev-parse", "--git-common-dir")
 			require.NoError(err, string(stderr))
 			gitDir := strings.TrimSpace(string(commonDir))
 			if !filepath.IsAbs(gitDir) {
 				gitDir = filepath.Join(first.WorktreePath, gitDir)
 			}
-			if previousWorkspace == "existing" {
+			var existingHead, existingStatus string
+			if previousWorkspace != "deleted" {
+				runGit(t, first.WorktreePath, "-c", "user.name=Test User", "-c", "user.email=test@example.test", "commit", "--allow-empty", "-m", "saved workspace commit")
+				require.NoError(os.WriteFile(filepath.Join(first.WorktreePath, "staged.txt"), []byte("staged work\n"), 0o600))
+				runGit(t, first.WorktreePath, "add", "staged.txt")
+				require.NoError(os.WriteFile(filepath.Join(first.WorktreePath, "base.txt"), []byte("unfinished edits\n"), 0o600))
+				require.NoError(os.WriteFile(filepath.Join(first.WorktreePath, "notes.txt"), []byte("untracked notes\n"), 0o600))
+				existingHead = runGitOutput(t, first.WorktreePath, "rev-parse", "HEAD")
+				existingStatus = runGitOutput(t, first.WorktreePath, "status", "--porcelain")
+			}
+			var previousSpare os.FileInfo
+			switch previousWorkspace {
+			case "pre-library spare":
+				// Seed the former Forge layout directly, without the new library's writer.
+				common, err := filepath.EvalSymlinks(gitDir)
+				require.NoError(err)
+				sum := sha256.Sum256([]byte(common))
+				spare := filepath.Join(filepath.Dir(first.WorktreePath), fmt.Sprintf(".kenn-forge-hot-%x", sum[:8]), "checkout")
+				runGit(t, gitDir, "worktree", "add", "--detach", "--no-checkout", spare, "HEAD")
+				runGit(t, spare, "reset", "--hard", "HEAD")
+				registration := runGitOutput(t, spare, "rev-parse", "--absolute-git-dir")
+				require.NoError(os.WriteFile(filepath.Join(registration, "kenn-forge-hot-worktree"), []byte("ready\n"), 0o600))
+				previousSpare, err = os.Stat(filepath.Join(spare, "base.txt"))
+				require.NoError(err)
+			case "existing":
 				// Simulate a workspace created before hot checkouts were enabled.
 				require.NoError(os.RemoveAll(filepath.Join(root, "worktrees", ".hot-repositories")))
-			} else {
+			case "deleted":
 				_, err = manager.Delete(t.Context(), first.ID, true, nil)
 				require.NoError(err)
 				remaining, err := database.ListWorkspaces(t.Context())
@@ -79,13 +107,13 @@ func TestHotWorktreeLifecycleWarmsClaimsRefillsAndStops(t *testing.T) {
 			}
 			// Enrollment survives deleting the last workspace and restarting Forge,
 			// even when no warming pass ran before deletion.
-			manager = workspace.NewManager(database, filepath.Join(root, "worktrees"))
+			manager = workspacetest.NewManager(t, database, filepath.Join(root, "worktrees"))
 			manager.SetClones(clones)
 			manager.SetTmuxCommand([]string{os.Args[0], "-test.run=^$", "--"})
 
 			var hotPath string
 			findHotWorktree := func() string {
-				out, stderr, err := gitcmd.New().Run(
+				out, stderr, err := gitsafe.Runner().Run(
 					t.Context(), gitDir, nil, "worktree", "list", "--porcelain",
 				)
 				if err != nil {
@@ -106,7 +134,7 @@ func TestHotWorktreeLifecycleWarmsClaimsRefillsAndStops(t *testing.T) {
 			handler.Start(parent, false)
 			t.Cleanup(func() {
 				cancelParent()
-				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
 				defer cancel()
 				require.NoError(handler.Shutdown(shutdownCtx))
 			})
@@ -144,6 +172,13 @@ func TestHotWorktreeLifecycleWarmsClaimsRefillsAndStops(t *testing.T) {
 			claimedFile, err := os.Stat(filepath.Join(secondPath, "base.txt"))
 			require.NoError(err)
 			require.True(os.SameFile(warmedFile, claimedFile))
+			if previousSpare != nil {
+				require.True(os.SameFile(previousSpare, claimedFile), "setup must claim the spare left by the previous Forge")
+			}
+			registration := runGitOutput(t, secondPath, "rev-parse", "--absolute-git-dir")
+			workspaceID, err := os.ReadFile(filepath.Join(registration, "kenn-forge-workspace-id"))
+			require.NoError(err)
+			require.Equal(secondID, strings.TrimSpace(string(workspaceID)))
 			require.Equal(latest, runGitOutput(t, secondPath, "rev-parse", "HEAD"))
 			contents, err := os.ReadFile(filepath.Join(secondPath, "later.txt"))
 			require.NoError(err)
@@ -154,9 +189,26 @@ func TestHotWorktreeLifecycleWarmsClaimsRefillsAndStops(t *testing.T) {
 				return statErr == nil
 			}, 10*time.Second, 20*time.Millisecond)
 			require.NoError(manager.WarmWorktrees(t.Context()))
+			if previousWorkspace != "deleted" {
+				require.Equal("first", runGitOutput(t, first.WorktreePath, "branch", "--show-current"))
+				require.Equal(existingHead, runGitOutput(t, first.WorktreePath, "rev-parse", "HEAD"))
+				require.Equal(existingStatus, runGitOutput(t, first.WorktreePath, "status", "--porcelain"))
+				for name, want := range map[string]string{
+					"base.txt": "unfinished edits\n", "staged.txt": "staged work\n", "notes.txt": "untracked notes\n",
+				} {
+					contents, err := os.ReadFile(filepath.Join(first.WorktreePath, name))
+					require.NoError(err)
+					require.Equal(want, string(contents))
+				}
+				stored, err := database.GetWorkspace(t.Context(), first.ID)
+				require.NoError(err)
+				require.NotNil(stored)
+				require.Equal("ready", stored.Status)
+				require.Equal(first.WorktreePath, stored.WorktreePath)
+			}
 
 			cancelParent()
-			shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+			shutdownCtx, cancelShutdown := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
 			defer cancelShutdown()
 			require.NoError(handler.Shutdown(shutdownCtx))
 		})

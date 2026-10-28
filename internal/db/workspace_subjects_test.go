@@ -9,6 +9,8 @@ import (
 )
 
 func TestListWorkspaceSubjectMetadataReturnsPullRequestAndIssue(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	d := openTestDB(t)
@@ -31,7 +33,28 @@ func TestListWorkspaceSubjectMetadataReturnsPullRequestAndIssue(t *testing.T) {
 	}].Title)
 }
 
+func TestListWorkspaceSubjectMetadataReportsDraftPullRequests(t *testing.T) {
+	t.Parallel()
+
+	require := require.New(t)
+	assert := assert.New(t)
+	d := openTestDB(t)
+	repoID := insertTestRepo(t, d, "acme", "widget")
+	insertTestMRWithOptions(t, d, testMR(repoID, 4, withMRDraft()))
+	insertTestMRWithOptions(t, d, testMR(repoID, 5))
+	draftKey := WorkspaceSubjectKey{RepoID: repoID, ItemType: WorkspaceItemTypePullRequest, ItemNumber: 4}
+	readyKey := WorkspaceSubjectKey{RepoID: repoID, ItemType: WorkspaceItemTypePullRequest, ItemNumber: 5}
+
+	got, err := d.ListWorkspaceSubjectMetadata(t.Context(), []WorkspaceSubjectKey{draftKey, readyKey})
+	require.NoError(err)
+	require.Len(got, 2)
+	assert.True(got[draftKey].IsDraft)
+	assert.False(got[readyKey].IsDraft)
+}
+
 func TestListWorkspaceSubjectMetadataUsesLaunchSpecWithoutProviderReplica(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	database := openTestDB(t)
@@ -55,11 +78,13 @@ func TestListWorkspaceSubjectMetadataUsesLaunchSpecWithoutProviderReplica(t *tes
 	require.Contains(got, key)
 	assert.Equal("github", got[key].Platform)
 	assert.Equal("github.com", got[key].PlatformHost)
-	assert.Equal(spec.Repository.PlatformRepoID, got[key].PlatformRepoID)
+	assert.Equal(spec.Repository.Key, got[key].RepoKey)
 	assert.Empty(got[key].Title, "provider details stay hub-owned")
 }
 
 func TestListWorkspaceSubjectMetadataUsesStableRepositoryAfterRename(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	database := openTestDB(t)
 	workspace, spec := workspaceLaunchFixture(t, database, "ws-renamed-overlay")
@@ -71,15 +96,14 @@ func TestListWorkspaceSubjectMetadataUsesStableRepositoryAfterRename(t *testing.
 	)
 	require.NoError(err)
 	require.NotNil(repo)
-	_, accepted, err := database.ReconcileRepositoryObservation(
+	_, err = database.ObserveRepository(
 		t.Context(), RepoIdentity{
 			Platform: "github", PlatformHost: "github.com",
-			PlatformRepoID: spec.Repository.PlatformRepoID,
-			Owner:          "acme-renamed", Name: "widget-renamed",
-		}, time.Now().UTC().Add(time.Hour),
+			Key:   spec.Repository.Key,
+			Owner: "acme-renamed", Name: "widget-renamed",
+		},
 	)
 	require.NoError(err)
-	require.True(accepted)
 	key := WorkspaceSubjectKey{
 		RepoID: repo.ID, ItemType: WorkspaceItemTypePullRequest, ItemNumber: 7,
 	}
@@ -95,6 +119,8 @@ func TestListWorkspaceSubjectMetadataUsesStableRepositoryAfterRename(t *testing.
 }
 
 func TestListWorkspaceSubjectMetadataHidesOnlyRemovedUpstreamItems(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()

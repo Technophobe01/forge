@@ -1,9 +1,11 @@
 import {
+  DEFAULT_ACP_SETTINGS,
   DEFAULT_MODE_VISIBILITY,
   DEFAULT_DETAIL_SETTINGS,
   DEFAULT_PULL_REQUEST_SETTINGS,
   DEFAULT_TERMINAL_SETTINGS,
   type ConfigRepo,
+  type ACPSettings,
   type DetailSettings,
   type LaunchTarget,
   type ModeVisibility,
@@ -15,6 +17,7 @@ import {
 } from "../api/types.js";
 
 export function createSettingsStore() {
+  let acpSettings = $state.raw<ACPSettings>({ ...DEFAULT_ACP_SETTINGS });
   let repos = $state.raw<ConfigRepo[]>([]);
   let terminalSettings = $state.raw<TerminalSettings>({
     ...DEFAULT_TERMINAL_SETTINGS,
@@ -33,6 +36,7 @@ export function createSettingsStore() {
   let workspaceSettings = $state.raw<Settings["workspaces"]>({
     auto_assign_on_create: false,
     default_sidebar_view: "diff",
+    default_execution_target: "",
     show_agent_status_in_lists: false,
   });
   let roborevSettings = $state.raw<Settings["roborev"]>({
@@ -40,6 +44,7 @@ export function createSettingsStore() {
   });
   let repoPresets = $state.raw<RepoPreset[]>([]);
   let loaded = $state(false);
+  let airplaneMode = $state(false);
 
   function getConfiguredRepos(): ConfigRepo[] {
     return repos;
@@ -130,6 +135,7 @@ export function createSettingsStore() {
     workspaceSettings = {
       auto_assign_on_create: value?.auto_assign_on_create ?? false,
       default_sidebar_view: value?.default_sidebar_view ?? "diff",
+      default_execution_target: value?.default_execution_target ?? "",
       show_agent_status_in_lists: value?.show_agent_status_in_lists ?? false,
     };
   }
@@ -196,6 +202,14 @@ export function createSettingsStore() {
   }
 
   return {
+    getACPSettings: () => acpSettings,
+    setACPSettings: (settings: ACPSettings) => {
+      acpSettings = settings;
+    },
+    getAirplaneMode: () => airplaneMode,
+    setAirplaneMode: (enabled: boolean) => {
+      airplaneMode = enabled;
+    },
     getConfiguredRepos,
     setConfiguredRepos,
     getRepoPresets,

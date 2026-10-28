@@ -2,7 +2,6 @@ package gitclone
 
 import (
 	"bytes"
-	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,10 +9,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	providerplatform "go.kenn.io/forge/platform"
 )
 
 func TestCommitsReachableFrom(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	mgr, shas := setupAncestryClone(t)
 	assert := assert.New(t)
 
@@ -36,7 +36,7 @@ func TestCommitsReachableFromUsesRepositoryIdentityNamespace(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	mgr, shas := setupAncestryClone(t)
-	ctx := WithRepositoryIdentity(context.Background(), "provider-repo-1")
+	ctx := WithRepositoryIdentity(t.Context(), providerplatform.RepositoryIdentity{Key: providerplatform.RepositoryIDKey(1001)})
 	legacyPath, err := mgr.ClonePath(
 		"github", "example.com", "acme", "widgets",
 	)
@@ -59,7 +59,7 @@ func TestCommitsReachableFromUsesRepositoryIdentityNamespace(t *testing.T) {
 }
 
 func TestCommitsReachableFromMissingHead(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	mgr, shas := setupAncestryClone(t)
 
 	result, err := mgr.CommitsReachableFrom(
@@ -72,7 +72,7 @@ func TestCommitsReachableFromMissingHead(t *testing.T) {
 }
 
 func TestCommitsReachableFromMissingClone(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	mgr := New(t.TempDir(), nil)
 
 	result, err := mgr.CommitsReachableFrom(
@@ -86,7 +86,7 @@ func TestCommitsReachableFromMissingClone(t *testing.T) {
 func TestCommitsReachableFromVisitBudget(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	mgr, shas := setupAncestryClone(t)
 	mgr.ancestryVisitBudget = 1
 
@@ -116,7 +116,7 @@ func TestCommitsReachableFromVisitBudget(t *testing.T) {
 func TestCommitsReachableFromRejectsOversizedCommit(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	mgr, shas := setupAncestryClone(t)
 
 	// Rebuild the clone with a head whose commit message exceeds the object
@@ -148,7 +148,7 @@ func TestCommitsReachableFromRejectsOversizedCommit(t *testing.T) {
 }
 
 func TestCommitsReachableFromNoCandidates(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	mgr, shas := setupAncestryClone(t)
 
 	result, err := mgr.CommitsReachableFrom(

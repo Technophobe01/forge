@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
+	"uuid"
 
 	"github.com/danielgtaylor/huma/v2"
 	"go.kenn.io/forge/internal/agentactivity"
@@ -17,6 +19,7 @@ import (
 	"go.kenn.io/forge/internal/gitclone"
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/providerplane"
+	"go.kenn.io/forge/internal/ptyowner"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/tokenauth"
 	"go.kenn.io/forge/internal/workspace"
@@ -27,12 +30,14 @@ import (
 
 type createWorkspaceInput struct {
 	Body struct {
-		Provider           string `json:"provider"`
-		PlatformHost       string `json:"platform_host"`
-		Owner              string `json:"owner"`
-		Name               string `json:"name"`
-		MRNumber           int    `json:"mr_number"`
-		SuppressAutoAssign bool   `json:"suppress_auto_assign,omitempty"`
+		Provider                string    `json:"provider"`
+		PlatformHost            string    `json:"platform_host"`
+		PlatformRepoID          int64     `json:"platform_repo_id,omitempty"`
+		BitbucketRepositoryUUID uuid.UUID `json:"bitbucket_repository_uuid,omitzero" doc:"Bitbucket Cloud repository UUID; set instead of platform_repo_id for Bitbucket Cloud"`
+		Owner                   string    `json:"owner"`
+		Name                    string    `json:"name"`
+		MRNumber                int       `json:"mr_number"`
+		SuppressAutoAssign      bool      `json:"suppress_auto_assign,omitempty"`
 	}
 }
 
@@ -43,10 +48,12 @@ type createIssueWorkspaceInput struct {
 	Name         string `path:"name"`
 	Number       int    `path:"number"`
 	Body         struct {
-		GitHeadRef             *string `json:"git_head_ref,omitempty"`
-		ReuseExistingBranch    bool    `json:"reuse_existing_branch,omitempty"`
-		ReuseExistingDirectory bool    `json:"reuse_existing_directory,omitempty"`
-		SuppressAutoAssign     bool    `json:"suppress_auto_assign,omitempty"`
+		PlatformRepoID          int64     `json:"platform_repo_id,omitempty"`
+		BitbucketRepositoryUUID uuid.UUID `json:"bitbucket_repository_uuid,omitzero" doc:"Bitbucket Cloud repository UUID; set instead of platform_repo_id for Bitbucket Cloud"`
+		GitHeadRef              *string   `json:"git_head_ref,omitempty"`
+		ReuseExistingBranch     bool      `json:"reuse_existing_branch,omitempty"`
+		ReuseExistingDirectory  bool      `json:"reuse_existing_directory,omitempty"`
+		SuppressAutoAssign      bool      `json:"suppress_auto_assign,omitempty"`
 	}
 }
 
@@ -59,8 +66,10 @@ type createAdHocWorkspaceInput struct {
 	Owner        string `path:"owner"`
 	Name         string `path:"name"`
 	Body         struct {
-		Branch              *string `json:"branch,omitempty" doc:"Branch for the new worktree; generated when empty"`
-		ReuseExistingBranch bool    `json:"reuse_existing_branch,omitempty"`
+		PlatformRepoID          int64     `json:"platform_repo_id,omitempty" doc:"Expected stable repository ID from the catalog"`
+		BitbucketRepositoryUUID uuid.UUID `json:"bitbucket_repository_uuid,omitzero" doc:"Bitbucket Cloud repository UUID; set instead of platform_repo_id for Bitbucket Cloud"`
+		Branch                  *string   `json:"branch,omitempty" doc:"Branch for the new worktree; generated when empty"`
+		ReuseExistingBranch     bool      `json:"reuse_existing_branch,omitempty"`
 	}
 }
 
@@ -126,6 +135,9 @@ type refreshWorkspaceInput struct {
 
 type getWorkspaceRuntimeInput struct {
 	ID string `path:"id"`
+	// Viewing marks a read from the workspace view while it shows; only such
+	// reads count as a viewer for idle stop and resume idle-stopped agents.
+	Viewing bool `query:"viewing" doc:"Set to true when the workspace view is showing."`
 }
 
 type launchWorkspaceRuntimeSessionInput struct {
@@ -170,11 +182,13 @@ type listWorkspacesOutput = httpapi.BodyOutput[listWorkspacesOutputBody]
 
 type getWorkspaceOutput = httpapi.BodyOutput[workspaceResponse]
 
-type getWorkspaceDiffOutput = httpapi.BodyOutput[diffResponse]
-type getWorkspaceFilePreviewOutput = httpapi.BodyOutput[filePreviewResponse]
-type getWorkspaceFilesOutput = httpapi.BodyOutput[filesResponse]
-type watchWorkspaceDiffOutput = httpapi.BodyOutput[workspaceDiffWatchResponse]
-type getWorkspaceCommitsOutput = httpapi.BodyOutput[commitsResponse]
+type (
+	getWorkspaceDiffOutput        = httpapi.BodyOutput[diffResponse]
+	getWorkspaceFilePreviewOutput = httpapi.BodyOutput[filePreviewResponse]
+	getWorkspaceFilesOutput       = httpapi.BodyOutput[filesResponse]
+	watchWorkspaceDiffOutput      = httpapi.BodyOutput[workspaceDiffWatchResponse]
+	getWorkspaceCommitsOutput     = httpapi.BodyOutput[commitsResponse]
+)
 
 type getWorkspaceRuntimeOutput = httpapi.BodyOutput[workspaceRuntimeResponse]
 
@@ -207,9 +221,16 @@ type workspaceDiffRequest struct {
 func (s *Handler) createWorkspace(
 	ctx context.Context, input *createWorkspaceInput,
 ) (*createWorkspaceOutput, error) {
+	repoKey, err := httpapi.RequestRepositoryKey(
+		"body.platform_repo_id", input.Body.PlatformRepoID, input.Body.BitbucketRepositoryUUID,
+	)
+	if err != nil {
+		return nil, err
+	}
 	result, err := s.CreatePullWorkspace(ctx, CreatePullWorkspaceRequest{
 		Provider: input.Body.Provider, PlatformHost: input.Body.PlatformHost,
-		Owner: input.Body.Owner, Name: input.Body.Name, Number: input.Body.MRNumber,
+		RepoKey: repoKey,
+		Owner:   input.Body.Owner, Name: input.Body.Name, Number: input.Body.MRNumber,
 		SuppressAutoAssign: input.Body.SuppressAutoAssign,
 	})
 	if err != nil {
@@ -230,6 +251,7 @@ func (s *Handler) CreatePullWorkspace(
 	input := &createWorkspaceInput{}
 	input.Body.Provider = req.Provider
 	input.Body.PlatformHost = req.PlatformHost
+	input.Body.PlatformRepoID, input.Body.BitbucketRepositoryUUID = req.RepoKey.Wire()
 	input.Body.Owner = req.Owner
 	input.Body.Name = req.Name
 	input.Body.MRNumber = req.Number
@@ -251,13 +273,19 @@ func (s *Handler) createPullWorkspaceRouteCore(
 	if err != nil {
 		return nil, err
 	}
+	repoKey, err := httpapi.RequestRepositoryKey(
+		"body.platform_repo_id", input.Body.PlatformRepoID, input.Body.BitbucketRepositoryUUID,
+	)
+	if err != nil {
+		return nil, err
+	}
 	spec, err := s.resolveWorkspaceLaunchSpec(
 		ctx,
 		providerplane.RepositoryRoute{
 			Provider: provider, PlatformHost: input.Body.PlatformHost,
 			Owner: input.Body.Owner, Name: input.Body.Name,
 		},
-		db.WorkspaceItemTypePullRequest, input.Body.MRNumber, "", false,
+		repoKey, db.WorkspaceItemTypePullRequest, input.Body.MRNumber, "", false,
 	)
 	if err != nil {
 		return nil, workspaceLaunchSpecProblem(err)
@@ -289,6 +317,7 @@ func (s *Handler) createPullWorkspaceRouteCore(
 			Provider: spec.Repository.Provider, PlatformHost: spec.Repository.PlatformHost,
 			Owner: spec.Repository.Owner, Name: spec.Repository.Name,
 		},
+		RepoKey:  spec.Repository.Key,
 		ItemType: db.WorkspaceItemTypePullRequest, ItemNumber: input.Body.MRNumber,
 	}, input.Body.SuppressAutoAssign)
 
@@ -348,7 +377,10 @@ func (s *Handler) runWorkspaceSetup(ws *workspace.Workspace) {
 	s.runWorkspaceSetupWithBasePath(ws, "")
 }
 
-func (s *Handler) runWorkspaceSetupWithBasePath(ws *workspace.Workspace, basePath string) {
+func (s *Handler) runWorkspaceSetupWithBasePath(caller *workspace.Workspace, basePath string) {
+	// Setup reloads the workspace in the background; callers keep reading theirs.
+	owned := *caller
+	ws := &owned
 	done, start := s.beginWorkspaceSetup(ws.ID)
 	if done == nil {
 		return
@@ -560,9 +592,16 @@ func (s *Handler) PublishWorkspaceCreated(workspaceID string, created bool) {
 func (s *Handler) createIssueWorkspace(
 	ctx context.Context, input *createIssueWorkspaceInput,
 ) (*createWorkspaceOutput, error) {
+	repoKey, err := httpapi.RequestRepositoryKey(
+		"body.platform_repo_id", input.Body.PlatformRepoID, input.Body.BitbucketRepositoryUUID,
+	)
+	if err != nil {
+		return nil, err
+	}
 	result, err := s.CreateIssueWorkspaceService(ctx, CreateIssueWorkspaceRequest{
 		Provider: input.Provider, PlatformHost: input.PlatformHost,
-		Owner: input.Owner, Name: input.Name, Number: input.Number,
+		RepoKey: repoKey,
+		Owner:   input.Owner, Name: input.Name, Number: input.Number,
 		GitHeadRef:             input.Body.GitHeadRef,
 		ReuseExistingBranch:    input.Body.ReuseExistingBranch,
 		ReuseExistingDirectory: input.Body.ReuseExistingDirectory,
@@ -587,6 +626,7 @@ func (s *Handler) CreateIssueWorkspaceService(
 		Provider: req.Provider, PlatformHost: req.PlatformHost,
 		Owner: req.Owner, Name: req.Name, Number: req.Number,
 	}
+	input.Body.PlatformRepoID, input.Body.BitbucketRepositoryUUID = req.RepoKey.Wire()
 	input.Body.GitHeadRef = req.GitHeadRef
 	input.Body.ReuseExistingBranch = req.ReuseExistingBranch
 	input.Body.ReuseExistingDirectory = req.ReuseExistingDirectory
@@ -614,27 +654,37 @@ func (s *Handler) createIssueWorkspaceRouteCore(
 	if err != nil {
 		return nil, httpapi.Validation("path.provider", err.Error())
 	}
-
-	existing, err := s.workspaces.GetByIssueForProvider(
-		ctx,
-		provider, input.PlatformHost, input.Owner, input.Name,
-		input.Number,
+	repoKey, err := httpapi.RequestRepositoryKey(
+		"body.platform_repo_id", input.Body.PlatformRepoID, input.Body.BitbucketRepositoryUUID,
 	)
 	if err != nil {
-		return nil, httpapi.Internal("lookup existing issue workspace: " + err.Error())
+		return nil, err
 	}
-	if existing != nil {
-		summary, getErr := s.workspaces.GetSummary(ctx, existing.ID)
-		if getErr != nil {
-			return nil, httpapi.Internal("get workspace summary: " + getErr.Error())
+
+	// Key-bearing requests resolve the launch specification before reuse so a
+	// replacement repository at the same route cannot supply the workspace.
+	if repoKey.IsZero() {
+		existing, err := s.workspaces.GetByIssueForProvider(
+			ctx,
+			provider, input.PlatformHost, input.Owner, input.Name,
+			input.Number,
+		)
+		if err != nil {
+			return nil, httpapi.Internal("lookup existing issue workspace: " + err.Error())
 		}
-		if summary == nil {
-			return nil, httpapi.Internal("workspace summary missing for existing workspace")
+		if existing != nil {
+			summary, getErr := s.workspaces.GetSummary(ctx, existing.ID)
+			if getErr != nil {
+				return nil, httpapi.Internal("get workspace summary: " + getErr.Error())
+			}
+			if summary == nil {
+				return nil, httpapi.Internal("workspace summary missing for existing workspace")
+			}
+			return &createWorkspaceOutput{
+				Status: http.StatusAccepted,
+				Body:   s.toWorkspaceResponse(ctx, summary),
+			}, nil
 		}
-		return &createWorkspaceOutput{
-			Status: http.StatusAccepted,
-			Body:   s.toWorkspaceResponse(ctx, summary),
-		}, nil
 	}
 	spec, err := s.resolveWorkspaceLaunchSpec(
 		ctx,
@@ -642,14 +692,14 @@ func (s *Handler) createIssueWorkspaceRouteCore(
 			Provider: provider, PlatformHost: input.PlatformHost,
 			Owner: input.Owner, Name: input.Name,
 		},
-		db.WorkspaceItemTypeIssue, input.Number,
+		repoKey, db.WorkspaceItemTypeIssue, input.Number,
 		strings.TrimSpace(derefString(input.Body.GitHeadRef)),
 		s.configSnapshot().IssueBranchSlug,
 	)
 	if err != nil {
 		return nil, workspaceLaunchSpecProblem(err)
 	}
-	existing, err = s.workspaces.GetByLaunchSpecIdentity(ctx, spec)
+	existing, err := s.workspaces.GetByLaunchSpecIdentity(ctx, spec)
 	if err != nil {
 		return nil, httpapi.Internal("lookup existing issue workspace identity: " + err.Error())
 	}
@@ -740,14 +790,7 @@ func (s *Handler) createIssueWorkspaceRouteCore(
 			return nil, httpapi.Validation("body.git_head_ref", msg)
 		}
 		if strings.Contains(msg, "UNIQUE constraint") {
-			existing, getErr := s.workspaces.GetByIssueForProvider(
-				ctx,
-				spec.Repository.Provider,
-				spec.Repository.PlatformHost,
-				spec.Repository.Owner,
-				spec.Repository.Name,
-				input.Number,
-			)
+			existing, getErr := s.workspaces.GetByLaunchSpecIdentity(ctx, spec)
 			if getErr == nil && existing != nil {
 				summary, summaryErr := s.workspaces.GetSummary(ctx, existing.ID)
 				if summaryErr == nil && summary != nil {
@@ -767,6 +810,7 @@ func (s *Handler) createIssueWorkspaceRouteCore(
 			Provider: spec.Repository.Provider, PlatformHost: spec.Repository.PlatformHost,
 			Owner: spec.Repository.Owner, Name: spec.Repository.Name,
 		},
+		RepoKey:  spec.Repository.Key,
 		ItemType: db.WorkspaceItemTypeIssue, ItemNumber: input.Number,
 	}, input.Body.SuppressAutoAssign)
 
@@ -806,9 +850,16 @@ func (s *Handler) CreateIssueWorkspace(
 func (s *Handler) createAdHocWorkspace(
 	ctx context.Context, input *createAdHocWorkspaceInput,
 ) (*createWorkspaceOutput, error) {
+	repoKey, err := httpapi.RequestRepositoryKey(
+		"body.platform_repo_id", input.Body.PlatformRepoID, input.Body.BitbucketRepositoryUUID,
+	)
+	if err != nil {
+		return nil, err
+	}
 	result, err := s.CreateAdHocWorkspaceService(ctx, CreateAdHocWorkspaceRequest{
 		Provider: input.Provider, PlatformHost: input.PlatformHost,
 		Owner: input.Owner, Name: input.Name, Branch: input.Body.Branch,
+		RepoKey:             repoKey,
 		ReuseExistingBranch: input.Body.ReuseExistingBranch,
 	})
 	if err != nil {
@@ -826,19 +877,12 @@ func (s *Handler) CreateAdHocWorkspaceService(
 			"item_type", db.WorkspaceItemTypeAdHoc,
 			"duration_ms", time.Since(started).Milliseconds(), "success", err == nil)
 	}()
-	if s.resolveRepository != nil {
-		if _, err := s.resolveRepository(ctx, providerplane.RepositoryRoute{
-			Provider: req.Provider, PlatformHost: req.PlatformHost,
-			Owner: req.Owner, Name: req.Name,
-		}); err != nil {
-			return WorkspaceResult{}, err
-		}
-	}
 	input := &createAdHocWorkspaceInput{
 		Provider: req.Provider, PlatformHost: req.PlatformHost,
 		Owner: req.Owner, Name: req.Name,
 	}
 	input.Body.Branch = req.Branch
+	input.Body.PlatformRepoID, input.Body.BitbucketRepositoryUUID = req.RepoKey.Wire()
 	input.Body.ReuseExistingBranch = req.ReuseExistingBranch
 	output, err := s.createAdHocWorkspaceRouteCore(ctx, input)
 	if err != nil {
@@ -853,11 +897,37 @@ func (s *Handler) createAdHocWorkspaceRouteCore(
 	if s.workspaces == nil {
 		return nil, httpapi.ServiceUnavailable("workspace manager not configured")
 	}
-	repo, err := s.lookupRepoByProviderRoute(
-		ctx, input.Provider, input.PlatformHost, input.Owner, input.Name,
+	repoKey, err := httpapi.RequestRepositoryKey(
+		"body.platform_repo_id", input.Body.PlatformRepoID, input.Body.BitbucketRepositoryUUID,
 	)
 	if err != nil {
-		return nil, providerRouteLookupError(err)
+		return nil, err
+	}
+	var repo *db.Repo
+	if s.resolveRepository != nil {
+		repo, err = s.resolveRepository(ctx, providerplane.RepositoryRoute{
+			Provider: input.Provider, PlatformHost: input.PlatformHost,
+			Owner: input.Owner, Name: input.Name,
+		}, repoKey)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		var active *db.ActiveRepo
+		if !repoKey.IsZero() {
+			active, err = s.resolver.LookupSelection(ctx, input.Provider, input.PlatformHost, input.Owner, input.Name, repoKey)
+		} else {
+			active, err = s.lookupRepoByProviderRoute(ctx, input.Provider, input.PlatformHost, input.Owner, input.Name)
+		}
+		if err != nil {
+			return nil, providerRouteLookupError(err)
+		}
+		if active != nil {
+			repo = active.Row()
+		}
+	}
+	if repo == nil {
+		return nil, httpapi.NotFound(httpapi.CodeRepoNotFound, "repo not found", nil)
 	}
 
 	branch := strings.TrimSpace(derefString(input.Body.Branch))
@@ -879,6 +949,7 @@ func (s *Handler) createAdHocWorkspaceRouteCore(
 		repo.Owner,
 		repo.Name,
 		workspace.CreateAdHocOptions{
+			RepoKey:             repo.Key,
 			BranchName:          branch,
 			ReuseExistingBranch: input.Body.ReuseExistingBranch,
 		},
@@ -943,7 +1014,7 @@ func (s *Handler) adHocWorkspaceForBranch(
 // fence-guarded write layer reports this before any row is persisted for the
 // replacement repository.
 func repositoryRouteFenceProblem(err error) error {
-	if errors.Is(err, db.ErrRepositoryRouteFenceChanged) {
+	if errors.Is(err, db.ErrRepositoryIdentityChanged) {
 		return httpapi.NotFound(httpapi.CodeRepoNotFound,
 			"repository identity changed during workspace creation", nil)
 	}
@@ -1064,7 +1135,9 @@ func (s *Handler) GetWorkspaceService(ctx context.Context, id string) (Workspace
 			httpapi.CodeWorkspaceNotFound, "workspace not found", nil,
 		)
 	}
-	return WorkspaceResult{Workspace: s.toCachedWorkspaceResponse(summary)}, nil
+	response := s.toCachedWorkspaceResponse(summary)
+	response.PushState = s.workspaces.ExecutionPushState(ctx, summary)
+	return WorkspaceResult{Workspace: response}, nil
 }
 
 func (s *Handler) refreshWorkspace(
@@ -1085,6 +1158,11 @@ func (s *Handler) refreshWorkspace(
 	}
 	if s.workspaceDiffCache != nil {
 		s.workspaceDiffCache.RevalidateWorkspace(input.ID)
+	}
+	if s.executionWorker.Enabled {
+		response := s.refreshWorkspaceResponse(ctx, summary)
+		response.PushState = s.workspaces.ExecutionPushState(ctx, summary)
+		return &refreshWorkspaceOutput{Body: response}, nil
 	}
 	if s.syncer == nil {
 		workspace := summary.Workspace
@@ -1116,8 +1194,8 @@ func (s *Handler) refreshWorkspace(
 	if err != nil {
 		return nil, providerRouteLookupError(err)
 	}
-	kind := repoProviderKind(*repo)
-	host := repoProviderHost(*repo)
+	kind := repoProviderKind(repo.Repo)
+	host := repoProviderHost(repo.Repo)
 
 	switch summary.ItemType {
 	case db.WorkspaceItemTypeIssue:
@@ -1223,7 +1301,7 @@ func (s *Handler) refreshWorkspaceRepoIndex(
 			"owner", owner, "name", name, "err", err)
 		return nil
 	}
-	if strings.Contains(err.Error(), "is not tracked") {
+	if errors.Is(err, ghclient.ErrRepoNotTracked) {
 		return httpapi.Forbidden(err.Error(), nil)
 	}
 	return httpapi.ProviderCallProblemWithDetail(
@@ -1251,7 +1329,7 @@ func (s *Handler) refreshWorkspaceIssue(
 	if err == nil {
 		return nil
 	}
-	if strings.Contains(err.Error(), "is not tracked") {
+	if errors.Is(err, ghclient.ErrRepoNotTracked) {
 		return httpapi.Forbidden(err.Error(), nil)
 	}
 	return httpapi.ProviderCallProblemWithDetail(
@@ -1275,10 +1353,10 @@ func (s *Handler) refreshWorkspacePullRequest(
 	if removed {
 		return nil
 	}
-	var diffErr *ghclient.DiffSyncError
 	err = s.syncer.SyncMROnProvider(ctx, kind, host, owner, name, number)
-	if err != nil && !errors.As(err, &diffErr) {
-		if strings.Contains(err.Error(), "is not tracked") {
+	diffErr, isDiffErr := errors.AsType[*ghclient.DiffSyncError](err)
+	if err != nil && !isDiffErr {
+		if errors.Is(err, ghclient.ErrRepoNotTracked) {
 			return httpapi.Forbidden(err.Error(), nil)
 		}
 		return httpapi.ProviderCallProblemWithDetail(
@@ -1307,6 +1385,9 @@ func (s *Handler) getWorkspaceCommits(
 
 	commits, ok, err := s.workspaceCommits(ctx, req)
 	if err != nil {
+		if problem, ok := errors.AsType[*httpapi.ProblemError](err); ok {
+			return nil, problem
+		}
 		slog.Error(
 			"failed to list workspace commits",
 			"workspace_id", input.ID,
@@ -1336,12 +1417,19 @@ func (s *Handler) getWorkspaceCommits(
 		)
 	}
 
+	stats, statsErr := gitclone.ReadCommitStats(ctx, req.Summary.WorktreePath, commits)
+	if statsErr != nil {
+		slog.Warn("failed to read workspace commit stats", "workspace_id", input.ID, "err", statsErr)
+	}
+
 	resp := commitsResponse{Commits: make([]commitResponse, len(commits))}
 	for i, c := range commits {
 		cr := commitResponse{
-			SHA:        c.SHA,
-			Message:    c.Message,
-			AuthorName: c.AuthorName,
+			SHA:         c.SHA,
+			Stats:       stats[c.SHA],
+			Message:     c.Message,
+			AuthorName:  c.AuthorName,
+			AuthorEmail: c.AuthorEmail, CommitterName: c.CommitterName, CommitterEmail: c.CommitterEmail,
 			AuthoredAt: c.AuthoredAt.UTC(),
 		}
 		if pushErr == nil && hasUpstream {
@@ -1792,6 +1880,9 @@ func (s *Handler) validateWorkspaceSHAs(
 ) (map[string]int, error) {
 	commits, ok, err := s.workspaceCommits(ctx, req)
 	if err != nil {
+		if problem, ok := errors.AsType[*httpapi.ProblemError](err); ok {
+			return nil, problem
+		}
 		return nil, httpapi.Upstream(
 			"failed to list workspace commits: "+err.Error(), "", "",
 		)
@@ -1818,6 +1909,35 @@ func (s *Handler) workspaceMergeTargetBranch(
 	ctx context.Context,
 	summary *db.WorkspaceSummary,
 ) (string, bool, error) {
+	if s.executionWorker.Enabled && summary.ItemType == db.WorkspaceItemTypePullRequest {
+		spec, err := s.db.GetWorkspaceLaunchSpec(ctx, summary.ID)
+		if err != nil {
+			return "", false, err
+		}
+		if spec != nil && spec.Pull != nil && spec.Pull.BaseBranch != "" {
+			if err := spec.RequireVisible(s.now().UTC()); err == nil {
+				return spec.Pull.BaseBranch, true, nil
+			} else if errors.Is(err, workspace.ErrLaunchSpecRefreshRequired) {
+				return "", false, httpapi.Conflict(httpapi.CodeConflict, "workspace source context has expired", map[string]any{
+					"reason": WorkspaceContextExpiredReason,
+				})
+			}
+		}
+		return "", false, workspace.ErrLaunchSpecRefreshRequired
+	}
+	if s.syncer == nil && s.launchSpecResolver != nil && summary.ItemType == db.WorkspaceItemTypePullRequest {
+		// Spokes keep hub-issued launch facts, not a local provider item cache.
+		ws := summary.Workspace
+		spec, err := s.workspaces.RequireWorkspaceLaunchSpec(ctx, &ws)
+		if err != nil {
+			return "", false, workspaceLaunchSpecProblem(err)
+		}
+		if spec == nil || spec.Pull == nil {
+			return "", false, nil
+		}
+		branch := strings.TrimSpace(spec.Pull.BaseBranch)
+		return branch, branch != "", nil
+	}
 	prNumber := summary.ItemNumber
 	if summary.ItemType != db.WorkspaceItemTypePullRequest {
 		if summary.AssociatedPRNumber == nil {
@@ -1878,9 +1998,6 @@ func (s *Handler) retryWorkspace(
 			return nil, httpapi.NotFound(httpapi.CodeWorkspaceNotFound, err.Error(), nil)
 		}
 		if errors.Is(err, workspace.ErrWorkspaceInvalidState) {
-			return nil, httpapi.Conflict(httpapi.CodeConflict, err.Error(), nil)
-		}
-		if errors.Is(err, workspace.ErrWorkspaceOwnershipUnproven) {
 			return nil, httpapi.Conflict(httpapi.CodeConflict, err.Error(), nil)
 		}
 		return nil, httpapi.Internal("retry workspace: " + err.Error())
@@ -2027,6 +2144,7 @@ func (s *Handler) probeWorkspaceEnrichment(
 	resp := toWorkspaceResponse(summary)
 	resp.Repo = s.repoRefFromParts(
 		summary.Platform, summary.PlatformHost, summary.RepoOwner, summary.RepoName,
+		summary.RepoKey,
 	)
 	if s.workspaces == nil ||
 		summary.Status != "ready" {
@@ -2048,8 +2166,7 @@ func (s *Handler) probeWorkspaceEnrichment(
 	}
 	var tmuxErr error
 	if plan.tmux {
-		tmuxErr = s.applyWorkspaceTmuxEnrichment(ctx, summary, &resp)
-		result.tmuxComplete = tmuxErr == nil
+		result.tmuxComplete, tmuxErr = s.applyWorkspaceTmuxEnrichment(ctx, summary, &resp)
 		result.tmuxErr = tmuxErr
 	}
 	err := errors.Join(gitStateErr, tmuxErr)
@@ -2075,13 +2192,14 @@ func (s *Handler) workspaceResponseWithTmuxEnrichment(
 	resp := toWorkspaceResponse(summary)
 	resp.Repo = s.repoRefFromParts(
 		summary.Platform, summary.PlatformHost, summary.RepoOwner, summary.RepoName,
+		summary.RepoKey,
 	)
 	if s.workspaces == nil || summary.Status != "ready" {
 		return workspaceEnrichmentProbeResult{response: resp, kind: workspaceEnrichmentTmux}
 	}
-	err := s.applyWorkspaceTmuxEnrichment(ctx, summary, &resp)
+	complete, err := s.applyWorkspaceTmuxEnrichment(ctx, summary, &resp)
 	return workspaceEnrichmentProbeResult{
-		response: resp, tmuxComplete: err == nil, tmuxErr: err, err: err,
+		response: resp, tmuxComplete: complete, tmuxErr: err, err: err,
 		kind: workspaceEnrichmentTmux,
 	}
 }
@@ -2093,22 +2211,31 @@ func (s *Handler) workspaceResponseWithTmuxEnrichment(
 // tmux spawns to second-guess them. Such a workspace counts as a complete
 // tmux sample whose last-activity time is the hook report's own timestamp, so
 // subject activity feeds still see hook-driven work move.
+//
+// The returned bool reports whether resp is a sample worth caching. A probe
+// that failed for some sessions still counts when a session that answered
+// shows the agent working: a missing session cannot make that signal wrong.
+// A partial idle result does not count, because the failed session may be
+// the one that is working.
 func (s *Handler) applyWorkspaceTmuxEnrichment(
 	ctx context.Context,
 	summary *db.WorkspaceSummary,
 	resp *workspaceResponse,
-) error {
+) (bool, error) {
 	if latest, ok := s.latestHookReportForWorkspace(summary); ok {
 		activityAt := latest.UpdatedAt.UTC().Format(time.RFC3339)
 		resp.TmuxLastOutputAt = &activityAt
-		return nil
+		return true, nil
 	}
 	sessions, sessionsErr := s.workspaceTmuxActivitySessions(ctx, summary)
-	activity, hasActivity, activityErr := s.probeWorkspaceTmuxActivity(ctx, summary, sessions)
+	activity, hasActivity, answeredWorking, activityErr := s.probeWorkspaceTmuxActivity(
+		ctx, summary, sessions,
+	)
 	if hasActivity {
 		applyTmuxActivity(resp, activity)
 	}
-	return errors.Join(sessionsErr, activityErr)
+	err := errors.Join(sessionsErr, activityErr)
+	return err == nil || answeredWorking, err
 }
 
 // latestHookReportForWorkspace returns the most recent hook report among the
@@ -2137,7 +2264,7 @@ func (s *Handler) latestHookReportForWorkspace(
 func (s *Handler) liveAgentSessionKeys(workspaceID string) []string {
 	liveSessionKeys := make([]string, 0)
 	for _, session := range s.runtime.ListSessions(workspaceID) {
-		if session.Kind == localruntime.LaunchTargetAgent &&
+		if session.Kind.IsAgent() &&
 			(session.Status == localruntime.SessionStatusRunning ||
 				session.Status == localruntime.SessionStatusStarting) {
 			liveSessionKeys = append(liveSessionKeys, session.Key)
@@ -2191,13 +2318,16 @@ func (s *Handler) workspaceTmuxActivitySessions(
 	return sessions, listErr
 }
 
+// probeWorkspaceTmuxActivity merges the activity of every session. The
+// second bool reports whether a session whose probe succeeded shows the
+// agent working; a failed session's fallback sample never counts.
 func (s *Handler) probeWorkspaceTmuxActivity(
 	ctx context.Context,
 	summary *db.WorkspaceSummary,
 	sessions []string,
-) (tmuxActivityResult, bool, error) {
+) (tmuxActivityResult, bool, bool, error) {
 	if len(sessions) == 0 {
-		return tmuxActivityResult{}, false, nil
+		return tmuxActivityResult{}, false, false, nil
 	}
 	tracker := s.tmuxActivity
 	if tracker == nil {
@@ -2206,27 +2336,41 @@ func (s *Handler) probeWorkspaceTmuxActivity(
 	probeCtx, cancelProbe := context.WithTimeout(ctx, tmuxActivityProbeTimeout)
 	defer cancelProbe()
 
-	results := make([]tmuxActivityResult, 0, len(sessions))
-	var probeErrs []error
-	for _, session := range sessions {
-		if s.tmuxActivity != nil {
-			if result, ok := tracker.Cached(session); ok {
-				results = append(results, result)
-				continue
+	// One slow session must not spend the shared budget before healthy
+	// siblings can start. Every session waits for the tracker's probe slots,
+	// so the next free slot goes to whichever session is still waiting.
+	results := make([]tmuxActivityResult, len(sessions))
+	probeErrs := make([]error, len(sessions))
+	var probes sync.WaitGroup
+	for i, session := range sessions {
+		probes.Go(func() {
+			if s.tmuxActivity != nil {
+				if result, ok := tracker.Cached(session); ok {
+					results[i] = result
+					return
+				}
 			}
-		}
-		result, ok, err := s.probeOneTmuxSession(
-			probeCtx, tracker, summary, session,
-		)
-		if ok {
-			results = append(results, result)
-		}
-		if err != nil {
-			probeErrs = append(probeErrs, err)
+			result, ok, err := s.probeOneTmuxSession(
+				probeCtx, tracker, summary, session,
+			)
+			if ok {
+				results[i] = result
+			}
+			if err != nil {
+				probeErrs[i] = fmt.Errorf("tmux session %q: %w", session, err)
+			}
+		})
+	}
+	probes.Wait()
+	answeredWorking := false
+	for i := range results {
+		if probeErrs[i] == nil && results[i].Working {
+			answeredWorking = true
 		}
 	}
+	// Preserve session order for ties regardless of probe completion order.
 	result, ok := mergeTmuxActivityResults(results)
-	return result, ok, errors.Join(probeErrs...)
+	return result, ok, answeredWorking, errors.Join(probeErrs...)
 }
 
 func (s *Handler) probeOneTmuxSession(
@@ -2271,6 +2415,9 @@ func (s *Handler) probeOneTmuxSession(
 	)
 	if err != nil {
 		probe.Probe.Cancel()
+		if errors.Is(err, ptyowner.ErrOwnerGone) {
+			return tmuxActivityResult{}, false, nil
+		}
 		slog.Debug(
 			"read tmux pane snapshot",
 			"workspace_id", summary.ID,
@@ -2425,11 +2572,11 @@ func readOnlyWorktreeIsDirty(ctx context.Context, worktreePath string) (bool, er
 		"--ignore-submodules=none",
 	)
 	if err != nil {
-		out := append(stdout, stderr...)
+		stdout = append(stdout, stderr...)
 		return false, fmt.Errorf(
 			"check worktree dirty state: %w: %s",
 			err,
-			strings.TrimSpace(string(out)),
+			strings.TrimSpace(string(stdout)),
 		)
 	}
 	return strings.TrimSpace(string(stdout)) != "", nil
@@ -2454,23 +2601,35 @@ func (s *Handler) getWorkspaceRuntime(
 	ctx context.Context,
 	input *getWorkspaceRuntimeInput,
 ) (*getWorkspaceRuntimeOutput, error) {
-	result, err := s.GetWorkspaceRuntimeService(ctx, input.ID)
+	result, err := s.GetWorkspaceRuntimeService(ctx, input.ID, input.Viewing)
 	if err != nil {
 		return nil, err
 	}
 	return &getWorkspaceRuntimeOutput{Body: workspaceRuntimeResponse(result)}, nil
 }
 
+// GetWorkspaceRuntimeService lists a workspace's runtimes. viewing reports a
+// page view, which starts resuming runtimes idle stop stopped in the
+// background; only the showing workspace page sets it.
 func (s *Handler) GetWorkspaceRuntimeService(
-	ctx context.Context, workspaceID string,
+	ctx context.Context, workspaceID string, viewing bool,
 ) (WorkspaceRuntimeResult, error) {
 	summary, err := s.getRuntimeWorkspace(ctx, workspaceID)
 	if err != nil {
 		return WorkspaceRuntimeResult{}, err
 	}
+	if viewing {
+		s.idle.Load().Viewed(&summary.Workspace)
+	}
+	_ = s.restoreWorkspaceACP(ctx, summary.ID, summary.WorktreePath)
 	sessions, err := s.workspaceRuntimeSessions(ctx, summary.ID)
 	if err != nil {
 		return WorkspaceRuntimeResult{}, httpapi.Internal("list runtime sessions: " + err.Error())
+	}
+	if viewing && slices.ContainsFunc(sessions, func(session localruntime.SessionInfo) bool {
+		return session.Status == localruntime.SessionStatusParked
+	}) {
+		s.idle.Load().ResumeStopped(summary.Workspace)
 	}
 	return WorkspaceRuntimeResult{
 		LaunchTargets: s.runtime.LaunchTargets(), Sessions: sessions,
@@ -2489,7 +2648,25 @@ func (s *Handler) workspaceRuntimeSessions(
 	if err != nil {
 		return nil, err
 	}
-	return mergeStoredRuntimeSessions(sessions, stored), nil
+	// A session that exited is gone even before its record is forgotten,
+	// unless it was kept for recovery: it then shows as unavailable, and Stop
+	// forgets it.
+	s.runtimeRecoveryMu.Lock()
+	stored = slices.DeleteFunc(stored, func(session db.WorkspaceRuntimeSession) bool {
+		return s.runtime.Exited(session.SessionKey) && !s.runtimeRecoveryPending[session.SessionKey]
+	})
+	s.runtimeRecoveryMu.Unlock()
+	merged := mergeStoredRuntimeSessions(sessions, stored)
+	idle := s.idle.Load()
+	for i := range merged {
+		if merged[i].Status != localruntime.SessionStatusError {
+			continue
+		}
+		if j := slices.IndexFunc(stored, func(session db.WorkspaceRuntimeSession) bool { return session.SessionKey == merged[i].Key }); j >= 0 && idle.Stopped(ctx, stored[j]) {
+			merged[i].Status = localruntime.SessionStatusParked
+		}
+	}
+	return merged, nil
 }
 
 func mergeStoredRuntimeSessions(
@@ -2571,7 +2748,7 @@ func (s *Handler) launchWorkspaceRuntimeSession(
 	input *launchWorkspaceRuntimeSessionInput,
 ) (*workspaceRuntimeSessionOutput, error) {
 	session, err := s.launchWorkspaceRuntimeService(
-		ctx, input.ID, input.Body.TargetKey, input.Body.DisplayRegion,
+		ctx, input.ID, input.Body.TargetKey, input.Body.DisplayRegion, "",
 	)
 	if err != nil {
 		return nil, err
@@ -2580,9 +2757,16 @@ func (s *Handler) launchWorkspaceRuntimeSession(
 }
 
 func (s *Handler) LaunchWorkspaceRuntimeService(
-	ctx context.Context, workspaceID, targetKey string,
+	ctx context.Context, workspaceID, targetKey, initialMessage string,
 ) (localruntime.SessionInfo, error) {
-	return s.launchWorkspaceRuntimeService(ctx, workspaceID, targetKey, "")
+	if initialMessage != "" {
+		message, _, err := normalizeAgentMessage(initialMessage, workspaceRuntimeTargetKind(s.runtime, strings.TrimSpace(targetKey)))
+		if err != nil {
+			return localruntime.SessionInfo{}, httpapi.Validation("message", err.Error())
+		}
+		initialMessage = message
+	}
+	return s.launchWorkspaceRuntimeService(ctx, workspaceID, targetKey, "", initialMessage)
 }
 
 func (s *Handler) PreferredWorkspaceAgentTargetService(
@@ -2592,7 +2776,7 @@ func (s *Handler) PreferredWorkspaceAgentTargetService(
 }
 
 func (s *Handler) launchWorkspaceRuntimeService(
-	ctx context.Context, workspaceID, targetKey, displayRegion string,
+	ctx context.Context, workspaceID, targetKey, displayRegion, initialMessage string,
 ) (session localruntime.SessionInfo, err error) {
 	started := time.Now()
 	defer func() {
@@ -2609,6 +2793,9 @@ func (s *Handler) launchWorkspaceRuntimeService(
 		return localruntime.SessionInfo{}, httpapi.Validation("body.target_key", "target_key is required")
 	}
 	if workspaceRuntimeTargetIsAgent(s.runtime, targetKey) {
+		if err := s.workspaces.ValidateExecutionIdentity(ctx, summary.WorktreePath); err != nil {
+			return localruntime.SessionInfo{}, httpapi.Validation("identity", err.Error())
+		}
 		if err := s.workspaces.PrepareAgentLaunchContext(
 			ctx,
 			workspace.PrepareAgentLaunchContextOptions{
@@ -2622,7 +2809,7 @@ func (s *Handler) launchWorkspaceRuntimeService(
 			return localruntime.SessionInfo{}, httpapi.Internal("prepare agent context: " + err.Error())
 		}
 	}
-	session, err = s.runtime.Launch(ctx, summary.ID, summary.WorktreePath, targetKey)
+	session, err = s.runtime.LaunchWithInitialMessage(ctx, summary.ID, summary.WorktreePath, targetKey, initialMessage)
 	if err != nil {
 		return localruntime.SessionInfo{}, workspaceRuntimeLaunchError(err)
 	}
@@ -2641,6 +2828,12 @@ func (s *Handler) launchWorkspaceRuntimeService(
 	}
 	s.invalidateWorkspaceEnrichment(summary.ID)
 	s.forgetRecordedRuntimeSessionIfExited(ctx, session)
+	if session.InitialMessageProvided {
+		s.reserveInitialMessageAttempt(summary.ID, session.Key, initialMessageAttempt{
+			TargetKey: targetKey, Message: initialMessage,
+		})
+		s.finishInitialMessageAttempt(summary.ID, session.Key, initialMessageDelivered)
+	}
 	return session, nil
 }
 
@@ -2651,13 +2844,27 @@ func (s *Handler) LaunchWorkspaceRuntimeSession(
 	return s.launchWorkspaceRuntimeSession(ctx, input)
 }
 
+// workspaceRuntimeTargetKind is the kind of a configured launch target, or
+// empty when there is none.
+func workspaceRuntimeTargetKind(runtime *localruntime.Manager, targetKey string) localruntime.LaunchTargetKind {
+	if runtime == nil {
+		return ""
+	}
+	for _, target := range runtime.LaunchTargets() {
+		if target.Key == targetKey {
+			return target.Kind
+		}
+	}
+	return ""
+}
+
 func workspaceRuntimeTargetIsAgent(runtime *localruntime.Manager, targetKey string) bool {
 	if runtime == nil {
 		return false
 	}
 	for _, target := range runtime.LaunchTargets() {
 		if target.Key == targetKey {
-			return target.Kind == localruntime.LaunchTargetAgent && target.Available
+			return target.Kind.IsAgent() && target.Available
 		}
 	}
 	return false
@@ -2675,17 +2882,30 @@ func (s *Handler) forgetRecordedRuntimeSessionIfExited(
 			return
 		}
 	}
+	// The exit can land before this record does. Keep a lost agent as the exit
+	// handler would, whether or not that handler has run yet.
+	s.runtimeRecoveryMu.Lock()
+	pending := s.runtimeRecoveryPending[session.Key]
+	s.runtimeRecoveryMu.Unlock()
+	if pending {
+		return
+	}
+	if exited, ok := s.runtime.ExitedSession(session.Key); ok && s.keepAgentAfterTmuxServerLoss(exited) {
+		s.invalidateWorkspaceEnrichment(session.WorkspaceID)
+		return
+	}
 	cleanupCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx), runtimeSessionCleanupTimeout,
 	)
 	defer cancel()
-	if _, err := s.workspaces.ForgetRuntimeSessionAfterExit(
+	forgotten, err := s.workspaces.ForgetRuntimeSessionAfterExit(
 		cleanupCtx,
 		session.WorkspaceID,
 		session.Key,
 		session.CreatedAt,
 		session.TmuxSession,
-	); err != nil {
+	)
+	if err != nil {
 		slog.Warn(
 			"forget runtime session that exited before record completed",
 			"workspace_id", session.WorkspaceID,
@@ -2693,6 +2913,9 @@ func (s *Handler) forgetRecordedRuntimeSessionIfExited(
 			"err", err,
 		)
 		return
+	}
+	if forgotten {
+		s.runtime.ForgetAgentExit(session.TmuxSession)
 	}
 	s.invalidateWorkspaceEnrichment(session.WorkspaceID)
 }
@@ -2722,7 +2945,46 @@ func (s *Handler) recordRuntimeSession(
 	); err != nil {
 		return httpapi.Internal("record runtime session: " + err.Error())
 	}
+	if session.Kind == localruntime.LaunchTargetAgent {
+		s.noteTmuxServer(ctx, session.Key, session.TmuxSession)
+		s.importEarlyConversation(ctx, workspaceID, session.Key)
+	}
 	return nil
+}
+
+// importEarlyConversation saves a conversation the agent reported before its
+// row existed: its first hook can beat the record, and SessionEnd may delete
+// the report before another hook arrives.
+func (s *Handler) importEarlyConversation(ctx context.Context, workspaceID, sessionKey string) {
+	if s.db == nil || s.agentActivity == nil {
+		return
+	}
+	ws, err := s.db.GetWorkspace(ctx, workspaceID)
+	if err != nil || ws == nil {
+		return
+	}
+	reports := s.agentActivity.LiveReportsForWorkspace(ws.WorktreePath, []string{sessionKey})
+	// Several conversations mean a nested agent reported too, and nothing
+	// tells which is the terminal's own; the next hook decides instead.
+	if len(reports) == 0 || !singleConversation(reports) {
+		return
+	}
+	// A row that already saves a conversation, as a resumed agent's does,
+	// keeps it: the newest report may be a nested agent's.
+	if _, err := s.db.ImportWorkspaceRuntimeConversation(
+		ctx, sessionKey, reports[0].Agent, reports[0].SessionID,
+	); err != nil {
+		slog.Warn("import early agent conversation", "session_key", sessionKey, "err", err)
+	}
+}
+
+func singleConversation(reports []agentactivity.Report) bool {
+	for _, report := range reports[1:] {
+		if report.Agent != reports[0].Agent || report.SessionID != reports[0].SessionID {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeRuntimeDisplayRegion(
@@ -2756,6 +3018,9 @@ func (s *Handler) stopWorkspaceRuntimeSession(
 		ctx, summary.ID, input.SessionKey,
 	); err != nil {
 		if errors.Is(err, localruntime.ErrSessionNotFound) {
+			if stopErr := s.runtime.StopDormantACP(ctx, summary.ID, input.SessionKey); stopErr != nil {
+				return nil, httpapi.Internal("stop ACP owner: " + stopErr.Error())
+			}
 			stopped, stopErr := s.workspaces.StopStoredRuntimeSessionByKey(
 				ctx, summary.ID, input.SessionKey,
 			)
@@ -2766,7 +3031,11 @@ func (s *Handler) stopWorkspaceRuntimeSession(
 			}
 			if stopped {
 				s.setRuntimeRecoveryPending(input.SessionKey, false)
+				s.setChatCannotReload(input.SessionKey, false)
 				s.removeAgentActivityRuntimeSession(input.SessionKey)
+				if err := s.runtime.ClearStopMark(input.SessionKey); err != nil {
+					slog.Warn("remove stop mark of stopped runtime", "session_key", input.SessionKey, "err", err)
+				}
 				s.invalidateWorkspaceEnrichment(summary.ID)
 				return nil, nil
 			}
@@ -2780,6 +3049,7 @@ func (s *Handler) stopWorkspaceRuntimeSession(
 		return nil, httpapi.Internal("forget runtime session: " + err.Error())
 	}
 	s.setRuntimeRecoveryPending(input.SessionKey, false)
+	s.setChatCannotReload(input.SessionKey, false)
 	s.removeAgentActivityRuntimeSession(input.SessionKey)
 	s.invalidateWorkspaceEnrichment(summary.ID)
 	return nil, nil
@@ -2917,13 +3187,13 @@ func (s *Handler) renameStoredRuntimeSession(
 	if err != nil || !updated {
 		return localruntime.SessionInfo{}, false, err
 	}
-	stored, err := s.workspaces.RuntimeSessionsForWorkspace(ctx, workspaceID)
+	sessions, err := s.workspaceRuntimeSessions(ctx, workspaceID)
 	if err != nil {
 		return localruntime.SessionInfo{}, false, err
 	}
-	for _, session := range stored {
-		if session.SessionKey == sessionKey {
-			return storedRuntimeSessionInfo(session), true, nil
+	for _, session := range sessions {
+		if session.Key == sessionKey {
+			return session, true, nil
 		}
 	}
 	return localruntime.SessionInfo{}, false, nil
@@ -2964,7 +3234,7 @@ func (s *Handler) getReadyRuntimeWorkspace(
 
 func workspaceRuntimeLaunchError(err error) error {
 	msg := err.Error()
-	if errors.Is(err, tokenauth.ErrMissingToken) {
+	if errors.Is(err, tokenauth.ErrMissingToken) || errors.Is(err, ptyowner.ErrCommandLineTooLong) {
 		return httpapi.BadRequest(httpapi.CodeBadRequest, msg, nil)
 	}
 	if strings.Contains(msg, "target not found") {
@@ -3046,9 +3316,6 @@ func (s *Handler) DeleteWorkspace(
 		}
 		if errors.Is(err, workspace.ErrWorkspaceNotFound) {
 			return nil, httpapi.NotFound(httpapi.CodeWorkspaceNotFound, err.Error(), nil)
-		}
-		if errors.Is(err, workspace.ErrWorkspaceOwnershipUnproven) {
-			return nil, httpapi.Conflict(httpapi.CodeConflict, err.Error(), nil)
 		}
 		return nil, httpapi.Internal("delete workspace: " + err.Error())
 	}

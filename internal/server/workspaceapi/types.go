@@ -2,31 +2,38 @@ package workspaceapi
 
 import (
 	"go.kenn.io/forge/internal/db"
+	"go.kenn.io/forge/internal/devbox"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/workspace/localruntime"
 )
 
-type diffResponse = httpapi.DiffResponse
-type filesResponse = httpapi.FilesResponse
+type (
+	diffResponse  = httpapi.DiffResponse
+	filesResponse = httpapi.FilesResponse
+)
 
 type workspaceDiffWatchResponse struct {
 	Changed bool   `json:"changed" doc:"True when the caller must reload the watched default-HEAD snapshot."`
 	Version string `json:"version" doc:"Opaque version of the current default-HEAD snapshot; never a version from another diff scope."`
 }
 
-type filePreviewResponse = httpapi.FilePreviewResponse
-type commitResponse = httpapi.CommitResponse
-type commitsResponse = httpapi.CommitsResponse
+type (
+	filePreviewResponse = httpapi.FilePreviewResponse
+	commitResponse      = httpapi.CommitResponse
+	commitsResponse     = httpapi.CommitsResponse
+)
 
 // WorkspaceRef is the lightweight link from item detail APIs back to an
 // existing kenn-forge workspace.
 type WorkspaceRef struct {
 	ID         string  `json:"id"`
 	Status     string  `json:"status"`
-	AgentState *string `json:"agent_state,omitempty" enum:"idle,working,input,approval,done" doc:"Hook-reported state of live agent sessions in the linked workspace."`
+	AgentState *string `json:"agent_state,omitempty" enum:"idle,working,input,approval,done" doc:"Hook- or ACP-reported state of live agent sessions in the linked workspace."`
 }
 
 type workspaceResponse struct {
+	PushState             *devbox.PushState         `json:"push_state,omitempty"`
+	CommitAttribution     *devbox.Attribution       `json:"commit_attribution,omitempty"`
 	ID                    string                    `json:"id"`
 	Repo                  httpapi.RepoRefResponse   `json:"repo"`
 	PlatformHost          string                    `json:"platform_host"`
@@ -42,11 +49,12 @@ type workspaceResponse struct {
 	TmuxWorking           bool                      `json:"tmux_working"`
 	TmuxActivitySource    string                    `json:"tmux_activity_source"`
 	TmuxLastOutputAt      *string                   `json:"tmux_last_output_at"`
-	AgentState            *string                   `json:"agent_state,omitempty" enum:"idle,working,input,approval,done" doc:"Hook-reported aggregate state for live agent sessions. Omitted when no live session has reported lifecycle state."`
-	AgentStateUpdatedAt   *string                   `json:"agent_state_updated_at,omitempty" format:"date-time" doc:"UTC timestamp of the hook report that produced agent_state."`
+	AgentState            *string                   `json:"agent_state,omitempty" enum:"idle,working,input,approval,done" doc:"Hook- or ACP-reported aggregate state for live agent sessions. Omitted when no live session has reported lifecycle state."`
+	AgentStateUpdatedAt   *string                   `json:"agent_state_updated_at,omitempty" format:"date-time" doc:"UTC timestamp of the activity report that produced agent_state."`
 	Status                string                    `json:"status"`
 	ErrorMessage          *string                   `json:"error_message,omitempty"`
 	CreatedAt             string                    `json:"created_at"`
+	ItemAuthor            *string                   `json:"item_author,omitempty" doc:"Author of the linked PR or issue."`
 	ItemLastActivityAt    *string                   `json:"item_last_activity_at,omitempty"`
 	MRTitle               *string                   `json:"mr_title,omitempty"`
 	MRState               *string                   `json:"mr_state,omitempty"`

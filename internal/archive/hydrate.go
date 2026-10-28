@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
 	"go.kenn.io/forge/internal/platformdb"
 
 	"go.kenn.io/forge/internal/db"
@@ -48,7 +49,7 @@ func (s *Service) hydrateItem(
 		commit.Outcome = db.ArchiveLookupPresent
 		if err := s.db.CommitArchiveItemSync(ctx, commit); err != nil {
 			if errors.Is(err, db.ErrArchiveItemEvidenceChanged) {
-				return s.recordItemSyncFailure(ctx, commit, work.AttemptCount, err)
+				return s.recordItemSyncFailure(ctx, commit, work.AttemptCount, syncResult.ProviderAttempted, err)
 			}
 			return err
 		}
@@ -71,7 +72,7 @@ func (s *Service) hydrateItem(
 		}
 		return s.db.CommitArchiveItemSync(ctx, commit)
 	}
-	return s.recordItemSyncFailure(ctx, commit, work.AttemptCount, syncErr)
+	return s.recordItemSyncFailure(ctx, commit, work.AttemptCount, syncResult.ProviderAttempted, syncErr)
 }
 
 func archiveTerminalSyncOutcome(
@@ -83,8 +84,8 @@ func archiveTerminalSyncOutcome(
 	if !errors.Is(err, platform.ErrLookupNotPresent) {
 		return "", nil, false
 	}
-	var platformErr *platform.Error
-	if !errors.As(err, &platformErr) {
+	platformErr, ok := errors.AsType[*platform.Error](err)
+	if !ok {
 		return "", nil, false
 	}
 	switch platformErr.Code {
@@ -109,6 +110,7 @@ func (s *Service) recordItemSyncFailure(
 	ctx context.Context,
 	commit db.ArchiveItemSyncCommit,
 	attempt int,
+	providerAttempted bool,
 	cause error,
 ) error {
 	decision := s.retries.Classify(cause, attempt, s.now())
@@ -117,11 +119,14 @@ func (s *Service) recordItemSyncFailure(
 	}
 	commit.ErrorDetail = cause.Error()
 	repositoryFailure := decision.Code == db.ArchiveErrorCodeAuthentication ||
-		decision.Code == db.ArchiveErrorCodeRepoBlocked
+		decision.Code == db.ArchiveErrorCodeRepoBlocked || decision.Code == db.ArchiveErrorCodeBudgetExhausted
 	if err := s.db.FailArchiveItemSync(
 		ctx, commit, decision.Code, decision.RetryAt, repositoryFailure,
 	); err != nil {
 		return errors.Join(cause, err)
+	}
+	if decision.Code == db.ArchiveErrorCodeBudgetExhausted {
+		return &admissionDeferredError{providerAttempted: providerAttempted}
 	}
 	return fmt.Errorf("sync archive %s %d: %w", commit.ItemType, commit.ItemNumber, cause)
 }

@@ -1,7 +1,6 @@
 package config
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +11,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"uuid"
+
+	platformpkg "go.kenn.io/forge/platform"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,6 +26,12 @@ func writeConfig(t *testing.T, content string) string {
 	path := filepath.Join(dir, "config.toml")
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
 	return path
+}
+
+func TestAirplaneModeRoundTrip(t *testing.T) {
+	cfg, saved := roundTripConfigString(t, "airplane_mode = true\n")
+	assert.True(t, cfg.AirplaneMode)
+	assert.True(t, saved.AirplaneMode)
 }
 
 func TestWorkspaceListAgentStatus(t *testing.T) {
@@ -56,6 +64,16 @@ func TestWorkspaceDefaultSidebarView(t *testing.T) {
 	})
 }
 
+func TestWorkspaceIdleRuntimeStopHours(t *testing.T) {
+	cfg, saved := roundTripConfigString(t, "[workspaces]\nidle_runtime_stop_hours = 12\n")
+	assert.Equal(t, 12, cfg.Workspaces.IdleRuntimeStopHours)
+	assert.Equal(t, 12, saved.Workspaces.IdleRuntimeStopHours)
+	for _, hours := range []string{"-1", "721"} {
+		_, err := Load(writeConfig(t, "[workspaces]\nidle_runtime_stop_hours = "+hours+"\n"))
+		require.ErrorContains(t, err, "workspaces.idle_runtime_stop_hours")
+	}
+}
+
 func roundTripConfigString(t *testing.T, content string) (*Config, *Config) {
 	t.Helper()
 	cfg, err := Load(writeConfig(t, content))
@@ -67,6 +85,79 @@ func roundTripConfigString(t *testing.T, content string) (*Config, *Config) {
 	return cfg, cfg2
 }
 
+func TestMCPDefaultConditions(t *testing.T) {
+	workerDir := t.TempDir()
+	worker := fmt.Sprintf(`
+host = "127.0.0.1"
+data_dir = %q
+[api]
+require_auth = true
+[execution_worker]
+enabled = true
+broker_socket = %q
+uid = 1001
+github_user_id = 1234
+commit_name = "Developer A"
+commit_email = "developer-a@example.org"
+`, workerDir, filepath.Join(workerDir, "broker.sock"))
+
+	for _, tt := range []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{name: "all defaults", content: "host = \"127.0.0.1\"\nport = 8091\n", want: true},
+		{name: "IPv6 loopback", content: "host = \"::1\"\n", want: true},
+		{name: "network", content: "host = \"192.0.2.10\"\n[api]\nrequire_auth = true\n"},
+		{name: "wildcard", content: "host = \"0.0.0.0\"\n[api]\nrequire_auth = true\n"},
+		{name: "worker", content: worker},
+		{name: "saved port", content: "host = \"127.0.0.1\"\n[mcp]\nport = 9192\n"},
+		{name: "cache override", content: "host = \"127.0.0.1\"\n[mcp]\ndiff_cache_mb = 256\n", want: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			cfg, err := Load(writeConfig(t, tt.content))
+			require.NoError(t, err)
+			assert.Equal(tt.want, cfg.MCPEnabled())
+			if tt.want {
+				assert.Equal(cfg.ListenAddr(), cfg.MCPListenAddr())
+				assert.Equal("http://"+cfg.ListenAddr()+"/mcp", cfg.MCPURL())
+				assert.True(cfg.MCPSharesMainListener())
+			}
+		})
+	}
+}
+
+func TestSetMCPEnabled(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		input    MCP
+		want     bool
+		expected *bool
+	}{
+		{"default on stays on", MCP{}, true, nil},
+		{"default on turns off", MCP{}, false, new(false)},
+		{"explicit off stays off", MCP{Enabled: new(false)}, false, new(false)},
+		{"explicit off returns to default", MCP{Enabled: new(false)}, true, nil},
+		{"explicit on stays on", MCP{Enabled: new(true)}, true, new(true)},
+		{"explicit on turns off", MCP{Enabled: new(true)}, false, new(false)},
+		{"saved port stays off", MCP{Port: 9192}, false, new(false)},
+		{"saved port turns on", MCP{Port: 9192}, true, new(true)},
+		{"saved port explicit off turns on", MCP{Enabled: new(false), Port: 9192}, true, new(true)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{Host: "127.0.0.1", MCP: tt.input}
+			before := cfg.MCPEnabled()
+			cfg.SetMCPEnabled(tt.want)
+			assert.Equal(t, tt.expected, cfg.MCP.Enabled)
+			assert.Equal(t, tt.want, cfg.MCPEnabled())
+			if tt.input.Enabled != nil {
+				assert.Equal(t, before, *tt.input.Enabled, "startup snapshot pointer must stay unchanged")
+			}
+		})
+	}
+}
+
 func TestMCPConfigDefaultsToBackendPortPlusOne(t *testing.T) {
 	assert := assert.New(t)
 	cfg, err := Load(writeConfig(t, "host = \"127.0.0.1\"\nport = 8091\n[mcp]\nenabled = true\n"))
@@ -76,16 +167,75 @@ func TestMCPConfigDefaultsToBackendPortPlusOne(t *testing.T) {
 	assert.Equal(int64(128<<20), cfg.MCPDiffCacheBytes())
 }
 
+func TestMCPListenAddrStaysLoopback(t *testing.T) {
+	tests := []struct {
+		host     string
+		port     string
+		basePath string
+		want     string
+	}{
+		{host: "127.0.0.1", want: "127.0.0.1:8092"},
+		{host: "::ffff:127.0.0.1", want: "127.0.0.1:8092"},
+		{host: "::1", port: "9192", want: "[::1]:9192"},
+		{host: "192.0.2.10", want: "127.0.0.1:8092"},
+		{host: "2001:db8::10", port: "9192", want: "127.0.0.1:9192"},
+		{host: "127.0.0.1", port: "8091", basePath: "/forge/", want: "127.0.0.1:8091"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			content := fmt.Sprintf("host = %q\nport = 8091\nbase_path = %q\n[mcp]\nenabled = true\n", tt.host, tt.basePath)
+			if tt.port != "" {
+				content += "port = " + tt.port + "\n"
+			}
+			cfg, err := Load(writeConfig(t, content))
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, cfg.MCPListenAddr())
+			assert.Equal(t, "http://"+tt.want+strings.TrimSuffix(tt.basePath, "/")+"/mcp", cfg.MCPURL())
+		})
+	}
+}
+
+func TestMCPSharesMainListenerOnlyWhenSocketsCollide(t *testing.T) {
+	tests := []struct {
+		name    string
+		host    string
+		mcpPort string
+		want    bool
+	}{
+		{name: "loopback same port", host: "127.0.0.1", mcpPort: "8091", want: true},
+		{name: "ipv6 loopback same port", host: "::1", mcpPort: "8091", want: true},
+		{name: "ipv4 wildcard same port", host: "0.0.0.0", mcpPort: "8091", want: true},
+		{name: "loopback default port", host: "127.0.0.1", want: false},
+		{name: "loopback distinct port", host: "127.0.0.1", mcpPort: "9192", want: false},
+		// The companion binds 127.0.0.1, which these main listeners do not cover.
+		{name: "interface same port", host: "192.0.2.10", mcpPort: "8091", want: false},
+		{name: "ipv6 wildcard same port", host: "::", mcpPort: "8091", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := fmt.Sprintf("host = %q\nport = 8091\n[api]\nrequire_auth = true\n[mcp]\nenabled = true\n", tt.host)
+			if tt.mcpPort != "" {
+				content += "port = " + tt.mcpPort + "\n"
+			}
+			cfg, err := Load(writeConfig(t, content))
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, cfg.MCPSharesMainListener())
+		})
+	}
+}
+
 func TestMCPConfigRoundTrip(t *testing.T) {
-	require := require.New(t)
-	cfg, err := Load(writeConfig(t, ""))
-	require.NoError(err)
-	cfg.MCP = MCP{Enabled: true, Port: 9192, DiffCacheMB: 256}
-	path := filepath.Join(t.TempDir(), "config.toml")
-	require.NoError(cfg.Save(path))
-	reloaded, err := Load(path)
-	require.NoError(err)
-	assert.Equal(t, MCP{Enabled: true, Port: 9192, DiffCacheMB: 256}, reloaded.MCP)
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprint(enabled), func(t *testing.T) {
+			cfg, saved := roundTripConfigString(t, fmt.Sprintf("host = \"127.0.0.1\"\n[mcp]\nenabled = %t\nport = 9192\ndiff_cache_mb = 256\n", enabled))
+			assert.Equal(t, enabled, cfg.MCPEnabled())
+			assert.Equal(t, MCP{Enabled: new(enabled), Port: 9192, DiffCacheMB: 256}, saved.MCP)
+			if !enabled {
+				assert.Empty(t, saved.MCPListenAddr())
+				assert.Empty(t, saved.MCPURL())
+			}
+		})
+	}
 }
 
 func TestMCPConfigValidation(t *testing.T) {
@@ -100,11 +250,6 @@ func TestMCPConfigValidation(t *testing.T) {
 			wantErr: "MCP port",
 		},
 		{
-			name:    "matches backend port",
-			content: "host = \"127.0.0.1\"\nport = 8091\n[mcp]\nenabled = true\nport = 8091\n",
-			wantErr: "MCP port",
-		},
-		{
 			name:    "explicit port below range",
 			content: "host = \"127.0.0.1\"\nport = 8091\n[mcp]\nenabled = true\nport = -1\n",
 			wantErr: "MCP port",
@@ -113,11 +258,6 @@ func TestMCPConfigValidation(t *testing.T) {
 			name:    "explicit port above range",
 			content: "host = \"127.0.0.1\"\nport = 8091\n[mcp]\nenabled = true\nport = 65536\n",
 			wantErr: "MCP port",
-		},
-		{
-			name:    "non-loopback host",
-			content: "host = \"192.0.2.10\"\nport = 8091\n[mcp]\nenabled = true\n",
-			wantErr: "loopback",
 		},
 		{
 			name:    "negative diff cache",
@@ -339,7 +479,7 @@ func TestSaveAppliesNotificationDefaultsForInMemoryConfig(t *testing.T) {
 	require.NoError(err)
 
 	assert.True(reloaded.NotificationsEnabled())
-	assert.Equal(defaultNotificationSyncInterval, reloaded.Notifications.SyncInterval)
+	assert.Equal(time.Hour, reloaded.NotificationSyncDuration())
 	assert.Equal(defaultNotificationPropagationInterval, reloaded.Notifications.PropagationInterval)
 	assert.Equal(25, reloaded.Notifications.BatchSize)
 }
@@ -844,6 +984,11 @@ name = "b"
 		{"single dot", "/./path", true, ""},
 		{"special chars", "/mid<script>", true, ""},
 		{"quotes", `/mid"man`, true, ""},
+		// Root probe and ping routes would be ambiguous without trailing slashes.
+		{"health probe name", "/healthz/", true, ""},
+		{"liveness probe name", "livez", true, ""},
+		{"ping prefix", "/api/ping/", true, ""},
+		{"probe-like but distinct", "/live/", false, "/live/"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -913,8 +1058,52 @@ name = "b"
 	assert.Equal("7d", cfg.Activity.TimeRange)
 	assert.False(cfg.Activity.HideClosed)
 	assert.False(cfg.Activity.HideBots)
+	assert.False(cfg.Activity.HideDrafts)
 	assert.True(cfg.Activity.CollapseThreads)
 	assert.False(cfg.Activity.UseWorkspaceActivityForRecency)
+	assert.Equal([]string{"pr", "issue"}, cfg.Activity.ItemTypes)
+	assert.Equal([]string{"comment", "review", "commit", "force_push"}, cfg.Activity.EventTypes)
+}
+
+func TestActivityFilterDefaultsRoundTrip(t *testing.T) {
+	for _, selection := range []struct {
+		name       string
+		items      string
+		events     string
+		wantItems  []string
+		wantEvents []string
+	}{
+		{"subset", `["issue"]`, `["comment", "force_push"]`, []string{"issue"}, []string{"comment", "force_push"}},
+		{"empty", `[]`, `[]`, []string{}, []string{}},
+	} {
+		t.Run(selection.name, func(t *testing.T) {
+			assert := assert.New(t)
+			_, reloaded := roundTripConfigString(t, fmt.Sprintf(`
+[activity]
+item_types = %s
+event_types = %s
+hide_notifications = true
+hide_drafts = true
+hide_default_branch = true
+roll_up_commits = true
+`, selection.items, selection.events))
+			assert.Equal(selection.wantItems, reloaded.Activity.ItemTypes)
+			assert.Equal(selection.wantEvents, reloaded.Activity.EventTypes)
+			assert.True(reloaded.Activity.HideNotifications)
+			assert.True(reloaded.Activity.HideDrafts)
+			assert.True(reloaded.Activity.HideDefaultBranch)
+			assert.True(reloaded.Activity.RollUpCommits)
+		})
+	}
+}
+
+func TestLoadActivityInvalidSelections(t *testing.T) {
+	for _, field := range []string{"item_types", "event_types"} {
+		t.Run(field, func(t *testing.T) {
+			_, err := Load(writeConfig(t, "[activity]\n"+field+" = [\"unknown\"]\n"))
+			require.ErrorContains(t, err, "invalid activity "+field)
+		})
+	}
 }
 
 func TestLoadActivityExplicit(t *testing.T) {
@@ -2737,7 +2926,7 @@ func TestRepositoryStableIdentitySurvivesConfigSave(t *testing.T) {
 [[repos]]
 owner = "acme"
 name = "widget"
-platform_repo_id = "repo-widget"
+platform_repo_id = 1001
 	`)
 	cfg, err := Load(path)
 	require.NoError(err)
@@ -2746,7 +2935,17 @@ platform_repo_id = "repo-widget"
 	require.NoError(cfg.Save(savedPath))
 	saved, err := os.ReadFile(savedPath)
 	require.NoError(err)
-	assert.Contains(string(saved), `platform_repo_id = "repo-widget"`)
+	assert.Contains(string(saved), `platform_repo_id = 1001`)
+}
+
+func TestRepositoryRejectsNegativePlatformRepoID(t *testing.T) {
+	_, err := Load(writeConfig(t, `
+[[repos]]
+owner = "acme"
+name = "widget"
+platform_repo_id = -1
+`))
+	require.ErrorContains(t, err, "platform_repo_id must be the provider's positive integer repository ID")
 }
 
 func TestRepoPresetsConfigRoundTrip(t *testing.T) {
@@ -2760,17 +2959,17 @@ name = "b"
 [[repo_presets]]
 name = "  Review queue  "
 repos = [
-  { provider = "github", platform_host = " github.com ", platform_repo_id = " R_widgets ", repo_path = " acme/widgets " },
-  { provider = "gitlab", platform_host = "git.example.com", platform_repo_id = "42", repo_path = "group/project" },
-  { provider = "github", platform_host = "github.com", platform_repo_id = "R_widgets", repo_path = "acme/old-widgets" },
+  { provider = "github", platform_host = " github.com ", platform_repo_id = 1001, repo_path = " acme/widgets " },
+  { provider = "gitlab", platform_host = "git.example.com", platform_repo_id = 42, repo_path = "group/project" },
+  { provider = "github", platform_host = "github.com", platform_repo_id = 1001, repo_path = "acme/old-widgets" },
 ]
 `)
 
 	want := []RepoPreset{{
 		Name: "Review queue",
 		Repos: []RepoPresetRepository{
-			{Provider: "github", PlatformHost: "github.com", PlatformRepoID: "R_widgets", RepoPath: "acme/widgets"},
-			{Provider: "gitlab", PlatformHost: "git.example.com", PlatformRepoID: "42", RepoPath: "group/project"},
+			{Provider: "github", PlatformHost: "github.com", PlatformRepoID: 1001, RepoPath: "acme/widgets"},
+			{Provider: "gitlab", PlatformHost: "git.example.com", PlatformRepoID: 42, RepoPath: "group/project"},
 		},
 	}}
 	assert.Equal(want, cfg.RepoPresets)
@@ -2789,7 +2988,7 @@ func TestRepoPresetValidation(t *testing.T) {
 			presets: `
 [[repo_presets]]
 name = "GLOBAL"
-repos = [{ provider = "github", platform_host = "github.com", platform_repo_id = "R_widgets", repo_path = "acme/widgets" }]
+repos = [{ provider = "github", platform_host = "github.com", platform_repo_id = 1001, repo_path = "acme/widgets" }]
 `,
 			wantErr: `repo_presets[0]: name "GLOBAL" is reserved`,
 		},
@@ -2798,11 +2997,11 @@ repos = [{ provider = "github", platform_host = "github.com", platform_repo_id =
 			presets: `
 [[repo_presets]]
 name = "Review Queue"
-repos = [{ provider = "github", platform_host = "github.com", platform_repo_id = "R_widgets", repo_path = "acme/widgets" }]
+repos = [{ provider = "github", platform_host = "github.com", platform_repo_id = 1001, repo_path = "acme/widgets" }]
 
 [[repo_presets]]
 name = "review queue"
-repos = [{ provider = "github", platform_host = "github.com", platform_repo_id = "R_docs", repo_path = "acme/docs" }]
+repos = [{ provider = "github", platform_host = "github.com", platform_repo_id = 1002, repo_path = "acme/docs" }]
 `,
 			wantErr: `duplicate repo preset name "review queue"`,
 		},
@@ -2811,7 +3010,7 @@ repos = [{ provider = "github", platform_host = "github.com", platform_repo_id =
 			presets: `
 [[repo_presets]]
 name = "   "
-repos = [{ provider = "github", platform_host = "github.com", platform_repo_id = "R_widgets", repo_path = "acme/widgets" }]
+repos = [{ provider = "github", platform_host = "github.com", platform_repo_id = 1001, repo_path = "acme/widgets" }]
 `,
 			wantErr: "repo_presets[0]: name is required",
 		},
@@ -2829,7 +3028,7 @@ repos = []
 			presets: `
 [[repo_presets]]
 name = "Review queue"
-repos = [{ provider = "GitHub", platform_host = "github.com", platform_repo_id = "R_widgets", repo_path = "acme/widgets" }]
+repos = [{ provider = "GitHub", platform_host = "github.com", platform_repo_id = 1001, repo_path = "acme/widgets" }]
 `,
 			wantErr: `repo_presets[0].repos[0]: repository identity must use a canonical provider`,
 		},
@@ -2838,9 +3037,9 @@ repos = [{ provider = "GitHub", platform_host = "github.com", platform_repo_id =
 			presets: `
 [[repo_presets]]
 name = "Review queue"
-repos = [{ provider = "bitbucket", platform_host = "bitbucket.org", platform_repo_id = "R_widgets", repo_path = "acme/widgets" }]
+repos = [{ provider = "unsupported", platform_host = "forge.example.test", platform_repo_id = 1001, repo_path = "acme/widgets" }]
 `,
-			wantErr: `repo_presets[0].repos[0]: unsupported provider "bitbucket"`,
+			wantErr: `repo_presets[0].repos[0]: unsupported provider "unsupported"`,
 		},
 		{
 			name: "stable repository id is required",
@@ -2848,6 +3047,15 @@ repos = [{ provider = "bitbucket", platform_host = "bitbucket.org", platform_rep
 [[repo_presets]]
 name = "Review queue"
 repos = [{ provider = "github", platform_host = "github.com", repo_path = "acme/widgets" }]
+`,
+			wantErr: `repo_presets[0].repos[0]: platform_repo_id is required`,
+		},
+		{
+			name: "stable repository id must be positive",
+			presets: `
+[[repo_presets]]
+name = "Review queue"
+repos = [{ provider = "github", platform_host = "github.com", platform_repo_id = -1, repo_path = "acme/widgets" }]
 `,
 			wantErr: `repo_presets[0].repos[0]: platform_repo_id is required`,
 		},
@@ -2950,7 +3158,7 @@ name = "b"
 }
 
 func TestTerminalRetainedSessionsValidation(t *testing.T) {
-	for _, retainedSessions := range []int{-1, 21} {
+	for _, retainedSessions := range []int{-1, 101} {
 		t.Run(fmt.Sprintf("value_%d", retainedSessions), func(t *testing.T) {
 			_, err := Load(writeConfig(t, fmt.Sprintf(`
 [[repos]]
@@ -3140,6 +3348,10 @@ name = "b"
 		assert.Equal(t, 500, cfg.BudgetPerHour())
 	})
 
+	t.Run("unset value on a config built without Load resolves to the default", func(t *testing.T) {
+		assert.Equal(t, 500, (&Config{}).BudgetPerHour())
+	})
+
 	t.Run("rejects value below 50", func(t *testing.T) {
 		path := writeConfig(t, `
 sync_budget_per_hour = 49
@@ -3149,7 +3361,19 @@ name = "b"
 `)
 		_, err := Load(path)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "sync_budget_per_hour must be >= 50 or omitted")
+		assert.Contains(t, err.Error(), "sync_budget_per_hour must be between 50 and 15000 or omitted")
+	})
+
+	t.Run("rejects value above the provider quota ceiling", func(t *testing.T) {
+		path := writeConfig(t, `
+sync_budget_per_hour = 15001
+[[repos]]
+owner = "a"
+name = "b"
+`)
+		_, err := Load(path)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "sync_budget_per_hour must be between 50 and 15000 or omitted")
 	})
 
 	t.Run("configured value preserved", func(t *testing.T) {
@@ -3273,7 +3497,6 @@ name = "b"
 		assert.False(*cfg.Modes.Actions)
 		assert.True(*cfg.Modes.Pulls)
 		assert.True(*cfg.Modes.Issues)
-		assert.True(*cfg.Modes.Reviews)
 		assert.True(*cfg.Modes.Workspaces)
 	})
 
@@ -3292,7 +3515,6 @@ repos = false
 docs = false
 pulls = false
 issues = false
-reviews = false
 workspaces = false
 `))
 		require.NoError(err)
@@ -3311,7 +3533,6 @@ workspaces = false
 		assert.False(*cfg2.Modes.Docs)
 		assert.False(*cfg2.Modes.Pulls)
 		assert.False(*cfg2.Modes.Issues)
-		assert.False(*cfg2.Modes.Reviews)
 		assert.False(*cfg2.Modes.Workspaces)
 	})
 }
@@ -4154,7 +4375,7 @@ func TestGitHubCLITokenForHostTimesOutWithoutCallerDeadline(t *testing.T) {
 	setGHAuthExecTimeout(t, time.Second)
 
 	start := time.Now()
-	got, err := GitHubCLITokenForHost(context.Background(), "github.com")
+	got, err := GitHubCLITokenForHost(t.Context(), "github.com")
 	elapsed := time.Since(start)
 
 	require.NoError(t, err)
@@ -4717,4 +4938,88 @@ func TestLoadQuickActionsAppliesInitialMessageContract(t *testing.T) {
 		Label: "Big", Agent: "codex", Prompt: strings.Repeat("a", MaxQuickActionPromptBytes+1),
 	}}}
 	require.ErrorContains(oversized.validateQuickActions(), "prompt must not exceed 64 KiB")
+}
+
+func TestFleetMemberOutboundDisabledSurvivesSave(t *testing.T) {
+	require := require.New(t)
+	path := writeConfig(t, `
+[api]
+require_auth = true
+[fleet]
+enabled = true
+base_url = "https://hub.example"
+[[fleet.members]]
+node_id = "fedcba9876543210fedcba9876543210"
+base_url = "https://spoke.example"
+state = "active"
+outbound_disabled = true
+`)
+	cfg, err := Load(path)
+	require.NoError(err)
+	require.NoError(cfg.Save(path))
+	loaded, err := Load(path)
+	require.NoError(err)
+	require.Len(loaded.Fleet.Members, 1)
+	assert.True(t, loaded.Fleet.Members[0].OutboundDisabled)
+}
+
+func TestBitbucketCloneURLConfiguration(t *testing.T) {
+	for _, tc := range []struct{ name, provider, remote, owner, repo string }{
+		{"data center", "bitbucket", "https://code.example.test:8443/scm/PROJECT/widgets.git", "PROJECT", "widgets"},
+		{"cloud workspace named scm", "bitbucket", "https://bitbucket.org/scm/widgets.git", "scm", "widgets"},
+		{"gitlab group named scm", "gitlab", "https://code.example.test/scm/PROJECT/widgets.git", "scm/PROJECT", "widgets"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := Repo{Platform: tc.provider, Name: tc.remote}
+			require.NoError(t, repo.normalize(""))
+			assert.Equal(t, tc.owner, repo.Owner)
+			assert.Equal(t, tc.repo, repo.Name)
+		})
+	}
+}
+
+func TestRepoPresetKeysBitbucketCloudRepositoryByUUID(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	cfg, err := Load(writeConfig(t, `
+[[repo_presets]]
+name = "Cloud"
+repos = [{ provider = "bitbucket", platform_host = "bitbucket.org", bitbucket_repository_uuid = "{11111111-1111-4111-8111-111111111111}", repo_path = "team/widgets" }]
+`))
+	require.NoError(err)
+	require.Len(cfg.RepoPresets, 1)
+
+	member := cfg.RepoPresets[0].Repos[0]
+	assert.Equal(
+		platformpkg.RepositoryUUIDKey(uuid.MustParse("11111111-1111-4111-8111-111111111111")),
+		member.RepositoryKey(),
+	)
+	assert.Equal("11111111-1111-4111-8111-111111111111", member.BitbucketRepositoryUUID)
+}
+
+func TestRepositoryKeyConfigErrorsNameTheField(t *testing.T) {
+	tests := map[string]struct {
+		entry   string
+		wantErr string
+	}{
+		"both keys": {
+			entry:   `platform_repo_id = 7` + "\n" + `bitbucket_repository_uuid = "11111111-1111-4111-8111-111111111111"`,
+			wantErr: "set platform_repo_id or bitbucket_repository_uuid, not both",
+		},
+		"malformed uuid": {
+			entry:   `bitbucket_repository_uuid = "not-a-uuid"`,
+			wantErr: "bitbucket_repository_uuid:",
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, `
+[[repos]]
+owner = "acme"
+name = "widget"
+`+tt.entry+`
+`))
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
 }

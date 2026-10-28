@@ -12,10 +12,10 @@
   import { getAppRuntime } from "../../app/runtime-context.js";
   import type { SourceBrowserFileEntry } from "../../utils/source-browser-files.js";
   import type { RepoBrowserCommit, RepoBrowserRef } from "../../api/types.js";
-  import { providerDefaultHost } from "../../api/provider-routes.js";
   import DocMarkdownView from "../../components/docs/DocMarkdownView.svelte";
   import { RefreshIcon, ExternalLinkIcon, SpinnerIcon } from "../../icons";
   import {
+    buildForgeHref,
     formatRepoBrowserCommitAge,
     formatRepoBrowserCommitDate,
     formatRepoBrowserFileSize,
@@ -23,6 +23,7 @@
   } from "./repoBrowserViewState.js";
   import PierreFileContents from "./PierreFileContents.svelte";
   import { apiBaseURL } from "../../api/runtime.js";
+  import { getGetRepoBrowserAssetOnHostUrl, getGetRepoBrowserAssetUrl } from "../../api/generated/repositories/repositories.js";
   import type { FolderIndex } from "../../api/docs/folderLinks";
   import { observeResizes } from "../../browser/observers.js";
 
@@ -559,20 +560,16 @@
   }
 
   function assetURL(path: string): string {
-    const params = new URLSearchParams();
-    params.set("repo_path", route.repoPath);
-    params.set("path", path);
-    if (selectedRef?.sha) {
-      params.set("ref_type", "commit");
-      params.set("ref_sha", selectedRef.sha);
-    }
-    const hostPath = route.platformHost
-      ? `/host/${encodeURIComponent(route.platformHost)}`
-      : "";
-    const endpointPath = `${hostPath}/repo/${encodeURIComponent(route.provider)}/${encodeURIComponent(route.owner)}/${encodeURIComponent(route.name)}/browser/asset`;
-    const url = new URL(endpointPath.replace(/^\//, ""), withTrailingSlash(apiBaseURL));
-    url.search = params.toString();
-    return url.toString();
+    const params = {
+      repo_path: route.repoPath,
+      path,
+      ...(selectedRef?.sha ? { ref_type: "commit", ref_sha: selectedRef.sha } : {}),
+    };
+    const repo = { provider: route.provider, owner: route.owner, name: route.name };
+    const endpointPath = route.platformHost
+      ? getGetRepoBrowserAssetOnHostUrl({ ...repo, platformHost: route.platformHost }, params)
+      : getGetRepoBrowserAssetUrl(repo, params);
+    return new URL(endpointPath.replace(/^\//, ""), withTrailingSlash(apiBaseURL)).toString();
   }
 
   function withTrailingSlash(value: string): string {
@@ -610,27 +607,6 @@
         onFailure: () => {},
       },
     );
-  }
-
-  function buildForgeHref(
-    value: RepoBrowserFeatureRoute,
-    ref: RepoBrowserRef | null,
-    path: string | null,
-  ): string | null {
-    if (!ref || !path) return null;
-    const host = value.platformHost ?? providerDefaultHost(value.provider);
-    if (!host) return null;
-    const encodedRepo = value.repoPath.split("/").map(encodeURIComponent).join("/");
-    const encodedPath = path.split("/").map(encodeURIComponent).join("/");
-    const encodedRef = encodeURIComponent(ref.name || ref.sha);
-    if (value.provider === "gitlab") {
-      return `https://${host}/${encodedRepo}/-/blob/${encodedRef}/${encodedPath}`;
-    }
-    if (value.provider === "forgejo" || value.provider === "gitea") {
-      const refKind = ref.type === "tag" ? "tag" : ref.type === "commit" ? "commit" : "branch";
-      return `https://${host}/${encodedRepo}/src/${refKind}/${encodedRef}/${encodedPath}`;
-    }
-    return `https://${host}/${encodedRepo}/blob/${encodedRef}/${encodedPath}`;
   }
 
   function applyRouteAnchor(value: RepoBrowserFeatureRoute): void {
@@ -747,7 +723,6 @@
     </aside>
 
     <SplitResizeHandle
-      class="repo-browser__files-resize"
       ariaLabel="Resize file tree"
       orientation="horizontal"
       ariaValueMin={Math.min(MIN_RAIL_WIDTH, maxFilesWidth())}
@@ -819,7 +794,6 @@
     </main>
 
     <SplitResizeHandle
-      class="repo-browser__history-resize"
       ariaLabel="Resize file history"
       orientation="horizontal"
       ariaValueMin={Math.min(MIN_RAIL_WIDTH, maxHistoryWidth())}
@@ -899,7 +873,7 @@
 
   .repo-browser__provider {
     color: var(--text-muted);
-    text-transform: uppercase;
+    text-transform: var(--label-transform, uppercase);
     font-size: var(--font-size-2xs);
     font-weight: 700;
   }
@@ -996,19 +970,10 @@
     background: var(--bg-surface);
   }
 
-  .repo-browser__sidebar {
-    flex: 0 0 auto;
-    border-right: thin solid var(--border-default);
-  }
-
+  /* The resize handles are the dividers; the rails draw no border beside them. */
+  .repo-browser__sidebar,
   .repo-browser__history {
     flex: 0 0 auto;
-    border-left: thin solid var(--border-default);
-  }
-
-  :global(.repo-browser__files-resize),
-  :global(.repo-browser__history-resize) {
-    background: var(--border-default);
   }
 
   .repo-browser__filter {
@@ -1244,7 +1209,7 @@
   }
 
   @media (max-width: 900px) {
-    :global(.repo-browser__history-resize),
+    .repo-browser__viewer + :global(.kit-split-resize-handle),
     .repo-browser__history {
       display: none;
     }
@@ -1252,7 +1217,7 @@
   }
 
   @media (max-width: 760px) {
-    :global(.repo-browser__files-resize),
+    .repo-browser__sidebar + :global(.kit-split-resize-handle),
     .repo-browser__sidebar {
       display: none;
     }

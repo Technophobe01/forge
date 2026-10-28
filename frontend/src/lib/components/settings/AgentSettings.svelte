@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Checkbox, IconButton } from "@kenn-io/kit-ui";
+  import { Button, Checkbox, IconButton, SearchInput, SelectDropdown } from "@kenn-io/kit-ui";
   import ChevronRightIcon from "@lucide/svelte/icons/chevron-right";
   import PlusIcon from "@lucide/svelte/icons/plus";
   import RotateCcwIcon from "@lucide/svelte/icons/rotate-ccw";
@@ -9,6 +9,7 @@
   import { getAppRuntime } from "../../app/runtime-context.js";
   import { showFlash } from "../../stores/flash.svelte.js";
   import { SettingsWorkflow, settingsErrorMessage } from "../../stores/settings-workflow.js";
+  import LaunchTargetName from "../terminal/LaunchTargetName.svelte";
   import { slide } from "svelte/transition";
 
   interface Props {
@@ -27,6 +28,7 @@
   }
 
   interface AgentDraft {
+    protocol: "terminal" | "acp";
     id: string;
     builtin: boolean;
     key: string;
@@ -40,6 +42,7 @@
   const builtins: BuiltinAgent[] = [
     { key: "codex", label: "Codex", binary: "codex" },
     { key: "claude", label: "Claude", binary: "claude" },
+    { key: "pi", label: "Pi", binary: "pi" },
     { key: "gemini", label: "Gemini", binary: "gemini" },
     { key: "opencode", label: "opencode", binary: "opencode" },
     { key: "aider", label: "aider", binary: "aider" },
@@ -50,20 +53,30 @@
   const runtime = getAppRuntime();
   let customID = 0;
   let saving = $state(false);
+  let checks = $state<Record<string, { command: string; status: "testing" | "passed" | "failed"; message: string }>>({});
+  const testing = $derived(Object.values(checks).some((check) => check.status === "testing"));
   // svelte-ignore state_referenced_locally
   let drafts = $state<AgentDraft[]>(initialDrafts(agents));
+  let filter = $state("");
+  const visibleDrafts = $derived(drafts.filter((draft) => matchesFilter(draft, filter)));
 
   const savedAgents = $derived(normalizeAgents(agents));
   const preservedDefaultBuiltinKeys = $derived(defaultBuiltinKeys(savedAgents));
   const serializedAgents = $derived(
     serializeDrafts(drafts, preservedDefaultBuiltinKeys),
   );
-  const hasInvalidDraft = $derived(drafts.some((draft) => !isDraftValid(draft)));
+  const draftProblems = $derived(
+    drafts.flatMap((draft) => {
+      const message = draftProblem(draft);
+      return message === null ? [] : [{ id: draft.id, message }];
+    }),
+  );
+  const hasInvalidDraft = $derived(draftProblems.length > 0);
   const isDirty = $derived(
     JSON.stringify(serializedAgents) !== JSON.stringify(savedAgents),
   );
   const canSave = $derived(
-    !saving && isDirty && !hasInvalidDraft,
+    !saving && !testing && isDirty && !hasInvalidDraft,
   );
 
   function initialDrafts(configured: AgentSettingsType[]): AgentDraft[] {
@@ -80,7 +93,17 @@
       if (!agent) continue;
       rows.push(draftFromAgent(null, agent));
     }
-    return rows;
+    // Sort once when drafts are built, so a row does not move while its
+    // label is being edited. Rows added before saving stay at the end.
+    return rows.sort((left, right) =>
+      agentName(left).localeCompare(agentName(right), undefined, { sensitivity: "base", numeric: true }),
+    );
+  }
+
+  function matchesFilter(draft: AgentDraft, query: string): boolean {
+    const needle = query.trim().toLowerCase();
+    if (needle === "") return true;
+    return [draft.label, draft.key, draft.binary].some((value) => value.toLowerCase().includes(needle));
   }
 
   function draftFromAgent(
@@ -99,6 +122,7 @@
       label,
       binary,
       args: stringifyArgs(command.slice(1)),
+      protocol: agent?.protocol === "acp" ? "acp" : "terminal",
       enabled: agent?.enabled ?? true,
       expanded: builtin === null && agent === undefined,
     };
@@ -107,6 +131,7 @@
   function normalizeAgents(configured: AgentSettingsType[]): AgentSettingsType[] {
     return configured
       .map((agent) => ({
+        ...(agent.protocol === "acp" ? { protocol: agent.protocol } : {}),
         key: agent.key.trim().toLowerCase(),
         label: agent.label.trim(),
         command: [...(agent.command ?? [])],
@@ -126,7 +151,7 @@
 
   function isDefaultBuiltinAgent(agent: AgentSettingsType): boolean {
     const builtin = builtins.find((candidate) => candidate.key === agent.key);
-    if (!builtin) return false;
+    if (!builtin || agent.protocol === "acp") return false;
     if (!agent.enabled || agent.label !== builtin.label) return false;
     const command = agent.command ?? [];
     return (
@@ -152,7 +177,7 @@
 
       if (draft.builtin && builtin) {
         const isDefault =
-          enabled &&
+          draft.protocol === "terminal" && enabled &&
           label === builtin.label &&
           binary === builtin.binary &&
           args.length === 0;
@@ -160,6 +185,7 @@
       }
 
       agentsToSave.push({
+        ...(draft.protocol === "acp" ? {protocol: draft.protocol} : {}),
         key,
         label,
         command,
@@ -169,11 +195,22 @@
     return normalizeAgents(agentsToSave);
   }
 
-  function isDraftValid(draft: AgentDraft): boolean {
-    const key = draft.key.trim();
-    if (!draft.builtin && key === "") return false;
-    if (draft.enabled && draft.binary.trim() === "") return false;
-    return true;
+  function draftProblem(draft: AgentDraft): string | null {
+    const missing = [
+      !draft.builtin && draft.key.trim() === "" ? "key" : null,
+      draft.enabled && draft.binary.trim() === "" ? "binary" : null,
+    ].filter((field) => field !== null);
+    if (missing.length === 0) return null;
+    return `${agentName(draft)} needs a ${missing.join(" and a ")}.`;
+  }
+
+  function setEnabled(draft: AgentDraft, enabled: boolean): void {
+    draft.enabled = enabled;
+    // A built-in saved disabled with no command has an empty binary; give it
+    // the default back so turning it on does not leave an unsavable row.
+    if (!enabled || !draft.builtin || draft.binary.trim() !== "") return;
+    const builtin = builtins.find((candidate) => candidate.key === draft.key);
+    if (builtin) draft.binary = builtin.binary;
   }
 
   function agentName(draft: AgentDraft): string {
@@ -185,6 +222,7 @@
   }
 
   function addCustomAgent(): void {
+    filter = "";
     drafts = [
       ...drafts,
       {
@@ -194,6 +232,7 @@
         label: "",
         binary: "",
         args: "",
+        protocol: "terminal",
         enabled: true,
         expanded: true,
       },
@@ -207,6 +246,7 @@
   function resetBuiltin(draft: AgentDraft): void {
     const builtin = builtins.find((candidate) => candidate.key === draft.key);
     if (!builtin) return;
+    draft.protocol = "terminal";
     draft.label = builtin.label;
     draft.binary = builtin.binary;
     draft.args = "";
@@ -221,6 +261,13 @@
     runtime.runCommand(
       Effect.gen(function* () {
         const workflow = yield* SettingsWorkflow;
+        for (const draft of drafts) {
+          if (draft.protocol !== "acp" || !draft.enabled) continue;
+          const previous = savedAgents.find((agent) => agent.key === draft.key.trim().toLowerCase());
+          const unchanged = previous?.protocol === "acp" && previous.enabled !== false &&
+            JSON.stringify(previous.command) === commandKey(draft);
+          if (!unchanged && currentCheck(draft)?.status !== "passed" && !(yield* checkAgent(draft))) return;
+        }
         return yield* workflow.persist(() => ({ agents: agentsToSave }));
       }).pipe(
         Effect.matchEffect({
@@ -230,6 +277,7 @@
             }),
           onSuccess: (settings) =>
             Effect.sync(() => {
+              if (!settings) return;
               const nextAgents = settings.agents ?? [];
               const nextLaunchTargets = settings.launch_targets ?? [];
               agents = nextAgents;
@@ -248,6 +296,37 @@
         onFailure: () => {},
       },
     );
+  }
+
+  function commandKey(draft: AgentDraft): string {
+    return JSON.stringify([draft.binary.trim(), ...parseArgs(draft.args)]);
+  }
+
+  function currentCheck(draft: AgentDraft) {
+    const check = checks[draft.id];
+    return check?.command === commandKey(draft) ? check : undefined;
+  }
+
+  function checkAgent(draft: AgentDraft) {
+    const command = [draft.binary.trim(), ...parseArgs(draft.args)];
+    const key = JSON.stringify(command);
+    return Effect.gen(function* () {
+      checks[draft.id] = { command: key, status: "testing", message: "Testing ACP connection…" };
+      const workflow = yield* SettingsWorkflow;
+      const result = yield* workflow.testACP(command).pipe(
+        Effect.catch((failure) => Effect.succeed({ valid: false, message: settingsErrorMessage(failure) })),
+      );
+      checks[draft.id] = { command: key, status: result.valid ? "passed" : "failed", message: result.message };
+      if (!result.valid) draft.expanded = true;
+      return result.valid;
+    });
+  }
+
+  function testAgent(draft: AgentDraft): void {
+    if (saving || testing || !draft.binary.trim()) return;
+    runtime.runCommand(checkAgent(draft), {
+      operation: "test ACP connection", safeContext: {}, onFailure: () => {},
+    });
   }
 
   function stringifyArgs(args: string[]): string {
@@ -306,12 +385,28 @@
 </script>
 
 <div class="agent-settings">
+  <SearchInput
+    bind:value={filter}
+    placeholder="Filter agents..."
+    ariaLabel="Filter workspace agents"
+    size="sm"
+    block
+  />
   <div class="agent-list">
-    {#each drafts as draft (draft.id)}
+    {#each visibleDrafts as draft (draft.id)}
       <div class={["agent-row", !draft.builtin && "agent-row--custom"]}>
         <div class="agent-row-header">
-          <Checkbox class="enable-field" bind:checked={draft.enabled} disabled={saving}>
-            {agentName(draft)}
+          <Checkbox
+            class="enable-field"
+            checked={draft.enabled}
+            disabled={saving}
+            onchange={(enabled) => setEnabled(draft, enabled)}
+          >
+            <LaunchTargetName
+              target={{ kind: draft.protocol === "acp" ? "acp" : "agent", key: draft.key }}
+              label={agentName(draft)}
+              fallbackIcon
+            />
           </Checkbox>
 
           <div class="row-actions">
@@ -354,58 +449,95 @@
 
         {#if draft.expanded}
           <div
-            class={["agent-fields", !draft.builtin && "agent-fields--custom"]}
+            class="agent-fields"
             transition:slide={{ duration: 120 }}
           >
-            {#if !draft.builtin}
+            <div class="agent-field-group">
+              {#if !draft.builtin}
+                <label class="field">
+                  <span>Key</span>
+                  <input
+                    type="text"
+                    bind:value={draft.key}
+                    aria-label="Custom agent key"
+                    disabled={saving}
+                    placeholder="review"
+                  />
+                </label>
+                <label class="field">
+                  <span>Label</span>
+                  <input
+                    type="text"
+                    bind:value={draft.label}
+                    aria-label="Custom agent label"
+                    disabled={saving}
+                    placeholder="Review Agent"
+                  />
+                </label>
+              {/if}
+
+              <div class="field">
+                <span>Experience</span>
+                <SelectDropdown
+                  title={`${agentName(draft)} experience`}
+                  value={draft.protocol}
+                  options={[{value: "terminal", label: "Terminal"}, {value: "acp", label: "ACP chat"}]}
+                  disabled={saving}
+                  onchange={(value) => { draft.protocol = value === "acp" ? "acp" : "terminal"; }}
+                />
+              </div>
+            </div>
+            <div class="agent-field-group">
               <label class="field">
-                <span>Key</span>
+                <span>{draft.protocol === "acp" ? "ACP executable" : "Binary"}</span>
                 <input
                   type="text"
-                  bind:value={draft.key}
-                  aria-label="Custom agent key"
-                  disabled={saving}
-                  placeholder="review"
+                  bind:value={draft.binary}
+                  aria-label={`${agentName(draft)} binary`}
+                  disabled={saving || !draft.enabled}
+                  placeholder={draft.key || "agent"}
                 />
               </label>
-              <label class="field">
-                <span>Label</span>
+
+              <label class="field field--args">
+                <span>Arguments</span>
                 <input
                   type="text"
-                  bind:value={draft.label}
-                  aria-label="Custom agent label"
-                  disabled={saving}
-                  placeholder="Review Agent"
+                  bind:value={draft.args}
+                  aria-label={`${agentName(draft)} arguments`}
+                  disabled={saving || !draft.enabled}
+                  placeholder="--flag value"
                 />
               </label>
+            </div>
+            {#if draft.protocol === "acp"}
+              <div class="acp-check">
+                <Button disabled={saving || testing || !draft.binary.trim()} onclick={() => testAgent(draft)}>
+                  {currentCheck(draft)?.status === "testing" ? "Testing…" : "Test ACP connection"}
+                </Button>
+                <p>Checks this host. New or changed ACP commands are tested before saving.</p>
+                {#if currentCheck(draft)}
+                  <p role="status" class:check-failed={currentCheck(draft)?.status === "failed"}>
+                    {currentCheck(draft)?.message}
+                  </p>
+                {/if}
+              </div>
             {/if}
-
-            <label class="field">
-              <span>Binary</span>
-              <input
-                type="text"
-                bind:value={draft.binary}
-                aria-label={`${agentName(draft)} binary`}
-                disabled={saving || !draft.enabled}
-                placeholder={draft.key || "agent"}
-              />
-            </label>
-
-            <label class="field field--args">
-              <span>Arguments</span>
-              <input
-                type="text"
-                bind:value={draft.args}
-                aria-label={`${agentName(draft)} arguments`}
-                disabled={saving || !draft.enabled}
-                placeholder="--flag value"
-              />
-            </label>
           </div>
         {/if}
       </div>
+    {:else}
+      <p class="agent-empty">No agents match "{filter.trim()}"</p>
     {/each}
   </div>
+
+  {#if draftProblems.length > 0}
+    <ul id="agent-save-blocked" class="save-blocked">
+      {#each draftProblems as problem (problem.id)}
+        <li>{problem.message}</li>
+      {/each}
+    </ul>
+  {/if}
 
   <div class="settings-actions">
     <button
@@ -421,6 +553,7 @@
       class="save-btn"
       type="button"
       aria-label="Save workspace agents"
+      aria-describedby={draftProblems.length > 0 ? "agent-save-blocked" : undefined}
       disabled={!canSave}
       onclick={() => void save()}
     >
@@ -430,6 +563,9 @@
 </div>
 
 <style>
+  .acp-check p { margin: var(--space-3) 0 0; color: var(--text-secondary); font-size: var(--font-size-sm); overflow-wrap: anywhere; }
+  .acp-check p.check-failed { color: var(--accent-red); }
+  @media (pointer: coarse) { .acp-check :global(button) { min-height: var(--mobile-chrome-hit-target); } }
   .agent-settings {
     display: flex;
     flex-direction: column;
@@ -454,6 +590,13 @@
     background: transparent;
   }
 
+  .agent-empty {
+    margin: 0;
+    padding: 8px;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+  }
+
   .agent-row:first-child {
     border-top: 0;
   }
@@ -471,16 +614,20 @@
   }
 
   .agent-fields {
-    display: grid;
-    grid-template-columns: minmax(120px, 1fr) minmax(150px, 1.2fr);
-    gap: 8px;
-    align-items: end;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
   }
 
-  .agent-fields--custom {
-    grid-template-columns:
-      minmax(88px, 0.8fr) minmax(72px, 0.7fr) minmax(96px, 0.9fr)
-      minmax(96px, 1fr) minmax(128px, 1.2fr);
+  .agent-field-group {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+    gap: var(--space-4);
+    align-items: start;
+  }
+
+  .field :global(.kit-select-dropdown) {
+    min-width: 0;
   }
 
   .field {
@@ -504,7 +651,7 @@
     color: var(--text-muted);
     font-size: var(--font-size-xs);
     font-weight: 600;
-    text-transform: uppercase;
+    text-transform: var(--label-transform, uppercase);
   }
 
   .field input {
@@ -527,6 +674,14 @@
 
   .chevron-icon--expanded {
     transform: rotate(90deg);
+  }
+
+  .save-blocked {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    color: var(--accent-red);
+    font-size: var(--font-size-sm);
   }
 
   .settings-actions {
@@ -573,11 +728,4 @@
     cursor: not-allowed;
   }
 
-  @media (max-width: 900px) {
-    .agent-fields,
-    .agent-fields--custom {
-      grid-template-columns: 1fr;
-      align-items: stretch;
-    }
-  }
 </style>

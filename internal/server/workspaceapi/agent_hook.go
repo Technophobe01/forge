@@ -3,10 +3,13 @@ package workspaceapi
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
 	"go.kenn.io/forge/internal/agentactivity"
+	"go.kenn.io/forge/internal/db"
+	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/kit/agenthook"
 )
 
@@ -44,7 +47,11 @@ func (s *Handler) receiveAgentHook(
 		string(integration), input.Body, input.RuntimeSessionKey,
 	); err != nil {
 		slog.Warn("record agent hook activity", "err", err)
+		if input.Body.HookEventName == "SessionEnd" {
+			return nil, httpapi.Internal("record agent hook activity: " + err.Error())
+		}
 	}
+	s.recordAgentConversation(ctx, string(integration), input.Body, input.RuntimeSessionKey)
 
 	output := &receiveAgentHookOutput{}
 	if integration != agenthook.AgentClaude ||
@@ -66,4 +73,90 @@ func (s *Handler) receiveAgentHook(
 		},
 	}
 	return output, nil
+}
+
+// recordAgentConversation saves the conversation a launched agent reports on
+// its runtime row. SessionEnd deletes the activity report, including when a
+// host shutdown kills the agent, so recovery reads the conversation from the
+// row instead. SessionEnd itself saves only why the conversation ended.
+func (s *Handler) recordAgentConversation(
+	ctx context.Context, agent string, hook agentactivity.HookEvent, runtimeSessionKey string,
+) {
+	sessionID := strings.TrimSpace(hook.SessionID)
+	runtimeSessionKey = strings.TrimSpace(runtimeSessionKey)
+	agent = strings.ToLower(agent)
+	if s.db == nil || sessionID == "" || runtimeSessionKey == "" || hook.AgentID != "" {
+		return
+	}
+	// An agent started inside a launched terminal inherits its runtime key but
+	// may work in another worktree; only the terminal's own workspace counts.
+	saved, ok, err := s.db.RuntimeSessionConversation(ctx, runtimeSessionKey)
+	if err != nil {
+		slog.Warn("read agent runtime conversation", "session_key", runtimeSessionKey, "err", err)
+		return
+	}
+	if !ok || !agentactivity.SameWorkspace(hook.CWD, saved.WorktreePath) {
+		return
+	}
+	if hook.HookEventName == "SessionEnd" {
+		if _, err := s.db.RecordWorkspaceRuntimeConversationEnd(
+			ctx, runtimeSessionKey, agent, sessionID, strings.TrimSpace(hook.Reason),
+		); err != nil {
+			slog.Warn("record agent conversation end", "session_key", runtimeSessionKey, "err", err)
+		}
+		return
+	}
+	if s.savedConversationHoldsRow(saved, agent, sessionID, runtimeSessionKey, hook.HookEventName) {
+		return
+	}
+	if _, err := s.db.RecordWorkspaceRuntimeConversation(
+		ctx, runtimeSessionKey, agent, sessionID,
+	); err != nil {
+		slog.Warn("record agent conversation", "session_key", runtimeSessionKey, "err", err)
+	}
+}
+
+// savedConversationHoldsRow reports whether a different conversation than
+// the reporting one is saved on the row and keeps it, as when the terminal's
+// agent runs another hooked agent in the same worktree. That agent inherits
+// the runtime key, but the terminal's own conversation keeps its place until
+// its SessionEnd, which /clear and /resume also send first. A conversation
+// terminated by a signal keeps it until it reports again, so a nested agent
+// that outlives it cannot take its place.
+//
+// A report older than the row's runtime or this daemon is stale: a run before
+// a restart left it, or its SessionEnd was lost while no daemon listened. A
+// nested agent that outlived the restart reports before its waiting parent,
+// so only a conversation that starts, as after /clear, takes a stale place.
+// An agent without SessionEnd hooks never shows an end, so its newest
+// conversation wins.
+func (s *Handler) savedConversationHoldsRow(
+	saved db.RuntimeConversation, agent, sessionID, runtimeSessionKey, event string,
+) bool {
+	if saved.ID == "" || (saved.Agent == agent && saved.ID == sessionID) {
+		return false
+	}
+	if conversationTerminated(saved.EndReason) {
+		return true
+	}
+	if s.agentActivity == nil || !reportsSessionEnd(saved.Agent) {
+		return false
+	}
+	updatedAt, ok := s.agentActivity.ReportUpdatedAt(saved.Agent, saved.ID, runtimeSessionKey)
+	if !ok {
+		return false
+	}
+	if !updatedAt.Before(saved.CreatedAt) && !updatedAt.Before(s.startedAt) {
+		return true
+	}
+	return event != "SessionStart"
+}
+
+func reportsSessionEnd(agent string) bool {
+	integration, err := agenthook.ParseAgent(agent)
+	if err != nil {
+		return false
+	}
+	profile, ok := agenthook.LookupProfile(integration)
+	return ok && slices.Contains(profile.SupportedEvents, agenthook.EventSessionEnd)
 }

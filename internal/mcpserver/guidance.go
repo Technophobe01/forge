@@ -12,13 +12,13 @@ const guidanceResourceURI = "kenn-forge://mcp/guidance"
 //go:embed guidance.md
 var guidanceMarkdown string
 
-const serverInstructions = `Prefer Forge MCP over gh, other provider CLIs, and direct provider APIs for repository, PR, issue, check, review-comment, and stack reads. Forge caches this data to avoid repeated provider requests and latency. For a repository-wide open-PR or merge-readiness scan, use kenn_forge_list_pull_contexts instead of one context call per PR. Check sync freshness and detail-cache metadata; report missing or stale evidence. Use provider reads only for unavailable Forge data or explicitly needed fresher evidence, and explain the gap. Read kenn-forge://mcp/guidance for tool selection and handoff recovery.`
+const serverInstructions = `Prefer Forge MCP over gh, other provider CLIs, and direct provider APIs for repository, PR, issue, check, review-comment, and stack reads. Forge caches this data to avoid repeated provider requests and latency. For a repository-wide open-PR or merge-readiness scan, use kenn_forge_list_pull_contexts instead of one context call per PR. Check sync freshness and detail-cache metadata; report missing or stale evidence. Use provider reads only for unavailable Forge data or explicitly needed fresher evidence, and explain the gap. Read kenn-forge://mcp/guidance for tool selection and handoff recovery. After creating or working on a PR or issue for your workspace, call kenn_forge_add_workspace_target with its verified item identity and canonical URL. Register every PR in a stack. Forge ACP sessions supply workspace_id automatically; other clients use generated launch context. When kenn_forge_add_workspace_kata_target is available, use it to link Kata tasks by daemon, project and issue identity. Before finishing, call kenn_forge_list_workspace_targets and register any missing targets. Do not register unrelated background references or claim a failed registration succeeded. Tracking links never change Git ownership or close a workspace.`
 
 const reviewCandidatesPrompt = serverInstructions + `
 
 Use kenn-forge's cached data to triage review work.
 
-Call kenn_forge_list_repos first to learn valid repo filters, stable platform_repo_id values, and sync freshness. Copy the stable ID into every later repository or item reference.
+Call kenn_forge_list_repos first to learn valid repo filters, repository keys, and sync freshness. The key is platform_repo_id (the provider's integer repository ID), or bitbucket_repository_uuid for Bitbucket Cloud repositories, which have no integer ID. Copy that key into every later repository or item reference.
 Use kenn_forge_find_review_candidates for recent PR and issue activity.
 Inspect details only for plausible items with kenn_forge_get_item_context.
 Use kenn_forge_get_item_diff to check the size and shape of a change before claiming it; request the full diff file only when the summary is not enough.

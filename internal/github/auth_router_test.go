@@ -4,13 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
-	gh "github.com/google/go-github/v91/github"
+	gh "github.com/google/go-github/v92/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/config"
@@ -58,6 +60,15 @@ func (c *routeRecordingClient) GetMarkdownImage(
 	c.calls = append(c.calls, "markdown-image:"+owner+"/"+repo+":"+sourceURL)
 	return platform.MarkdownImage{
 		Content: []byte(c.marker), ContentType: "image/png",
+	}, nil
+}
+
+func (c *routeRecordingClient) OpenMarkdownMedia(
+	_ context.Context, owner, repo, sourceURL, byteRange string,
+) (platform.MarkdownMedia, error) {
+	c.calls = append(c.calls, "markdown-media:"+owner+"/"+repo+":"+sourceURL+":"+byteRange)
+	return platform.MarkdownMedia{
+		Body: io.NopCloser(strings.NewReader(c.marker)), ContentType: "video/mp4", ContentLength: -1,
 	}, nil
 }
 
@@ -146,6 +157,8 @@ func (c *routeRecordingClient) GetRateLimitSnapshot(ctx context.Context) (*platf
 }
 
 func TestGitHubProviderPreservesRepositoryAwareNotificationRouting(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	fallback := &routeRecordingClient{marker: "fallback"}
@@ -175,6 +188,8 @@ func TestGitHubProviderPreservesRepositoryAwareNotificationRouting(t *testing.T)
 }
 
 func TestGitHubProviderRoutesMarkdownImagesByRepositoryCredential(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	const source = "https://github.com/user-attachments/assets/1111"
@@ -210,11 +225,51 @@ func TestGitHubProviderRoutesMarkdownImagesByRepositoryCredential(t *testing.T) 
 	assert.Empty(fallback.calls)
 }
 
+func TestGitHubProviderRoutesMarkdownMediaByRepositoryCredential(t *testing.T) {
+	t.Parallel()
+
+	assert := assert.New(t)
+	require := require.New(t)
+	const source = "https://github.com/user-attachments/assets/2222"
+	fallback := &routeRecordingClient{marker: "fallback"}
+	exact := &routeRecordingClient{marker: "exact"}
+	router, err := NewHostRouter(
+		"github.com",
+		&Route{Key: RouteKey{Host: "github.com"}, Client: fallback},
+		&Route{
+			Key:    RouteKey{Host: "github.com", Owner: "acme", Name: "widget"},
+			Client: exact,
+		},
+	)
+	require.NoError(err)
+	routed, err := NewRoutedClient(router)
+	require.NoError(err)
+	provider := newTestGitHubProvider(t, "github.com", routed)
+
+	require.True(provider.Capabilities().ReadMarkdownMedia,
+		"a routed GitHub host must keep markdown video playback")
+
+	media, err := provider.OpenMarkdownMedia(t.Context(), platform.RepoRef{
+		Platform: platform.KindGitHub, Host: "github.com",
+		Owner: "acme", Name: "widget", RepoPath: "acme/widget",
+	}, source, "bytes=0-0")
+	require.NoError(err)
+	defer media.Body.Close()
+
+	body, err := io.ReadAll(media.Body)
+	require.NoError(err)
+	assert.Equal("exact", string(body))
+	assert.Equal([]string{"markdown-media:acme/widget:" + source + ":bytes=0-0"}, exact.calls)
+	assert.Empty(fallback.calls)
+}
+
 // Display-name enrichment runs inside repository sync, so it must use the
 // repository's credential. An owner-scoped or App-only configuration has no
 // host fallback route, and billing the lookup to a fallback identity would also
 // spend the wrong budget and skip repository provider-work accounting.
 func TestDisplayNameLookupUsesRepositoryCredentialWithoutHostFallback(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	owner := &routeRecordingClient{marker: "owner"}
@@ -253,7 +308,7 @@ func TestDisplayNameLookupUsesRepositoryCredentialWithoutHostFallback(t *testing
 // derives none and the App candidate is skipped for the PAT unless the caller
 // supplies owner context — silently spending the user's budget for a read the
 // route's tracker bills to the installation.
-func TestRepositoryRoutedUserLookupUsesAppInstallationToken(t *testing.T) {
+func TestRepositoryRoutedUserLookupUsesAppInstallationToken(t *testing.T) { //nolint:paralleltest // t.Setenv writes USER_LOOKUP_PAT
 	assert := assert.New(t)
 	require := require.New(t)
 	t.Setenv("USER_LOOKUP_PAT", "user-token")
@@ -293,7 +348,7 @@ func TestRepositoryRoutedUserLookupUsesAppInstallationToken(t *testing.T) {
 		"the installation the route bills is the one that pays for the read")
 }
 
-func TestSyncerRateSnapshotScopesAppRouteToOwner(t *testing.T) {
+func TestSyncerRateSnapshotScopesAppRouteToOwner(t *testing.T) { //nolint:paralleltest // t.Setenv writes SNAPSHOT_PAT
 	assert := assert.New(t)
 	require := require.New(t)
 	t.Setenv("SNAPSHOT_PAT", "user-token")
@@ -349,6 +404,8 @@ func (c *routeRecordingClient) ListNotifications(
 }
 
 func TestHostRouterSelectsExactOwnerAndFallbackRoutes(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	fallback := &Route{
@@ -385,6 +442,8 @@ func TestHostRouterSelectsExactOwnerAndFallbackRoutes(t *testing.T) {
 }
 
 func TestHostRouterRejectsConflictingRouteHostWithoutMutation(t *testing.T) {
+	t.Parallel()
+
 	route := &Route{Key: RouteKey{Host: "github.com", Owner: "acme"}}
 
 	_, err := NewHostRouter("ghe.example.com", route)
@@ -394,6 +453,8 @@ func TestHostRouterRejectsConflictingRouteHostWithoutMutation(t *testing.T) {
 }
 
 func TestHostRouterReturnsSafeMissingRouteError(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	router, err := NewHostRouter("ghe.example.com", nil)
 	require.NoError(err)
@@ -429,6 +490,8 @@ func (c *routedNativeStackClient) ListNativeStacksPage(
 }
 
 func TestRoutedClientServesNativeStacksThroughSelectedRoute(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	hints := map[int]*platformgithub.NativeStackHint{
@@ -473,6 +536,8 @@ func TestRoutedClientServesNativeStacksThroughSelectedRoute(t *testing.T) {
 }
 
 func TestRoutedClientDelegatesByRepositoryOwnerAndFallback(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	fallbackClient := &routeRecordingClient{marker: "fallback"}
@@ -551,6 +616,8 @@ func TestRoutedClientDelegatesByRepositoryOwnerAndFallback(t *testing.T) {
 }
 
 func TestRoutedClientDiscoveryMergesPATAndSelectedAppResults(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	repoWithID := func(id int64, name string) *gh.Repository {
@@ -643,6 +710,8 @@ func TestRoutedClientDiscoveryMergesPATAndSelectedAppResults(t *testing.T) {
 }
 
 func TestRoutedClientPreservesAndRoutesArchiveInventory(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	fallbackClient := &routeRecordingClient{marker: "fallback"}
@@ -711,6 +780,8 @@ func TestRoutedClientPreservesAndRoutesArchiveInventory(t *testing.T) {
 }
 
 func TestRoutedClientUsesDedicatedArchiveRoute(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	normal := &routeRecordingClient{marker: "normal"}
@@ -739,6 +810,8 @@ func TestRoutedClientUsesDedicatedArchiveRoute(t *testing.T) {
 }
 
 func TestRoutedClientUsesDedicatedArchiveRouteForOwnerDiscovery(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	normal := &routeRecordingClient{marker: "normal"}
 	archive := &routeRecordingClient{marker: "archive"}
@@ -763,6 +836,8 @@ func TestRoutedClientUsesDedicatedArchiveRouteForOwnerDiscovery(t *testing.T) {
 }
 
 func TestNewHostRouterDeduplicatesSharedArchiveRoutes(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	archive := &routeRecordingClient{marker: "archive"}
 	router, err := NewHostRouter(
@@ -799,6 +874,8 @@ func mustArchiveIdentity(t *testing.T, router *HostRouter, owner, name string) I
 }
 
 func TestRoutedClientWithoutFallbackRejectsOwnerlessAPIs(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	ownerClient := &routeRecordingClient{marker: "owner"}
@@ -819,6 +896,8 @@ func TestRoutedClientWithoutFallbackRejectsOwnerlessAPIs(t *testing.T) {
 }
 
 func TestSyncerFetcherForSelectsRepositoryRoute(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	fallbackFetcher := &GraphQLFetcher{}
@@ -842,6 +921,8 @@ func TestSyncerFetcherForSelectsRepositoryRoute(t *testing.T) {
 }
 
 func TestSyncerSelectsIdentityScopedTrackersAndBudgetsForRepo(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	database := openTestDB(t)
@@ -922,6 +1003,8 @@ func TestSyncerSelectsIdentityScopedTrackersAndBudgetsForRepo(t *testing.T) {
 }
 
 func TestSyncerDoesNotFallBackToReadTrackerWithoutWriteIdentity(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	database := openTestDB(t)
 	appIdentity := IdentityKey{Host: "github.com", Principal: "installation:789"}
@@ -949,6 +1032,8 @@ func TestSyncerDoesNotFallBackToReadTrackerWithoutWriteIdentity(t *testing.T) {
 }
 
 func TestSyncerNotificationAdmissionRejectsMissingWriteIdentity(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	appIdentity := IdentityKey{Host: "github.com", Principal: "installation:789"}
 	router, err := NewHostRouter(
@@ -967,6 +1052,8 @@ func TestSyncerNotificationAdmissionRejectsMissingWriteIdentity(t *testing.T) {
 }
 
 func TestSyncerNotificationAdmissionUsesRepositoryWriteIdentity(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	database := openTestDB(t)
 	user123 := IdentityKey{Host: "github.com", Principal: "user:123"}
@@ -1010,6 +1097,8 @@ func TestSyncerNotificationAdmissionUsesRepositoryWriteIdentity(t *testing.T) {
 }
 
 func TestSyncerNotificationIdentityAdmissionUsesSplitCredentials(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	database := openTestDB(t)
 	readIdentity := IdentityKey{
@@ -1082,6 +1171,8 @@ func TestSyncerNotificationIdentityAdmissionUsesSplitCredentials(t *testing.T) {
 }
 
 func TestSyncerRefreshesRateSnapshotsPerIdentityRoute(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	database := openTestDB(t)
@@ -1134,12 +1225,14 @@ func TestSyncerRefreshesRateSnapshotsPerIdentityRoute(t *testing.T) {
 }
 
 func TestSyncerRateSnapshotTriesHealthyRouteForSharedIdentity(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	database := openTestDB(t)
 	identity := IdentityKey{Host: "github.com", Principal: "user:123"}
 	rest := NewRateTracker(database, "github.com", "user:123", "rest")
-	failed := &routeRecordingClient{snapshotErr: fmt.Errorf("expired token")}
+	failed := &routeRecordingClient{snapshotErr: errors.New("expired token")}
 	healthy := &routeRecordingClient{snapshot: &platformgithub.RateLimitSnapshot{
 		Core: &Rate{Limit: 5000, Remaining: 4200},
 	}}
@@ -1166,6 +1259,8 @@ func TestSyncerRateSnapshotTriesHealthyRouteForSharedIdentity(t *testing.T) {
 }
 
 func TestSyncerRefreshesWriteOnlyIdentityRateSnapshot(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	database := openTestDB(t)
@@ -1215,6 +1310,8 @@ func TestSyncerRefreshesWriteOnlyIdentityRateSnapshot(t *testing.T) {
 }
 
 func TestSyncerSharedIdentityResetResetsEveryRouteBudget(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	database := openTestDB(t)
@@ -1248,6 +1345,8 @@ func TestSyncerSharedIdentityResetResetsEveryRouteBudget(t *testing.T) {
 }
 
 func TestSyncerAppPauseDoesNotDelayPATIdentityOnSameHost(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	database := openTestDB(t)
@@ -1278,6 +1377,8 @@ func TestSyncerAppPauseDoesNotDelayPATIdentityOnSameHost(t *testing.T) {
 }
 
 func TestSyncerCadenceKeysAreIdentityScoped(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	identity123 := IdentityKey{Host: "github.com", Principal: "user:123"}
@@ -1309,6 +1410,8 @@ func TestSyncerCadenceKeysAreIdentityScoped(t *testing.T) {
 }
 
 func TestRoutedClientKeepsDistinctIdentityGoGitHubCachesIsolated(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	database := openTestDB(t)
@@ -1359,6 +1462,8 @@ func TestRoutedClientKeepsDistinctIdentityGoGitHubCachesIsolated(t *testing.T) {
 }
 
 func TestRoutedClientsForSameIdentityUpdateSharedRateTracker(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	database := openTestDB(t)
@@ -1404,6 +1509,8 @@ func TestRoutedClientsForSameIdentityUpdateSharedRateTracker(t *testing.T) {
 }
 
 func TestHostRouterKeepsAuthorizationRoutesSeparateFromSharedIdentity(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	identity := IdentityKey{Host: "github.com", Principal: "user:123"}
@@ -1429,6 +1536,8 @@ func TestHostRouterKeepsAuthorizationRoutesSeparateFromSharedIdentity(t *testing
 }
 
 func TestHostRouterRepoCredentialAliasFollowsRename(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	router, err := NewHostRouter("github.com",
@@ -1444,7 +1553,7 @@ func TestHostRouterRepoCredentialAliasFollowsRename(t *testing.T) {
 	require.NoError(err)
 
 	router.RegisterRepoCredentialAlias("acme", "gadget",
-		RouteKey{Host: "github.com", Owner: "acme", Name: "widget"}, "R_1")
+		RouteKey{Host: "github.com", Owner: "acme", Name: "widget"}, platform.RepositoryIDKey(1001))
 	identity, err := router.ReadIdentityForRepo("acme", "gadget")
 	require.NoError(err)
 	assert.Equal("widget-bot", identity.Principal)
@@ -1452,13 +1561,15 @@ func TestHostRouterRepoCredentialAliasFollowsRename(t *testing.T) {
 	// A second rename that targets the first alias still lands on the
 	// configured route.
 	router.RegisterRepoCredentialAlias("acme", "gizmo",
-		RouteKey{Host: "github.com", Owner: "acme", Name: "gadget"}, "R_1")
+		RouteKey{Host: "github.com", Owner: "acme", Name: "gadget"}, platform.RepositoryIDKey(1001))
 	identity, err = router.ReadIdentityForRepo("acme", "gizmo")
 	require.NoError(err)
 	assert.Equal("widget-bot", identity.Principal)
 }
 
 func TestHostRouterArchiveAliasFallsBackWhenArchiveAppLosesCoverage(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	normal := &routeRecordingClient{marker: "normal"}
@@ -1473,7 +1584,7 @@ func TestHostRouterArchiveAliasFallsBackWhenArchiveAppLosesCoverage(t *testing.T
 	)
 	require.NoError(err)
 	router.RegisterRepoCredentialAlias("acme", "gadget",
-		RouteKey{Host: "github.com", Owner: "acme", Name: "widget"}, "R_1")
+		RouteKey{Host: "github.com", Owner: "acme", Name: "widget"}, platform.RepositoryIDKey(1001))
 	routed, err := NewRoutedClient(router)
 	require.NoError(err)
 	_, err = routed.GetRepository(
@@ -1486,6 +1597,8 @@ func TestHostRouterArchiveAliasFallsBackWhenArchiveAppLosesCoverage(t *testing.T
 }
 
 func TestRegisterConfiguredRepoCredentialAliasesRoutesRenamedRepo(t *testing.T) {
+	t.Parallel()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	router, err := NewHostRouter("github.com",
@@ -1501,7 +1614,7 @@ func TestRegisterConfiguredRepoCredentialAliasesRoutesRenamedRepo(t *testing.T) 
 		config.Repo{Owner: "acme", Name: "widget"},
 		[]RepoRef{{
 			Platform: platform.KindGitHub, PlatformHost: "github.com",
-			Owner: "acme", Name: "gadget", PlatformExternalID: "R_1",
+			Owner: "acme", Name: "gadget", Key: platform.RepositoryIDKey(1001),
 		}},
 	)
 
@@ -1512,6 +1625,8 @@ func TestRegisterConfiguredRepoCredentialAliasesRoutesRenamedRepo(t *testing.T) 
 }
 
 func TestPublishResolvedRepositoryClearsDisplacedCredentialAlias(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	router, err := NewHostRouter("github.com",
 		&Route{
@@ -1520,15 +1635,15 @@ func TestPublishResolvedRepositoryClearsDisplacedCredentialAlias(t *testing.T) {
 		},
 	)
 	require.NoError(err)
-	// The displaced repository R_old was renamed onto acme/widget earlier
+	// The displaced repository 1001 was renamed onto acme/widget earlier
 	// and aliased credential selection back to its configured route.
 	router.RegisterRepoCredentialAlias("acme", "widget",
-		RouteKey{Host: "github.com", Owner: "acme", Name: "old-widget"}, "R_old")
+		RouteKey{Host: "github.com", Owner: "acme", Name: "old-widget"}, platform.RepositoryIDKey(1001))
 
 	syncer := &Syncer{routers: map[string]*HostRouter{"github.com": router}}
 	replacement := RepoRef{
 		Platform: platform.KindGitHub, PlatformHost: "github.com",
-		Owner: "acme", Name: "widget", PlatformExternalID: "R_new",
+		Owner: "acme", Name: "widget", Key: platform.RepositoryIDKey(1002),
 	}
 	syncer.publishResolvedRepository(replacement, replacement, true)
 

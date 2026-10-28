@@ -41,7 +41,10 @@ export interface WorkspaceRuntimeTarget {
 }
 
 export interface WorkspaceRuntimePort {
-  readonly read: (target: WorkspaceRuntimeTarget) => Effect.Effect<WorkspaceRuntimeState, WorkspaceRuntimePortFailure>;
+  readonly read: (
+    target: WorkspaceRuntimeTarget,
+    viewing?: boolean,
+  ) => Effect.Effect<WorkspaceRuntimeState, WorkspaceRuntimePortFailure>;
   readonly launch: (
     target: WorkspaceRuntimeTarget,
     targetKey: string,
@@ -100,6 +103,8 @@ export interface WorkspaceRuntimeWorkflowOptions {
 
 export interface WorkspaceRuntimeReadOptions {
   readonly force?: boolean | undefined;
+  /** The workspace view is showing: the host counts it as a viewer and resumes idle-stopped agents. */
+  readonly viewing?: boolean | undefined;
 }
 
 export interface AcceptedWorkspaceLaunchReconciliation {
@@ -109,9 +114,15 @@ export interface AcceptedWorkspaceLaunchReconciliation {
   readonly onExpired: Effect.Effect<void>;
 }
 
+export interface WorkspaceRuntimeLaunchLeaf {
+  readonly surface: "workflow" | "detail";
+  readonly id: string;
+}
+
 export type WorkspaceRuntimeLaunchPlacement =
   | {
       readonly _tag: "Workflow";
+      readonly leaf?: WorkspaceRuntimeLaunchLeaf | undefined;
       readonly onSettled?: ((settlement: WorkspaceRuntimeLaunchSettlement) => void) | undefined;
     }
   | { readonly _tag: "Terminal"; readonly insertIntoTree: boolean }
@@ -135,6 +146,7 @@ interface WorkspaceRuntimeLaunchRequest extends WorkspaceRuntimeMutationRequestB
   readonly targetKey: string;
   readonly region: "workflow" | "terminal";
   readonly placement: WorkspaceRuntimeLaunchPlacement;
+  readonly admissionRuntime?: WorkspaceRuntimeState | undefined;
 }
 
 interface WorkspaceRuntimeStopRequest extends WorkspaceRuntimeMutationRequestBase {
@@ -358,6 +370,9 @@ export interface WorkspaceRuntimeWorkflowService {
     targetKey: string,
     region: "workflow" | "terminal",
     placement: WorkspaceRuntimeLaunchPlacement,
+    // Only pass the fresh read performed for this queued launch's admission,
+    // immediately before submission. Presentation snapshots are not authority.
+    admissionRuntime?: WorkspaceRuntimeState,
   ) => Effect.Effect<void>;
   readonly rename: (target: WorkspaceRuntimeTarget, sessionKey: string, label: string) => Effect.Effect<void>;
   readonly stop: (target: WorkspaceRuntimeTarget, sessionKey: string) => Effect.Effect<void>;
@@ -975,7 +990,11 @@ export function makeWorkspaceRuntimeWorkflow(
     ) {
       switch (request._tag) {
         case "Launch": {
-          yield* port.read(request.target).pipe(
+          yield* (
+            request.admissionRuntime === undefined
+              ? port.read(request.target)
+              : Effect.succeed(request.admissionRuntime)
+          ).pipe(
             Effect.matchEffect({
               onFailure: (error) => storeAndPresentMutation(failedMutationState(request, error)),
               onSuccess: (baseline) => {
@@ -1121,6 +1140,7 @@ export function makeWorkspaceRuntimeWorkflow(
       const targetKey = runtimeTargetKey(workspaceId, hostKey);
       const fiber = yield* SynchronizedRef.modifyEffect(active, (current) => {
         const existing = current.get(owner);
+        // A viewing poll that joins an in-flight read leaves the view to its next poll.
         if (options.force !== true && existing?.targetKey === targetKey) {
           return Effect.succeed<
             readonly [
@@ -1129,7 +1149,7 @@ export function makeWorkspaceRuntimeWorkflow(
             ]
           >([existing.fiber, current]);
         }
-        return FiberMap.run(reads, owner, port.read(target)).pipe(
+        return FiberMap.run(reads, owner, port.read(target, options.viewing)).pipe(
           Effect.map((nextFiber) => [nextFiber, new Map(current).set(owner, { targetKey, fiber: nextFiber })]),
         );
       });
@@ -1249,8 +1269,8 @@ export function makeWorkspaceRuntimeWorkflow(
 
     return {
       read,
-      launch: (target, targetKey, region, placement) =>
-        submitMutation({ _tag: "Launch", target, targetKey, region, placement }),
+      launch: (target, targetKey, region, placement, admissionRuntime) =>
+        submitMutation({ _tag: "Launch", target, targetKey, region, placement, admissionRuntime }),
       rename: (target, sessionKey, label) => submitMutation({ _tag: "Rename", target, sessionKey, label }),
       stop: (target, sessionKey) => submitMutation({ _tag: "Stop", target, sessionKey }),
       applyPreset: (target, preset) => submitMutation({ _tag: "ApplyPreset", target, preset }),
@@ -1351,16 +1371,28 @@ async function rawResponseBody(response: Response): Promise<unknown> {
 export const WorkspaceRuntimePortLive = Effect.gen(function* () {
   const api = yield* GeneratedApi;
 
-  const read = Effect.fn("WorkspaceRuntimePort.read")(function* (target: WorkspaceRuntimeTarget) {
+  const read = Effect.fn("WorkspaceRuntimePort.read")(function* (target: WorkspaceRuntimeTarget, viewing?: boolean) {
     const { workspaceId, hostKey } = target;
     if (hostKey !== undefined) {
-      const data = yield* api.execute("load fleet workspace runtime", (signal) =>
-        api.client.FleetService.getFleetWorkspaceRuntime({ hostKey, id: workspaceId }, { signal }),
+      const data = yield* api.execute<unknown>("load fleet workspace runtime", (signal) =>
+        hostKey.startsWith("devbox:")
+          ? api.client.DevboxesService.getDevboxRuntime(
+              { connectionId: hostKey.slice(7), id: workspaceId },
+              viewing === true ? { viewing } : {},
+              { signal },
+            )
+          : api.client.FleetService.getFleetWorkspaceRuntime(
+              { hostKey, id: workspaceId },
+              viewing === true ? { viewing: true } : {},
+              { signal },
+            ),
       );
       return normalizeWorkspaceRuntime(yield* decodeFleetWorkspaceRuntime(data));
     }
     const runtime = yield* api.execute("load workspace runtime", (signal) =>
-      api.client.WorkspacesService.getWorkspaceRuntime({ id: workspaceId }, { signal }),
+      api.client.WorkspacesService.getWorkspaceRuntime({ id: workspaceId }, viewing === true ? { viewing } : {}, {
+        signal,
+      }),
     );
     return normalizeWorkspaceRuntime(runtime);
   });
@@ -1373,8 +1405,12 @@ export const WorkspaceRuntimePortLive = Effect.gen(function* () {
     const { workspaceId, hostKey } = target;
     const body = { target_key: targetKey, display_region: region };
     if (hostKey !== undefined) {
-      const data = yield* api.execute("launch fleet workspace session", (signal) =>
-        api.client.FleetService.launchFleetWorkspaceRuntimeSession({ hostKey, id: workspaceId }, body, { signal }),
+      const data = yield* api.execute<unknown>("launch fleet workspace session", (signal) =>
+        hostKey.startsWith("devbox:")
+          ? api.client.DevboxesService.launchDevboxSession({ connectionId: hostKey.slice(7), id: workspaceId }, body, {
+              signal,
+            })
+          : api.client.FleetService.launchFleetWorkspaceRuntimeSession({ hostKey, id: workspaceId }, body, { signal }),
       );
       return yield* decodeFleetRuntimeSession(data);
     }
@@ -1390,12 +1426,18 @@ export const WorkspaceRuntimePortLive = Effect.gen(function* () {
   ) {
     const { workspaceId, hostKey } = target;
     if (hostKey !== undefined) {
-      const data = yield* api.execute("rename fleet workspace session", (signal) =>
-        api.client.FleetService.renameFleetWorkspaceRuntimeSession(
-          { hostKey, id: workspaceId, sessionKey },
-          { label },
-          { signal },
-        ),
+      const data = yield* api.execute<unknown>("rename fleet workspace session", (signal) =>
+        hostKey.startsWith("devbox:")
+          ? api.client.DevboxesService.renameDevboxSession(
+              { connectionId: hostKey.slice(7), id: workspaceId, sessionKey },
+              { label },
+              { signal },
+            )
+          : api.client.FleetService.renameFleetWorkspaceRuntimeSession(
+              { hostKey, id: workspaceId, sessionKey },
+              { label },
+              { signal },
+            ),
       );
       return yield* decodeFleetRuntimeSession(data);
     }
@@ -1412,8 +1454,16 @@ export const WorkspaceRuntimePortLive = Effect.gen(function* () {
     const { workspaceId, hostKey } = target;
     const operation = hostKey === undefined ? "stop workspace session" : "stop fleet workspace session";
     if (hostKey !== undefined) {
-      yield* api.execute(operation, (signal) =>
-        api.client.FleetService.stopFleetWorkspaceRuntimeSession({ hostKey, id: workspaceId, sessionKey }, { signal }),
+      yield* api.execute<unknown>(operation, (signal) =>
+        hostKey.startsWith("devbox:")
+          ? api.client.DevboxesService.stopDevboxSession(
+              { connectionId: hostKey.slice(7), id: workspaceId, sessionKey },
+              { signal },
+            )
+          : api.client.FleetService.stopFleetWorkspaceRuntimeSession(
+              { hostKey, id: workspaceId, sessionKey },
+              { signal },
+            ),
       );
       return;
     }
@@ -1425,8 +1475,13 @@ export const WorkspaceRuntimePortLive = Effect.gen(function* () {
   const refresh = Effect.fn("WorkspaceRuntimePort.refresh")(function* (target: WorkspaceRuntimeTarget) {
     const { workspaceId, hostKey } = target;
     if (hostKey !== undefined) {
-      const workspace = yield* api.execute("refresh fleet workspace", (signal) =>
-        api.client.FleetService.refreshFleetWorkspace({ hostKey, id: workspaceId }, { signal }),
+      const workspace = yield* api.execute<unknown>("refresh fleet workspace", (signal) =>
+        hostKey.startsWith("devbox:")
+          ? api.client.DevboxesService.refreshDevboxWorkspace(
+              { connectionId: hostKey.slice(7), id: workspaceId },
+              { signal },
+            )
+          : api.client.FleetService.refreshFleetWorkspace({ hostKey, id: workspaceId }, { signal }),
       );
       return yield* decodeWorkspaceDetail(workspace, hostKey);
     }
@@ -1439,8 +1494,13 @@ export const WorkspaceRuntimePortLive = Effect.gen(function* () {
   const retry = Effect.fn("WorkspaceRuntimePort.retrySetup")(function* (target: WorkspaceRuntimeTarget) {
     const { workspaceId, hostKey } = target;
     if (hostKey !== undefined) {
-      const workspace = yield* api.execute("retry fleet workspace setup", (signal) =>
-        api.client.FleetService.retryFleetWorkspace({ hostKey, id: workspaceId }, { signal }),
+      const workspace = yield* api.execute<unknown>("retry fleet workspace setup", (signal) =>
+        hostKey.startsWith("devbox:")
+          ? api.client.DevboxesService.retryDevboxWorkspace(
+              { connectionId: hostKey.slice(7), id: workspaceId },
+              { signal },
+            )
+          : api.client.FleetService.retryFleetWorkspace({ hostKey, id: workspaceId }, { signal }),
       );
       return yield* decodeWorkspaceDetail(workspace, hostKey);
     }
@@ -1459,10 +1519,15 @@ export const WorkspaceRuntimePortLive = Effect.gen(function* () {
       const response = yield* Effect.tryPromise({
         try: (signal) =>
           orvalRequest(
-            api.client.FleetService.getDeleteFleetWorkspaceUrl(
-              { hostKey, id: workspaceId },
-              force ? { force: true } : undefined,
-            ),
+            hostKey.startsWith("devbox:")
+              ? api.client.DevboxesService.getDeleteDevboxWorkspaceUrl(
+                  { connectionId: hostKey.slice(7), id: workspaceId },
+                  force ? { force: true } : undefined,
+                )
+              : api.client.FleetService.getDeleteFleetWorkspaceUrl(
+                  { hostKey, id: workspaceId },
+                  force ? { force: true } : undefined,
+                ),
             {
               method: "DELETE",
               signal,
@@ -1506,7 +1571,12 @@ export const WorkspaceRuntimePortLive = Effect.gen(function* () {
     if (hostKey !== undefined) {
       const response = yield* Effect.tryPromise({
         try: (signal) =>
-          orvalRequest(api.client.FleetService.getGetFleetWorkspaceUrl({ hostKey, id: workspaceId }), { signal }),
+          orvalRequest(
+            hostKey.startsWith("devbox:")
+              ? api.client.DevboxesService.getGetDevboxWorkspaceUrl({ connectionId: hostKey.slice(7), id: workspaceId })
+              : api.client.FleetService.getGetFleetWorkspaceUrl({ hostKey, id: workspaceId }),
+            { signal },
+          ),
         catch: (cause) => TransientTransportError.make({ operation: "confirm fleet workspace deletion", cause }),
       });
       if (response.status === 404) return true;

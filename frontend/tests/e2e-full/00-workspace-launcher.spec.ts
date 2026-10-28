@@ -23,6 +23,7 @@ import {
 } from "@playwright/test";
 import { startIsolatedWorkspaceE2EServer, type IsolatedE2EServer } from "./support/e2eServer";
 import { runPaletteCommand } from "./support/paletteCommands";
+import { trackTerminalReadiness, waitForTerminalInputReady } from "./support/terminalReadiness";
 
 type WorkspaceStatusResponse = {
   id: string;
@@ -72,6 +73,7 @@ async function createIssueWorkspace(api: APIRequestContext, issueNumber: number)
 // attached, and a marker file cannot.
 async function typeMarkerCommand(page: Page, container: Locator, worktreePath: string, marker: string): Promise<void> {
   const markerPath = path.join(worktreePath, marker);
+  await waitForTerminalInputReady(container);
   await container.click({ position: { x: 10, y: 10 } });
   await page.keyboard.type(`touch '${markerPath}'`);
   await page.keyboard.press("Enter");
@@ -84,6 +86,7 @@ test.describe("embedded workspace launcher", () => {
   // The pane layout persists, so an arrangement left by another spec would decide
   // whether the workspace pane is even on screen here.
   test.beforeEach(async ({ page }) => {
+    trackTerminalReadiness(page);
     await page.addInitScript(() => {
       for (const surface of ["prs", "issues", "activity"]) {
         localStorage.removeItem(`kenn-forge-pane-layout-v1:${surface}`);
@@ -91,7 +94,7 @@ test.describe("embedded workspace launcher", () => {
     });
   });
 
-  test("launches a first session from the overlay and another from the pane header", async ({ page }) => {
+  test("launches sessions from the contained launcher and the pane menu", async ({ page }) => {
     test.skip(
       !hasCommand("git") || !hasCommand("tmux", ["-V"]),
       "git and tmux are required for the real workspace flow",
@@ -111,7 +114,24 @@ test.describe("embedded workspace launcher", () => {
       // pane has no Home tab to fall back to.
       const launcher = page.getByRole("dialog", { name: "Launch a session" });
       await expect(launcher).toBeVisible();
-      await launcher.getByRole("button", { name: "Shell" }).click();
+      const bounds = await launcher.evaluate((panel) => {
+        const stage = panel.closest(".workspace-stage")!;
+        const parent = stage.getBoundingClientRect();
+        const child = panel.getBoundingClientRect();
+        return (
+          child.left >= parent.left &&
+          child.right <= parent.right &&
+          child.top >= parent.top &&
+          child.bottom <= parent.bottom
+        );
+      });
+      expect(bounds).toBe(true);
+      // The pane toolbar stays usable while its launcher is open.
+      await page.getByRole("button", { name: "Workspace info", exact: true }).click();
+      await expect(page.getByRole("dialog", { name: "Workspace info", exact: true })).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(launcher).toBeVisible();
+      await launcher.getByRole("button", { name: "Shell", exact: true }).click();
 
       // The successful launch response records and publishes the session, so the
       // overlay stands down without waiting on a redundant runtime reload. The live
@@ -121,16 +141,33 @@ test.describe("embedded workspace launcher", () => {
       await expect(container).toBeVisible();
       await typeMarkerCommand(page, container, workspace.worktree_path, "launcher-marker");
 
-      // The direct pane-header action must reach the same launcher after a session is
-      // already running, without opening the workspace controls popover first.
-      const headerLaunch = page.getByRole("button", { name: "Launch session" });
-      await expect(headerLaunch).toBeVisible();
-      await headerLaunch.click();
+      // Reopening over xterm must keep launch buttons above its canvas layers.
+      await runPaletteCommand(page, "Launch a workspace session");
       await expect(launcher).toBeVisible();
       await launcher.getByRole("button", { name: "Shell", exact: true }).click();
       await expect(launcher).toBeHidden();
 
-      // The e2e-only endpoint reads SQLite directly, so two persisted shell targets
+      await page.getByRole("button", { name: "Workspace info", exact: true }).click();
+      const info = page.getByRole("dialog", { name: "Workspace info", exact: true });
+      await expect(info.getByText(workspace.worktree_path, { exact: true })).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(info).toBeHidden();
+      await expect(page).toHaveURL(/\/issues\/github\/acme\/widgets\/10$/);
+      await expect(container.filter({ visible: true })).toBeVisible();
+
+      // The direct pane menu must offer launch targets after a session is
+      // already running, without opening the workspace controls popover first.
+      const headerLaunch = page
+        .getByRole("tablist", { name: "Workflow group tabs" })
+        .getByRole("button", { name: "Launch", exact: true });
+      await expect(headerLaunch).toBeVisible();
+      await headerLaunch.click();
+      const launchMenu = page.getByRole("dialog", { name: "Run configurations" });
+      await expect(launchMenu).toBeVisible();
+      await launchMenu.getByRole("button", { name: "Shell", exact: true }).click();
+      await expect(launchMenu).toBeHidden();
+
+      // The e2e-only endpoint reads SQLite directly, so three persisted shell targets
       // prove the header-opened launch completed across the HTTP/runtime boundary.
       await expect
         .poll(async () => {
@@ -139,7 +176,8 @@ test.describe("embedded workspace launcher", () => {
           const body = (await response.json()) as { target_keys: string[] };
           return body.target_keys;
         })
-        .toEqual(["plain_shell", "plain_shell"]);
+        .toEqual(["plain_shell", "plain_shell", "plain_shell"]);
+      await expect(page.getByRole("tab", { name: "Shell 3", exact: true })).toHaveAttribute("aria-selected", "true");
       const activeContainer = page.locator(
         ".detail-pane-workspace-slot .tabbed-panel-tab-panel.active .terminal-container",
       );
@@ -173,7 +211,7 @@ test.describe("embedded workspace launcher", () => {
         const workspace = await createIssueWorkspace(api, 10);
 
         await page.goto(`${isolatedServer.info.base_url}/terminal/${workspace.id}`);
-        await page.getByRole("region", { name: "Worktree Home" }).getByRole("button", { name: "Shell" }).click();
+        await page.getByRole("region", { name: "Session launcher" }).getByRole("button", { name: "Shell" }).click();
 
         const terminal = page.locator(".workspace-tab-slot .terminal-container");
         await expect(terminal).toBeVisible();
@@ -182,6 +220,7 @@ test.describe("embedded workspace launcher", () => {
           .poll(() => page.evaluate(() => document.activeElement?.classList.contains("xterm-helper-textarea")))
           .toBe(false);
 
+        await waitForTerminalInputReady(terminal);
         await terminal.tap({ position: { x: 10, y: 10 } });
 
         await expect

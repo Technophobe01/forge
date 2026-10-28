@@ -87,15 +87,16 @@ test("repository selector filters Workspaces and keeps preset actions fixed", as
     Name: name,
     Platform: "github",
     PlatformHost: "github.com",
-    PlatformRepoID: `R_${name}`,
+    PlatformRepoID: 2001 + index,
   }));
+  const repoId = (name: string) => 2001 + repoNames.indexOf(name);
   const configuredRepos = repoNames.map((name) => ({
     provider: "github",
     platform_host: "github.com",
     owner: "acme",
     name,
     repo_path: `acme/${name}`,
-    platform_repo_id: `R_${name}`,
+    platform_repo_id: repoId(name),
     is_glob: false,
     matched_repo_count: 1,
     hidden_from_ui: false,
@@ -108,7 +109,7 @@ test("repository selector filters Workspaces and keeps preset actions fixed", as
       ...contextMenuWorkspace.repo,
       name,
       repo_path: `acme/${name}`,
-      platform_repo_id: `R_${name}`,
+      platform_repo_id: repoId(name),
     },
     item_number: number,
     mr_title: title,
@@ -203,10 +204,12 @@ test("workspace row context menu escapes the clipped sidebar", async ({ page }) 
   await expect(row).toBeVisible();
   const rowBox = await row.boundingBox();
   expect(rowBox).not.toBeNull();
+  // Near the right edge so the menu overflows the sidebar, but clear of the
+  // sidebar resize handle's grab margin, which covers the last pixels.
   await row.click({
     button: "right",
     position: {
-      x: Math.max(1, rowBox!.width - 4),
+      x: Math.max(1, rowBox!.width - 8),
       y: Math.max(1, rowBox!.height / 2),
     },
   });

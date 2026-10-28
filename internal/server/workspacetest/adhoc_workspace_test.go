@@ -1,12 +1,13 @@
 package workspacetest
 
 import (
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -14,11 +15,13 @@ import (
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/gitclone"
 	"go.kenn.io/forge/internal/testutil/gitfixture"
+	"go.kenn.io/forge/platform"
 )
 
 // Starting new work needs no provider item: a tracked repository plus an
 // optional branch name is enough to get a materialized worktree.
 func TestCreateAdHocWorkspaceMaterializesRequestedBranch(t *testing.T) {
+	runParallelWorkspaceGitTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -48,11 +51,12 @@ func TestCreateAdHocWorkspaceMaterializesRequestedBranch(t *testing.T) {
 }
 
 func TestCreateAdHocWorkspaceAfterRepositoryRouteReuse(t *testing.T) {
+	runParallelWorkspaceGitTest(t)
 	require := require.New(t)
 
 	fixture := setupWorkspaceServerFixture(t, nil)
 	replacementBare, err := fixture.clones.ClonePathForContext(
-		gitclone.WithRepositoryIdentity(t.Context(), "repo-current-occupant"),
+		gitclone.WithRepositoryIdentity(t.Context(), platform.RepositoryIdentity{Key: platform.RepositoryIDKey(2002)}),
 		"github", "github.com", "acme", "widget",
 	)
 	require.NoError(err)
@@ -66,16 +70,15 @@ func TestCreateAdHocWorkspaceAfterRepositoryRouteReuse(t *testing.T) {
 		t, replacementBare, "config", "--add",
 		"url."+fixture.remote+".insteadOf", "https://github.com/acme/widget.git",
 	)
-	current, _, err := fixture.database.ReconcileRepositoryObservation(
+	current, err := fixture.database.ObserveRepository(
 		t.Context(),
 		db.RepoIdentity{
-			Platform:       "github",
-			PlatformHost:   "github.com",
-			PlatformRepoID: "repo-current-occupant",
-			Owner:          "acme",
-			Name:           "widget",
+			Platform:     "github",
+			PlatformHost: "github.com",
+			Key:          platform.RepositoryIDKey(2002),
+			Owner:        "acme",
+			Name:         "widget",
 		},
-		time.Now().UTC().Add(time.Hour),
 	)
 	require.NoError(err)
 	require.NotNil(current)
@@ -92,9 +95,92 @@ func TestCreateAdHocWorkspaceAfterRepositoryRouteReuse(t *testing.T) {
 	require.NoError(err)
 	require.NotNil(workspace)
 	require.Equal(current.Repository.ID, workspace.RepoID)
+
+	// A picker may still hold the previous owner of this route. Neither a new
+	// branch nor reuse of the replacement repository's workspace may redirect it.
+	for _, route := range []string{
+		"/api/v1/repo/gh/acme/widget/workspaces",
+		"/api/v1/host/github.com/repo/gh/acme/widget/workspaces",
+	} {
+		for _, branch := range []string{"spike/route-reuse", "spike/stale-picker"} {
+			request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://forge.test"+route,
+				strings.NewReader(fmt.Sprintf(`{"branch":%q,"platform_repo_id":3609862021}`, branch)))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			fixture.server.ServeHTTP(response, request)
+			require.Equal(http.StatusNotFound, response.Code, response.Body.String())
+			require.Contains(response.Body.String(), `"code":"repoNotFound"`)
+		}
+		request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://forge.test"+route,
+			strings.NewReader(`{"branch":"spike/route-reuse","platform_repo_id":2002}`))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		fixture.server.ServeHTTP(response, request)
+		require.Equal(http.StatusAccepted, response.Code, response.Body.String())
+		require.Contains(response.Body.String(), ready.ID)
+	}
+}
+
+func TestCreateAdHocWorkspaceFollowsCachedRepositoryRename(t *testing.T) {
+	runParallelWorkspaceGitTest(t)
+	assert, require := assert.New(t), require.New(t)
+	fixture := setupWorkspaceServerFixture(t, nil)
+	_, err := fixture.database.ObserveRepository(t.Context(), db.RepoIdentity{
+		Platform: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(3609862021),
+		Owner: "acme", Name: "widgets",
+	})
+	require.NoError(err)
+	require.NoError(fixture.database.UpdateRepoProviderObservation(t.Context(), fixture.repoID, db.RepoProviderMetadata{
+		CloneURL: "https://github.com/acme/widgets.git", DefaultBranch: "main",
+	}, nil, nil))
+	renamedBare, err := fixture.clones.ClonePathForContext(
+		gitclone.WithRepositoryIdentity(t.Context(), platform.RepositoryIdentity{Key: platform.RepositoryIDKey(3609862021)}), "github", "github.com", "acme", "widgets",
+	)
+	require.NoError(err)
+	gitfixture.Run(t, t.TempDir(), "clone", "--bare", fixture.remote, renamedBare)
+	gitfixture.Run(t, renamedBare, "remote", "set-url", "origin", "https://github.com/acme/widgets.git")
+	gitfixture.Run(t, renamedBare, "config", "--add", "url."+fixture.remote+".insteadOf", "https://github.com/acme/widgets.git")
+
+	for _, platformRepoID := range []int64{0, 9999} {
+		request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://forge.test/api/v1/repo/gh/acme/widget/workspaces",
+			strings.NewReader(fmt.Sprintf(`{"branch":"work/missing","platform_repo_id":%d}`, platformRepoID)))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		fixture.server.ServeHTTP(response, request)
+		require.Equal(http.StatusNotFound, response.Code, response.Body.String())
+	}
+
+	branch := "work/cached-rename"
+	response, err := fixture.client.HTTP.CreateRepoWorkspaceWithResponse(t.Context(), &generated.CreateRepoWorkspaceRequestOptions{
+		PathParams: &generated.CreateRepoWorkspacePath{Provider: "gh", Owner: "acme", Name: "widget"},
+		Body:       &generated.CreateRepoWorkspaceBody{Branch: &branch, PlatformRepoID: new(int64(3609862021))},
+	})
+	require.NoError(err)
+	require.Equal(http.StatusAccepted, response.StatusCode, string(response.Body))
+	require.NotNil(response.JSON202)
+	ready := waitForWorkspaceReady(t, t.Context(), fixture.client, response.JSON202.ID)
+	stored, err := fixture.database.GetWorkspace(t.Context(), ready.ID)
+	require.NoError(err)
+	require.NotNil(stored)
+	assert.Equal(fixture.repoID, stored.RepoID)
+	assert.Equal("widgets", stored.RepoName)
+
+	// Displacing the original from its new route makes its stable ID inactive.
+	_, err = fixture.database.ObserveRepository(t.Context(), db.RepoIdentity{
+		Platform: "github", PlatformHost: "github.com", Key: platform.RepositoryIDKey(2002),
+		Owner: "acme", Name: "widgets",
+	})
+	require.NoError(err)
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://forge.test/api/v1/repo/gh/acme/widget/workspaces",
+		strings.NewReader(`{"branch":"work/cached-rename","platform_repo_id":3609862021}`))
+	request.Header.Set("Content-Type", "application/json")
+	rejected := httptest.NewRecorder()
+	fixture.server.ServeHTTP(rejected, request)
+	assert.Equal(http.StatusNotFound, rejected.Code, rejected.Body.String())
 }
 
 func TestCreateAdHocWorkspaceGeneratesBranchWhenOmitted(t *testing.T) {
+	runParallelWorkspaceGitTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -114,6 +200,7 @@ func TestCreateAdHocWorkspaceGeneratesBranchWhenOmitted(t *testing.T) {
 // A repeat request for the same branch reopens the workspace that already owns
 // it rather than creating a second worktree.
 func TestCreateAdHocWorkspaceReusesWorkspaceForSameBranch(t *testing.T) {
+	runParallelWorkspaceGitTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -132,6 +219,9 @@ func TestCreateAdHocWorkspaceReusesWorkspaceForSameBranch(t *testing.T) {
 	require.NotNil(second.JSON202)
 	assert.Equal(first.JSON202.ID, second.JSON202.ID)
 	assert.Nil(second.JSON202.Created)
+	// Let background setup finish its clone before cleanup removes the
+	// clone directory out from under it.
+	waitForWorkspaceReady(t, t.Context(), fixture.client, first.JSON202.ID)
 
 	listResp, err := fixture.client.HTTP.ListWorkspacesWithResponse(t.Context())
 	require.NoError(err)
@@ -146,6 +236,7 @@ func TestCreateAdHocWorkspaceReusesWorkspaceForSameBranch(t *testing.T) {
 }
 
 func TestCreateAdHocWorkspaceRejectsInvalidBranch(t *testing.T) {
+	runParallelWorkspaceGitTest(t)
 	require := require.New(t)
 
 	fixture := setupWorkspaceServerFixture(t, nil)
@@ -158,6 +249,7 @@ func TestCreateAdHocWorkspaceRejectsInvalidBranch(t *testing.T) {
 }
 
 func TestCreateAdHocWorkspaceRejectsUntrackedRepo(t *testing.T) {
+	runParallelWorkspaceGitTest(t)
 	require := require.New(t)
 
 	fixture := setupWorkspaceServerFixture(t, nil)
@@ -170,6 +262,7 @@ func TestCreateAdHocWorkspaceRejectsUntrackedRepo(t *testing.T) {
 }
 
 func TestCreateAdHocWorkspaceExistingBranchIsUniquified(t *testing.T) {
+	runParallelWorkspaceGitTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -192,6 +285,7 @@ func TestCreateAdHocWorkspaceExistingBranchIsUniquified(t *testing.T) {
 }
 
 func TestCreateAdHocWorkspaceReusesExistingBranchWhenAsked(t *testing.T) {
+	runParallelWorkspaceGitTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -218,6 +312,7 @@ func TestCreateAdHocWorkspaceReusesExistingBranchWhenAsked(t *testing.T) {
 }
 
 func TestCreateAdHocWorkspaceReuseMissingBranchReportsCreated(t *testing.T) {
+	runParallelWorkspaceGitTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -238,6 +333,7 @@ func TestCreateAdHocWorkspaceReuseMissingBranchReportsCreated(t *testing.T) {
 // Reuse is the one case where work does not start at origin/HEAD: the existing
 // branch is adopted at its own tip, however far that has diverged.
 func TestCreateAdHocWorkspaceReuseStartsFromDivergedBranchTip(t *testing.T) {
+	runParallelWorkspaceGitTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -269,6 +365,7 @@ func TestCreateAdHocWorkspaceReuseStartsFromDivergedBranchTip(t *testing.T) {
 // still resolves to it, while a new workspace request for the renamed branch
 // receives a unique branch.
 func TestCreateAdHocWorkspaceAfterInWorktreeBranchRename(t *testing.T) {
+	runParallelWorkspaceGitTest(t)
 	assert := assert.New(t)
 	require := require.New(t)
 

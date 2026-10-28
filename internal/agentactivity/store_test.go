@@ -1,6 +1,8 @@
 package agentactivity
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -8,7 +10,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -42,13 +46,54 @@ func TestStoreTracksHookLifecycleByRuntimeSession(t *testing.T) {
 	require.True(ok)
 	assert.Equal(StateInput, snapshot.State)
 
-	reportHook(t, store, "runtime-a", map[string]any{
-		"session_id": "agent-a", "cwd": workspace,
-		"hook_event_name": "Stop",
-	})
-	snapshot, ok = store.SnapshotForWorkspace(workspace, []string{"runtime-a"})
-	require.True(ok)
-	assert.Equal(StateDone, snapshot.State)
+	for _, tc := range []struct {
+		name       string
+		background []any
+		crons      []any
+		pending    bool
+	}{
+		{name: "background task", background: []any{map[string]any{"id": "task-1", "type": "shell", "status": "running"}}, pending: true},
+		{name: "scheduled wakeup", crons: []any{map[string]any{"id": "cron-1", "schedule": "* * * * *", "recurring": true}}, pending: true},
+		{name: "empty arrays", background: []any{}, crons: []any{}},
+		{name: "absent arrays"},
+	} {
+		hook := map[string]any{"session_id": "agent-a", "cwd": workspace, "hook_event_name": "Stop"}
+		if tc.background != nil {
+			hook["background_tasks"] = tc.background
+		}
+		if tc.crons != nil {
+			hook["session_crons"] = tc.crons
+		}
+		reportHook(t, store, "runtime-a", hook)
+		snapshot, ok = store.SnapshotForWorkspace(workspace, []string{"runtime-a"})
+		require.True(ok)
+		assert.Equal(StateDone, snapshot.State, tc.name)
+		reports := store.LiveReportsForWorkspace(workspace, []string{"runtime-a"})
+		require.Len(reports, 1)
+		assert.Equal(tc.pending, reports[0].PendingWork, tc.name)
+		reportHook(t, store, "runtime-a", map[string]any{
+			"session_id": "agent-a", "cwd": workspace,
+			"hook_event_name": "Notification", "notification_type": "idle_prompt",
+		})
+		reports = store.LiveReportsForWorkspace(workspace, []string{"runtime-a"})
+		require.Len(reports, 1)
+		assert.Equal(tc.pending, reports[0].PendingWork, tc.name+" after idle prompt")
+		reportHook(t, store, "runtime-a", map[string]any{
+			"session_id": "agent-a", "cwd": workspace,
+			"hook_event_name": "UserPromptSubmit",
+		})
+		reports = store.LiveReportsForWorkspace(workspace, []string{"runtime-a"})
+		require.Len(reports, 1)
+		assert.Equal(tc.pending, reports[0].PendingWork, tc.name+" after new prompt")
+		reportHook(t, store, "runtime-a", map[string]any{
+			"session_id": "agent-a", "cwd": workspace,
+			"hook_event_name": "PermissionRequest",
+		})
+		reports = store.LiveReportsForWorkspace(workspace, []string{"runtime-a"})
+		require.Len(reports, 1)
+		assert.Equal(StateApproval, reports[0].State, tc.name)
+		assert.Equal(tc.pending, reports[0].PendingWork, tc.name+" while awaiting approval")
+	}
 
 	reportHook(t, store, "runtime-a", map[string]any{
 		"session_id": "agent-a", "cwd": workspace,
@@ -167,38 +212,65 @@ func TestHandleEventRecordsWorkingState(t *testing.T) {
 }
 
 func TestStoreKeysReportsByAgentAndCodingSession(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	workspace := t.TempDir()
-	store := NewStore(t.TempDir())
+	for _, tc := range []struct {
+		name                    string
+		firstAgent, secondAgent string
+		firstKey, secondKey     string
+	}{
+		{"agent", "codex", "claude", "shared-runtime", "shared-runtime"},
+		{"runtime", "opencode", "opencode", "runtime-a", "runtime-b"},
+	} {
+		for _, source := range []string{"hook", "record"} {
+			t.Run(tc.name+"/"+source, func(t *testing.T) {
+				assert := assert.New(t)
+				require := require.New(t)
+				workspace := t.TempDir()
+				store := NewStore(t.TempDir())
+				now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+				store.now = func() time.Time { return now }
+				recordDone := func(agent, key string) {
+					if source == "record" {
+						require.NoError(store.Record(agent, "shared-session", key, workspace, StateDone))
+						return
+					}
+					require.NoError(store.HandleEvent(agent, HookEvent{
+						SessionID: "shared-session", CWD: workspace, HookEventName: "Stop",
+					}, key))
+				}
 
-	reportAgentHook(t, store, "codex", "runtime-codex", map[string]any{
-		"session_id": "shared-session", "cwd": workspace,
-		"hook_event_name": "UserPromptSubmit",
-	})
-	reportAgentHook(t, store, "claude", "runtime-claude", map[string]any{
-		"session_id": "shared-session", "cwd": workspace,
-		"hook_event_name": "Stop",
-	})
+				recordDone(tc.firstAgent, tc.firstKey)
+				firstCompletion := now
+				now = now.Add(time.Minute)
+				recordDone(tc.secondAgent, tc.secondKey)
+				secondCompletion := now
+				now = now.Add(time.Minute)
+				recordDone(tc.firstAgent, tc.firstKey)
 
-	reports := store.LiveReportsForWorkspace(
-		workspace, []string{"runtime-codex", "runtime-claude"},
-	)
-	require.Len(reports, 2)
-	assert.Equal("claude", reports[0].Agent)
-	assert.Equal(StateDone, reports[0].State)
-	assert.Equal("codex", reports[1].Agent)
-	assert.Equal(StateWorking, reports[1].State)
+				liveKeys := []string{tc.firstKey, tc.secondKey}
+				reports := store.LiveReportsForWorkspace(workspace, liveKeys)
+				require.Len(reports, 2)
+				assert.Equal(tc.secondAgent, reports[0].Agent)
+				assert.Equal(tc.secondKey, reports[0].RuntimeSessionKey)
+				assert.Equal(StateDone, reports[0].State)
+				assert.Equal(secondCompletion, reports[0].UpdatedAt)
+				assert.Equal(tc.firstAgent, reports[1].Agent)
+				assert.Equal(tc.firstKey, reports[1].RuntimeSessionKey)
+				assert.Equal(StateDone, reports[1].State)
+				assert.Equal(firstCompletion, reports[1].UpdatedAt)
 
-	reportAgentHook(t, store, "codex", "runtime-codex", map[string]any{
-		"session_id": "shared-session", "cwd": workspace,
-		"hook_event_name": "SessionEnd",
-	})
-	reports = store.LiveReportsForWorkspace(
-		workspace, []string{"runtime-codex", "runtime-claude"},
-	)
-	require.Len(reports, 1)
-	assert.Equal("claude", reports[0].Agent)
+				if source == "hook" {
+					survivor := reports[0]
+					reportAgentHook(t, store, tc.firstAgent, tc.firstKey, map[string]any{
+						"session_id": "shared-session", "cwd": workspace,
+						"hook_event_name": "SessionEnd",
+					})
+					reports = store.LiveReportsForWorkspace(workspace, liveKeys)
+					require.Len(reports, 1)
+					assert.Equal(survivor, reports[0])
+				}
+			})
+		}
+	}
 }
 
 func TestStoreLiveReportsExcludeWrongWorkspaceDeadAndNestedSessions(t *testing.T) {
@@ -232,6 +304,32 @@ func TestStoreLiveReportsExcludeWrongWorkspaceDeadAndNestedSessions(t *testing.T
 	assert.Equal(StateDone, reports[0].State)
 }
 
+func TestStoreRemovesZeroLengthReportsDuringScan(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	store := NewStore(t.TempDir())
+	cwd := t.TempDir()
+	require.NoError(store.Record("claude", "live", "runtime", cwd, StateWorking))
+	reports := store.LiveReportsForWorkspace(cwd, []string{"runtime"})
+	require.Len(reports, 1)
+	cached := &store.cacheReports[0]
+	path := store.reportPath("claude", "chat", "runtime")
+	require.NoError(os.WriteFile(path, nil, 0o600))
+	assert.Equal(reports, store.LiveReportsForWorkspace(cwd, []string{"runtime"}))
+	assert.NoFileExists(path)
+	assert.Same(cached, &store.cacheReports[0], "an empty report must not invalidate the cached live reports")
+	require.NoError(store.Record("claude", "chat", "runtime", cwd, StateDone))
+	require.Len(store.LiveReportsForWorkspace(cwd, []string{"runtime"}), 2)
+	require.NoError(os.Truncate(path, 0))
+	assert.Equal(reports, store.LiveReportsForWorkspace(cwd, []string{"runtime"}))
+	assert.NoFileExists(path)
+	store = NewStore(store.root)
+	require.NoError(os.WriteFile(path, nil, 0o600))
+	assert.Equal(reports, store.LiveReportsForWorkspace(cwd, []string{"runtime"}))
+	assert.NoFileExists(path)
+}
+
 func TestStoreRemovesLegacyAgentlessReportsDuringScan(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -250,6 +348,81 @@ func TestStoreRemovesLegacyAgentlessReportsDuringScan(t *testing.T) {
 	assert.Empty(store.LiveReportsForWorkspace(workspace, []string{"runtime-legacy"}))
 	_, err := os.Stat(legacyPath)
 	require.ErrorIs(err, os.ErrNotExist)
+}
+
+func TestStoreReadsReportsSavedBeforePerTerminalNames(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	root := t.TempDir()
+	workspace := t.TempDir()
+	sum := sha256.Sum256([]byte("claude\x00shared"))
+	legacy := filepath.Join(root, hex.EncodeToString(sum[:])+".json")
+	writeLegacy := func(state, updated string) {
+		require.NoError(os.WriteFile(legacy, fmt.Appendf(nil,
+			`{"agent":"claude","session_id":"shared","runtime_session_key":"runtime-a","cwd":%q,"state":%q,"updated_at":%q}`,
+			workspace, state, updated,
+		), 0o600))
+	}
+	s := NewStore(root)
+	s.now = func() time.Time { return time.Date(2026, 8, 7, 12, 5, 0, 0, time.UTC) }
+	state := func() State {
+		reports := s.LiveReportsForWorkspace(workspace, []string{"runtime-a"})
+		require.Len(reports, 1)
+		return reports[0].State
+	}
+
+	writeLegacy("approval", "2026-08-07T12:00:00Z")
+	assert.Equal(StateApproval, state())
+
+	require.NoError(s.Record("claude", "shared", "runtime-a", workspace, StateDone))
+	assert.Equal(StateDone, state())
+
+	// An agent started before the upgrade still writes the old name.
+	writeLegacy("approval", "2026-08-07T12:10:00Z")
+	assert.Equal(StateApproval, state())
+
+	// Claude Code's idle_prompt leaves a pending approval saved under the old name alone.
+	reportAgentHook(t, s, "claude", "runtime-a", map[string]any{
+		"session_id": "shared", "cwd": workspace,
+		"hook_event_name": "Notification", "notification_type": "idle_prompt",
+	})
+	assert.Equal(StateApproval, state())
+
+	writeLegacy("done", "2026-08-07T12:20:00Z")
+	s.now = func() time.Time { return time.Date(2026, 8, 7, 12, 30, 0, 0, time.UTC) }
+	require.NoError(s.Record("claude", "shared", "runtime-a", workspace, StateDone))
+	reports := s.LiveReportsForWorkspace(workspace, []string{"runtime-a"})
+	require.Len(reports, 1)
+	assert.Equal(time.Date(2026, 8, 7, 12, 20, 0, 0, time.UTC), reports[0].UpdatedAt)
+
+	require.NoError(s.Remove("claude", "shared", "runtime-a"))
+	entries, err := os.ReadDir(root)
+	require.NoError(err)
+	assert.Empty(entries)
+}
+
+func TestStoreSessionEndWithInvalidLegacyReport(t *testing.T) {
+	for _, content := range []string{"", "corrupt", "{}", `{"state":"unknown"}`} {
+		t.Run(content, func(t *testing.T) {
+			t.Parallel()
+			assert := assert.New(t)
+			store := NewStore(t.TempDir())
+			cwd := t.TempDir()
+			legacy := store.legacyReportPath("claude", "chat")
+			require.NoError(t, os.WriteFile(legacy, []byte(content), 0o600))
+			require.NoError(t, store.Record("claude", "chat", "runtime", cwd, StateDone))
+			assert.NoError(store.HandleEvent("claude", HookEvent{SessionID: "chat", HookEventName: "SessionEnd"}, "runtime"))
+			assert.NoFileExists(store.reportPath("claude", "chat", "runtime"))
+			if content == "" {
+				assert.NoFileExists(legacy)
+			} else {
+				data, err := os.ReadFile(legacy)
+				require.NoError(t, err)
+				assert.Equal(content, string(data))
+			}
+			assert.Empty(store.LiveReportsForWorkspace(cwd, []string{"runtime"}))
+		})
+	}
 }
 
 func reportHook(t *testing.T, store *Store, runtimeKey string, input map[string]any) {
@@ -372,6 +545,77 @@ func TestStoreIdlePromptKeepsPendingInputAndApproval(t *testing.T) {
 	}
 }
 
+func TestStoreIdlePromptDoesNotFinishAnUnpromptedSession(t *testing.T) {
+	t.Parallel()
+	store := NewStore(t.TempDir())
+	workspace := t.TempDir()
+	idlePrompt := map[string]any{
+		"session_id": "agent-a", "cwd": workspace,
+		"hook_event_name": "Notification", "notification_type": "idle_prompt",
+	}
+
+	// With no recorded turn there is nothing to call done.
+	reportHook(t, store, "runtime-a", idlePrompt)
+	assert.Empty(t, store.LiveReportsForWorkspace(workspace, []string{"runtime-a"}))
+
+	reportHook(t, store, "runtime-a", map[string]any{
+		"session_id": "agent-a", "cwd": workspace,
+		"hook_event_name": "SessionStart", "source": "startup",
+	})
+	reportHook(t, store, "runtime-a", idlePrompt)
+	reports := store.LiveReportsForWorkspace(workspace, []string{"runtime-a"})
+	require.Len(t, reports, 1)
+	assert.Equal(t, StateIdle, reports[0].State, "a session never prompted stays idle")
+	assert.False(t, reports[0].Continued)
+}
+
+func TestStoreConcurrentEventCannotOverwriteStopPendingWork(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		store := NewStore(t.TempDir())
+		workspace := t.TempDir()
+		reportHook(t, store, "runtime-a", map[string]any{
+			"session_id": "agent-a", "cwd": workspace, "hook_event_name": "UserPromptSubmit",
+		})
+
+		// The next report blocks between reading the saved report and writing
+		// its own, until released.
+		release := make(chan struct{})
+		var calls atomic.Int32
+		store.now = func() time.Time {
+			if calls.Add(1) == 1 {
+				<-release
+			}
+			return time.Now()
+		}
+		notified := make(chan error, 1)
+		go func() {
+			notified <- store.HandleEvent("codex", HookEvent{
+				SessionID: "agent-a", CWD: workspace,
+				HookEventName: "Notification", NotificationType: "permission_prompt",
+			}, "runtime-a")
+		}()
+		synctest.Wait()
+		stopped := make(chan error, 1)
+		go func() {
+			stopped <- store.HandleEvent("codex", HookEvent{
+				SessionID: "agent-a", CWD: workspace, HookEventName: "Stop",
+				BackgroundTasks: []any{map[string]any{"id": "task-1"}},
+			}, "runtime-a")
+		}()
+		// Unserialized, Stop finishes here and the notification then overwrites it.
+		synctest.Wait()
+		close(release)
+		require.NoError(t, <-notified)
+		require.NoError(t, <-stopped)
+
+		reports := store.LiveReportsForWorkspace(workspace, []string{"runtime-a"})
+		require.Len(t, reports, 1)
+		assert.Equal(t, StateDone, reports[0].State)
+		assert.True(t, reports[0].PendingWork, "Stop's pending work must survive a concurrent notification")
+	})
+}
+
 func TestStoreRetainRuntimeSessionsRemovesOthers(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -394,4 +638,43 @@ func TestStoreRetainRuntimeSessionsRemovesOthers(t *testing.T) {
 	assert.True(ok)
 	_, ok = store.SnapshotForWorkspace(workspace, []string{"runtime-b"})
 	assert.False(ok, "the report of a runtime not in the keep set is removed")
+}
+
+func TestRecordKeepsFirstCompletionAndRemovesSession(t *testing.T) {
+	store := NewStore(t.TempDir())
+	cwd := t.TempDir()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+	require.NoError(t, store.Record("acp", "chat", "runtime", cwd, StateDone))
+	now = now.Add(time.Minute)
+	require.NoError(t, store.Record("acp", "chat", "runtime", cwd, StateDone))
+	reports := store.LiveReportsForWorkspace(cwd, []string{"runtime"})
+	require.Len(t, reports, 1)
+	assert.Equal(t, time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC), reports[0].UpdatedAt)
+
+	require.NoError(t, store.Record("acp", "chat", "runtime", cwd, StateWorking))
+	require.NoError(t, store.Record("acp", "chat", "runtime", cwd, StateDone))
+	reports = store.LiveReportsForWorkspace(cwd, []string{"runtime"})
+	require.Len(t, reports, 1)
+	assert.Equal(t, now, reports[0].UpdatedAt, "a new turn completes as new")
+	require.Error(t, store.Record("acp", "chat", "runtime", cwd, "unknown"))
+
+	require.NoError(t, store.Record("acp", "chat", "other-runtime", cwd, StateWorking))
+	require.NoError(t, store.Remove("acp", "chat", "runtime"))
+	assert.Empty(t, store.LiveReportsForWorkspace(cwd, []string{"runtime"}))
+	reports = store.LiveReportsForWorkspace(cwd, []string{"other-runtime"})
+	require.Len(t, reports, 1)
+	assert.Equal(t, StateWorking, reports[0].State)
+}
+
+func TestSessionStartSourceMarksContinuedConversation(t *testing.T) {
+	t.Parallel()
+	for source, continued := range map[string]bool{"resume": true, "fork": true, "compact": false, "startup": false, "clear": false, "": false} {
+		store := NewStore(t.TempDir())
+		worktree := t.TempDir()
+		require.NoError(t, store.HandleEvent("claude", HookEvent{SessionID: "agent-1", CWD: worktree, HookEventName: "SessionStart", Source: source}, "runtime-1"))
+		reports := store.LiveReportsForWorkspace(worktree, []string{"runtime-1"})
+		require.Len(t, reports, 1)
+		assert.Equal(t, continued, reports[0].Continued, "source %q", source)
+	}
 }

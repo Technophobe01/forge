@@ -6,7 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
+	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 	"go.kenn.io/forge/platform"
 )
 
@@ -40,8 +40,7 @@ func TestNormalizeProjectPreservesGitLabIdentity(t *testing.T) {
 	assert.Equal("Group/SubGroup/Project", repo.Ref.RepoPath)
 	assert.Equal("Group/SubGroup", repo.Ref.Owner)
 	assert.Equal("project", repo.Ref.Name)
-	assert.Equal(int64(42), repo.Ref.PlatformID)
-	assert.Equal("42", repo.Ref.PlatformExternalID)
+	assert.Equal(platform.RepositoryIDKey(42), repo.Ref.Key)
 	assert.True(repo.Private)
 	assert.True(repo.Archived)
 	require.NotNil(t, repo.ViewerCanMerge)
@@ -528,7 +527,7 @@ func TestNormalizeNotesDedupeKeyIncludesRepositoryAndParent(t *testing.T) {
 		{ID: 1, Body: "same note id", Author: gitlab.NoteAuthor{Username: "alice"}},
 	}
 	otherRepo := testGitLabRepoRef()
-	otherRepo.PlatformID = 43
+	otherRepo.Key = platform.RepositoryIDKey(43)
 	otherRepo.RepoPath = "other/project"
 
 	firstMR := NormalizeMergeRequestNotes(testGitLabRepoRef(), 7, "", notes)
@@ -817,11 +816,11 @@ func TestNormalizeIssueRelatedMergeRequestsKeepsProviderHostBoundary(t *testing.
 
 func testGitLabRepoRef() platform.RepoRef {
 	return platform.RepoRef{
-		Platform:   platform.KindGitLab,
-		Host:       "gitlab.example.com",
-		Owner:      "group",
-		Name:       "project",
-		RepoPath:   "group/project",
-		PlatformID: 42,
+		Platform: platform.KindGitLab,
+		Host:     "gitlab.example.com",
+		Owner:    "group",
+		Name:     "project",
+		RepoPath: "group/project",
+		Key:      platform.RepositoryIDKey(42),
 	}
 }

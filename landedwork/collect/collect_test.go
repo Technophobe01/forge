@@ -3,6 +3,7 @@ package collect_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -89,7 +90,7 @@ func TestCollectQueryRecordsChargedOnce(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	s := &script{t: t, steps: []step{
-		{key: "repository", value: platform.Repository{Ref: route, PlatformID: 12}},
+		{key: "repository", value: observedRepository(12)},
 		{key: "association/" + head + "/", value: platform.Page[platform.LandingChangeRef]{Exhausted: true}},
 		{key: "association/" + source + "/", value: platform.Page[platform.LandingChangeRef]{Exhausted: true}},
 	}}
@@ -110,6 +111,7 @@ func (s *script) GetRepository(_ context.Context, r platform.RepoRef) (platform.
 	}
 	return v.(platform.Repository), nil
 }
+
 func (s *script) ListLandingAssociations(_ context.Context, r platform.RepoRef, sha, cursor string) (platform.Page[platform.LandingChangeRef], error) {
 	require.Equal(s.t, route, r)
 	v, err := s.next("association/" + sha + "/" + cursor)
@@ -118,6 +120,7 @@ func (s *script) ListLandingAssociations(_ context.Context, r platform.RepoRef, 
 	}
 	return v.(platform.Page[platform.LandingChangeRef]), nil
 }
+
 func (s *script) GetLandingChange(_ context.Context, _ platform.RepoRef, ref platform.LandingChangeRef) (platform.LandingChange, error) {
 	require.Equal(s.t, platform.LandingChangeRef{ID: 7, Number: 3, TargetID: 12}, ref)
 	v, err := s.next("detail")
@@ -126,9 +129,19 @@ func (s *script) GetLandingChange(_ context.Context, _ platform.RepoRef, ref pla
 	}
 	return v.(platform.LandingChange), nil
 }
+
 func (s *script) ListLandingSource(_ context.Context, _ platform.RepoRef, ref platform.LandingChangeRef, cursor string) (platform.Page[string], error) {
 	require.Equal(s.t, platform.LandingChangeRef{ID: 7, Number: 3, TargetID: 12}, ref)
 	v, err := s.next("source/" + cursor)
+	if err != nil {
+		return platform.Page[string]{}, err
+	}
+	return v.(platform.Page[string]), nil
+}
+
+func (s *script) ListLandingSourceRange(_ context.Context, _ platform.RepoRef, ref platform.LandingChangeRef, base, head, cursor string) (platform.Page[string], error) {
+	require.Equal(s.t, platform.LandingChangeRef{ID: 7, Number: 3, TargetID: 12}, ref)
+	v, err := s.next("range/" + base + "/" + head + "/" + cursor)
 	if err != nil {
 		return platform.Page[string]{}, err
 	}
@@ -139,7 +152,7 @@ func mergedScript(t *testing.T) *script {
 	t.Helper()
 	detail := platform.LandingChange{Ref: platform.LandingChangeRef{ID: 7, Number: 3, TargetID: 12}, TargetID: 12, TargetBranch: "main", Merged: new(true), MergeSHA: new(head), SourceHead: new(source), SourceCount: new(int64(1)), Terminal: head, TerminalEvidence: "merged_commit_sha"}
 	s := &script{t: t, policy: platform.LandingSourcePolicy{RequireCount: true, MaxCommits: 250}, steps: []step{
-		{key: "repository", value: platform.Repository{Ref: route, PlatformID: 12}},
+		{key: "repository", value: observedRepository(12)},
 		{key: "association/" + head + "/", value: platform.Page[platform.LandingChangeRef]{Items: []platform.LandingChangeRef{{ID: 7, Number: 3, TargetID: 12}}, NextCursor: "next"}},
 		{key: "association/" + head + "/next", value: platform.Page[platform.LandingChangeRef]{Items: []platform.LandingChangeRef{{ID: 7, Number: 3, TargetID: 12}}, Exhausted: true}},
 		{key: "association/" + source + "/", value: platform.Page[platform.LandingChangeRef]{Exhausted: true}},
@@ -257,6 +270,78 @@ func TestCollectSourceProof(t *testing.T) {
 	}
 }
 
+// A change above its list cap is listed from its reported source base, and
+// that range must reproduce the reported count and head to be complete.
+func TestCollectSourceRangeBeyondCap(t *testing.T) {
+	older := strings.Repeat("d", 40)
+	for _, tc := range []struct {
+		name, reason, stage string
+		edit                func(*script, *platform.LandingChange)
+	}{
+		{"range complete", "", "", func(*script, *platform.LandingChange) {}},
+		{"range continues", "", "", func(s *script, _ *platform.LandingChange) {
+			s.steps[5].value = platform.Page[string]{Items: []string{older}, NextCursor: "next"}
+			s.steps = slices.Insert(s.steps, 6, step{key: "range/" + base + "/" + source + "/next", value: platform.Page[string]{Items: []string{source}, Exhausted: true}})
+		}},
+		{"no range support", "provider_truncation", "detail", func(s *script, _ *platform.LandingChange) {
+			s.policy.RangeMaxCommits = 0
+			s.steps = s.steps[:5]
+		}},
+		{"count beyond range ceiling", "provider_truncation", "detail", func(s *script, d *platform.LandingChange) {
+			d.SourceCount = new(int64(4))
+			s.steps = s.steps[:5]
+		}},
+		{"base absent", "provider_truncation", "detail", func(s *script, d *platform.LandingChange) {
+			d.SourceBase = nil
+			s.steps = s.steps[:5]
+		}},
+		{"base malformed", "invalid_observation", "detail", func(s *script, d *platform.LandingChange) {
+			d.SourceBase = new("main")
+			s.steps = s.steps[:5]
+		}},
+		{"range shorter than count", "provider_truncation", "source", func(s *script, _ *platform.LandingChange) {
+			s.steps[5].value = platform.Page[string]{Items: []string{source}, Exhausted: true}
+			s.steps = s.steps[:6]
+		}},
+		{"range omits head", "provider_truncation", "source", func(s *script, _ *platform.LandingChange) {
+			s.steps[5].value = platform.Page[string]{Items: []string{older, base}, Exhausted: true}
+			s.steps = s.steps[:6]
+		}},
+		{"base changed on recheck", "changed_observation", "detail_recheck", func(s *script, _ *platform.LandingChange) {
+			d := s.steps[6].value.(platform.LandingChange)
+			d.SourceBase = new(older)
+			s.steps[6].value = d
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			s := mergedScript(t)
+			s.policy = platform.LandingSourcePolicy{RequireCount: true, MaxCommits: 1, RangeMaxCommits: 3}
+			d := s.steps[4].value.(platform.LandingChange)
+			d.SourceBase, d.SourceCount = new(base), new(int64(2))
+			s.steps[5] = step{key: "range/" + base + "/" + source + "/", value: platform.Page[string]{Items: []string{older, source}, Exhausted: true}}
+			s.steps[6].value = d
+			tc.edit(s, &d)
+			s.steps[4].value = d
+			got, err := collect.Collect(ctx, s, route, query, limits)
+			require.NoError(t, err)
+			assert := assert.New(t)
+			assert.Empty(s.steps)
+			assert.Equal(tc.reason, got.Evidence.Inventory.Reason)
+			require.Len(t, got.Observations, 1)
+			assert.Equal(tc.reason, got.Observations[0].Reason)
+			assert.Equal(tc.stage, got.Observations[0].FailureStage)
+			require.Len(t, got.Evidence.Candidates, 1)
+			assert.Equal(tc.reason == "", got.Evidence.Candidates[0].SourceComplete)
+			if tc.reason == "" {
+				assert.Equal([]string{older, source}, got.Evidence.Candidates[0].Source)
+				assert.Equal(new(base), got.Observations[0].Change.SourceBase)
+			}
+		})
+	}
+}
+
 func TestCollectLimitsAndFailures(t *testing.T) {
 	for _, tc := range []struct {
 		name, reason   string
@@ -369,7 +454,7 @@ func TestCollectNoResultOnInvalidInput(t *testing.T) {
 			case "canceled":
 				cancel()
 			case "identity":
-				s.steps[0].value = platform.Repository{Ref: route, PlatformID: 99}
+				s.steps[0].value = observedRepository(99)
 			case "reader identity":
 				s.steps[4] = step{key: "detail", err: platform.ErrLandingIdentityMismatch}
 			case "output":
@@ -426,4 +511,83 @@ func TestCollectCursorCycle(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "repeated_cursor", got.Evidence.Inventory.Reason)
 	assert.False(t, got.Evidence.Inventory.Complete)
+}
+
+func observedRepository(id int64) platform.Repository {
+	ref := route
+	ref.Key = platform.RepositoryIDKey(id)
+	return platform.Repository{Ref: ref}
+}
+
+// inventoryScript also lists every merged change that targets the repository.
+type inventoryScript struct{ *script }
+
+func (s inventoryScript) ListMergedLandingChanges(_ context.Context, r platform.RepoRef, cursor string) (platform.Page[platform.LandingChangeRef], error) {
+	require.Equal(s.t, route, r)
+	v, err := s.next("inventory/" + cursor)
+	if err != nil {
+		return platform.Page[platform.LandingChangeRef]{}, err
+	}
+	return v.(platform.Page[platform.LandingChangeRef]), nil
+}
+
+// Commit associations can name only changes in another repository of the same
+// network. A complete list of the repository's own merged changes establishes
+// local absence instead, so the foreign changes need not block collection.
+func TestCollectForeignAssociations(t *testing.T) {
+	foreign := platform.LandingChangeRef{ID: 8, Number: 3, TargetID: 99}
+	local := platform.LandingChangeRef{ID: 7, Number: 3, TargetID: 12}
+	detail := platform.LandingChange{Ref: local, TargetID: 12, TargetBranch: "main", Merged: new(true), MergeSHA: new(head), SourceHead: new(source), SourceCount: new(int64(1)), Terminal: head, TerminalEvidence: "merged_commit_sha"}
+	for _, mode := range []string{"no inventory", "local change", "no local changes", "failed inventory", "foreign inventory"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			s := &script{t: t, policy: platform.LandingSourcePolicy{RequireCount: true, MaxCommits: 250}, steps: []step{
+				{key: "repository", value: observedRepository(12)},
+				{key: "association/" + head + "/", value: platform.Page[platform.LandingChangeRef]{Items: []platform.LandingChangeRef{foreign}, Exhausted: true}},
+				{key: "association/" + source + "/", value: platform.Page[platform.LandingChangeRef]{Exhausted: true}},
+			}}
+			var reader platform.LandingEvidenceReader = inventoryScript{s}
+			reason := ""
+			switch mode {
+			case "no inventory":
+				reader, reason = s, "ambiguous_absence"
+			case "local change":
+				s.steps = append(s.steps,
+					step{key: "inventory/", value: platform.Page[platform.LandingChangeRef]{Items: []platform.LandingChangeRef{local}, NextCursor: "next"}},
+					step{key: "inventory/next", value: platform.Page[platform.LandingChangeRef]{Exhausted: true}},
+					step{key: "detail", value: detail},
+					step{key: "source/", value: platform.Page[string]{Items: []string{source}, Exhausted: true}},
+					step{key: "detail", value: detail})
+			case "no local changes":
+				s.steps = append(s.steps, step{key: "inventory/", value: platform.Page[platform.LandingChangeRef]{Exhausted: true}})
+			case "failed inventory":
+				s.steps = append(s.steps, step{key: "inventory/", err: errors.New("unavailable")})
+				reason = "request_failed"
+			case "foreign inventory":
+				s.steps = append(s.steps, step{key: "inventory/", value: platform.Page[platform.LandingChangeRef]{Items: []platform.LandingChangeRef{foreign}, Exhausted: true}})
+				reason = "invalid_observation"
+			}
+			got, err := collect.Collect(ctx, reader, route, query, limits)
+			require.NoError(t, err)
+			assert := assert.New(t)
+			assert.Empty(s.steps)
+			assert.Equal(reason, got.Evidence.Inventory.Reason)
+			assert.Equal(reason == "", got.Evidence.Inventory.Complete)
+			var ids []string
+			for _, c := range got.Evidence.Candidates {
+				ids = append(ids, c.ID)
+			}
+			if mode == "local change" {
+				require.Equal(t, []string{"7"}, ids)
+				assert.True(got.Evidence.Candidates[0].SourceComplete)
+			} else {
+				assert.Empty(ids, "a foreign change is never a local candidate")
+			}
+			require.NotEmpty(t, got.Observations)
+			last := got.Observations[len(got.Observations)-1]
+			assert.Equal(int64(8), last.Change.Ref.ID)
+			assert.Equal("foreign_repository", last.Reason)
+		})
+	}
 }

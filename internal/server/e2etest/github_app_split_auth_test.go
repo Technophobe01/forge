@@ -26,6 +26,7 @@ import (
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/server"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/reposeed"
 	"go.kenn.io/forge/internal/testutil/servertest"
 	"go.kenn.io/forge/internal/tokenauth"
 	"go.kenn.io/forge/platform"
@@ -38,7 +39,7 @@ import (
 // carry the minted installation token while a user-facing mutation
 // (posting a PR comment) must carry the user's PAT so GitHub
 // attributes it to the user instead of the app bot.
-func TestGitHubAppSplitAuthE2E(t *testing.T) {
+func TestGitHubAppSplitAuthE2E(t *testing.T) { //nolint:paralleltest // t.Setenv writes KENN_FORGE_GITHUB_TOKEN
 	assert := assert.New(t)
 	require := require.New(t)
 	t.Setenv("KENN_FORGE_GITHUB_TOKEN", "user-pat-e2e")
@@ -57,29 +58,28 @@ func TestGitHubAppSplitAuthE2E(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/v3/repos/kenn-io/kenn-forge",
-		func(w http.ResponseWriter, r *http.Request) {
-			// The repo settings refresh fetches metadata with the app
-			// token and overlays viewer permissions from the PAT; the
-			// permissions block is viewer-specific (only the PAT can
-			// push), so viewer_can_merge in the DB proves the overlay
-			// happened.
-			permissions := `"permissions": {"push": false}`
-			mergeSettings := ""
-			if r.Header.Get("Authorization") == "Bearer user-pat-e2e" {
-				record("write:repo-viewer-overlay", r)
-				permissions = `"permissions": {"push": true}`
-				if userMergeSettingsComplete.Load() {
-					mergeSettings = `,
+	repoMetadata := func(w http.ResponseWriter, r *http.Request) {
+		// The repo settings refresh fetches metadata with the app
+		// token and overlays viewer permissions from the PAT; the
+		// permissions block is viewer-specific (only the PAT can
+		// push), so viewer_can_merge in the DB proves the overlay
+		// happened.
+		permissions := `"permissions": {"push": false}`
+		mergeSettings := ""
+		if r.Header.Get("Authorization") == "Bearer user-pat-e2e" {
+			record("write:repo-viewer-overlay", r)
+			permissions = `"permissions": {"push": true}`
+			if userMergeSettingsComplete.Load() {
+				mergeSettings = `,
 					"allow_squash_merge": true,
 					"allow_merge_commit": false,
 					"allow_rebase_merge": false`
-				}
-			} else {
-				record("read:repo-metadata", r)
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprint(w, `{
+		} else {
+			record("read:repo-metadata", r)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
 				"id": 4242001,
 				"node_id": "R_kenn_forge",
 				"name": "kenn-forge",
@@ -90,7 +90,9 @@ func TestGitHubAppSplitAuthE2E(t *testing.T) {
 				"clone_url": "https://github.com/kenn-io/forge.git",
 				`+permissions+mergeSettings+`
 			}`)
-		})
+	}
+	mux.HandleFunc("GET /api/v3/repos/kenn-io/kenn-forge", repoMetadata)
+	mux.HandleFunc("GET /api/v3/repositories/4242001", repoMetadata)
 	mux.HandleFunc("GET /api/v3/repos/kenn-io/kenn-forge/pulls",
 		func(w http.ResponseWriter, r *http.Request) {
 			record("read:list-pulls", r)
@@ -242,24 +244,22 @@ repository_selection = "all"
 
 	database := dbtest.Open(t)
 	ref := ghclient.RepoRef{
-		Platform:           platform.KindGitHub,
-		Owner:              "kenn-io",
-		Name:               "kenn-forge",
-		RepoPath:           "kenn-io/kenn-forge",
-		PlatformHost:       "github.com",
-		PlatformRepoID:     4242001,
-		PlatformExternalID: "R_kenn_forge",
-		DefaultBranch:      "main",
+		Platform:      platform.KindGitHub,
+		Owner:         "kenn-io",
+		Name:          "kenn-forge",
+		RepoPath:      "kenn-io/kenn-forge",
+		PlatformHost:  "github.com",
+		Key:           platform.RepositoryIDKey(4242001),
+		DefaultBranch: "main",
 	}
-	repoID, err := database.UpsertRepo(t.Context(), platformdb.DBRepoIdentity(platform.RepoRef{
-		Platform:           platform.KindGitHub,
-		Host:               "github.com",
-		Owner:              "kenn-io",
-		Name:               "kenn-forge",
-		RepoPath:           "kenn-io/kenn-forge",
-		PlatformID:         4242001,
-		PlatformExternalID: "R_kenn_forge",
-		DefaultBranch:      "main",
+	repoID, err := reposeed.Seed(t.Context(), database, platformdb.DBRepoIdentity(platform.RepoRef{
+		Platform:      platform.KindGitHub,
+		Host:          "github.com",
+		Owner:         "kenn-io",
+		Name:          "kenn-forge",
+		RepoPath:      "kenn-io/kenn-forge",
+		Key:           platform.RepositoryIDKey(4242001),
+		DefaultBranch: "main",
 	}))
 	require.NoError(err)
 	// Reproduce a row damaged by an older App-only refresh. The first sync's
@@ -419,7 +419,7 @@ repository_selection = "all"
 		"the viewer permission overlay must use the user's PAT")
 	assert.Equal("Bearer ghs_app_token_e2e", authByCall["read:repo-metadata"],
 		"repository metadata must stay on the app token")
-	notificationCall := "read:other GET /api/v3/repos/kenn-io/kenn-forge/notifications"
+	notificationCall := "read:other GET /api/v3/notifications"
 	assert.Equal("Bearer user-pat-e2e", authByCall[notificationCall],
 		"notification APIs are user-scoped and must use the user's PAT")
 	for name, auth := range authByCall {
@@ -467,7 +467,7 @@ repository_selection = "all"
 		"PAT writes and notification reads must be attributed to the user pool")
 }
 
-func TestGitHubAppGlobDiscoveryUsesInstallationRepositoriesE2E(t *testing.T) {
+func TestGitHubAppGlobDiscoveryUsesInstallationRepositoriesE2E(t *testing.T) { //nolint:paralleltest // t.Setenv writes KENN_FORGE_GITHUB_TOKEN
 	assert := assert.New(t)
 	require := require.New(t)
 	t.Setenv("KENN_FORGE_GITHUB_TOKEN", "user-pat-e2e")
@@ -528,15 +528,14 @@ func TestGitHubAppGlobDiscoveryUsesInstallationRepositoriesE2E(t *testing.T) {
 			]
 		}`)
 	})
-	mux.HandleFunc("GET /api/v3/repos/mariusvniekerk/private-repo",
-		func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Authorization") == "Bearer user-pat-e2e" {
-				record("write:repo-viewer-overlay", r)
-			} else {
-				record("read:repo-metadata", r)
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprint(w, `{
+	repoMetadata := func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer user-pat-e2e" {
+			record("write:repo-viewer-overlay", r)
+		} else {
+			record("read:repo-metadata", r)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
 				"id": 99001,
 				"node_id": "R_private",
 				"name": "private-repo",
@@ -548,7 +547,9 @@ func TestGitHubAppGlobDiscoveryUsesInstallationRepositoriesE2E(t *testing.T) {
 				"clone_url": "https://github.com/mariusvniekerk/private-repo.git",
 				"permissions": {"push": true}
 			}`)
-		})
+	}
+	mux.HandleFunc("GET /api/v3/repos/mariusvniekerk/private-repo", repoMetadata)
+	mux.HandleFunc("GET /api/v3/repositories/99001", repoMetadata)
 	mux.HandleFunc("GET /api/v3/repos/mariusvniekerk/private-repo/pulls",
 		func(w http.ResponseWriter, r *http.Request) {
 			record("read:list-pulls", r)
@@ -704,7 +705,7 @@ func decodeRepoOperations(t *testing.T, body io.Reader) map[string]repoOperation
 // attributed to the user), so with no PAT or gh credential behind the
 // app every write must be reported unavailable up front and the
 // mutation endpoint must refuse rather than write as the app bot.
-func TestGitHubAppNoUserCredentialGatesWritesE2E(t *testing.T) {
+func TestGitHubAppNoUserCredentialGatesWritesE2E(t *testing.T) { //nolint:paralleltest // t.Setenv writes KENN_FORGE_GITHUB_TOKEN
 	assert := assert.New(t)
 	require := require.New(t)
 	// The configured PAT env var is present but empty: only the app
@@ -728,10 +729,9 @@ func TestGitHubAppNoUserCredentialGatesWritesE2E(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprint(w, `{"resources":{"core":{"limit":12500,"remaining":12000,"reset":2000000000}}}`)
 	})
-	mux.HandleFunc("GET /api/v3/repos/kenn-io/kenn-forge",
-		func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprint(w, `{
+	repoMetadata := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
 				"id": 4242001,
 				"node_id": "R_kenn_forge",
 				"name": "kenn-forge",
@@ -741,7 +741,9 @@ func TestGitHubAppNoUserCredentialGatesWritesE2E(t *testing.T) {
 				"html_url": "https://github.com/kenn-io/kenn-forge",
 				"clone_url": "https://github.com/kenn-io/forge.git"
 			}`)
-		})
+	}
+	mux.HandleFunc("GET /api/v3/repos/kenn-io/kenn-forge", repoMetadata)
+	mux.HandleFunc("GET /api/v3/repositories/4242001", repoMetadata)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprint(w, `[]`)
@@ -812,24 +814,22 @@ repository_selection = "all"
 
 	database := dbtest.Open(t)
 	ref := ghclient.RepoRef{
-		Platform:           platform.KindGitHub,
-		Owner:              "kenn-io",
-		Name:               "kenn-forge",
-		RepoPath:           "kenn-io/kenn-forge",
-		PlatformHost:       "github.com",
-		PlatformRepoID:     4242001,
-		PlatformExternalID: "R_kenn_forge",
-		DefaultBranch:      "main",
+		Platform:      platform.KindGitHub,
+		Owner:         "kenn-io",
+		Name:          "kenn-forge",
+		RepoPath:      "kenn-io/kenn-forge",
+		PlatformHost:  "github.com",
+		Key:           platform.RepositoryIDKey(4242001),
+		DefaultBranch: "main",
 	}
-	repoID, err := database.UpsertRepo(t.Context(), platformdb.DBRepoIdentity(platform.RepoRef{
-		Platform:           platform.KindGitHub,
-		Host:               "github.com",
-		Owner:              "kenn-io",
-		Name:               "kenn-forge",
-		RepoPath:           "kenn-io/kenn-forge",
-		PlatformID:         4242001,
-		PlatformExternalID: "R_kenn_forge",
-		DefaultBranch:      "main",
+	repoID, err := reposeed.Seed(t.Context(), database, platformdb.DBRepoIdentity(platform.RepoRef{
+		Platform:      platform.KindGitHub,
+		Host:          "github.com",
+		Owner:         "kenn-io",
+		Name:          "kenn-forge",
+		RepoPath:      "kenn-io/kenn-forge",
+		Key:           platform.RepositoryIDKey(4242001),
+		DefaultBranch: "main",
 	}))
 	require.NoError(err)
 	_, err = database.UpsertMergeRequest(t.Context(), &db.MergeRequest{

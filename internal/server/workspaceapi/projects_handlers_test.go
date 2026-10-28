@@ -5,6 +5,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,8 +21,6 @@ import (
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	gitcmd "go.kenn.io/kit/git/cmd"
-	gitenv "go.kenn.io/kit/git/env"
 	managedworktree "go.kenn.io/kit/git/managed"
 
 	"go.kenn.io/forge/internal/db"
@@ -28,22 +28,33 @@ import (
 	"go.kenn.io/forge/internal/providerplane"
 	"go.kenn.io/forge/internal/server/httpapi"
 	"go.kenn.io/forge/internal/testutil/dbtest"
+	"go.kenn.io/forge/internal/testutil/gitfixture"
+	"go.kenn.io/forge/internal/testutil/gitsafe"
+	"go.kenn.io/forge/internal/testutil/reposeed"
+	"go.kenn.io/forge/internal/workspace"
+	"go.kenn.io/forge/platform"
 )
 
+func TestKillProjectRuntimeTmuxSessionTreatsServerExitAsGone(t *testing.T) {
+	command := []string{"sh", "-c", "echo 'server exited unexpectedly' >&2; exit 1"}
+	err := killProjectRuntimeTmuxSession(t.Context(), command, "session")
+	require.NoError(t, err)
+}
+
 func TestRegisterProjectUsesHubRepositoryIdentity(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	database := dbtest.Open(t)
-	observedAt := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	handler := New(Deps{
 		DB: database,
 		ResolveRepository: func(
-			ctx context.Context, route providerplane.RepositoryRoute,
+			ctx context.Context, route providerplane.RepositoryRoute, _ platform.RepositoryKey,
 		) (*db.Repo, error) {
-			entry, _, err := database.ReconcileRepositoryObservation(ctx, db.RepoIdentity{
+			entry, err := database.ObserveRepository(ctx, db.RepoIdentity{
 				Platform: route.Provider, PlatformHost: route.PlatformHost,
-				PlatformRepoID: "provider-repository-1",
-				Owner:          route.Owner, Name: route.Name,
-			}, observedAt)
+				Key:   platform.RepositoryIDKey(1001),
+				Owner: route.Owner, Name: route.Name,
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -51,7 +62,7 @@ func TestRegisterProjectUsesHubRepositoryIdentity(t *testing.T) {
 		},
 	})
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Second)
 		defer cancel()
 		require.NoError(handler.Shutdown(ctx))
 	})
@@ -64,27 +75,85 @@ func TestRegisterProjectUsesHubRepositoryIdentity(t *testing.T) {
 		"main",
 	)
 	require.NoError(err)
-	var platformRepoID string
+	var platformRepoID int64
 	require.NoError(database.ReadDB().QueryRowContext(t.Context(), `
 		SELECT r.platform_repo_id
 		FROM forge_projects p
 		JOIN forge_repos r ON r.id = p.repo_id
 		WHERE p.id = ?`, created.ID).Scan(&platformRepoID))
-	require.Equal("provider-repository-1", platformRepoID)
+	require.Equal(int64(1001), platformRepoID)
+}
+
+func TestRegisterProjectWithoutHubLinksOnlyTrackedRepository(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		trackRoute bool
+	}{
+		{name: "tracked route links repository", trackRoute: true},
+		{name: "untracked route stays unlinked"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			database := dbtest.Open(t)
+			var trackedRepoID int64
+			if tt.trackRoute {
+				var err error
+				trackedRepoID, err = reposeed.Seed(t.Context(), database, db.RepoIdentity{
+					Platform: "github", PlatformHost: "github.com",
+					Key: platform.RepositoryIDKey(1001), Owner: "acme", Name: "widget",
+				})
+				require.NoError(err)
+			}
+			handler := New(Deps{DB: database})
+			t.Cleanup(func() {
+				ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Second)
+				defer cancel()
+				require.NoError(handler.Shutdown(ctx))
+			})
+
+			created, err := handler.registerProjectAtPath(
+				t.Context(), t.TempDir(), "Widget",
+				&platformIdentityPayload{
+					Platform: "github", PlatformHost: "github.com",
+					Owner: "acme", Name: "widget",
+				},
+				"main",
+			)
+			require.NoError(err)
+
+			var repoID sql.NullInt64
+			require.NoError(database.ReadDB().QueryRowContext(t.Context(),
+				`SELECT repo_id FROM forge_projects WHERE id = ?`, created.ID,
+			).Scan(&repoID))
+			repos, err := database.ListRepos(t.Context())
+			require.NoError(err)
+			if tt.trackRoute {
+				assert.Equal(sql.NullInt64{Int64: trackedRepoID, Valid: true}, repoID)
+				assert.Len(repos, 1)
+				return
+			}
+			assert.False(repoID.Valid)
+			assert.Empty(repos, "registration must not create a repository row")
+		})
+	}
 }
 
 func TestWorktreeLifecycleProblemMapsExistingBranch(t *testing.T) {
+	t.Parallel()
 	err := worktreeLifecycleProblem(
 		managedworktree.ErrBranchAlreadyExists, "body.setup_script",
 	)
 
-	problem, ok := err.(*httpapi.ProblemError)
+	problem, ok := errors.AsType[*httpapi.ProblemError](err)
 	require.True(t, ok, "want *ProblemError, got %T", err)
 	assert.Equal(t, http.StatusConflict, problem.Status)
 	assert.Equal(t, httpapi.CodeBranchConflict, problem.Code)
 }
 
-func TestManagedWorktreeExecutionUsesSharedProcessLimiter(t *testing.T) {
+func TestManagedWorktreeExecutionUsesSharedProcessLimiter(t *testing.T) { //nolint:paralleltest // swaps the procutil default limiter
 	require := require.New(t)
 	restore := procutil.SetDefaultLimiterForTest(
 		procutil.NewLimiterWithAcquireTimeout(1, time.Millisecond),
@@ -95,7 +164,7 @@ func TestManagedWorktreeExecutionUsesSharedProcessLimiter(t *testing.T) {
 	t.Cleanup(release)
 
 	_, err = runManagedWorktreeGit(
-		context.Background(), gitcmd.Runner{Env: os.Environ()}, t.TempDir(), "status",
+		context.Background(), gitsafe.Runner(), t.TempDir(), "status",
 	)
 	require.ErrorIs(err, procutil.ErrProcessLimitReached)
 
@@ -103,32 +172,18 @@ func TestManagedWorktreeExecutionUsesSharedProcessLimiter(t *testing.T) {
 		Script: "/bin/true", Dir: t.TempDir(), Env: os.Environ(),
 	})
 	require.ErrorIs(err, procutil.ErrProcessLimitReached)
-
-	_, err = managedWorktreeIsDirty(context.Background(), t.TempDir())
-	require.ErrorIs(err, procutil.ErrProcessLimitReached)
 }
 
 func TestCreateProjectWorktreeFromMergeRequestUsesHubFacts(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
-	gitConfig := filepath.Join(t.TempDir(), "gitconfig")
-	require.NoError(os.WriteFile(gitConfig, nil, 0o600))
-	t.Setenv("GIT_CONFIG_GLOBAL", gitConfig)
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	runGit := func(dir string, args ...string) string {
 		t.Helper()
-		command := procutil.Command("git", args...)
-		command.Dir = dir
-		command.Env = append(
-			gitenv.StripAll(os.Environ()),
-			"GIT_CONFIG_GLOBAL="+gitConfig, "GIT_CONFIG_NOSYSTEM=1",
-		)
-		output, err := command.CombinedOutput()
-		require.NoError(err, "git %v: %s", args, output)
-		return strings.TrimSpace(string(output))
+		return strings.TrimSpace(string(gitfixture.Run(t, dir, args...)))
 	}
 	origin := filepath.Join(t.TempDir(), "origin")
 	require.NoError(os.MkdirAll(origin, 0o755))
@@ -146,9 +201,9 @@ func TestCreateProjectWorktreeFromMergeRequestUsesHubFacts(t *testing.T) {
 	runGit(filepath.Dir(projectRoot), "clone", "-q", origin, projectRoot)
 
 	database := dbtest.Open(t)
-	repoID, err := database.UpsertRepo(t.Context(), db.RepoIdentity{
+	repoID, err := reposeed.Seed(t.Context(), database, db.RepoIdentity{
 		Platform: "github", PlatformHost: "github.com",
-		PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget",
+		Owner: "acme", Name: "widget",
 	})
 	require.NoError(err)
 	project, err := database.CreateProject(t.Context(), db.CreateProjectInput{
@@ -162,14 +217,17 @@ func TestCreateProjectWorktreeFromMergeRequestUsesHubFacts(t *testing.T) {
 		HeadRepoCloneURL: origin, ExpectedHeadSHA: headSHA,
 	}
 	resolver := stubLaunchSpecResolver{mergeRequestFacts: &facts}
+	coordinator, err := workspace.NewRepositoryCoordinator("")
+	require.NoError(err)
 	handler := New(Deps{
+		RepositoryWorktrees:        coordinator,
 		DB:                         database,
 		Resolver:                   httpapi.NewRepositoryResolver(httpapi.RepositoryResolverDeps{DB: database}),
 		MergeRequestWorktreeSource: resolver,
 		EnrichmentDisabled:         true,
 	})
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Second)
 		defer cancel()
 		require.NoError(handler.Shutdown(ctx))
 	})
@@ -197,4 +255,33 @@ func TestCreateProjectWorktreeFromMergeRequestUsesHubFacts(t *testing.T) {
 	localMR, err := database.GetMergeRequestByRepoIDAndNumber(t.Context(), repoID, 7)
 	require.NoError(err)
 	assert.Nil(localMR)
+}
+
+// A rollback that leaves files behind must not hide why creation failed:
+// the response keeps the cause's status and code and flags the leftovers.
+func TestWorktreeLifecycleProblemKeepsCauseWhenCleanupIsIncomplete(t *testing.T) {
+	t.Parallel()
+	cleanup := fmt.Errorf("%w: path %q", managedworktree.ErrWorktreeCleanupIncomplete, "/work/checkout")
+	for _, tt := range []struct {
+		name   string
+		cause  error
+		status int
+		code   httpapi.ProblemCode
+	}{
+		{"hook failure", &managedworktree.HookError{Script: "setup.sh", ExitCode: 3, Stderr: "boom"}, http.StatusUnprocessableEntity, httpapi.CodeHookFailed},
+		{"branch conflict", managedworktree.ErrBranchAlreadyExists, http.StatusConflict, httpapi.CodeBranchConflict},
+		{"unclassified", errors.New("disk full"), http.StatusInternalServerError, httpapi.CodeInternalError},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := worktreeLifecycleProblem(errors.Join(tt.cause, cleanup), "body.setup_script")
+
+			problem, ok := errors.AsType[*httpapi.ProblemError](err)
+			require.True(t, ok, "want *ProblemError, got %T", err)
+			assert.Equal(t, tt.status, problem.Status)
+			assert.Equal(t, tt.code, problem.Code)
+			assert.Equal(t, true, problem.Details["cleanupIncomplete"])
+			assert.Contains(t, problem.Detail, "/work/checkout")
+		})
+	}
 }

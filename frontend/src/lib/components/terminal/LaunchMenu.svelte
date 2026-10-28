@@ -1,9 +1,12 @@
 <script lang="ts">
-  import type { LaunchTarget } from "../../api/types.js";
+  import { mountTerminalPopover } from "./terminal-popover.js";
+  import type { LaunchTarget, QuickAction } from "../../api/types.js";
   import PlayIcon from "@lucide/svelte/icons/play";
   import ChevronDownIcon from "@lucide/svelte/icons/chevron-down";
+  import ZapIcon from "@lucide/svelte/icons/zap";
   import LaunchTargetName from "./LaunchTargetName.svelte";
-  import { isVisibleLaunchTarget } from "./launchTargets";
+  import { visibleLaunchTargets } from "./launchTargets";
+  import { sortQuickActionsByLabel } from "../../stores/workspace-quick-actions.js";
 
   interface LaunchMenuProps {
     launchTargets: LaunchTarget[];
@@ -13,6 +16,9 @@
      *  so its window listeners don't outlive the visible surface. */
     hostVisible?: boolean;
     onLaunch?: (targetKey: string) => void;
+    quickActions?: QuickAction[];
+    quickActionBusy?: boolean;
+    onQuickAction?: (action: QuickAction) => void;
   }
 
   const {
@@ -21,20 +27,25 @@
     disabled = false,
     hostVisible = true,
     onLaunch,
+    quickActions = [],
+    quickActionBusy = false,
+    onQuickAction,
   }: LaunchMenuProps = $props();
 
-  let open = $state(false);
+  let open = $state<"launch" | "quick" | null>(null);
   let rootEl = $state<HTMLDivElement | null>(null);
+  let panelEl = $state<HTMLDivElement | null>(null);
 
-  const visibleTargets = $derived(launchTargets.filter(isVisibleLaunchTarget));
+  const visibleTargets = $derived(visibleLaunchTargets(launchTargets));
+  const sortedQuickActions = $derived(sortQuickActionsByLabel(quickActions));
 
   $effect(() => {
-    if (disabled || !hostVisible) open = false;
+    if (disabled || !hostVisible) open = null;
   });
 
   function launch(targetKey: string): void {
     if (disabled) return;
-    open = false;
+    open = null;
     onLaunch?.(targetKey);
   }
 
@@ -46,14 +57,15 @@
     if (!open) return;
 
     function onPointerDown(ev: PointerEvent): void {
-      if (rootEl && ev.target instanceof Node && rootEl.contains(ev.target)) {
+      if (rootEl && ev.target instanceof Node && (rootEl.contains(ev.target) || panelEl?.contains(ev.target))) {
         return;
       }
-      open = false;
+      open = null;
     }
     function onKeydown(ev: KeyboardEvent): void {
       if (ev.key === "Escape") {
-        open = false;
+        rootEl?.querySelector<HTMLButtonElement>('[aria-expanded="true"]')?.focus();
+        open = null;
       }
     }
     window.addEventListener("pointerdown", onPointerDown, true);
@@ -68,13 +80,15 @@
 <div class="launch-menu" bind:this={rootEl}>
   <button
     class="launch-trigger"
+    type="button"
+    title="Launch in this pane"
     aria-label="Launch"
     aria-haspopup="true"
-    aria-expanded={open}
+    aria-expanded={open === "launch"}
     disabled={disabled}
     onclick={() => {
       if (disabled) return;
-      open = !open;
+      open = open === "launch" ? null : "launch";
     }}
   >
     <PlayIcon
@@ -83,7 +97,6 @@
       strokeWidth="2.5"
       aria-hidden="true"
     />
-    <span>Launch</span>
     <ChevronDownIcon
       class="launch-trigger-chevron"
       size="12"
@@ -91,19 +104,57 @@
       aria-hidden="true"
     />
   </button>
+  {#if sortedQuickActions.length > 0 && onQuickAction}
+    <button
+      class="launch-trigger quick-actions-trigger"
+      type="button"
+      title="Quick actions"
+      aria-label="Quick actions"
+      aria-haspopup="dialog"
+      aria-expanded={open === "quick"}
+      disabled={disabled || quickActionBusy}
+      onclick={() => { open = open === "quick" ? null : "quick"; }}
+    >
+      <ZapIcon size="13" strokeWidth="2.2" aria-hidden="true" />
+    </button>
+  {/if}
   {#if open}
-    <div class="launch-popover">
-      <div class="popover-heading">Run configurations</div>
-      {#each visibleTargets as target (target.key)}
-        <button
-          class="launch-option"
-          disabled={disabled || !target.available || launchingKey === target.key}
-          title={target.disabled_reason ?? targetLabel(target)}
-          onclick={() => launch(target.key)}
-        >
-          <LaunchTargetName {target} label={targetLabel(target)} iconSize={13} fallbackIcon />
-        </button>
-      {/each}
+    <div
+      class="launch-popover"
+      role="dialog"
+      aria-label={open === "quick" ? "Quick actions" : "Run configurations"}
+      bind:this={panelEl}
+      {@attach (node) => {
+        const cleanup = mountTerminalPopover(node, rootEl!);
+        node.querySelector<HTMLButtonElement>("button:enabled")?.focus();
+        return cleanup;
+      }}
+    >
+      <div class="popover-heading">{open === "quick" ? "Quick actions" : "Run configurations"}</div>
+      {#if open === "quick"}
+        {#each sortedQuickActions as action (action.label)}
+          {@const target = launchTargets.find((candidate) => candidate.key === action.agent && (candidate.kind === "agent" || candidate.kind === "acp"))}
+          <button
+            class="launch-option"
+            disabled={disabled || quickActionBusy || !target?.available || launchingKey === action.agent}
+            title={!target ? `Agent "${action.agent}" is not configured` : !target.available ? target.disabled_reason || `Agent "${action.agent}" is not available` : action.prompt}
+            onclick={() => { open = null; onQuickAction?.(action); }}
+          >
+            <LaunchTargetName target={{ kind: "agent", key: action.agent }} label={action.label} iconSize={13} fallbackIcon />
+          </button>
+        {/each}
+      {:else}
+        {#each visibleTargets as target (target.key)}
+          <button
+            class="launch-option"
+            disabled={disabled || !target.available || launchingKey === target.key}
+            title={target.disabled_reason ?? targetLabel(target)}
+            onclick={() => launch(target.key)}
+          >
+            <LaunchTargetName {target} label={targetLabel(target)} iconSize={13} fallbackIcon />
+          </button>
+        {/each}
+      {/if}
     </div>
   {/if}
 </div>
@@ -111,17 +162,25 @@
 <style>
   .launch-menu {
     position: relative;
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+  }
+
+  .quick-actions-trigger {
+    width: 24px;
+    justify-content: center;
   }
 
   .launch-trigger {
     display: inline-flex;
     align-items: center;
     gap: var(--space-2);
-    height: 22px;
-    padding: 0 7px 0 8px;
-    border: 1px solid var(--border-default);
+    height: 24px;
+    padding: 0 4px;
+    border: 1px solid transparent;
     border-radius: 3px;
-    background: var(--bg-surface);
+    background: transparent;
     color: var(--text-primary);
     font: inherit;
     font-size: var(--font-size-sm);
@@ -153,10 +212,8 @@
   }
 
   .launch-popover {
-    position: absolute;
-    right: 0;
-    top: calc(100% + 4px);
-    z-index: 20;
+    position: fixed;
+    z-index: calc(var(--z-overlay) - 1);
     min-width: 220px;
     padding: 4px;
     border: 1px solid var(--border-default);
@@ -170,8 +227,8 @@
     color: var(--text-muted);
     font-size: var(--font-size-xs);
     font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
+    text-transform: var(--label-transform, uppercase);
+    letter-spacing: var(--letter-spacing-label, 0.06em);
     border-bottom: 1px solid var(--border-muted);
     margin-bottom: 3px;
   }
